@@ -67,12 +67,22 @@ bool y2r_video_blit(AVFrame *f, gfx3dSide_t side, int w, int h) {
     /* CPU will read g_out; invalidate so we don't see stale cache lines */
     GSPGPU_InvalidateDataCache(g_out, (u32)w * h * 2);
 
-    /* transpose row-major RGB565 into the rotated top framebuffer (sequential writes) */
+    /* Transpose row-major RGB565 into the rotated top framebuffer. Cache-blocked:
+       a naive transpose does a strided (cache-missing) read per pixel, which is the
+       Old-3DS bottleneck. Processing TBxTB tiles keeps each source chunk in cache. */
     u16 *fb = (u16 *)gfxGetFramebuffer(GFX_TOP, side, NULL, NULL);
-    for (int x = 0; x < w; x++) {
-        u16 *col = fb + x * SCR_H;
-        for (int y = 0; y < h; y++)
-            col[SCR_H - 1 - y] = g_out[y * w + x];
+    enum { TB = 16 };
+    for (int xo = 0; xo < w; xo += TB) {
+        int xe = xo + TB < w ? xo + TB : w;
+        for (int yo = 0; yo < h; yo += TB) {
+            int ye = yo + TB < h ? yo + TB : h;
+            for (int x = xo; x < xe; x++) {
+                u16 *col = fb + x * SCR_H;
+                const u16 *src = g_out + x;
+                for (int y = yo; y < ye; y++)
+                    col[SCR_H - 1 - y] = src[y * w];
+            }
+        }
     }
     return true;
 }
