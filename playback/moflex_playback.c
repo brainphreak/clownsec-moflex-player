@@ -101,7 +101,6 @@ static void blit_eye(AVFrame *out, gfx3dSide_t side, int W, int H) {
 }
 
 /* ---- control panel layout (bottom screen, 320x240) ---- */
-enum { FOCUS_PROG = 0, FOCUS_PLAY = 1, FOCUS_VOL = 2, FOCUS_N = 3 };
 #define BAR_X 14
 #define BAR_Y 60
 #define BAR_W 292
@@ -124,8 +123,7 @@ static void fmt_time(int64_t us, char *o, int cap) {
     else       snprintf(o, cap, "%d:%02d", m, s);
 }
 
-static void panel_draw(const char *title, int64_t cur, int64_t dur,
-                       int playing, int focus, int grabbed) {
+static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing) {
     ui_begin(GFX_BOTTOM);
     ui_clear(UI_BLACK);
 
@@ -140,25 +138,26 @@ static void panel_draw(const char *title, int64_t cur, int64_t dur,
     /* progress bar */
     double frac = dur > 0 ? (double)cur / (double)dur : 0.0;
     if (frac > 1) frac = 1;
-    u16 bc = (focus == FOCUS_PROG) ? UI_WHITE : UI_GRAY;
     ui_fill(BAR_X, BAR_Y, BAR_W, BAR_H, UI_RGB(60, 60, 60));
-    ui_fill(BAR_X, BAR_Y, (int)(BAR_W * frac), BAR_H, bc);
+    ui_fill(BAR_X, BAR_Y, (int)(BAR_W * frac), BAR_H, UI_WHITE);
     int kx = BAR_X + (int)(BAR_W * frac);
-    ui_fill(kx - 2, BAR_Y - 3, 5, BAR_H + 6, (grabbed == 1) ? UI_RGB(80,160,255) : bc);
+    ui_fill(kx - 2, BAR_Y - 3, 5, BAR_H + 6, UI_RGB(80, 160, 255));
 
     /* transport: RW (<<)   play/pause   FF (>>) */
-    ui_play_l(RW_CX - 5, PLAY_CY, 15, UI_GRAY); ui_play_l(RW_CX + 6, PLAY_CY, 15, UI_GRAY);
-    if (playing) ui_pause(PLAY_CX, PLAY_CY, 26, (focus == FOCUS_PLAY) ? UI_WHITE : UI_GRAY);
-    else         ui_play(PLAY_CX, PLAY_CY, 30, (focus == FOCUS_PLAY) ? UI_WHITE : UI_GRAY);
-    ui_play(FF_CX - 6, PLAY_CY, 15, UI_GRAY); ui_play(FF_CX + 5, PLAY_CY, 15, UI_GRAY);
+    ui_play_l(RW_CX - 5, PLAY_CY, 15, UI_WHITE); ui_play_l(RW_CX + 6, PLAY_CY, 15, UI_WHITE);
+    if (playing) ui_pause(PLAY_CX, PLAY_CY, 26, UI_WHITE);
+    else         ui_play(PLAY_CX, PLAY_CY, 30, UI_WHITE);
+    ui_play(FF_CX - 6, PLAY_CY, 15, UI_WHITE); ui_play(FF_CX + 5, PLAY_CY, 15, UI_WHITE);
 
     /* volume slider (vertical, right) */
-    u16 vc = (focus == FOCUS_VOL) ? UI_WHITE : UI_GRAY;
     ui_fill(VOL_X, VOL_Y, 12, VOL_H, UI_RGB(60, 60, 60));
     int vf = (int)(VOL_H * (g_vol / 4.0f));
-    ui_fill(VOL_X, VOL_Y + VOL_H - vf, 12, vf, (grabbed == 2) ? UI_RGB(80,160,255) : vc);
+    ui_fill(VOL_X, VOL_Y + VOL_H - vf, 12, vf, UI_RGB(80, 160, 255));
     char vs[8]; snprintf(vs, sizeof(vs), "%d%%", (int)(g_vol * 100 + 0.5f));
-    ui_text(VOL_X - 18, VOL_Y + VOL_H + 4, 1, vc, vs);
+    ui_text(VOL_X - 18, VOL_Y + VOL_H + 4, 1, UI_WHITE, vs);
+
+    /* control hint */
+    ui_text_center(UI_W / 2, 225, 1, UI_GRAY, "A play/pause  <> seek  ^v vol  B back");
 
     ui_text(BACK_X, BACK_Y, 1, UI_GRAY, "B:back   A:grab/toggle");
     ui_present();
@@ -273,7 +272,7 @@ MoflexResult moflex_play(const char *path) {
        Present a stereo frame ONLY when a consecutive L+R both decode, so the
        two eyes are always the same moment (never a mismatched pair). */
     int vidx = 0, left_ok = 0, left_vidx = -2;
-    int playing = 1, focus = FOCUS_PLAY, grabbed = 0, dirty = 1, since_panel = 999;
+    int playing = 1, dirty = 1, since_panel = 999;
     int64_t cur_us = 0, dur_us = m.duration_us;
     int64_t seek_to_us = 0; int want_seek = 0, shold = 0;
     MfxPacket pkt;
@@ -289,29 +288,19 @@ MoflexResult moflex_play(const char *path) {
         u32 kd = hidKeysDown(), kh = hidKeysHeld();
         touchPosition tp; hidTouchRead(&tp);
 
-        /* ---- button input ---- */
-        if (!grabbed) {
-            if (kd & KEY_B) { result = MOFLEX_QUIT_BACK; break; }
-            if (kd & (KEY_RIGHT | KEY_DOWN)) { focus = (focus + 1) % FOCUS_N; dirty = 1; }
-            if (kd & (KEY_LEFT | KEY_UP))    { focus = (focus + FOCUS_N - 1) % FOCUS_N; dirty = 1; }
-            if (kd & KEY_A) {
-                if (focus == FOCUS_PROG) { grabbed = 1; dirty = 1; }
-                else if (focus == FOCUS_VOL) { grabbed = 2; dirty = 1; }
-                else { playing = !playing; if (have_audio) ndspChnSetPaused(0, !playing); dirty = 1; }
-            }
-        } else {
-            if (kd & KEY_B) { grabbed = 0; dirty = 1; }
-            if (grabbed == 1) {   /* progress: hold L/R to keep scrubbing (~30s steps) */
-                int sdir = (kh & KEY_RIGHT) ? 1 : ((kh & KEY_LEFT) ? -1 : 0);
-                if (sdir == 0) shold = 0;
-                else {
-                    int fire = (kd & (KEY_RIGHT | KEY_LEFT)) ? 1 : 0;   /* initial press */
-                    if (!fire) { shold++; if (shold > 14 && (shold % 6 == 0)) fire = 1; }  /* repeat after a short delay */
-                    if (fire) { seek_to_us = cur_us + (int64_t)sdir * 30000000; want_seek = 1; }
-                }
-            } else {              /* volume: U/D */
-                if (kd & KEY_UP)   { if (g_vol < 4.0f) g_vol += 0.25f; vol_save(); dirty = 1; }
-                if (kd & KEY_DOWN) { if (g_vol > 0.25f) g_vol -= 0.25f; vol_save(); dirty = 1; }
+        /* ---- controls (direct, nothing to select): A play/pause,
+               Left/Right (hold) rewind/FF, Up/Down volume, B back ---- */
+        if (kd & KEY_B) { result = MOFLEX_QUIT_BACK; break; }
+        if (kd & KEY_A) { playing = !playing; if (have_audio) ndspChnSetPaused(0, !playing); dirty = 1; }
+        if (kd & KEY_UP)   { if (g_vol < 4.0f)  g_vol += 0.25f; vol_save(); dirty = 1; }
+        if (kd & KEY_DOWN) { if (g_vol > 0.25f) g_vol -= 0.25f; vol_save(); dirty = 1; }
+        {   /* Left/Right seek, hold to keep scrubbing (~30s steps) */
+            int sdir = (kh & KEY_RIGHT) ? 1 : ((kh & KEY_LEFT) ? -1 : 0);
+            if (sdir == 0) shold = 0;
+            else {
+                int fire = (kd & (KEY_RIGHT | KEY_LEFT)) ? 1 : 0;   /* initial press */
+                if (!fire) { shold++; if (shold > 14 && (shold % 6 == 0)) fire = 1; }  /* repeat while held */
+                if (fire) { seek_to_us = cur_us + (int64_t)sdir * 30000000; want_seek = 1; }
             }
         }
 
@@ -326,7 +315,7 @@ MoflexResult moflex_play(const char *path) {
                 g_vol = nv; vol_save(); dirty = 1;
             } else if (kd & KEY_TOUCH) {
                 if (py >= PLAY_CY - 20 && py <= PLAY_CY + 20) {
-                    if (px >= PLAY_CX - 20 && px <= PLAY_CX + 20) { playing = !playing; grabbed = 0; if (have_audio) ndspChnSetPaused(0, !playing); dirty = 1; }
+                    if (px >= PLAY_CX - 20 && px <= PLAY_CX + 20) { playing = !playing; if (have_audio) ndspChnSetPaused(0, !playing); dirty = 1; }
                     else if (px >= RW_CX - 18 && px <= RW_CX + 18) { seek_to_us = cur_us - 30000000; want_seek = 1; }
                     else if (px >= FF_CX - 18 && px <= FF_CX + 18) { seek_to_us = cur_us + 30000000; want_seek = 1; }
                 } else if (py >= BACK_Y - 4 && px <= 180) { result = MOFLEX_QUIT_BACK; break; }
@@ -407,7 +396,7 @@ MoflexResult moflex_play(const char *path) {
 
         /* ---- panel redraw (throttled to spare CPU on old 3DS) ---- */
         if (dirty || ++since_panel > 20) {
-            panel_draw(title, cur_us, dur_us, playing, focus, grabbed);
+            panel_draw(title, cur_us, dur_us, playing);
             since_panel = 0; dirty = 0;
         }
     }
