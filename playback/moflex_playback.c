@@ -161,8 +161,6 @@ static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing)
 
     /* control hint */
     ui_text_center(UI_W / 2, 225, 1, UI_GRAY, "A play/pause  <> seek  ^v vol  B back");
-
-    ui_text(BACK_X, BACK_Y, 1, UI_GRAY, "B:back   A:grab/toggle");
     ui_present();
 }
 
