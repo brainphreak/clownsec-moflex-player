@@ -1,0 +1,20 @@
+# build output
+build/
+*.o
+*.d
+*.elf
+*.3dsx
+*.smdh
+*.map
+*.lst
+*.cia
+app/banner.bin
+
+# CIA build tools (third-party binaries, fetched separately — see README)
+tools/bin/
+
+# PC verification scratch
+pc_verify/out/
+
+# macOS
+.DS_Store
