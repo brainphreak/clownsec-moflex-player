@@ -11,6 +11,7 @@
 #include "mobicompat.h"
 #include "adpcm_moflex.h"
 #include "ui_gfx.h"
+#include "y2r_video.h"
 
 extern int    mobi_init(AVCodecContext *);
 extern int    mobi_decode(AVCodecContext *, AVFrame *, int *, AVPacket *);
@@ -86,6 +87,8 @@ static inline u16 yuv2rgb565(int Y, int U, int V) {
     return (u16)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
 }
 static void blit_eye(AVFrame *out, gfx3dSide_t side, int W, int H) {
+    if (y2r_video_blit(out, side, W, H)) return;   /* hardware color conversion */
+    /* software fallback (per-pixel YUV->RGB565 + rotate) */
     u16 *fb = (u16 *)gfxGetFramebuffer(GFX_TOP, side, NULL, NULL);
     const uint8_t *Yp = out->data[0], *Up = out->data[1], *Vp = out->data[2];
     int ys = out->linesize[0], cs = out->linesize[1];
@@ -238,6 +241,8 @@ MoflexResult moflex_play(const char *path) {
         buffer and appear together only on gfxSwapBuffers. Single-buffered here would
         make the left eye update before the right (branding_show() turns this off). */
     gfxSet3D(true);
+
+    y2r_video_init(W, H);   /* hardware YUV->RGB; blit_eye falls back to software if unavailable */
 
     /* short movie title from filename */
     const char *base = strrchr(path, '/'); base = base ? base + 1 : path;
@@ -408,6 +413,7 @@ done:
     else if (cur_us > 3000000) resume_save_us(path, cur_us);
     if (have_audio) { ndspChnWaveBufClear(0); ndspChnSetPaused(0, false);
         for (int i = 0; i < NWB; i++) if (abuf[i]) linearFree(abuf[i]); }
+    y2r_video_exit();
     av_frame_free(&out);
     mobi_close(&ctx);
     free(ctx.priv_data);
