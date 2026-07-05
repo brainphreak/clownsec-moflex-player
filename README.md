@@ -39,7 +39,7 @@ cd app
 make
 ```
 
-Produces `app/moflex_player.3dsx`. Copy it to your SD card's `/3ds/` folder.
+Produces `app/clownsec_player.3dsx`. Copy it to your SD card's `/3ds/` folder.
 
 ### `.cia` (installable title)
 
@@ -55,7 +55,7 @@ cd app
 ./build_cia.sh
 ```
 
-Produces `app/moflex_player.cia`. Install with FBI or your CIA installer of choice.
+Produces `app/clownsec_player.cia`. Install with FBI or your CIA installer of choice.
 
 > Note: the CIA exheader (`app/cia.rsf`) maps the DSP hardware registers
 > (`IORegisterMapping`) that `ndsp` audio writes to — without them a real 3DS throws a

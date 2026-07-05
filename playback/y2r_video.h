@@ -14,4 +14,14 @@ void y2r_video_exit(void);
  * Y2R is not ready (caller should fall back to the software blit). */
 bool y2r_video_blit(AVFrame *f, gfx3dSide_t side, int w, int h);
 
+/* Same, but into a caller-provided framebuffer (for the blit worker thread). */
+bool y2r_video_blit_fb(AVFrame *f, u16 *fb, int w, int h);
+
+/* Async: start the Y2R conversion (returns immediately; hardware runs in the
+ * background), then later wait + transpose into fb. The source frame must not be
+ * touched between start and finish. */
+bool y2r_video_start(AVFrame *f, int w, int h);
+void y2r_video_finish(u16 *fb);
+void y2r_video_drain(void);
+
 #endif

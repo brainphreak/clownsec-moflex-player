@@ -132,7 +132,7 @@ int catalog_parse(const char *text, int kind, const char *dl_base, const char *a
             }
         }
     } else {
-        /* zackk: items[] (keep moflex/zip, drop cia) */
+        /* zackk: items[] (keep moflex/zip AND cia -- CIAs carry an embedded moflex we can play) */
         cJSON *items = cJSON_GetObjectItemCaseSensitive(root, "items");
         cJSON *it;
         cJSON_ArrayForEach(it, items) {
@@ -142,7 +142,8 @@ int catalog_parse(const char *text, int kind, const char *dl_base, const char *a
             const char *ft = sgets(it, "fileType");
             int iszip = ends_ci(fn, ".zip");
             int ismof = ends_ci(fn, ".moflex") || !strcasecmp(ft, "moflex");
-            if (!iszip && !ismof) continue;   /* skip cia etc. */
+            int iscia = ends_ci(fn, ".cia")    || !strcasecmp(ft, "cia");
+            if (!iszip && !ismof && !iscia) continue;   /* skip anything else */
             const char *url = sgets(it, "archiveUrl");
             if (!url[0]) continue;
             CatEntry *e = &out[n];

@@ -17,9 +17,11 @@
 #include "catalog.h"
 #include "poster.h"
 #include "unzip.h"
+#include "cia_moflex.h"
 #include "ui_gfx.h"
 #include "branding.h"
 
+#define APP_VERSION "v1.0.0"
 #define MAXE     1024
 #define NAMELEN  256
 #define PATHLEN  1024
@@ -58,13 +60,17 @@ static char move_name[NAMELEN];
 
 static int is_moflex(const char *n) {
     size_t L = strlen(n);
-    return L > 7 && strcasecmp(n + L - 7, ".moflex") == 0;
+    /* playable = a plain .moflex OR a .cia with an embedded moflex (played in place) */
+    return (L > 7 && strcasecmp(n + L - 7, ".moflex") == 0)
+        || (L > 4 && strcasecmp(n + L - 4, ".cia") == 0);
 }
 static int cmp_entry(const void *a, const void *b) {
     const Entry *x = a, *y = b;
     if (x->is_dir != y->is_dir) return y->is_dir - x->is_dir;
     return strcasecmp(x->name, y->name);
 }
+static int s_filter_movies = 1;        /* when set, only show playable movies (moflex + movie CIAs) */
+static int s_manage_movies_only = 0;   /* manage-mode toggle (Y): all files vs movies only */
 static void scan(void) {
     nentries = 0;
     DIR *d = opendir(cwd);
@@ -76,7 +82,11 @@ static void scan(void) {
             snprintf(full, sizeof(full), "%s%s", cwd, e->d_name);
             struct stat st;
             int isdir = (stat(full, &st) == 0) && S_ISDIR(st.st_mode);
-            if (!isdir && !is_moflex(e->d_name)) continue;
+            if (!isdir && s_filter_movies) {                 /* movies-only view (play, or manage toggle) */
+                if (!is_moflex(e->d_name)) continue;          /* only .moflex / .cia */
+                if (cia_is_cia(e->d_name) && !cia_has_moflex(full)) continue;   /* only movie CIAs */
+            }
+            /* else (manage + show-all): list every file so it works as a general download/file tool */
             snprintf(entries[nentries].name, NAMELEN, "%s", e->d_name);
             entries[nentries].is_dir = isdir;
             nentries++;
@@ -105,26 +115,31 @@ static void enter_dir(const char *name) {
 enum { MODE_PLAY = 0, MODE_MANAGE = 1 };
 
 static void draw_browser(int mode) {
-    printf("\x1b[2J\x1b[H");
-    printf("=== %s ===\n", mode == MODE_MANAGE ? "MANAGE" : "OPEN");
-    printf("%.38s\n", cwd);
-    if (move_pending) printf("[MOVE] %.24s  R:paste\n", move_name);
-    else if (mode == MODE_MANAGE) printf("A:manage/open  B:up/home\n");
-    else printf("A:play/open  B:up/home  X:manage\n");
-    printf("START:exit  SELECT:refresh\n\n");
-    if (nentries == 0) { printf("(empty - no folders or .moflex)\n"); return; }
+    /* Redraw in place: home cursor, erase each line to EOL as we overwrite it (\x1b[K), and clear any
+     * leftover lines at the end (\x1b[J). Avoids the \x1b[2J full-clear flash that tore during scrolling. */
+    printf("\x1b[H");
+    printf("=== %s ===\x1b[K\n", mode == MODE_MANAGE ? "MANAGE" : "OPEN");
+    printf("%.38s\x1b[K\n", cwd);
+    if (move_pending) printf("[MOVE] %.24s  R:paste\x1b[K\n", move_name);
+    else if (mode == MODE_MANAGE) printf("A:open X:manage Y:%s B:up\x1b[K\n", s_manage_movies_only ? "show all" : "movies only");
+    else printf("A:play/open  B:up/home  X:manage\x1b[K\n");
+    printf("START:exit  SELECT:refresh\x1b[K\n\x1b[K\n");
+    if (nentries == 0) { printf("(empty - no folders or .moflex)\x1b[K\n\x1b[J"); return; }
     if (sel < scroll) scroll = sel;
     if (sel >= scroll + ROWS) scroll = sel - ROWS + 1;
     for (int i = scroll; i < nentries && i < scroll + ROWS; i++) {
         char disp[NAMELEN];
         snprintf(disp, sizeof(disp), "%s", entries[i].name);
-        if (!entries[i].is_dir) {                       /* hide the extension */
+        if (!entries[i].is_dir && mode != MODE_MANAGE) {   /* play mode: clean movie titles (no ext);
+                                                            * manage mode: show real filenames + ext */
             size_t L = strlen(disp);
             if (L > 7 && !strcasecmp(disp + L - 7, ".moflex")) disp[L - 7] = 0;
             else if (L > 4 && !strcasecmp(disp + L - 4, ".zip")) disp[L - 4] = 0;
+            else if (L > 4 && !strcasecmp(disp + L - 4, ".cia")) disp[L - 4] = 0;
         }
-        printf("%c%s%.35s\n", i == sel ? '>' : ' ', entries[i].is_dir ? "[" : " ", disp);
+        printf("%c%s%.35s\x1b[K\n", i == sel ? '>' : ' ', entries[i].is_dir ? "[" : " ", disp);
     }
+    printf("\x1b[J");   /* clear any lines left over from a previously longer view */
 }
 
 /* ---------- small modal helpers ---------- */
@@ -153,7 +168,7 @@ static void upload_screen(void) {
             printf("\x1b[2J\x1b[H=== UPLOAD (web server) ===\n\n");
             if (ok) {
                 printf("Server ON. On a computer or phone on\nthe same Wi-Fi, open:\n\n  %s\n\n", httpd_url());
-                printf("Upload .moflex files from the page.\nBrowse folders + delete there too.\n\n");
+                printf("Upload any files from the page.\nBrowse folders + delete there too.\n\n");
             } else {
                 printf("Could not start server.\nIs Wi-Fi connected?\n\n");
             }
@@ -419,6 +434,46 @@ static void draw_info_top(const CatEntry *e, const u16 *poster) {
     ui_present();
 }
 
+/* ---- background poster loader: keeps scrolling perfectly fluid (the main loop never blocks on a
+ * poster download/decode; a worker thread does it and the UI just polls for the result). ---- */
+static volatile int pw_run = 0, pw_req = -1, pw_done = -2, pw_ok = 0;
+static char      pw_url[256], pw_key[NAMELEN];
+static u16      *pw_buf = NULL;
+static LightLock pw_lock;
+static Thread    pw_thread = NULL;
+
+static void pw_fn(void *arg) {
+    (void)arg;
+    while (pw_run) {
+        int id; char url[256], key[NAMELEN];
+        LightLock_Lock(&pw_lock);
+        id = pw_req; snprintf(url, sizeof url, "%s", pw_url); snprintf(key, sizeof key, "%s", pw_key);
+        LightLock_Unlock(&pw_lock);
+        if (id < 0 || id == pw_done) { svcSleepThread(12000000); continue; }   /* nothing new -> idle */
+        int ok = url[0] && pw_buf && poster_get(url, key, pw_buf, POSTER_W, POSTER_H);
+        LightLock_Lock(&pw_lock);
+        if (pw_req == id) { pw_ok = ok; pw_done = id; }   /* publish only if still the wanted selection */
+        LightLock_Unlock(&pw_lock);
+    }
+}
+static void pw_start(u16 *buf) {
+    pw_buf = buf; pw_run = 1; pw_req = -1; pw_done = -2; pw_ok = 0;
+    LightLock_Init(&pw_lock);
+    s32 prio = 0x30; svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
+    pw_thread = threadCreate(pw_fn, NULL, 32 * 1024, prio, -1, false);   /* -1 = default app core (preemptive) */
+}
+static void pw_stop(void) {
+    if (!pw_thread) return;
+    pw_run = 0; threadJoin(pw_thread, 2000000000LL); threadFree(pw_thread); pw_thread = NULL;
+}
+static void pw_request(int id, const char *url, const char *key) {
+    LightLock_Lock(&pw_lock);
+    pw_req = id;
+    snprintf(pw_url, sizeof pw_url, "%s", url ? url : "");
+    snprintf(pw_key, sizeof pw_key, "%s", key ? key : "");
+    LightLock_Unlock(&pw_lock);
+}
+
 static void catalog_browse(const Source *src) {
     printf("\x1b[2J\x1b[H=== DOWNLOAD ===\n\nFetching catalog...\n%.38s\n", src->url);
     gfxFlushBuffers(); gfxSwapBuffers();
@@ -438,8 +493,10 @@ static void catalog_browse(const Source *src) {
     if (nc > 1) qsort(cat, nc, sizeof(CatEntry), cat_cmp);   /* alphabetical */
 
     gfxSet3D(false);   /* top screen becomes a 2D info panel while browsing */
-    u16 *poster = (u16 *)malloc((size_t)POSTER_W * POSTER_H * sizeof(u16));
-    int csel = 0, cscroll = 0, redraw = 1, hfu = 0, hfd = 0;
+    u16 *poster  = (u16 *)malloc((size_t)POSTER_W * POSTER_H * sizeof(u16));
+    u16 *pworker = (u16 *)malloc((size_t)POSTER_W * POSTER_H * sizeof(u16));
+    if (pworker) pw_start(pworker);   /* background loader -> scrolling never blocks on a poster */
+    int csel = 0, cscroll = 0, redraw = 1, hfu = 0, hfd = 0, requested = 0;
     int shown = -1, phave = 0, settle = 0;   /* poster debounce state */
     while (aptMainLoop()) {
         hidScanInput();
@@ -476,15 +533,20 @@ static void catalog_browse(const Source *src) {
                 printf("\x1b[2J\x1b[H=== DOWNLOAD ===\n\nDownload failed: the server did not\n"
                        "return a zip (file not found at URL).\n\nB: back\n");
             } else if (ok && e->is_zip) {
-                char stem[NAMELEN]; snprintf(stem, sizeof(stem), "%s", e->fname);
-                size_t sl = strlen(stem); if (sl > 4) stem[sl - 4] = 0;   /* drop .zip */
-                char folder[PATHLEN + NAMELEN];
-                snprintf(folder, sizeof(folder), "%s%s", destdir, stem);
-                printf("\x1b[2J\x1b[H=== DOWNLOAD ===\n\nExtracting %.30s ...\n", stem);
-                gfxFlushBuffers(); gfxSwapBuffers();
-                bool ex = unzip_to_dir(dest, folder);
-                remove(dest);   /* delete the .zip after extracting */
-                printf("\n%s\nFolder: %.30s\n\nB: back\n", ex ? "Extracted." : "Extract FAILED.", stem);
+                if (confirm("Extract the zip now?\n(No = keep the .zip file)")) {
+                    char stem[NAMELEN]; snprintf(stem, sizeof(stem), "%s", e->fname);
+                    size_t sl = strlen(stem); if (sl > 4) stem[sl - 4] = 0;   /* drop .zip */
+                    char folder[PATHLEN + NAMELEN];
+                    snprintf(folder, sizeof(folder), "%s%s", destdir, stem);
+                    printf("\x1b[2J\x1b[H=== DOWNLOAD ===\n\nExtracting %.30s ...\n", stem);
+                    gfxFlushBuffers(); gfxSwapBuffers();
+                    int nf = unzip_to_dir(dest, folder);
+                    remove(dest);   /* delete the .zip after extracting */
+                    if (nf > 0) printf("\nExtracted %d file%s.\nFolder: %.30s\n\nB: back\n", nf, nf == 1 ? "" : "s", stem);
+                    else        printf("\nExtract FAILED.\nFolder: %.30s\n\nB: back\n", stem);
+                } else {
+                    printf("\x1b[2J\x1b[H=== DOWNLOAD ===\n\nZip saved (not extracted):\n%.32s\n\nB: back\n", e->fname);
+                }
             } else {
                 printf("\x1b[2J\x1b[H=== DOWNLOAD ===\n\n%s\n%s\n\nB: back\n",
                        g_dl_name, ok ? "Done." : "Failed / cancelled.");
@@ -492,7 +554,7 @@ static void catalog_browse(const Source *src) {
             wait_back();
             redraw = 1;
         }
-        if (csel != shown) { redraw = 1; phave = 0; settle = 0; }   /* moved -> drop poster */
+        if (csel != shown) { redraw = 1; phave = 0; settle = 0; requested = 0; }   /* moved -> drop poster */
         if (redraw) {
             printf("\x1b[2J\x1b[HDOWNLOAD  %d/%d  [%c]\n", csel + 1, nc, firstc(cat[csel].name));
             printf("Up/Dn:1  <>:page  L/R:letter\n");
@@ -504,18 +566,70 @@ static void catalog_browse(const Source *src) {
             draw_info_top(&cat[csel], phave ? poster : NULL);
             shown = csel;
             redraw = 0;
-        } else if (!phave && cat[csel].art[0] && ++settle == 8) {
-            /* debounced (once the selection has been still ~8 frames): fetch the poster */
-            if (poster && poster_get(cat[csel].art, cat[csel].fname, poster, POSTER_W, POSTER_H)) {
-                phave = 1;
-                draw_info_top(&cat[csel], poster);
-            }
+        }
+        /* debounced request to the background loader (a few idle frames), then poll for its result --
+         * NOTHING here blocks, so scrolling is always fluid no matter how slow the poster is. */
+        if (!phave && !requested && cat[csel].art[0] && ++settle >= 6) {
+            pw_request(csel, cat[csel].art, cat[csel].fname);
+            requested = 1;
+        }
+        if (!phave && requested && pw_done == csel) {
+            if (pw_ok && poster && pworker) { memcpy(poster, pworker, (size_t)POSTER_W * POSTER_H * 2); phave = 1; }
+            requested = 0; redraw = 1;   /* redraw to show the poster (or leave the panel text-only) */
         }
         gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
     }
+    pw_stop();
     branding_show();   /* restore the 3D logo on the top screen */
     free(poster);
+    free(pworker);
     free(cat);
+}
+
+/* Enter any URL on the keyboard and download it straight to a chosen folder (cia, moflex, anything). */
+static void download_url_direct(void) {
+    char url[CAT_URLLEN] = "";
+    SwkbdState s;
+    swkbdInit(&s, SWKBD_TYPE_NORMAL, 2, -1);
+    swkbdSetHintText(&s, "File URL: https://... (.cia/.moflex/any)");
+    if (swkbdInputText(&s, url, sizeof(url)) != SWKBD_BUTTON_RIGHT || !url[0]) return;
+    /* default filename = last path segment of the URL, minus any ?query/#frag */
+    char fname[NAMELEN];
+    const char *slash = strrchr(url, '/'); const char *nm = slash ? slash + 1 : url;
+    snprintf(fname, sizeof(fname), "%s", nm);
+    char *cut = strpbrk(fname, "?#"); if (cut) *cut = 0;
+    if (!fname[0]) snprintf(fname, sizeof(fname), "download.bin");
+    /* let the user confirm/rename the save filename */
+    swkbdInit(&s, SWKBD_TYPE_NORMAL, 2, -1);
+    swkbdSetHintText(&s, "Save as (filename)");
+    swkbdSetInitialText(&s, fname);
+    if (swkbdInputText(&s, fname, sizeof(fname)) != SWKBD_BUTTON_RIGHT || !fname[0]) return;
+    char destdir[PATHLEN];
+    if (!pick_folder(destdir, sizeof(destdir))) return;
+    char dest[PATHLEN + NAMELEN];
+    snprintf(dest, sizeof(dest), "%s%s", destdir, fname);
+    snprintf(g_dl_name, sizeof(g_dl_name), "%s", fname);
+    g_last_prog = 0;
+    consoleInit(GFX_BOTTOM, NULL);
+    printf("\x1b[2J\x1b[H=== DOWNLOAD URL ===\n\n-> %.32s\n\n", fname);
+    gfxFlushBuffers(); gfxSwapBuffers();
+    bool ok = download_to_file(url, dest, dl_progress, NULL);
+    if (!ok) { remove(dest); printf("\nFailed / cancelled.\n\nB: back\n"); wait_back(); return; }
+    size_t fl = strlen(fname);
+    if (fl > 4 && !strcasecmp(fname + fl - 4, ".zip") && file_is_zip(dest) &&
+        confirm("Extract the zip now?\n(No = keep the .zip file)")) {
+        char stem[NAMELEN]; snprintf(stem, sizeof(stem), "%s", fname); stem[fl - 4] = 0;
+        char folder[PATHLEN + NAMELEN]; snprintf(folder, sizeof(folder), "%s%s", destdir, stem);
+        printf("\x1b[2J\x1b[H=== DOWNLOAD URL ===\n\nExtracting %.28s ...\n", stem);
+        gfxFlushBuffers(); gfxSwapBuffers();
+        int nf = unzip_to_dir(dest, folder);
+        remove(dest);
+        printf(nf > 0 ? "\nExtracted %d file%s.\n\nB: back\n" : "\nExtract FAILED.\n\nB: back\n",
+               nf, nf == 1 ? "" : "s");
+    } else {
+        printf("\nDone.\n\nB: back\n");
+    }
+    wait_back();
 }
 
 static void download_screen(void) {
@@ -525,11 +639,12 @@ static void download_screen(void) {
         hidScanInput();
         u32 k = hidKeysDown();
         if (k & KEY_B) break;
-        int total = nsources + 1;   /* +1 = add source */
+        int total = nsources + 2;   /* + URL download + add source */
         if (k & KEY_DOWN) { m = (m + 1) % total; redraw = 1; }
         if (k & KEY_UP)   { m = (m - 1 + total) % total; redraw = 1; }
         if (k & KEY_A) {
             if (m < nsources) catalog_browse(&sources[m]);
+            else if (m == nsources) download_url_direct();
             else add_source_swkbd();
             redraw = 1;
         }
@@ -539,7 +654,8 @@ static void download_screen(void) {
             printf("A:open  B:back\n\n");
             for (int i = 0; i < nsources; i++)
                 printf("%c %.36s\n", i == m ? '>' : ' ', sources[i].name);
-            printf("%c + Add source (keyboard)\n", m == nsources ? '>' : ' ');
+            printf("%c + Download from URL\n", m == nsources ? '>' : ' ');
+            printf("%c + Add source (keyboard)\n", m == nsources + 1 ? '>' : ' ');
             redraw = 0;
         }
         gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
@@ -612,14 +728,71 @@ static void do_paste(void) {
 }
 
 /* play a movie file, then restore the menu screens. returns the play result. */
+/* Choose which embedded moflex to play when a CIA holds several. Returns index, or -1 = back. */
+static int pick_moflex(const CiaMoflex *list, int n) {
+    int sel = 0, top = 0, prev = -1, hold = 0;
+    for (;;) {
+        if (!aptMainLoop()) return -1;
+        if (sel != prev) {                                  /* redraw only on change (in place, no flash) */
+            if (sel < top) top = sel; if (sel >= top + 20) top = sel - 19;
+            printf("\x1b[H=== CHOOSE VIDEO ===\x1b[K\n%d in this CIA\x1b[K\nUp/Dn  A:play  B:back\x1b[K\n\x1b[K\n", n);
+            for (int i = top; i < top + 20; i++) {
+                if (i < n) {
+                    char nm[64]; snprintf(nm, sizeof nm, "%s", list[i].name);
+                    size_t L = strlen(nm); if (L > 7 && !strcasecmp(nm + L - 7, ".moflex")) nm[L - 7] = 0;
+                    printf("%c%.30s %lldMB\x1b[K\n", i == sel ? '>' : ' ', nm, (long long)(list[i].size / 1000000));
+                } else printf("\x1b[K\n");
+            }
+            printf("\x1b[J");
+            prev = sel;
+        }
+        gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
+        hidScanInput();
+        u32 k = hidKeysDown(), kh = hidKeysHeld();
+        if (kh & (KEY_DOWN | KEY_UP)) hold++; else hold = 0;
+        int step = (k & (KEY_DOWN | KEY_UP)) || (hold > 12 && hold % 4 == 0);
+        if (step && (kh & KEY_DOWN) && sel < n - 1) sel++;
+        if (step && (kh & KEY_UP)   && sel > 0)     sel--;
+        if (k & KEY_A) return sel;
+        if (k & KEY_B) return -1;
+    }
+}
+
 static MoflexResult play_movie(const char *path) {
+    cia_clear_selection();
+    const char *title_src = path; char titlebuf[NAMELEN];
+    if (cia_is_cia(path)) {
+        CiaMoflex list[64];
+        int nc = cia_list_moflex(path, list, 64);
+        if (nc == 0) {
+            consoleInit(GFX_BOTTOM, NULL);
+            printf("\x1b[2J\x1b[H=== NOT A MOVIE ===\n\nThis CIA has no playable video inside\n"
+                   "(it's an app, or its content is\nencrypted).\n\nB: back\n");
+            wait_back(); branding_show();
+            return MOFLEX_QUIT_BACK;
+        }
+        int sel = 0;
+        if (nc > 1) {                                   /* several videos -> let the user choose */
+            consoleInit(GFX_BOTTOM, NULL);
+            sel = pick_moflex(list, nc);
+            if (sel < 0) { branding_show(); return MOFLEX_QUIT_BACK; }
+        }
+        /* title = the embedded movie's real name (from movie_title.csv); only fall back to the CIA's own
+         * filename for a lone unnamed moflex (nicer than a bare "movie"). */
+        { size_t L = strlen(list[sel].name);
+          int raw = (L > 7 && !strcasecmp(list[sel].name + L - 7, ".moflex"));
+          if (!raw || nc > 1) { snprintf(titlebuf, sizeof titlebuf, "%s", list[sel].name); title_src = titlebuf; } }
+        cia_set_selection(path, list[sel].off, list[sel].size, title_src == titlebuf ? titlebuf : NULL);
+    }
     snprintf(g_now_playing_path, sizeof(g_now_playing_path), "%s", path);
-    const char *base = strrchr(path, '/'); base = base ? base + 1 : path;
-    snprintf(g_now_playing, sizeof(g_now_playing), "%s", base);
-    { size_t L = strlen(g_now_playing);   /* hide extension in the title */
+    { const char *base = strrchr(title_src, '/'); base = base ? base + 1 : title_src;
+      snprintf(g_now_playing, sizeof(g_now_playing), "%s", base);
+      size_t L = strlen(g_now_playing);   /* hide extension in the title */
       if (L > 7 && !strcasecmp(g_now_playing + L - 7, ".moflex")) g_now_playing[L - 7] = 0;
-      else if (L > 4 && !strcasecmp(g_now_playing + L - 4, ".zip")) g_now_playing[L - 4] = 0; }
+      else if (L > 4 && !strcasecmp(g_now_playing + L - 4, ".zip")) g_now_playing[L - 4] = 0;
+      else if (L > 4 && !strcasecmp(g_now_playing + L - 4, ".cia")) g_now_playing[L - 4] = 0; }
     MoflexResult r = moflex_play(path);
+    cia_clear_selection();
     consoleInit(GFX_BOTTOM, NULL);
     gfxSetDoubleBuffering(GFX_BOTTOM, false);
     branding_show();               /* restore the 3D logo on the top screen */
@@ -630,6 +803,7 @@ static MoflexResult play_movie(const char *path) {
 /* returns: 1 = exit app, 0 = back to the player home, 2 = a file was picked (sel_out set) */
 
 static int browser(int mode, char *sel_out, size_t sel_cap) {
+    s_filter_movies = (mode != MODE_MANAGE) ? 1 : s_manage_movies_only;   /* play=movies; manage=toggle */
     scan();
     draw_browser(mode);
     int hfu = 0, hfd = 0;
@@ -646,6 +820,12 @@ static int browser(int mode, char *sel_out, size_t sel_cap) {
             if (k & KEY_LEFT)  { sel -= ROWS; if (sel < 0) sel = 0; draw_browser(mode); }
         }
         if (k & KEY_SELECT) { scan(); draw_browser(mode); }
+        if (k & KEY_Y && mode == MODE_MANAGE) {   /* toggle: all files vs movies only */
+            s_manage_movies_only = !s_manage_movies_only;
+            s_filter_movies = s_manage_movies_only;
+            if (sel > 0) sel = 0;
+            scan(); draw_browser(mode);
+        }
         if (k & KEY_R && move_pending) { do_paste(); draw_browser(mode); }
         if (k & KEY_B) {
             if (at_root()) return 0;           /* leave browser -> home menu */
@@ -678,7 +858,7 @@ static HomeBtn g_btns[3] = {
     { 222, 210,  92, 24, "ADD VIDEOS",    1 },
 };
 
-static void home_draw(int bsel) {
+static void home_draw(int bsel, long long rpos) {
     ui_begin(GFX_BOTTOM);
     ui_clear(UI_BLACK);
 
@@ -686,6 +866,7 @@ static void home_draw(int bsel) {
 
     /* app title */
     ui_text_center(UI_W / 2, 12, 2, UI_WHITE, "CLOWNSEC VIDEO");
+    ui_text(UI_W - 52, 2, 1, UI_RGB(90, 90, 90), APP_VERSION);   /* version (bump for releases) */
 
     /* loaded movie name, or a prompt */
     if (loaded) {
@@ -704,13 +885,10 @@ static void home_draw(int bsel) {
                    loaded ? "PLAY / RESUME" : "PLAY - choose a video");
 
     /* real resume time as plain text (no fake progress bar) */
-    if (loaded) {
-        long long rpos = moflex_resume_get(g_now_playing_path);
-        if (rpos > 0) {
-            long t = (long)(rpos / 1000000);
-            char rt[40]; snprintf(rt, sizeof(rt), "resume at %ld:%02ld", t / 60, t % 60);
-            ui_text_center(pcx, pcy + 50, 1, UI_RGB(150, 150, 150), rt);
-        }
+    if (loaded && rpos > 0) {
+        long t = (long)(rpos / 1000000);
+        char rt[40]; snprintf(rt, sizeof(rt), "resume at %ld:%02ld", t / 60, t % 60);
+        ui_text_center(pcx, pcy + 50, 1, UI_RGB(150, 150, 150), rt);
     }
 
     /* three buttons */
@@ -727,6 +905,8 @@ static void home_draw(int bsel) {
 
 static int home_gui(void) {
     int bsel = 0, redraw = 1;
+    /* read the resume position ONCE (not every frame -- that hammered the SD card) */
+    long long rpos = g_now_playing_path[0] ? moflex_resume_get(g_now_playing_path) : 0;
     while (aptMainLoop()) {
         hidScanInput();
         u32 k = hidKeysDown();
@@ -747,9 +927,11 @@ static int home_gui(void) {
                 return g_now_playing_path[0] ? 3 : 0;
         }
 
-        (void)redraw;
-        home_draw(bsel);
-        ui_present();               /* offscreen -> fb in one shot (no flicker) */
+        if (redraw) {               /* only redraw on change, not every frame */
+            home_draw(bsel, rpos);
+            ui_present();           /* offscreen -> fb in one shot (no flicker) */
+            redraw = 0;
+        }
         gspWaitForVBlank();
     }
     return -1;

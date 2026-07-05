@@ -12,6 +12,8 @@ static Handle g_done = 0;
 
 bool y2r_video_init(int w, int h) {
     g_ready = 0;
+    /* Y2R + CPU transpose measured ~4x faster than the software 1-pass blit on Old 3DS
+       (18.7ms vs 71.8ms per pair), so it stays on. */
     /* escape hatch: create sdmc:/moflex_player/sw_convert.txt to force the software blit */
     FILE *sw = fopen("sdmc:/moflex_player/sw_convert.txt", "rb");
     if (sw) { fclose(sw); return false; }
@@ -24,7 +26,7 @@ bool y2r_video_init(int w, int h) {
     memset(&p, 0, sizeof(p));
     p.input_format         = INPUT_YUV420_INDIV_8;      /* planar YUV420p (mobiclip output) */
     p.output_format        = OUTPUT_RGB_16_565;         /* matches the top framebuffer */
-    p.rotation             = ROTATION_NONE;
+    p.rotation             = ROTATION_NONE;              /* rotate on the CPU (BLOCK_LINE rotate is batched/scrambled) */
     p.block_alignment      = BLOCK_LINE;                 /* linear, row-major */
     p.input_line_width     = (s16)w;
     p.input_lines          = (s16)h;
@@ -46,31 +48,27 @@ void y2r_video_exit(void) {
     g_ready = 0;
 }
 
-bool y2r_video_blit(AVFrame *f, gfx3dSide_t side, int w, int h) {
+/* Kick off the Y2R conversion (non-blocking) -- the hardware runs while the CPU can
+   decode the next frame. The source frame must stay untouched until y2r_video_finish. */
+bool y2r_video_start(AVFrame *f, int w, int h) {
     if (!g_ready || w != g_w || h != g_h) return false;
     int cw = w / 2, ch = h / 2;
-
-    /* flush the decoded planes so Y2R's DMA reads what the CPU just wrote */
     GSPGPU_FlushDataCache(f->data[0], (u32)w * h);
     GSPGPU_FlushDataCache(f->data[1], (u32)cw * ch);
     GSPGPU_FlushDataCache(f->data[2], (u32)cw * ch);
-
     Y2RU_SetSendingY(f->data[0], (u32)w * h,  (s16)w,  0);
     Y2RU_SetSendingU(f->data[1], (u32)cw * ch, (s16)cw, 0);
     Y2RU_SetSendingV(f->data[2], (u32)cw * ch, (s16)cw, 0);
-    Y2RU_SetReceiving(g_out, (u32)w * h * 2, (s16)(w * 2 * 8), 0);   /* 8 lines/unit (per Y2R note) */
-
+    Y2RU_SetReceiving(g_out, (u32)w * h * 2, (s16)(w * 2 * 8), 0);
     svcClearEvent(g_done);
-    if (R_FAILED(Y2RU_StartConversion())) return false;
-    svcWaitSynchronization(g_done, 300000000LL);   /* 300ms safety timeout */
+    return R_SUCCEEDED(Y2RU_StartConversion());
+}
 
-    /* CPU will read g_out; invalidate so we don't see stale cache lines */
+/* Wait for the started conversion and transpose the result into fb (cache-blocked). */
+void y2r_video_finish(u16 *fb) {
+    int w = g_w, h = g_h;
+    svcWaitSynchronization(g_done, 300000000LL);
     GSPGPU_InvalidateDataCache(g_out, (u32)w * h * 2);
-
-    /* Transpose row-major RGB565 into the rotated top framebuffer. Cache-blocked:
-       a naive transpose does a strided (cache-missing) read per pixel, which is the
-       Old-3DS bottleneck. Processing TBxTB tiles keeps each source chunk in cache. */
-    u16 *fb = (u16 *)gfxGetFramebuffer(GFX_TOP, side, NULL, NULL);
     enum { TB = 16 };
     for (int xo = 0; xo < w; xo += TB) {
         int xe = xo + TB < w ? xo + TB : w;
@@ -84,5 +82,18 @@ bool y2r_video_blit(AVFrame *f, gfx3dSide_t side, int w, int h) {
             }
         }
     }
+}
+
+void y2r_video_drain(void) {   /* wait for an in-flight conversion (e.g. before a seek) */
+    if (g_ready) svcWaitSynchronization(g_done, 300000000LL);
+}
+
+bool y2r_video_blit_fb(AVFrame *f, u16 *fb, int w, int h) {   /* synchronous (prime/fallback) */
+    if (!y2r_video_start(f, w, h)) return false;
+    y2r_video_finish(fb);
     return true;
+}
+
+bool y2r_video_blit(AVFrame *f, gfx3dSide_t side, int w, int h) {
+    return y2r_video_blit_fb(f, (u16 *)gfxGetFramebuffer(GFX_TOP, side, NULL, NULL), w, h);
 }

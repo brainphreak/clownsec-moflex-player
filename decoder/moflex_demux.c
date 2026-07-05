@@ -7,8 +7,11 @@
 
 /* ---- buffered byte reader (mirrors avio_* used by moflex.c) ---- */
 static void io_fill(MfxDemux *m) {
-    m->rbase = (int64_t)ftello(m->f);
-    size_t got = fread(m->rbuf, 1, MFX_RBUF, m->f);
+    m->rbase = (int64_t)ftello(m->f) - m->base;      /* logical pos within [base, base+file_size) */
+    int toread = MFX_RBUF;
+    int64_t remain = m->file_size - m->rbase;         /* never read past the window (CIA-embedded moflex) */
+    if (remain < MFX_RBUF) toread = remain > 0 ? (int)remain : 0;
+    size_t got = toread ? fread(m->rbuf, 1, (size_t)toread, m->f) : 0;
     m->rn = (int)got;
     m->rp = 0;
     if (m->rn <= 0) { m->rn = 0; m->eof = 1; }
@@ -30,7 +33,7 @@ static void    io_seek(MfxDemux *m, int64_t off, int whence) {
     if (target >= m->rbase && target <= m->rbase + m->rn) {
         m->rp = (int)(target - m->rbase);
     } else {
-        fseeko(m->f, (off_t)target, SEEK_SET);
+        fseeko(m->f, (off_t)(m->base + target), SEEK_SET);   /* physical = base + logical */
         m->rn = m->rp = 0; m->rbase = target;
     }
     m->eof = 0;
@@ -171,35 +174,41 @@ static int acc_append(MfxStream *st, MfxDemux *m, int n) {
     return 0;
 }
 
-int mfx_open(MfxDemux *m, FILE *f) {
+int mfx_open_window(MfxDemux *m, FILE *f, int64_t base, int64_t size) {
     memset(m, 0, sizeof(*m));
     m->f = f;
+    m->base = base;
     m->rbuf = (uint8_t *)malloc(MFX_RBUF);
     if (!m->rbuf) return -1;
 
-    /* probe file size + duration: last sync timestamp (microseconds) in the tail */
-    fseeko(f, 0, SEEK_END);
-    m->file_size = (int64_t)ftello(f);
+    /* window size (whole file, or the embedded region) + duration probe over the window's tail */
+    if (size >= 0) m->file_size = size;
+    else { fseeko(f, 0, SEEK_END); m->file_size = (int64_t)ftello(f) - base; }
     {
         int plen = 2 * 1024 * 1024;
         if ((int64_t)plen > m->file_size) plen = (int)m->file_size;
         int64_t probe = m->file_size - plen;
         uint8_t *pb = (uint8_t *)malloc(plen);
         if (pb) {
-            fseeko(f, probe, SEEK_SET);
+            fseeko(f, base + probe, SEEK_SET);
             int got = (int)fread(pb, 1, plen, f);
             int64_t last = 0;
+            const int64_t MAX_US = 24LL * 3600 * 1000000;   /* 24h sanity cap */
             for (int i = 0; i + 12 < got; i++)
                 if (pb[i] == 0x4C && pb[i + 1] == 0x32) {
                     int64_t t = 0;
                     for (int j = 0; j < 8; j++) t = (t << 8) | pb[i + 4 + j];
-                    last = t; i += 11;
+                    /* accept only sane, monotonically-increasing timestamps -- the 0x4C32 byte
+                     * pattern also appears inside media data, so reject garbage (negative, absurd,
+                     * or out-of-order) to avoid a bogus duration that breaks the bar and seeking. */
+                    if (t > last && t < MAX_US) last = t;
+                    i += 11;
                 }
             m->duration_us = last;
             free(pb);
         }
     }
-    fseeko(f, 0, SEEK_SET);
+    fseeko(f, base, SEEK_SET);
     m->rn = m->rp = 0; m->rbase = 0; m->eof = 0;   /* reset buffered reader */
 
     int ret = moflex_read_sync(m);
@@ -207,6 +216,8 @@ int mfx_open(MfxDemux *m, FILE *f) {
     io_seek(m, 0, SEEK_SET);   /* AVFMTCTX_NOHEADER: restart for packets */
     return 0;
 }
+
+int mfx_open(MfxDemux *m, FILE *f) { return mfx_open_window(m, f, 0, -1); }
 
 int mfx_seek_frac(MfxDemux *m, double frac) {
     if (m->file_size <= 0) return -1;
@@ -258,6 +269,36 @@ int mfx_seek_time(MfxDemux *m, int64_t target_us) {
     return mfx_seek_frac(m, best);              /* land at/just before target */
 }
 
+/* Detect frame-interleaved 3D vs 2D: a 3D moflex delivers ~2x the timebase frame rate (an L and an R
+ * frame per displayed instant); a 2D one delivers ~1x. Pre-scans ~2s of packets (demux only, no
+ * decode) then rewinds to the start so playback is unaffected. Returns 1 = 3D, 0 = 2D. */
+int mfx_detect_stereo(MfxDemux *m) {
+    int vi = -1;
+    for (int i = 0; i < m->nb_streams; i++)
+        if (m->streams[i].media_type == MFX_TYPE_VIDEO && vi < 0) vi = i;
+    if (vi < 0 || m->streams[vi].tb_den <= 0 || m->streams[vi].tb_num <= 0) return 1;   /* default 3D */
+
+    double tbfps = (double)m->streams[vi].tb_den / (double)m->streams[vi].tb_num;
+    long vc = 0; int64_t t0 = -1; MfxPacket p;
+    while (mfx_next_packet(m, &p) == 1) {
+        if (m->streams[p.stream_index].media_type != MFX_TYPE_VIDEO) continue;
+        if (t0 < 0) t0 = m->ts;
+        vc++;
+        if (m->ts - t0 >= 2000000) break;   /* 2s of content is plenty to see the 1x vs 2x ratio */
+    }
+    int stereo = 1;
+    if (t0 >= 0 && m->ts > t0 && vc > 4) {
+        double dfps = (double)vc / ((double)(m->ts - t0) / 1e6);
+        stereo = (dfps / tbfps) > 1.5;      /* ~2x = 3D interleaved, ~1x = 2D */
+    }
+    /* rewind demux to the start for playback */
+    io_seek(m, 0, SEEK_SET);
+    m->in_block = 0;
+    for (int i = 0; i < m->nb_streams; i++) m->streams[i].acc_size = 0;
+    m->eof = 0;
+    return stereo;
+}
+
 void mfx_close(MfxDemux *m) {
     for (int i = 0; i < m->nb_streams; i++) free(m->streams[i].acc);
     free(m->rbuf);
@@ -301,6 +342,10 @@ int mfx_next_packet(MfxDemux *m, MfxPacket *pkt) {
             if ((unsigned)pkt_size > m->size) return -1;
 
             MfxStream *st = &m->streams[stream_index];
+            if (m->audio_only && st->media_type != MFX_TYPE_AUDIO) {
+                io_seek(m, (int64_t)pkt_size, SEEK_CUR);   /* audio-only reader: skip video data (no memcpy/read) */
+                continue;
+            }
             if (acc_append(st, m, pkt_size) < 0) return -1;
 
             if (endframe && st->acc_size > 0) {

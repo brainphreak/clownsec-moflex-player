@@ -17,7 +17,7 @@ Worked autonomously on the three deliverables. Nothing destructive: your friend'
   A/V sync + B/START to exit). Used by BOTH the standalone app and your friend's player.
 - `app/` is now a real standalone player: **bottom-screen file browser** (scans
   `sdmc:/` for `.moflex`, D-pad to select, A to play, START to exit) → `moflex_play`.
-- **Builds clean.** Deployed `moflex_player.3dsx` to the repo root and both Citra sdmc
+- **Builds clean.** Deployed `clownsec_player.3dsx` to the repo root and both Citra sdmc
   dirs. ⚠️ The browser is **built but not yet hardware-tested** (couldn't reliably
   drive Citra's UI while you were asleep) — please give it a run.
 
@@ -33,7 +33,7 @@ moflex_port/
   decoder/        moflex_demux, mobiclip, mobicompat, adpcm_moflex   (portable core)
   ffmpeg_support/ vlc/golomb/mathtables/reverse .c + include/ (bundled FFmpeg headers)
   playback/       moflex_playback.{c,h}   (reusable moflex_play())
-  app/            standalone player (source/main.c + Makefile) -> moflex_player.3dsx
+  app/            standalone player (source/main.c + Makefile) -> clownsec_player.3dsx
   pc_verify/      build_pc.sh + test_decode.c + test_audio.c (bit-exact vs ffmpeg)
   README.md  INTEGRATION.md  STATUS.md
 ```

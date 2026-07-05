@@ -31,6 +31,71 @@
 #include "golomb.h"
 #include "mathops.h"
 
+/* --- lightweight phase profiler: accumulate ARM11 ticks per decode phase.
+ * OFF by default (zero overhead in the shipped app); define MOBI_PROFILE to measure. --- */
+#ifdef MOBI_PROFILE
+#include <3ds.h>
+#define PROF_NOW() svcGetSystemTick()
+#else
+#define PROF_NOW() 0ULL
+#endif
+/* 0=intra prediction, 1=intra residual (entropy+IDCT), 2=pframe residual, 3=motion comp */
+uint64_t mobi_prof[8];
+
+/* runtime optimization switch so one binary can A/B decode paths:
+ *   bit 0 = SWAR motion comp   bit 1 = IDCT zero-row skip
+ *   bit 2 = DC-only block       bit 3 = cache prefetch (PLD)   bit 4 = UHADD8 motion comp
+ * DEFAULT 0 = stock decode (the shipped app relies on this; the gputest harness sets it per test).
+ * Findings: 1 SWAR hurt, 2 idct-skip ~2%, 4 DC-only noise, 8 prefetch helps pure-decode ~5% but
+ * REGRESSES in-player (fights Y2R for the memory bus), 16 UHADD8 bit-exact but 0 gain (memory-bound). */
+int mobi_opt = 0;
+#define PF(p) do { if (mobi_opt & 8) __builtin_prefetch((p), 0, 1); } while (0)
+
+/* SWAR (SIMD-within-a-register): process 4 packed bytes per 32-bit op. The >>1 + mask
+ * keeps each byte independent (no inter-byte carry, since 127+127 = 254 < 256). */
+#include <string.h>
+static inline uint32_t ld4(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
+static inline void     st4(uint8_t *p, uint32_t v) { memcpy(p, &v, 4); }
+#define AVG2(a, b) ((((a) >> 1) & 0x7F7F7F7Fu) + (((b) >> 1) & 0x7F7F7F7Fu))
+
+/* ARMv6 media instruction: parallel per-byte (a+b)>>1 (rounded). Correct back to mobiclip's
+ * truncated (a>>1)+(b>>1): they differ by 1 only when both bytes are odd, and the UHADD8
+ * result is >=1 there, so a plain subtract can't underflow -> bit-identical. */
+static inline uint32_t u8avg(uint32_t a, uint32_t b) {
+    uint32_t r;
+    __asm__("uhadd8 %0, %1, %2" : "=r"(r) : "r"(a), "r"(b));
+    return r - ((a & b) & 0x01010101u);
+}
+
+/* hand-written ARM assembly half-pel motion comp (mc_asm.s); aligned src + width%4==0 only. */
+extern void mc_havg_a(uint8_t *dst, const uint8_t *src, int w, int h, int ds, int ss);
+extern void mc_vavg_a(uint8_t *dst, const uint8_t *src, int w, int h, int ds, int ss);
+extern void mc_diag_a(uint8_t *dst, const uint8_t *src, int w, int h, int ds, int ss);
+
+/* load the 4 bytes at p (any alignment) using only ALIGNED word loads + a barrel shift --
+ * no unaligned access (its penalty is what killed the naive SWAR), no memcpy. */
+static inline uint32_t load_uw(const uint8_t *p) {
+    uintptr_t a = (uintptr_t)p;
+    const uint32_t *aw = (const uint32_t *)(a & ~(uintptr_t)3);
+    unsigned sh = ((unsigned)a & 3u) * 8;
+    if (sh == 0) return aw[0];
+    return (aw[0] >> sh) | (aw[1] << (32 - sh));
+}
+
+/* clamp lookup table (ported from the official decoder: it fuses the residual add + the
+ * 0..255 saturate into one load, no branch). g_clamp[CLAMP_OFF + v] == clip_uint8(v). */
+#define CLAMP_OFF  1024
+#define CLAMP_SIZE (CLAMP_OFF * 2 + 256)
+static uint8_t g_clamp[CLAMP_SIZE];
+static int g_clamp_ready = 0;
+static void clamp_init(void) {
+    for (int i = 0; i < CLAMP_SIZE; i++) {
+        int v = i - CLAMP_OFF;
+        g_clamp[i] = v < 0 ? 0 : v > 255 ? 255 : (uint8_t)v;
+    }
+    g_clamp_ready = 1;
+}
+
 #define MOBI_RL_VLC_BITS 12
 #define MOBI_MV_VLC_BITS 6
 
@@ -412,7 +477,7 @@ static void read_run_encoding(AVCodecContext *avctx,
     *level = n & 0x1F;
 }
 
-static int add_coefficients(AVCodecContext *avctx, AVFrame *frame,
+static int add_coefficients_impl(AVCodecContext *avctx, AVFrame *frame,
                             int bx, int by, int size, int plane)
 {
     MobiClipContext *s = avctx->priv_data;
@@ -421,6 +486,10 @@ static int add_coefficients(AVCodecContext *avctx, AVFrame *frame,
     const uint8_t *ztab = size == 8 ? ff_zigzag_direct : zigzag4x4_tab;
     const int *qtab = s->qtab[size == 8];
     uint8_t *dst = frame->data[plane] + by * frame->linesize[plane] + bx;
+    unsigned rowmask = 1;   /* row 0 is always live (mat[0] += 32 below) */
+    int ac = 0;             /* number of AC (non-DC) coefficients */
+    if ((mobi_opt & 32) && !g_clamp_ready) clamp_init();
+    uint64_t _te = PROF_NOW();
 
     for (int pos = 0; get_bits_left(gb) > 0; pos++) {
         int qval, last, run, level;
@@ -451,14 +520,36 @@ static int add_coefficients(AVCodecContext *avctx, AVFrame *frame,
             return AVERROR_INVALIDDATA;
         qval = qtab[pos];
         mat[ztab[pos]] = qval *(unsigned)level;
+        rowmask |= 1u << (ztab[pos] / size);
+        if (ztab[pos]) ac++;                  /* count AC (non-DC) coefficients */
 
         if (last)
             break;
     }
 
+    mobi_prof[5] += PROF_NOW() - _te;         /* bucket 5 = coefficient entropy decode */
+    uint64_t _tt = PROF_NOW();
+
     mat[0] += 32;
-    for (int y = 0; y < size; y++)
-        idct(&mat[y * size], size);
+    if ((mobi_opt & 4) && ac == 0) {          /* DC-only block -> uniform delta, skip all IDCTs */
+        int t[8] = { 0 }; t[0] = mat[0]; idct(t, size);
+        int u[8] = { 0 }; u[0] = t[0];        idct(u, size);
+        int d = u[0] >> 6;
+        for (int y = 0; y < size; y++) {
+            for (int x = 0; x < size; x++) dst[x] = av_clip_uint8(dst[x] + d);
+            dst += frame->linesize[plane];
+        }
+        mobi_prof[4] += PROF_NOW() - _tt;
+        return 0;
+    }
+    if (mobi_opt & 2) {                       /* skip the row IDCT for all-zero rows */
+        for (int y = 0; y < size; y++)
+            if (rowmask & (1u << y))
+                idct(&mat[y * size], size);
+    } else {
+        for (int y = 0; y < size; y++)
+            idct(&mat[y * size], size);
+    }
 
     for (int y = 0; y < size; y++) {
         for (int x = y + 1; x < size; x++) {
@@ -470,12 +561,26 @@ static int add_coefficients(AVCodecContext *avctx, AVFrame *frame,
         }
 
         idct(&mat[y * size], size);
-        for (int x = 0; x < size; x++)
-            dst[x] = av_clip_uint8(dst[x] + (mat[y * size + x] >> 6));
+        if (mobi_opt & 32)                    /* clamp-LUT: fused residual-add + saturate, no branch */
+            for (int x = 0; x < size; x++)
+                dst[x] = g_clamp[CLAMP_OFF + dst[x] + (mat[y * size + x] >> 6)];
+        else
+            for (int x = 0; x < size; x++)
+                dst[x] = av_clip_uint8(dst[x] + (mat[y * size + x] >> 6));
         dst += frame->linesize[plane];
     }
 
+    mobi_prof[4] += PROF_NOW() - _tt;         /* bucket 4 = transform (IDCT + write-back) */
     return 0;
+}
+
+static int add_coefficients(AVCodecContext *avctx, AVFrame *frame,
+                            int bx, int by, int size, int plane)
+{
+    uint64_t t = PROF_NOW();
+    int r = add_coefficients_impl(avctx, frame, bx, by, size, plane);
+    mobi_prof[1] += PROF_NOW() - t;
+    return r;
 }
 
 static int add_pframe_coefficients(AVCodecContext *avctx, AVFrame *frame,
@@ -827,6 +932,7 @@ static int predict_intra(AVCodecContext *avctx, AVFrame *frame, int ax, int ay,
     GetBitContext *gb = &s->gb;
     int w = avctx->width >> !!plane, h = avctx->height >> !!plane;
     int ret = 0;
+    uint64_t _pt = PROF_NOW();
 
     switch (pmode) {
     case 0:
@@ -913,6 +1019,8 @@ static int predict_intra(AVCodecContext *avctx, AVFrame *frame, int ax, int ay,
         block_fill(frame->data[plane], size, frame->linesize[plane], w, h, ax, ay, pick_8);
         break;
     }
+
+    mobi_prof[0] += PROF_NOW() - _pt;
 
     if (add_coeffs)
         ret = add_coefficients(avctx, frame, ax, ay, size, plane);
@@ -1068,7 +1176,7 @@ static int get_index(int x)
     return x == 16 ? 0 : x == 8 ? 1 : x == 4 ? 2 : x == 2 ? 3 : 0;
 }
 
-static int predict_motion(AVCodecContext *avctx,
+static int predict_motion_impl(AVCodecContext *avctx,
                           int width, int height, int index,
                           int offsetm, int offsetx, int offsety)
 {
@@ -1127,55 +1235,237 @@ static int predict_motion(AVCodecContext *avctx,
                 offsety + height + (mv.y + 1 >> 1) > fheight)
                 return AVERROR_INVALIDDATA;
 
+            src = s->pic[sidx]->data[i] + offsetx + (mv.x >> 1) +
+                           (offsety + (mv.y >> 1)) * src_linesize;
+          if (mobi_opt & 0x100) {                      /* hand-written ARM assembly half-pel */
+            int al = (((uintptr_t)src & 3) == 0) && ((width & 3) == 0);
             switch (method) {
             case 0:
-                src = s->pic[sidx]->data[i] + offsetx + (mv.x >> 1) +
-                               (offsety + (mv.y >> 1)) * src_linesize;
+                for (int y = 0; y < height; y++) { memcpy(dst, src, width); dst += dst_linesize; src += src_linesize; }
+                break;
+            case 1:
+                if (al) mc_havg_a(dst, src, width, height, dst_linesize, src_linesize);
+                else for (int y = 0; y < height; y++) { for (int x = 0; x < width; x++) dst[x] = (uint8_t)((src[x] >> 1) + (src[x + 1] >> 1)); dst += dst_linesize; src += src_linesize; }
+                break;
+            case 2:
+                if (al) mc_vavg_a(dst, src, width, height, dst_linesize, src_linesize);
+                else for (int y = 0; y < height; y++) { for (int x = 0; x < width; x++) dst[x] = (uint8_t)((src[x] >> 1) + (src[x + src_linesize] >> 1)); dst += dst_linesize; src += src_linesize; }
+                break;
+            case 3:
+                if (al) mc_diag_a(dst, src, width, height, dst_linesize, src_linesize);
+                else for (int y = 0; y < height; y++) { for (int x = 0; x < width; x++)
+                        dst[x] = (uint8_t)((((src[x] >> 1) + (src[x + 1] >> 1)) >> 1) + (((src[x + src_linesize] >> 1) + (src[x + 1 + src_linesize] >> 1)) >> 1));
+                    dst += dst_linesize; src += src_linesize; }
+                break;
+            }
+          } else if (mobi_opt & 16) {                  /* ARMv6 media path (UHADD8), 4 px/op */
+            switch (method) {
+            case 0:
                 for (int y = 0; y < height; y++) {
-                    for (int x = 0; x < width; x++)
-                        dst[x] = src[x];
-                    dst += dst_linesize;
-                    src += src_linesize;
+                    PF(src + src_linesize);
+                    int x = 0;
+                    for (; x + 4 <= width; x += 4) st4(dst + x, ld4(src + x));
+                    for (; x < width; x++) dst[x] = src[x];
+                    dst += dst_linesize; src += src_linesize;
                 }
                 break;
             case 1:
-                src = s->pic[sidx]->data[i] + offsetx + (mv.x >> 1) +
-                               (offsety + (mv.y >> 1)) * src_linesize;
                 for (int y = 0; y < height; y++) {
-                    for (int x = 0; x < width; x++) {
-                        dst[x] = (uint8_t)((src[x] >> 1) + (src[x + 1] >> 1));
-                    }
-
-                    dst += dst_linesize;
-                    src += src_linesize;
+                    PF(src + src_linesize);
+                    int x = 0;
+                    for (; x + 4 <= width; x += 4) st4(dst + x, u8avg(ld4(src + x), ld4(src + x + 1)));
+                    for (; x < width; x++) dst[x] = (uint8_t)((src[x] >> 1) + (src[x + 1] >> 1));
+                    dst += dst_linesize; src += src_linesize;
                 }
                 break;
             case 2:
-                src = s->pic[sidx]->data[i] + offsetx + (mv.x >> 1) +
-                               (offsety + (mv.y >> 1)) * src_linesize;
                 for (int y = 0; y < height; y++) {
-                    for (int x = 0; x < width; x++) {
-                        dst[x] = (uint8_t)((src[x] >> 1) + (src[x + src_linesize] >> 1));
-                    }
-
-                    dst += dst_linesize;
-                    src += src_linesize;
+                    PF(src + 2 * src_linesize);
+                    int x = 0;
+                    for (; x + 4 <= width; x += 4) st4(dst + x, u8avg(ld4(src + x), ld4(src + x + src_linesize)));
+                    for (; x < width; x++) dst[x] = (uint8_t)((src[x] >> 1) + (src[x + src_linesize] >> 1));
+                    dst += dst_linesize; src += src_linesize;
                 }
                 break;
             case 3:
-                src = s->pic[sidx]->data[i] + offsetx + (mv.x >> 1) +
-                               (offsety + (mv.y >> 1)) * src_linesize;
                 for (int y = 0; y < height; y++) {
-                    for (int x = 0; x < width; x++) {
+                    PF(src + 2 * src_linesize);
+                    int x = 0;
+                    for (; x + 4 <= width; x += 4)
+                        st4(dst + x, u8avg(u8avg(ld4(src + x), ld4(src + x + 1)),
+                                           u8avg(ld4(src + x + src_linesize), ld4(src + x + 1 + src_linesize))));
+                    for (; x < width; x++)
                         dst[x] = (uint8_t)((((src[x] >> 1) + (src[x + 1] >> 1)) >> 1) +
                                            (((src[x + src_linesize] >> 1) + (src[x + 1 + src_linesize] >> 1)) >> 1));
-                    }
-
-                    dst += dst_linesize;
-                    src += src_linesize;
+                    dst += dst_linesize; src += src_linesize;
                 }
                 break;
             }
+          } else if (mobi_opt & 0x40) {
+            /* ported motion comp: copy each source row to an ALIGNED temp, then SWAR using aligned
+             * word loads + a shift to build the +1 neighbor -- no unaligned loads (that penalty is
+             * what made the naive SWAR regress). u8avg is bit-exact to (a>>1)+(b>>1). */
+            uint8_t ta[24] __attribute__((aligned(4)));
+            uint8_t tb[24] __attribute__((aligned(4)));
+            switch (method) {
+            case 0:
+                for (int y = 0; y < height; y++) { memcpy(dst, src, width); dst += dst_linesize; src += src_linesize; }
+                break;
+            case 1:
+                for (int y = 0; y < height; y++) {
+                    memcpy(ta, src, width + 1);
+                    int x = 0;
+                    for (; x + 4 <= width; x += 4) {
+                        uint32_t w = *(const uint32_t *)(ta + x);
+                        uint32_t wn = (w >> 8) | ((uint32_t)ta[x + 4] << 24);
+                        st4(dst + x, u8avg(w, wn));
+                    }
+                    for (; x < width; x++) dst[x] = (uint8_t)((ta[x] >> 1) + (ta[x + 1] >> 1));
+                    dst += dst_linesize; src += src_linesize;
+                }
+                break;
+            case 2:
+                for (int y = 0; y < height; y++) {
+                    memcpy(ta, src, width); memcpy(tb, src + src_linesize, width);
+                    int x = 0;
+                    for (; x + 4 <= width; x += 4)
+                        st4(dst + x, u8avg(*(const uint32_t *)(ta + x), *(const uint32_t *)(tb + x)));
+                    for (; x < width; x++) dst[x] = (uint8_t)((ta[x] >> 1) + (tb[x] >> 1));
+                    dst += dst_linesize; src += src_linesize;
+                }
+                break;
+            case 3:
+                for (int y = 0; y < height; y++) {
+                    memcpy(ta, src, width + 1); memcpy(tb, src + src_linesize, width + 1);
+                    int x = 0;
+                    for (; x + 4 <= width; x += 4) {
+                        uint32_t wa = *(const uint32_t *)(ta + x), wan = (wa >> 8) | ((uint32_t)ta[x + 4] << 24);
+                        uint32_t wb = *(const uint32_t *)(tb + x), wbn = (wb >> 8) | ((uint32_t)tb[x + 4] << 24);
+                        st4(dst + x, u8avg(u8avg(wa, wan), u8avg(wb, wbn)));
+                    }
+                    for (; x < width; x++)
+                        dst[x] = (uint8_t)((((ta[x] >> 1) + (ta[x + 1] >> 1)) >> 1) +
+                                           (((tb[x] >> 1) + (tb[x + 1] >> 1)) >> 1));
+                    dst += dst_linesize; src += src_linesize;
+                }
+                break;
+            }
+          } else if (mobi_opt & 0x80) {
+            /* direct aligned-read SWAR: no memcpy, no unaligned loads -- load_uw reads via aligned
+             * words + shift. (PF prefetch is gated on bit 8, so 0x88 = this + prefetch.) */
+            switch (method) {
+            case 0:
+                for (int y = 0; y < height; y++) { memcpy(dst, src, width); dst += dst_linesize; src += src_linesize; }
+                break;
+            case 1:
+                for (int y = 0; y < height; y++) {
+                    PF(src + src_linesize);
+                    int x = 0;
+                    for (; x + 4 <= width; x += 4) st4(dst + x, u8avg(load_uw(src + x), load_uw(src + x + 1)));
+                    for (; x < width; x++) dst[x] = (uint8_t)((src[x] >> 1) + (src[x + 1] >> 1));
+                    dst += dst_linesize; src += src_linesize;
+                }
+                break;
+            case 2:
+                for (int y = 0; y < height; y++) {
+                    PF(src + 2 * src_linesize);
+                    int x = 0;
+                    for (; x + 4 <= width; x += 4) st4(dst + x, u8avg(load_uw(src + x), load_uw(src + x + src_linesize)));
+                    for (; x < width; x++) dst[x] = (uint8_t)((src[x] >> 1) + (src[x + src_linesize] >> 1));
+                    dst += dst_linesize; src += src_linesize;
+                }
+                break;
+            case 3:
+                for (int y = 0; y < height; y++) {
+                    PF(src + 2 * src_linesize);
+                    int x = 0;
+                    for (; x + 4 <= width; x += 4)
+                        st4(dst + x, u8avg(u8avg(load_uw(src + x), load_uw(src + x + 1)),
+                                           u8avg(load_uw(src + x + src_linesize), load_uw(src + x + 1 + src_linesize))));
+                    for (; x < width; x++)
+                        dst[x] = (uint8_t)((((src[x] >> 1) + (src[x + 1] >> 1)) >> 1) +
+                                           (((src[x + src_linesize] >> 1) + (src[x + 1 + src_linesize] >> 1)) >> 1));
+                    dst += dst_linesize; src += src_linesize;
+                }
+                break;
+            }
+          } else if (mobi_opt & 1) {
+            switch (method) {
+            case 0:                                    /* full-pel: straight copy */
+                for (int y = 0; y < height; y++) {
+                    memcpy(dst, src, width);
+                    dst += dst_linesize; src += src_linesize;
+                }
+                break;
+            case 1:                                    /* half-pel horizontal */
+                for (int y = 0; y < height; y++) {
+                    int x = 0;
+                    for (; x + 4 <= width; x += 4)
+                        st4(dst + x, AVG2(ld4(src + x), ld4(src + x + 1)));
+                    for (; x < width; x++)
+                        dst[x] = (uint8_t)((src[x] >> 1) + (src[x + 1] >> 1));
+                    dst += dst_linesize; src += src_linesize;
+                }
+                break;
+            case 2:                                    /* half-pel vertical */
+                for (int y = 0; y < height; y++) {
+                    int x = 0;
+                    for (; x + 4 <= width; x += 4)
+                        st4(dst + x, AVG2(ld4(src + x), ld4(src + x + src_linesize)));
+                    for (; x < width; x++)
+                        dst[x] = (uint8_t)((src[x] >> 1) + (src[x + src_linesize] >> 1));
+                    dst += dst_linesize; src += src_linesize;
+                }
+                break;
+            case 3:                                    /* half-pel diagonal (2x2 avg) */
+                for (int y = 0; y < height; y++) {
+                    int x = 0;
+                    for (; x + 4 <= width; x += 4) {
+                        uint32_t top = AVG2(ld4(src + x), ld4(src + x + 1));
+                        uint32_t bot = AVG2(ld4(src + x + src_linesize), ld4(src + x + 1 + src_linesize));
+                        st4(dst + x, AVG2(top, bot));
+                    }
+                    for (; x < width; x++)
+                        dst[x] = (uint8_t)((((src[x] >> 1) + (src[x + 1] >> 1)) >> 1) +
+                                           (((src[x + src_linesize] >> 1) + (src[x + 1 + src_linesize] >> 1)) >> 1));
+                    dst += dst_linesize; src += src_linesize;
+                }
+                break;
+            }
+          } else {
+            switch (method) {                          /* original byte-at-a-time paths */
+            case 0:
+                for (int y = 0; y < height; y++) {
+                    PF(src + src_linesize);
+                    for (int x = 0; x < width; x++) dst[x] = src[x];
+                    dst += dst_linesize; src += src_linesize;
+                }
+                break;
+            case 1:
+                for (int y = 0; y < height; y++) {
+                    PF(src + src_linesize);
+                    for (int x = 0; x < width; x++) dst[x] = (uint8_t)((src[x] >> 1) + (src[x + 1] >> 1));
+                    dst += dst_linesize; src += src_linesize;
+                }
+                break;
+            case 2:
+                for (int y = 0; y < height; y++) {
+                    PF(src + 2 * src_linesize);
+                    for (int x = 0; x < width; x++) dst[x] = (uint8_t)((src[x] >> 1) + (src[x + src_linesize] >> 1));
+                    dst += dst_linesize; src += src_linesize;
+                }
+                break;
+            case 3:
+                for (int y = 0; y < height; y++) {
+                    PF(src + 2 * src_linesize);
+                    for (int x = 0; x < width; x++)
+                        dst[x] = (uint8_t)((((src[x] >> 1) + (src[x + 1] >> 1)) >> 1) +
+                                           (((src[x + src_linesize] >> 1) + (src[x + 1 + src_linesize] >> 1)) >> 1));
+                    dst += dst_linesize; src += src_linesize;
+                }
+                break;
+            }
+          }
         }
     } else {
         int tidx;
@@ -1191,7 +1481,7 @@ static int predict_motion(AVCodecContext *avctx,
 
             idx2 = get_vlc2(gb, mv_vlc[s->moflex][tidx], MOBI_MV_VLC_BITS, 1);
 
-            ret = predict_motion(avctx, width, height, idx2,
+            ret = predict_motion_impl(avctx, width, height, idx2,
                                  offsetm, offsetx + i * adjx, offsety + i * adjy);
             if (ret < 0)
                 return ret;
@@ -1199,6 +1489,16 @@ static int predict_motion(AVCodecContext *avctx,
     }
 
     return 0;
+}
+
+static int predict_motion(AVCodecContext *avctx,
+                          int width, int height, int index,
+                          int offsetm, int offsetx, int offsety)
+{
+    uint64_t t = PROF_NOW();
+    int r = predict_motion_impl(avctx, width, height, index, offsetm, offsetx, offsety);
+    mobi_prof[3] += PROF_NOW() - t;
+    return r;
 }
 
 static int mobiclip_decode(AVCodecContext *avctx, AVFrame *rframe,

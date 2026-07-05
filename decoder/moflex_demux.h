@@ -53,18 +53,28 @@ typedef struct {
     int      flags;
     int      in_block;
 
-    int64_t  file_size;
+    int64_t  file_size;     /* size of the moflex window (whole file, or the region inside a CIA) */
+    int64_t  base;          /* byte offset of the moflex within the file (0 = plain .moflex) */
     int64_t  duration_us;   /* estimated total duration (microseconds) */
+    int      audio_only;    /* if set, mfx_next_packet skips (seeks past) non-audio chunks */
 
     unsigned br_last, br_pos;  /* bit reader */
 } MfxDemux;
 
 /* Returns 0 on success. Parses the first sync so stream table is known. */
 int  mfx_open(MfxDemux *m, FILE *f);
+
+/* Like mfx_open but reads only the window [base, base+size) of the file -- used to play a moflex
+ * embedded inside a (unencrypted) CIA in place. size < 0 = to end of file. */
+int  mfx_open_window(MfxDemux *m, FILE *f, int64_t base, int64_t size);
 void mfx_close(MfxDemux *m);
 
 /* Returns 1 and fills *pkt on a packet, 0 at EOF, <0 on error. */
 int  mfx_next_packet(MfxDemux *m, MfxPacket *pkt);
+
+/* Detect frame-interleaved 3D (1) vs 2D (0) by the delivered-vs-timebase frame-rate ratio.
+ * Pre-scans ~2s then rewinds to the start. Call right after mfx_open, before playback. */
+int  mfx_detect_stereo(MfxDemux *m);
 
 /* Seek to ~fraction (0..1) of the file, realign to the next sync marker.
  * Approximate (nearest block); caller should flush the decoder and decode

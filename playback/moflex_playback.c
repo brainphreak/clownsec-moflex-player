@@ -8,15 +8,18 @@
 #include <sys/stat.h>
 
 #include "moflex_demux.h"
+#include "cia_moflex.h"
 #include "mobicompat.h"
 #include "adpcm_moflex.h"
 #include "ui_gfx.h"
 #include "y2r_video.h"
+#include <citro2d.h>   /* Old-3DS GPU playback path (no CPU transpose) */
 
 extern int    mobi_init(AVCodecContext *);
 extern int    mobi_decode(AVCodecContext *, AVFrame *, int *, AVPacket *);
 extern void   mobi_flush(AVCodecContext *);
 extern int    mobi_close(AVCodecContext *);
+extern int    mobi_opt;   /* decode-path selector; 14 = prefetch|idct-skip|dc (bit-exact, ~6-8% faster) */
 extern size_t mobi_ctx_size(void);
 
 #define SCR_W 400
@@ -24,6 +27,7 @@ extern size_t mobi_ctx_size(void);
 
 /* ---- software volume (persisted) ---- */
 static float g_vol = 1.0f;
+static int   g_old3d_warn = 0;   /* Old 3DS + 3D content: show the "unsupported / perf issues" notice */
 static void vol_load(void) {
     FILE *f = fopen("sdmc:/moflex_player/volume.txt", "rb");
     if (f) { float v; if (fscanf(f, "%f", &v) == 1 && v >= 0.25f && v <= 4.0f) g_vol = v; fclose(f); }
@@ -45,7 +49,8 @@ static void resume_path(const char *movie, char *out, size_t cap) {
         key[j++] = ok ? c : '_';
     }
     key[j] = 0;
-    snprintf(out, cap, "sdmc:/moflex_player/resume/%s.pos", key);
+    char suf[24]; cia_selection_suffix(movie, suf, sizeof suf);   /* per-embedded-video for multi-moflex CIAs */
+    snprintf(out, cap, "sdmc:/moflex_player/resume/%s%s.pos", key, suf);
 }
 static int64_t resume_load(const char *movie) {
     char p[256]; resume_path(movie, p, sizeof(p));
@@ -54,8 +59,8 @@ static int64_t resume_load(const char *movie) {
     return (ok && us > 0) ? (int64_t)us : 0;
 }
 static void resume_save_us(const char *movie, int64_t us) {
-    mkdir("sdmc:/moflex_player", 0777);
-    mkdir("sdmc:/moflex_player/resume", 0777);
+    static int made = 0;   /* create the dir once, not on every checkpoint (each mkdir hits the SD/FS) */
+    if (!made) { mkdir("sdmc:/moflex_player", 0777); mkdir("sdmc:/moflex_player/resume", 0777); made = 1; }
     char p[256]; resume_path(movie, p, sizeof(p));
     FILE *f = fopen(p, "wb"); if (f) { fprintf(f, "%lld\n", (long long)us); fclose(f); }
 }
@@ -86,10 +91,10 @@ static inline u16 yuv2rgb565(int Y, int U, int V) {
     int b = clamp8[((y + bu[U]) >> 8) + 256];
     return (u16)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
 }
-static void blit_eye(AVFrame *out, gfx3dSide_t side, int W, int H) {
-    if (y2r_video_blit(out, side, W, H)) return;   /* hardware color conversion */
+/* Convert+rotate one eye into a specific framebuffer (used by the blit worker). */
+static void blit_to(AVFrame *out, u16 *fb, int W, int H) {
+    if (y2r_video_blit_fb(out, fb, W, H)) return;   /* hardware color conversion */
     /* software fallback (per-pixel YUV->RGB565 + rotate) */
-    u16 *fb = (u16 *)gfxGetFramebuffer(GFX_TOP, side, NULL, NULL);
     const uint8_t *Yp = out->data[0], *Up = out->data[1], *Vp = out->data[2];
     int ys = out->linesize[0], cs = out->linesize[1];
     int w = W < SCR_W ? W : SCR_W, h = H < SCR_H ? H : SCR_H;
@@ -101,6 +106,54 @@ static void blit_eye(AVFrame *out, gfx3dSide_t side, int W, int H) {
             col[k] = yuv2rgb565(Yp[y * ys + x], Up[(y >> 1) * cs + cx], Vp[(y >> 1) * cs + cx]);
         }
     }
+}
+
+static void blit_eye(AVFrame *out, gfx3dSide_t side, int W, int H) {
+    blit_to(out, (u16 *)gfxGetFramebuffer(GFX_TOP, side, NULL, NULL), W, H);
+}
+
+/* ---- blit worker: runs the Y2R+transpose for both eyes on the 2nd CPU core so it
+ * overlaps the (slow) MobiClip decode on the main core -> ~doubles Old-3DS throughput. */
+typedef struct { AVFrame *l, *r; u16 *fbl, *fbr; int w, h; } BlitJob;
+static volatile int bw_run = 0;
+static LightEvent   bw_start, bw_done;
+static BlitJob      bw_job;
+static Thread       bw_thread = NULL;
+static volatile u64 bw_ticks = 0;   /* last pair's blit time */
+
+static void bw_fn(void *arg) {
+    (void)arg;
+    while (bw_run) {
+        LightEvent_Wait(&bw_start);
+        if (!bw_run) break;
+        u64 t = svcGetSystemTick();
+        blit_to(bw_job.l, bw_job.fbl, bw_job.w, bw_job.h);
+        blit_to(bw_job.r, bw_job.fbr, bw_job.w, bw_job.h);
+        bw_ticks = svcGetSystemTick() - t;
+        LightEvent_Signal(&bw_done);
+    }
+}
+
+static int bw_init(void) {
+    bw_run = 1;
+    LightEvent_Init(&bw_start, RESET_ONESHOT);
+    LightEvent_Init(&bw_done, RESET_ONESHOT);
+    bool isnew = false; APT_CheckNew3DS(&isnew);
+    int core = isnew ? 2 : 1;                 /* New3DS: core2; Old3DS: syscore (core1) */
+    if (!isnew) APT_SetAppCpuTimeLimit(80);   /* let our thread run on the syscore */
+    s32 prio = 0x30; svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
+    bw_thread = threadCreate(bw_fn, NULL, 32 * 1024, prio - 1, core, true);
+    if (!bw_thread) { bw_run = 0; return 0; }
+    return 1;
+}
+
+static void bw_exit(void) {
+    if (!bw_thread) return;
+    bw_run = 0;
+    LightEvent_Signal(&bw_start);
+    threadJoin(bw_thread, UINT64_MAX);
+    threadFree(bw_thread);
+    bw_thread = NULL;
 }
 
 /* ---- control panel layout (bottom screen, 320x240) ---- */
@@ -126,11 +179,17 @@ static void fmt_time(int64_t us, char *o, int cap) {
     else       snprintf(o, cap, "%d:%02d", m, s);
 }
 
+/* debug timing overlay (per stereo pair), updated ~1x/sec from the loop */
+static int g_dbg_fps = 0, g_dbg_dec10 = 0, g_dbg_blit10 = 0, g_dbg_aud10 = 0;
+
 static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing) {
     ui_begin(GFX_BOTTOM);
     ui_clear(UI_BLACK);
 
     ui_text(6, 6, 1, UI_WHITE, title);
+
+    if (g_old3d_warn)   /* Old 3DS can't keep up with 3D's doubled frame rate */
+        ui_text(6, 44, 1, UI_RED, "3D Has Performance Issues on Old3DS");
 
     char tc[16], td[16], line[40];
     fmt_time(cur, tc, sizeof(tc));
@@ -183,7 +242,7 @@ static void do_seek(MfxDemux *m, AVCodecContext *ctx, int64_t target_us) {
  * vblank pacing) and show that landing frame immediately, so seeking is responsive
  * and audio can then resume in sync instead of racing ahead of a frozen frame. */
 static void prime_after_seek(MfxDemux *m, AVCodecContext *ctx, AVFrame *out, int W, int H,
-                             int64_t *cur_us, int *vidx, int *left_ok, int *left_vidx) {
+                             int64_t *cur_us, int *vidx, int *left_ok, int *left_vidx, int is3d) {
     MfxPacket pkt;
     for (int guard = 0; guard < 4000; guard++) {           /* bound the scan */
         if (mfx_next_packet(m, &pkt) != 1) return;
@@ -191,6 +250,10 @@ static void prime_after_seek(MfxDemux *m, AVCodecContext *ctx, AVFrame *out, int
         *cur_us = m->ts;
         AVPacket ap; ap.data = pkt.data; ap.size = pkt.size; int got = 0;
         int ok = (mobi_decode(ctx, out, &got, &ap) >= 0 && got);
+        if (!is3d) {                                        /* 2D: first decodable frame is the landing */
+            if (ok) { blit_eye(out, GFX_LEFT, W, H); gfxFlushBuffers(); gfxSwapBuffers(); (*vidx)++; return; }
+            (*vidx)++; continue;
+        }
         if ((*vidx & 1) == 0) {                             /* left eye */
             if (ok) { blit_eye(out, GFX_LEFT, W, H); *left_ok = 1; *left_vidx = *vidx; }
             else *left_ok = 0;
@@ -207,15 +270,424 @@ static void prime_after_seek(MfxDemux *m, AVCodecContext *ctx, AVFrame *out, int
     }
 }
 
+/* ===================== Old-3DS GPU playback path =====================
+ * citro2d: Y2R (hardware color) -> GPU texture -> C2D draw (GPU does the 90-deg rotate, so the
+ * CPU never touches the cache-thrashing transpose that stutters the Old 3DS). Bottom panel is
+ * drawn with C2D too. Same controls/seek/resume as the classic path. */
+#define NWB 16                 /* deeper audio buffer -> more slack against fps dips */
+#define ABUF_SAMPLES (16 * 1024)
+#define VLEAD_US 20000         /* show each frame ~20ms ahead of its audible audio position (lip-sync bias) */
+#define GT_W 512
+#define GT_H 256
+static Handle g_y2r_done;
+static void g_y2r_init(int W, int H) {
+    y2rInit();
+    Y2RU_ConversionParams p; memset(&p, 0, sizeof p);
+    p.input_format = INPUT_YUV420_INDIV_8; p.output_format = OUTPUT_RGB_16_565;
+    p.rotation = ROTATION_NONE; p.block_alignment = BLOCK_8_BY_8;
+    p.input_line_width = (s16)W; p.input_lines = (s16)H;
+    p.standard_coefficient = COEFFICIENT_ITU_R_BT_601_SCALING; p.alpha = 0xFF;
+    Y2RU_SetConversionParams(&p);
+    Y2RU_SetTransferEndInterrupt(true);
+    Y2RU_GetTransferEndEvent(&g_y2r_done);
+}
+static void g_y2r_start(AVFrame *o, C3D_Tex *tex, int W, int H) {
+    int cw = W / 2, ch = H / 2;
+    GSPGPU_FlushDataCache(o->data[0], (u32)W * H);
+    GSPGPU_FlushDataCache(o->data[1], (u32)cw * ch);
+    GSPGPU_FlushDataCache(o->data[2], (u32)cw * ch);
+    Y2RU_SetSendingY(o->data[0], (u32)W * H, (s16)W, 0);
+    Y2RU_SetSendingU(o->data[1], (u32)cw * ch, (s16)cw, 0);
+    Y2RU_SetSendingV(o->data[2], (u32)cw * ch, (s16)cw, 0);
+    Y2RU_SetReceiving(tex->data, (u32)W * H * 2, (s16)(W * 2 * 8), (s16)((GT_W - W) * 2 * 8));
+    svcClearEvent(g_y2r_done); Y2RU_StartConversion();
+}
+static void g_y2r_wait(C3D_Tex *tex) { svcWaitSynchronization(g_y2r_done, 300000000LL); C3D_TexFlush(tex); }
+
+static void g_panel(C3D_RenderTarget *bot, C2D_Text *ttitle, C2D_Text *ttime, C2D_Text *thint,
+                    int64_t cur, int64_t dur, int playing, float vol) {
+    u32 wht = C2D_Color32(255, 255, 255, 255), gry = C2D_Color32(150, 150, 150, 255);
+    C2D_TargetClear(bot, C2D_Color32(0, 0, 0, 255));
+    C2D_SceneBegin(bot);
+    C2D_DrawText(ttitle, C2D_WithColor, 6, 4, 0, 0.6f, 0.6f, wht);
+    C2D_DrawText(ttime,  C2D_WithColor, 6, 26, 0, 0.5f, 0.5f, gry);
+    double frac = dur > 0 ? (double)cur / (double)dur : 0; if (frac > 1) frac = 1;
+    C2D_DrawRectSolid(BAR_X, BAR_Y, 0, BAR_W, BAR_H, C2D_Color32(60, 60, 60, 255));
+    C2D_DrawRectSolid(BAR_X, BAR_Y, 0, (float)(BAR_W * frac), BAR_H, wht);
+    C2D_DrawRectSolid(BAR_X + (float)(BAR_W * frac) - 2, BAR_Y - 3, 0, 5, BAR_H + 6, C2D_Color32(80, 160, 255, 255));
+    if (playing) { C2D_DrawRectSolid(PLAY_CX - 9, PLAY_CY - 13, 0, 6, 26, wht); C2D_DrawRectSolid(PLAY_CX + 3, PLAY_CY - 13, 0, 6, 26, wht); }
+    else C2D_DrawTriangle(PLAY_CX - 8, PLAY_CY - 13, wht, PLAY_CX - 8, PLAY_CY + 13, wht, PLAY_CX + 12, PLAY_CY, wht, 0);
+    C2D_DrawRectSolid(VOL_X, VOL_Y, 0, 12, VOL_H, C2D_Color32(60, 60, 60, 255));
+    C2D_DrawRectSolid(VOL_X, VOL_Y + VOL_H * (1.0f - vol / 4.0f), 0, 12, VOL_H * (vol / 4.0f), wht);
+    C2D_DrawText(thint, C2D_WithColor, 8, 222, 0, 0.42f, 0.42f, gry);
+}
+
+/* ---- audio worker: runs on core 1, owns ndsp, reads its OWN file handle so it feeds the DSP
+ * at real time completely decoupled from the video decode on core 0 (this is what the official
+ * player does -- one worker thread -- and why its audio never stutters). ---- */
+static volatile int   g_aw_stop, g_aw_paused, g_aw_seek;
+static volatile int64_t g_aw_seek_us;
+static volatile int64_t g_aud_play_us;   /* content timestamp the DSP is actually playing now */
+static volatile int64_t g_aud_start = -1;/* audio timeline anchor (astart) -> video compares RELATIVE time */
+static volatile int64_t g_vid_us;        /* content timestamp the video has reached (main thread) */
+static void audio_worker(void *arg) {
+    const char *path = (const char *)arg;
+    FILE *af = fopen(path, "rb");
+    if (!af) return;
+    MfxDemux am;
+    if (mfx_open_auto(&am, af, path) != 0) { fclose(af); return; }
+    am.audio_only = 1;   /* skip video chunks entirely -> minimal core-1 work, less contention */
+    int ai = -1;
+    for (int i = 0; i < am.nb_streams; i++) if (am.streams[i].media_type == MFX_TYPE_AUDIO && ai < 0) ai = i;
+    if (ai < 0) { mfx_close(&am); fclose(af); return; }
+    int arate = am.streams[ai].sample_rate, chn = am.streams[ai].channels;
+    ndspChnReset(0); ndspChnSetInterp(0, NDSP_INTERP_POLYPHASE); ndspChnSetRate(0, (float)arate);
+    ndspChnSetFormat(0, chn == 2 ? NDSP_FORMAT_STEREO_PCM16 : NDSP_FORMAT_MONO_PCM16);
+    float mix[12]; memset(mix, 0, sizeof mix); mix[0] = mix[1] = 1.0f; ndspChnSetMix(0, mix);
+    ndspWaveBuf wbuf[NWB]; int16_t *abuf[NWB]; memset(wbuf, 0, sizeof wbuf);
+    for (int i = 0; i < NWB; i++) { abuf[i] = (int16_t *)linearAlloc(ABUF_SAMPLES * chn * 2); wbuf[i].data_vaddr = abuf[i]; wbuf[i].status = NDSP_WBUF_DONE; }
+    int wb_idx = 0, was_paused = 0;
+    int64_t astart = -1; long long played = 0; int slot_ns[NWB]; memset(slot_ns, 0, sizeof slot_ns);
+    MfxPacket pkt;
+    while (!g_aw_stop) {
+        if (g_aw_seek) {
+            mfx_seek_time(&am, g_aw_seek_us);
+            ndspChnWaveBufClear(0);
+            for (int i = 0; i < NWB; i++) wbuf[i].status = NDSP_WBUF_DONE;
+            wb_idx = 0; g_aw_seek = 0;
+            /* leave g_aud_play_us = -1 (offline); the first decoded audio packet below sets astart and
+             * brings the clock online at the real landing position -> video holds until audio truly flows. */
+            astart = -1; played = 0; memset(slot_ns, 0, sizeof slot_ns); g_aud_play_us = -1; g_aud_start = -1;
+        }
+        if (g_aw_paused) { if (!was_paused) { ndspChnSetPaused(0, true); was_paused = 1; } svcSleepThread(8000000); continue; }
+        if (was_paused) { ndspChnSetPaused(0, false); was_paused = 0; }
+        if (mfx_next_packet(&am, &pkt) != 1) { g_aw_paused = 1; continue; }   /* EOF -> idle */
+        if (am.streams[pkt.stream_index].media_type != MFX_TYPE_AUDIO) continue;   /* skip video */
+        ndspWaveBuf *wb = &wbuf[wb_idx];
+        while (wb->status != NDSP_WBUF_FREE && wb->status != NDSP_WBUF_DONE) {
+            if (g_aw_stop || g_aw_seek || g_aw_paused) break;
+            svcSleepThread(3000000);   /* 3ms: buffers are deep, so poll lazily -> far fewer syscore
+                                        * wakeups fighting the memory-bound video decoder on core 0 */
+        }
+        if (g_aw_stop || g_aw_seek || g_aw_paused) continue;
+        int fr = adpcm_moflex_decode(pkt.data, pkt.size, chn, abuf[wb_idx]);
+        if (fr > 0 && fr <= ABUF_SAMPLES) {
+            if (astart < 0) { astart = am.ts; g_aud_start = am.ts; }   /* anchor the audio timeline */
+            played += slot_ns[wb_idx]; slot_ns[wb_idx] = fr;   /* the slot we're reusing has finished */
+            g_aud_play_us = astart + (int64_t)(played * 1000000LL / arate);
+            float v = g_vol;
+            if (v != 1.0f) { int16_t *s = abuf[wb_idx]; int ns = fr * chn;
+                for (int i = 0; i < ns; i++) { int t = (int)(s[i] * v); s[i] = (int16_t)(t > 32767 ? 32767 : (t < -32768 ? -32768 : t)); } }
+            DSP_FlushDataCache(abuf[wb_idx], fr * chn * 2);
+            memset(wb, 0, sizeof *wb); wb->data_vaddr = abuf[wb_idx]; wb->nsamples = fr;
+            ndspChnWaveBufAdd(0, wb); wb_idx = (wb_idx + 1) % NWB;
+            /* audio is the MASTER clock: it always plays at natural 1.0x pitch. The video
+             * thread slaves to g_aud_play_us (below). No rate-matching -> no pitch artifacts. */
+        }
+    }
+    ndspChnWaveBufClear(0); ndspChnReset(0);
+    for (int i = 0; i < NWB; i++) if (abuf[i]) linearFree(abuf[i]);
+    mfx_close(&am); fclose(af);
+}
+
+static MoflexResult moflex_play_gpu(const char *path) {
+    vol_load();
+    FILE *f = fopen(path, "rb");
+    if (!f) return MOFLEX_ERROR;
+    MfxDemux m;
+    if (mfx_open_auto(&m, f, path) != 0) { fclose(f); return MOFLEX_ERROR; }
+    int vi = -1, ai = -1;
+    for (int i = 0; i < m.nb_streams; i++) {
+        if (m.streams[i].media_type == MFX_TYPE_VIDEO && vi < 0) vi = i;
+        if (m.streams[i].media_type == MFX_TYPE_AUDIO && ai < 0) ai = i;
+    }
+    if (vi < 0) { mfx_close(&m); fclose(f); return MOFLEX_ERROR; }
+    int W = m.streams[vi].width, H = m.streams[vi].height;
+    int arate = ai >= 0 ? m.streams[ai].sample_rate : 44100, chn = ai >= 0 ? m.streams[ai].channels : 2;
+    int have_audio = (ai >= 0);
+    int is3d = mfx_detect_stereo(&m);   /* 3D interleaved vs flat 2D (2D = half the frames -> Old 3DS keeps up) */
+    /* per-frame display cadence from the stream timebase -- the container block timestamps are coarse
+     * (carried-forward, many frames share one), so pacing per-frame off them makes the video hang then
+     * burst. Packets are mono eyes, so a stereo PAIR spans 2 frames. Clamp sane; default 25 pairs/s. */
+    int64_t pair_dur = 40000;
+    if (m.streams[vi].tb_den > 0) {
+        /* the stream timebase IS the per-displayed-frame period (e.g. 1001/24000 = 23.976fps).
+         * Do NOT double it -- the earlier x2 made the video play at half speed. */
+        int64_t pd = (int64_t)m.streams[vi].tb_num * 1000000 / m.streams[vi].tb_den;
+        if (pd >= 16000 && pd <= 100000) pair_dur = pd;
+    }
+
+    AVCodecContext ctx; memset(&ctx, 0, sizeof ctx);
+    ctx.width = W; ctx.height = H; ctx.priv_data = calloc(1, mobi_ctx_size());
+    if (!ctx.priv_data || mobi_init(&ctx) != 0) { free(ctx.priv_data); mfx_close(&m); fclose(f); return MOFLEX_ERROR; }
+    mobi_opt = 14;
+    AVFrame *fL = av_frame_alloc(), *fR = av_frame_alloc();
+
+    const char *bn = strrchr(path, '/'); bn = bn ? bn + 1 : path;
+    char title[64];
+    const char *cia_title = cia_selection_title(path);   /* movie title if playing inside a CIA */
+    if (cia_title) snprintf(title, sizeof title, "%.60s", cia_title);
+    else {
+        snprintf(title, sizeof title, "%.60s", bn);
+        size_t L = strlen(title);
+        if (L > 7 && !strcasecmp(title + L - 7, ".moflex")) title[L - 7] = 0;
+        else if (L > 4 && !strcasecmp(title + L - 4, ".zip")) title[L - 4] = 0;
+        else if (L > 4 && !strcasecmp(title + L - 4, ".cia")) title[L - 4] = 0;
+    }
+
+    /* citro2d presents in 24-bit; the app had the screens in RGB565 (software UI) -> switch to the
+     * gfxInitDefault default so the display reads citro2d's output correctly (restored on exit). */
+    gfxSetScreenFormat(GFX_TOP, GSP_BGR8_OES);
+    gfxSetScreenFormat(GFX_BOTTOM, GSP_BGR8_OES);
+    gfxSet3D(is3d);
+    C3D_Init(C3D_DEFAULT_CMDBUF_SIZE); C2D_Init(C2D_DEFAULT_MAX_OBJECTS); C2D_Prepare();
+    C3D_RenderTarget *topL = C2D_CreateScreenTarget(GFX_TOP, GFX_LEFT);
+    C3D_RenderTarget *topR = C2D_CreateScreenTarget(GFX_TOP, GFX_RIGHT);
+    C3D_RenderTarget *bot  = C2D_CreateScreenTarget(GFX_BOTTOM, GFX_LEFT);
+    #define NTB 12           /* decode-ahead ring: decode banks ready pairs here during calm scenes
+                              * (1.55x real time) so busy scenes (0.87x) coast on them -> no drift.
+                              * ~0.5s of video; each pair is one step late so R-eye Y2R overlaps next L. */
+    C3D_Tex texL[NTB], texR[NTB];
+    Tex3DS_SubTexture sub = { (u16)W, (u16)H, 0.0f, 1.0f, (float)W / GT_W, 1.0f - (float)H / GT_H };
+    C2D_Image imgL[NTB], imgR[NTB];
+    for (int i = 0; i < NTB; i++) {
+        C3D_TexInit(&texL[i], GT_W, GT_H, GPU_RGB565); C3D_TexSetFilter(&texL[i], GPU_LINEAR, GPU_LINEAR);
+        C3D_TexInit(&texR[i], GT_W, GT_H, GPU_RGB565); C3D_TexSetFilter(&texR[i], GPU_LINEAR, GPU_LINEAR);
+        imgL[i] = (C2D_Image){ &texL[i], &sub }; imgR[i] = (C2D_Image){ &texR[i], &sub };
+    }
+    g_y2r_init(W, H);
+    C2D_TextBuf sbuf = C2D_TextBufNew(128), tmbuf = C2D_TextBufNew(48);
+    C2D_Text ttitle, thint, ttime;
+    C2D_TextParse(&ttitle, sbuf, title); C2D_TextOptimize(&ttitle);
+    C2D_TextParse(&thint, sbuf, "A pause <>seek ^v vol  L/R=A/V sync  B back"); C2D_TextOptimize(&thint);
+    char last_ts[64] = "";
+    C2D_TextParse(&ttime, tmbuf, " "); C2D_TextOptimize(&ttime);
+    u32 black = C2D_Color32(0, 0, 0, 255);
+
+    MoflexResult result = MOFLEX_QUIT_BACK;
+    int vidx = 0, left_ok = 0, left_vidx = -2, playing = 1, dirty = 1;
+    /* decode-ahead ring: wr = pairs decoded-in (monotonic), rd = pairs presented; slot = idx % NTB.
+     * last_rp = slot whose R-eye Y2R is still in flight (waited before the next L start). */
+    int wr = 0, rd = 0, last_rp = -1, shown_landing = 0, last_shown = -1;
+    int64_t ring_ts[NTB], ring_bts[NTB]; int ring_ready[NTB] = { 0 };   /* synthetic + raw block ts */
+    int64_t cur_show_ts = 0, cur_show_bts = 0, next_vts = 0, v_anchor = 0; int have_anchor = 0;
+    int64_t cal_aud0 = -1; int cal_frames = 0;                    /* calibrate pair_dur from the AUDIO clock */
+    int g_vlead_ms = 20, qmin = 99;                               /* DIAG: live A/V trim (L/R) + min ring depth */
+    int64_t ce_prev = 0; u64 ce_wall = 0; int ce_have = 0;        /* outer rate lock: drive drift->0 via pair_dur */
+    u64 t0_wall = 0; int64_t t0_us_base = 0;   /* real-time clock to keep video locked to audio */
+    /* capacity HUD: time spent purely in mobi_decode vs content-time produced -> decode capacity
+     * (mono fps the CPU can sustain) vs demand (mono fps the content needs). cap>=need => banking wins. */
+    u64 dec_ticks = 0; int dec_frames = 0; int64_t win_us0 = -1; u64 win_w0 = 0; int hud_cap = 0, hud_need = 0;
+    int64_t cur_us = 0, dur_us = m.duration_us, seek_to_us = 0; int want_seek = 0, shold = 0;
+    int64_t rpos = resume_load(path), last_save = 0;
+    if (rpos > 3000000 && (dur_us <= 0 || rpos < dur_us - 10000000)) { seek_to_us = rpos; want_seek = 1; last_save = rpos; }
+    MfxPacket pkt;
+
+    /* audio on a WORKER thread (core 1) with its OWN file handle -> fed in real time, decoupled
+     * from the video decode on core 0. This is the stutter fix (what the official player does). */
+    Thread awt = NULL;
+    if (have_audio) {
+        g_aw_stop = 0; g_aw_paused = 0;
+        g_aud_play_us = -1;                                 /* "audio not started yet" -> video won't race */
+        g_aw_seek = want_seek; g_aw_seek_us = seek_to_us;   /* worker seeks to the resume pos too */
+        APT_SetAppCpuTimeLimit(30);                          /* light audio worker on the syscore */
+        s32 aprio = 0x30; svcGetThreadPriority(&aprio, CUR_THREAD_HANDLE);
+        awt = threadCreate(audio_worker, (void *)path, 16 * 1024, aprio - 1, 1, false);
+        if (!awt) have_audio = 0;
+    }
+
+    while (aptMainLoop()) {
+        hidScanInput();
+        u32 kd = hidKeysDown(), kh = hidKeysHeld();
+        touchPosition tp; hidTouchRead(&tp);
+        if (kd & KEY_B) { result = MOFLEX_QUIT_BACK; break; }
+        if (kd & KEY_A) { playing = !playing; if (have_audio) g_aw_paused = !playing; t0_wall = 0; dirty = 1; }
+        if (kd & KEY_UP)   { if (g_vol < 4.0f) g_vol += 0.25f; vol_save(); dirty = 1; }
+        if (kd & KEY_DOWN) { if (g_vol > 0.25f) g_vol -= 0.25f; vol_save(); dirty = 1; }
+        /* DIAG: L/R shoulders trim A/V sync live. R = video shown earlier (fixes audio-early),
+         * L = video later. Find where lips match, then read 'o' off the HUD. */
+        if (kd & KEY_R) { if (g_vlead_ms <  400) g_vlead_ms += 15; dirty = 1; }
+        if (kd & KEY_L) { if (g_vlead_ms > -400) g_vlead_ms -= 15; dirty = 1; }
+        /* DIAG: X/Y fine-tune the frame rate (pair_dur). If video drifts BEHIND audio, frames are too
+         * slow -> Y shrinks pair_dur; if it races AHEAD, X grows it. Dial until it holds sync, read 'pd'. */
+        if (kd & KEY_Y) { if (pair_dur > 16000) pair_dur -= 250; dirty = 1; }
+        if (kd & KEY_X) { if (pair_dur < 100000) pair_dur += 250; dirty = 1; }
+        { int sdir = (kh & KEY_RIGHT) ? 1 : ((kh & KEY_LEFT) ? -1 : 0);
+          if (!sdir) shold = 0;
+          else { int fire = (kd & (KEY_RIGHT | KEY_LEFT)) ? 1 : 0;
+                 if (!fire) { shold++; if (shold > 14 && (shold % 6 == 0)) fire = 1; }
+                 if (fire) { seek_to_us = cur_us + (int64_t)sdir * 30000000; want_seek = 1; } } }
+        if ((kd | kh) & KEY_TOUCH) {
+            int px = tp.px, py = tp.py;
+            if (py >= BAR_Y - 8 && py <= BAR_Y + BAR_H + 8 && px >= BAR_X && px <= BAR_X + BAR_W) {
+                if (kd & KEY_TOUCH) { seek_to_us = (int64_t)((double)(px - BAR_X) / BAR_W * dur_us); want_seek = 1; }
+            } else if (px >= VOL_X - 6 && px <= VOL_X + 18 && py >= VOL_Y && py <= VOL_Y + VOL_H) {
+                float nv = (float)(VOL_Y + VOL_H - py) / VOL_H * 4.0f; if (nv < 0.25f) nv = 0.25f; if (nv > 4.0f) nv = 4.0f;
+                g_vol = nv; vol_save(); dirty = 1;
+            } else if (kd & KEY_TOUCH) {
+                if (py >= PLAY_CY - 20 && py <= PLAY_CY + 20) {
+                    if (px >= PLAY_CX - 20 && px <= PLAY_CX + 20) { playing = !playing; if (have_audio) g_aw_paused = !playing; t0_wall = 0; dirty = 1; }
+                    else if (px >= RW_CX - 18 && px <= RW_CX + 18) { seek_to_us = cur_us - 30000000; want_seek = 1; }
+                    else if (px >= FF_CX - 18 && px <= FF_CX + 18) { seek_to_us = cur_us + 30000000; want_seek = 1; }
+                } else if (py >= BACK_Y - 4 && px <= 180) { result = MOFLEX_QUIT_BACK; break; }
+            }
+        }
+        if (want_seek) {
+            do_seek(&m, &ctx, seek_to_us);
+            vidx = 0; left_ok = 0; playing = 1;
+            wr = 0; rd = 0; last_rp = -1; shown_landing = 0; last_shown = -1;   /* drop the whole ring */
+            for (int i = 0; i < NTB; i++) ring_ready[i] = 0;
+            have_anchor = 0; cal_aud0 = -1; cal_frames = 0; qmin = 99; ce_have = 0;   /* re-anchor; reset diag */
+            if (have_audio) { g_aud_play_us = -1;   /* audio clock offline until worker re-locks at new pos */
+                              g_aw_seek_us = seek_to_us; g_aw_seek = 1; g_aw_paused = 0; }
+            t0_wall = 0; g_vid_us = seek_to_us;   /* reset the pace clock so it re-locks at the new position */
+            want_seek = 0; dirty = 1;
+        }
+
+        /* ---- DECODE: fill the ring full-tilt whenever there's space. In calm scenes the decoder runs
+         * 1.55x real time, so this BANKS ready pairs; in busy scenes (0.87x) the display coasts on them.
+         * This is what turns the raw surplus into smooth, drift-free playback. ---- */
+        int decoded = 0;
+        if (playing && (wr - rd) < NTB - 2) {
+            decoded = 1;
+            if (mfx_next_packet(&m, &pkt) != 1) { playing = 0; if (have_audio) g_aw_paused = 1; dirty = 1; }
+            else {
+                cur_us = m.ts; if (cur_us < 0) cur_us = 0; if (dur_us > 0 && cur_us > dur_us) cur_us = dur_us;
+                if (cur_us - last_save > 15000000 || cur_us < last_save) { resume_save_us(path, cur_us); last_save = cur_us; }
+                int mt = m.streams[pkt.stream_index].media_type;
+                if (mt == MFX_TYPE_VIDEO && !is3d) {            /* 2D: one full frame per ring slot */
+                    int got = 0, fill = wr % NTB;
+                    AVPacket ap; ap.data = pkt.data; ap.size = pkt.size;
+                    u64 _dt = svcGetSystemTick();
+                    int ok = (mobi_decode(&ctx, fL, &got, &ap) >= 0 && got);
+                    dec_ticks += svcGetSystemTick() - _dt; dec_frames++;
+                    if (ok) {
+                        if (last_rp >= 0) { g_y2r_wait(&texL[last_rp]); ring_ready[last_rp] = 1; last_rp = -1; }
+                        g_y2r_start(fL, &texL[fill], W, H);
+                        if (!have_anchor) { next_vts = cur_us; v_anchor = cur_us; have_anchor = 1; }
+                        ring_ts[fill] = next_vts; ring_bts[fill] = cur_us; next_vts += pair_dur;
+                        ring_ready[fill] = 0; last_rp = fill; wr++;
+                    }
+                    vidx++;
+                } else if (mt == MFX_TYPE_VIDEO) {              /* 3D: pair L+R into one ring slot */
+                    int eye = vidx & 1; AVFrame *dst = eye ? fR : fL; int got = 0, fill = wr % NTB;
+                    AVPacket ap; ap.data = pkt.data; ap.size = pkt.size;
+                    u64 _dt = svcGetSystemTick();
+                    int ok = (mobi_decode(&ctx, dst, &got, &ap) >= 0 && got);
+                    dec_ticks += svcGetSystemTick() - _dt; dec_frames++;
+                    if (eye == 0) {
+                        if (ok) {
+                            left_ok = 1; left_vidx = vidx;
+                            /* the previous pair's R-eye conversion overlapped THIS L decode -> its wait is
+                             * free now; do it BEFORE starting this L (one Y2R engine/event) and mark it ready. */
+                            if (last_rp >= 0) { g_y2r_wait(&texR[last_rp]); ring_ready[last_rp] = 1; last_rp = -1; }
+                            g_y2r_start(fL, &texL[fill], W, H);
+                        } else left_ok = 0;
+                    } else {
+                        if (ok && left_ok && vidx == left_vidx + 1) {
+                            g_y2r_wait(&texL[fill]); g_y2r_start(fR, &texR[fill], W, H);
+                            /* even, smooth per-frame timestamp from the synthetic clock, re-anchored to the
+                             * coarse block ts so it can't drift off the true content time. */
+                            /* Pure synthetic frame clock: anchor + k*pair_dur. Do NOT steer it toward the
+                             * block ts here -- that ts is throttled to our present rate, so steering to it
+                             * fights the outer rate lock. pair_dur is corrected ONLY by the rate lock (which
+                             * uses the audio-drift signal). ring_bts keeps the raw block ts for that signal. */
+                            if (!have_anchor) { next_vts = cur_us; v_anchor = cur_us; have_anchor = 1; }
+                            ring_ts[fill] = next_vts; ring_bts[fill] = cur_us;
+                            next_vts += pair_dur;
+                            ring_ready[fill] = 0; last_rp = fill; wr++;
+                        }
+                        left_ok = 0;
+                    }
+                    vidx++;
+                    /* NOTE: measuring the frame rate at runtime is a trap -- when the ring fills, decode
+                     * is throttled to the present rate, so any measurement just re-measures whatever
+                     * (possibly wrong) rate we're already using and reinforces it. The container's declared
+                     * timebase (pair_dur, set once from tb) is the ground truth; X/Y fine-tunes it. */
+                    (void)cal_aud0; (void)cal_frames;
+                }
+            }
+        }
+
+        /* ---- clock = elapsed audio time since AUDIO started; video uses elapsed time since VIDEO started.
+         * Comparing RELATIVE times cancels any offset between the two demuxes' timelines (they disagreed by
+         * seconds, which froze the video at startup). No audio -> real-time wall clock. ---- */
+        int64_t arel;   /* audio content elapsed (us), or -1 if audio not flowing yet */
+        if (have_audio) {
+            arel = (g_aud_play_us >= 0 && g_aud_start >= 0) ? (g_aud_play_us - g_aud_start) : -1;
+        } else {
+            if (!t0_wall && (wr - rd) > 0 && ring_ready[rd % NTB]) { t0_wall = osGetTime(); }
+            arel = t0_wall ? (int64_t)(osGetTime() - t0_wall) * 1000 : -1;
+        }
+
+        /* ---- PRESENT: show each ready frame when the audio's elapsed time reaches that frame's elapsed
+         * time (+ a small constant lead). Pinned to audio -> cannot drift; no frame-rate estimation. ---- */
+        int show_slot = -1;
+        if (playing && (wr - rd) > 0 && ring_ready[rd % NTB]) {
+            int slot = rd % NTB;
+            int64_t vrel = ring_bts[slot] - v_anchor;   /* this frame's elapsed video time */
+            if (arel < 0) { if (!shown_landing) show_slot = slot; }   /* audio not started: show landing frame */
+            else if (arel + (int64_t)g_vlead_ms * 1000 >= vrel) show_slot = slot;
+            if (show_slot >= 0) { rd++; shown_landing = 1; last_shown = show_slot; cur_show_bts = ring_bts[slot];
+                                  g_vid_us = cur_show_bts; dirty = 1; if ((wr - rd) < qmin) qmin = wr - rd; }
+        }
+        /* if we neither decoded nor have a frame to show, don't spin the CPU */
+        if (!decoded && show_slot < 0 && !dirty) gspWaitForVBlank();
+
+        if (dirty && last_shown >= 0) {
+            int64_t ptime = cur_show_bts;
+            char tc[16], ts[64];
+            fmt_time(ptime, tc, sizeof tc);
+            /* DIAG HUD: e = video-audio error ms (pinned per-frame, so it should stay ~CONSTANT now, not
+             * grow); q = ring depth now/worst; sp = ring content span ms (coarse-ts check); o = lead (L/R). */
+            int aerr = (have_audio && g_aud_play_us >= 0 && g_aud_start >= 0)
+                       ? (int)(((cur_show_bts - v_anchor) - (g_aud_play_us - g_aud_start)) / 1000) : 0;
+            int span = (wr > rd) ? (int)((ring_bts[(wr - 1) % NTB] - ring_bts[rd % NTB]) / 1000) : 0;
+            snprintf(ts, sizeof ts, "%s e%d q%d/%d sp%d o%d",
+                     tc, aerr, wr - rd, qmin == 99 ? 0 : qmin, span, g_vlead_ms);
+            if (strcmp(ts, last_ts)) { strncpy(last_ts, ts, sizeof last_ts - 1);
+                C2D_TextBufClear(tmbuf); C2D_TextParse(&ttime, tmbuf, ts); C2D_TextOptimize(&ttime); }
+            C3D_FrameBegin(0);
+            C2D_TargetClear(topL, black); C2D_SceneBegin(topL); C2D_DrawImageAt(imgL[last_shown], 0, 0, 0, NULL, 1, 1);
+            C2D_TargetClear(topR, black); C2D_SceneBegin(topR); C2D_DrawImageAt(is3d ? imgR[last_shown] : imgL[last_shown], 0, 0, 0, NULL, 1, 1);
+            g_panel(bot, &ttitle, &ttime, &thint, ptime, dur_us, playing, g_vol);
+            C3D_FrameEnd(0);
+            dirty = 0;
+        }
+    }
+    if (!aptMainLoop() && result == MOFLEX_QUIT_BACK) result = MOFLEX_QUIT_EXIT;
+gdone:
+    if (dur_us > 0 && cur_us >= dur_us - 10000000) resume_clear(path);
+    else if (cur_us > 3000000) resume_save_us(path, cur_us);
+    if (awt) { g_aw_stop = 1; threadJoin(awt, 2000000000LL); threadFree(awt); }   /* stop audio worker */
+    C2D_TextBufDelete(sbuf); C2D_TextBufDelete(tmbuf);
+    for (int i = 0; i < NTB; i++) { C3D_TexDelete(&texL[i]); C3D_TexDelete(&texR[i]); }
+    gspWaitForVBlank(); gspWaitForVBlank();
+    C2D_Fini(); C3D_Fini(); y2rExit();
+    /* restore the software-UI framebuffer format for the home/browser screens */
+    gfxSetScreenFormat(GFX_TOP, GSP_RGB565_OES);
+    gfxSetScreenFormat(GFX_BOTTOM, GSP_RGB565_OES);
+    gfxSet3D(false);
+    av_frame_free(&fL); av_frame_free(&fR);
+    mobi_close(&ctx); free(ctx.priv_data); mfx_close(&m); fclose(f);
+    return result;
+}
+
 MoflexResult moflex_play(const char *path) {
+    /* One path for BOTH consoles now: the classic audio-paced player. It plays 2D fluidly everywhere and
+     * 3D perfectly on New 3DS; on Old 3DS 3D just can't keep up (decode is 2x the frames) and degrades --
+     * that's expected. The old separate Old-3DS GPU pipeline (moflex_play_gpu) is retired, keeping one
+     * proven code path. (moflex_play_gpu stays in the file, unused, for a future asm-decoder 3D revisit.) */
     init_luts();
     vol_load();
 
     FILE *f = fopen(path, "rb");
     if (!f) { printf("\x1b[2J\x1b[Hfopen failed\npress A\n"); mp_wait_key(); return MOFLEX_ERROR; }
 
+    mobi_opt = 14;   /* prefetch + idct-skip + DC-only: bit-exact, ~6-8% faster decode (esp. Old 3DS) */
+
     MfxDemux m;
-    if (mfx_open(&m, f) != 0) { printf("\x1b[2J\x1b[Hmfx_open failed\npress A\n"); mp_wait_key(); fclose(f); return MOFLEX_ERROR; }
+    if (mfx_open_auto(&m, f, path) != 0) { printf("\x1b[2J\x1b[Hmfx_open failed\npress A\n"); mp_wait_key(); fclose(f); return MOFLEX_ERROR; }
 
     int vi = -1, ai = -1;
     for (int i = 0; i < m.nb_streams; i++) {
@@ -226,6 +698,13 @@ MoflexResult moflex_play(const char *path) {
     int W = m.streams[vi].width, H = m.streams[vi].height;
     int arate = ai >= 0 ? m.streams[ai].sample_rate : 44100;
     int chn   = ai >= 0 ? m.streams[ai].channels    : 2;
+    int is3d  = mfx_detect_stereo(&m);   /* frame-interleaved 3D vs flat 2D (auto from frame-rate ratio) */
+    { bool isnew = false; APT_CheckNew3DS(&isnew);
+      g_old3d_warn = (!isnew && is3d); }   /* Old 3DS can't decode the doubled 3D frames in real time */
+    /* The video is shown as its frame is READ, while audio sits buffered ahead of what's heard -> the
+     * picture leads the sound by ~the audio-queue depth. Shallower queue = tighter lip-sync. 2D races
+     * ahead (light decode) so it needs the shallowest; 3D a bit deeper for slack against decode dips. */
+    int nwb = is3d ? 8 : 4;
 
     AVCodecContext ctx;
     memset(&ctx, 0, sizeof(ctx));
@@ -233,24 +712,37 @@ MoflexResult moflex_play(const char *path) {
     ctx.priv_data = calloc(1, mobi_ctx_size());
     if (!ctx.priv_data || mobi_init(&ctx) != 0) { free(ctx.priv_data); mfx_close(&m); fclose(f); return MOFLEX_ERROR; }
     AVFrame *out = av_frame_alloc();
+    /* two decoded-frame sets (L,R each): decode into one while the worker blits the other */
+    AVFrame *setL[2] = { av_frame_alloc(), av_frame_alloc() };
+    AVFrame *setR[2] = { av_frame_alloc(), av_frame_alloc() };
+    int cur_set = 0, pair_in_flight = 0;
 
     gfxSetScreenFormat(GFX_TOP, GSP_RGB565_OES);
     gfxSetDoubleBuffering(GFX_TOP, true);   /* MUST be on: both eyes go to the back
         buffer and appear together only on gfxSwapBuffers. Single-buffered here would
         make the left eye update before the right (branding_show() turns this off). */
-    gfxSet3D(true);
+    gfxSet3D(is3d);                          /* 3D on for interleaved stereo; off = flat 2D */
 
-    y2r_video_init(W, H);   /* hardware YUV->RGB; blit_eye falls back to software if unavailable */
+    int use_y2r = y2r_video_init(W, H);   /* hardware YUV->RGB conversion */
+    int y2r_started = 0;                   /* a Y2R(left-eye) conversion is in flight */
+    (void)bw_init; (void)setL; (void)setR; (void)cur_set; (void)pair_in_flight;
 
-    /* short movie title from filename */
+    /* short movie title: the embedded movie's real name if playing inside a CIA, else the filename */
     const char *base = strrchr(path, '/'); base = base ? base + 1 : path;
-    char title[64]; snprintf(title, sizeof(title), "%.60s", base);
-    { size_t L = strlen(title);                        /* hide extension */
-      if (L > 7 && !strcasecmp(title + L - 7, ".moflex")) title[L - 7] = 0;
-      else if (L > 4 && !strcasecmp(title + L - 4, ".zip")) title[L - 4] = 0; }
+    char title[64];
+    const char *cia_title = cia_selection_title(path);
+    if (cia_title) snprintf(title, sizeof(title), "%.60s", cia_title);
+    else {
+        snprintf(title, sizeof(title), "%.60s", base);
+        size_t L = strlen(title);                      /* hide extension */
+        if (L > 7 && !strcasecmp(title + L - 7, ".moflex")) title[L - 7] = 0;
+        else if (L > 4 && !strcasecmp(title + L - 4, ".zip")) title[L - 4] = 0;
+        else if (L > 4 && !strcasecmp(title + L - 4, ".cia")) title[L - 4] = 0;
+    }
 
     /* audio */
-    #define NWB 8
+    #undef NWB
+    #define NWB 16
     #define ABUF_SAMPLES (16 * 1024)
     ndspWaveBuf wbuf[NWB];
     int16_t *abuf[NWB] = { 0 };
@@ -280,6 +772,9 @@ MoflexResult moflex_play(const char *path) {
     int64_t seek_to_us = 0; int want_seek = 0, shold = 0;
     MfxPacket pkt;
 
+    /* perf timing: accumulate decode/blit/audio ticks, report per second */
+    u64 dbg_dec = 0, dbg_blit = 0, dbg_aud = 0; int dbg_vf = 0, dbg_pairs = 0, dbg_ap = 0; u64 dbg_win = osGetTime();
+
     /* auto-resume where we left off (unless within 10s of the end) */
     int64_t rpos = resume_load(path), last_save = 0;
     if (rpos > 3000000 && (dur_us <= 0 || rpos < dur_us - 10000000)) {
@@ -294,7 +789,8 @@ MoflexResult moflex_play(const char *path) {
         /* ---- controls (direct, nothing to select): A play/pause,
                Left/Right (hold) rewind/FF, Up/Down volume, B back ---- */
         if (kd & KEY_B) { result = MOFLEX_QUIT_BACK; break; }
-        if (kd & KEY_A) { playing = !playing; if (have_audio) ndspChnSetPaused(0, !playing); dirty = 1; }
+        if (kd & KEY_A) { playing = !playing; if (have_audio) ndspChnSetPaused(0, !playing); dirty = 1;
+                          if (!playing) { resume_save_us(path, cur_us); last_save = cur_us; } }   /* checkpoint while stopped (SD write can't stall the read loop) */
         if (kd & KEY_UP)   { if (g_vol < 4.0f)  g_vol += 0.25f; vol_save(); dirty = 1; }
         if (kd & KEY_DOWN) { if (g_vol > 0.25f) g_vol -= 0.25f; vol_save(); dirty = 1; }
         {   /* Left/Right seek, hold to keep scrubbing (~30s steps) */
@@ -318,7 +814,8 @@ MoflexResult moflex_play(const char *path) {
                 g_vol = nv; vol_save(); dirty = 1;
             } else if (kd & KEY_TOUCH) {
                 if (py >= PLAY_CY - 20 && py <= PLAY_CY + 20) {
-                    if (px >= PLAY_CX - 20 && px <= PLAY_CX + 20) { playing = !playing; if (have_audio) ndspChnSetPaused(0, !playing); dirty = 1; }
+                    if (px >= PLAY_CX - 20 && px <= PLAY_CX + 20) { playing = !playing; if (have_audio) ndspChnSetPaused(0, !playing); dirty = 1;
+                          if (!playing) { resume_save_us(path, cur_us); last_save = cur_us; } }   /* checkpoint while stopped */
                     else if (px >= RW_CX - 18 && px <= RW_CX + 18) { seek_to_us = cur_us - 30000000; want_seek = 1; }
                     else if (px >= FF_CX - 18 && px <= FF_CX + 18) { seek_to_us = cur_us + 30000000; want_seek = 1; }
                 } else if (py >= BACK_Y - 4 && px <= 180) { result = MOFLEX_QUIT_BACK; break; }
@@ -327,6 +824,7 @@ MoflexResult moflex_play(const char *path) {
 
         /* ---- apply a requested seek (resume playback, flush stale audio) ---- */
         if (want_seek) {
+            if (y2r_started) { y2r_video_drain(); y2r_started = 0; }   /* drop any in-flight Y2R */
             do_seek(&m, &ctx, seek_to_us);
             vidx = 0; left_ok = 0;          /* re-establish L/R pairing after seek */
             playing = 1;
@@ -337,7 +835,7 @@ MoflexResult moflex_play(const char *path) {
                 wb_idx = 0;
             }
             /* show the landing frame right away; audio then resumes synced to it */
-            prime_after_seek(&m, &ctx, out, W, H, &cur_us, &vidx, &left_ok, &left_vidx);
+            prime_after_seek(&m, &ctx, out, W, H, &cur_us, &vidx, &left_ok, &left_vidx, is3d);
             want_seek = 0; dirty = 1;
         }
 
@@ -349,11 +847,12 @@ MoflexResult moflex_play(const char *path) {
                 cur_us = m.ts;
                 if (cur_us < 0) cur_us = 0;
                 if (dur_us > 0 && cur_us > dur_us) cur_us = dur_us;
-                if (cur_us - last_save > 15000000 || cur_us < last_save) {  /* checkpoint ~every 15s */
-                    resume_save_us(path, cur_us); last_save = cur_us;
-                }
+                /* NOTE: no periodic resume write here -- an SD write mid-stream stalls the FS
+                 * service and hitches the video (the shared SDMC path). We checkpoint only when
+                 * stopped: on pause (above) and on exit (done:), when the read loop is idle. */
                 int mt = m.streams[pkt.stream_index].media_type;
                 if (mt == MFX_TYPE_AUDIO && have_audio) {
+                    u64 ta = svcGetSystemTick();
                     ndspWaveBuf *wb = &wbuf[wb_idx];
                     int spins = 0;
                     /* wait for a free audio buffer WITHOUT scanning input here --
@@ -374,23 +873,41 @@ MoflexResult moflex_play(const char *path) {
                         memset(wb, 0, sizeof(*wb));
                         wb->data_vaddr = abuf[wb_idx]; wb->nsamples = fr;
                         ndspChnWaveBufAdd(0, wb);
-                        wb_idx = (wb_idx + 1) % NWB;
+                        wb_idx = (wb_idx + 1) % nwb;   /* nwb = 16 (3D) or 4 (2D) -> tighter 2D A/V */
                     }
+                    dbg_aud += svcGetSystemTick() - ta; dbg_ap++;
                 } else if (mt == MFX_TYPE_VIDEO) {
                     AVPacket ap; ap.data = pkt.data; ap.size = pkt.size;
-                    int got = 0;
+                    int got = 0, eye = vidx & 1;
+                    u64 t0 = svcGetSystemTick();
                     int ok = (mobi_decode(&ctx, out, &got, &ap) >= 0 && got);  /* decode every frame (keeps ref chain) */
-                    if ((vidx & 1) == 0) {                /* left eye */
-                        if (ok) { blit_eye(out, GFX_LEFT, W, H); left_ok = 1; left_vidx = vidx; }
+                    dbg_dec += svcGetSystemTick() - t0; dbg_vf++;
+                    (void)y2r_started; (void)use_y2r;
+                    if (!is3d) {                           /* 2D: every frame is a full flat frame -> present it */
+                        if (ok) { u64 tb = svcGetSystemTick(); blit_eye(out, GFX_LEFT, W, H); dbg_blit += svcGetSystemTick() - tb;
+                                  gfxFlushBuffers(); gfxSwapBuffers(); dbg_pairs++; }
+                    } else if (eye == 0) {                 /* left eye */
+                        if (ok) { u64 tb = svcGetSystemTick(); blit_eye(out, GFX_LEFT, W, H); dbg_blit += svcGetSystemTick() - tb; left_ok = 1; left_vidx = vidx; }
                         else left_ok = 0;
                     } else {                              /* right eye: present only a matched pair */
                         if (ok && left_ok && vidx == left_vidx + 1) {
-                            blit_eye(out, GFX_RIGHT, W, H);
+                            u64 tb = svcGetSystemTick(); blit_eye(out, GFX_RIGHT, W, H); dbg_blit += svcGetSystemTick() - tb;
                             gfxFlushBuffers(); gfxSwapBuffers();
+                            dbg_pairs++;
                         }
                         left_ok = 0;
                     }
                     vidx++;                               /* always advance -> parity tracks the stream */
+                    /* report timing ~once per second */
+                    u64 nowm = osGetTime();
+                    if (nowm - dbg_win >= 1000) {
+                        double tpms = SYSCLOCK_ARM11 / 1000.0;   /* ticks per ms (Old 3DS clock) */
+                        g_dbg_fps = dbg_pairs;
+                        g_dbg_dec10  = dbg_vf ? (int)(dbg_dec * 10.0 / tpms / dbg_vf) : 0;
+                        g_dbg_blit10 = dbg_pairs ? (int)(dbg_blit * 10.0 / tpms / (dbg_pairs * 2)) : 0;
+                        g_dbg_aud10  = dbg_pairs ? (int)(dbg_aud * 10.0 / tpms / dbg_pairs) : 0;
+                        dbg_dec = dbg_blit = dbg_aud = 0; dbg_vf = dbg_pairs = dbg_ap = 0; dbg_win = nowm;
+                    }
                 }
             }
         } else {
@@ -406,13 +923,17 @@ MoflexResult moflex_play(const char *path) {
     if (!aptMainLoop() && result == MOFLEX_QUIT_BACK) result = MOFLEX_QUIT_EXIT;
 
 done:
+    g_old3d_warn = 0;
     /* remember where we stopped (clear it if we watched to the end) */
     if (dur_us > 0 && cur_us >= dur_us - 10000000) resume_clear(path);
     else if (cur_us > 3000000) resume_save_us(path, cur_us);
     if (have_audio) { ndspChnWaveBufClear(0); ndspChnSetPaused(0, false);
         for (int i = 0; i < NWB; i++) if (abuf[i]) linearFree(abuf[i]); }
+    if (y2r_started) y2r_video_drain();   /* let any in-flight Y2R finish before freeing frames */
     y2r_video_exit();
     av_frame_free(&out);
+    av_frame_free(&setL[0]); av_frame_free(&setL[1]);
+    av_frame_free(&setR[0]); av_frame_free(&setR[1]);
     mobi_close(&ctx);
     free(ctx.priv_data);
     mfx_close(&m);

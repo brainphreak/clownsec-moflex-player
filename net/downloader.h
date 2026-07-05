@@ -21,4 +21,8 @@ bool download_to_file(const char *url, const char *dest, dl_progress_cb cb, void
  * Good for fetching the catalog JSON. Caps at max_bytes. */
 bool download_to_mem(const char *url, char **out, size_t *out_len, size_t max_bytes);
 
+/* Set a global abort hook: if it returns non-zero, the CURRENT transfer aborts. Used to make
+ * poster loads cancellable so scrolling stays fluid. Pass NULL to clear. */
+void download_set_abort(int (*abort_cb)(void));
+
 #endif

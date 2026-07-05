@@ -35,8 +35,11 @@ static void setup(CURL *e, const char *url) {
 
 /* ---- progress bridge ---- */
 typedef struct { dl_progress_cb cb; void *user; } Prog;
+static int (*g_abort_cb)(void) = NULL;
+void download_set_abort(int (*abort_cb)(void)) { g_abort_cb = abort_cb; }
 static int xfer_cb(void *p, curl_off_t dltotal, curl_off_t dlnow, curl_off_t ul, curl_off_t un) {
     (void)ul; (void)un;
+    if (g_abort_cb && g_abort_cb()) return 1;   /* user wants to move on -> abort this transfer */
     Prog *pr = (Prog *)p;
     if (pr && pr->cb && !pr->cb(pr->user, (uint32_t)dlnow, (uint32_t)dltotal)) return 1; /* abort */
     return 0;
@@ -98,6 +101,10 @@ bool download_to_mem(const char *url, char **out, size_t *out_len, size_t max_by
     setup(e, url);
     curl_easy_setopt(e, CURLOPT_WRITEFUNCTION, mem_cb);
     curl_easy_setopt(e, CURLOPT_WRITEDATA, &m);
+    Prog pr = { NULL, NULL };   /* no % callback, but enable xfer so the global abort hook can fire */
+    curl_easy_setopt(e, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(e, CURLOPT_XFERINFOFUNCTION, xfer_cb);
+    curl_easy_setopt(e, CURLOPT_XFERINFODATA, &pr);
     CURLcode r = curl_easy_perform(e);
     curl_easy_cleanup(e);
 

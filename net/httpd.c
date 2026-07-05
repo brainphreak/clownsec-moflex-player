@@ -126,7 +126,7 @@ static void serve_listing(int fd, const char *dir) {
 
     /* upload + new-folder widgets */
     send_str(fd,
-        "<p><input type=file id=f multiple accept='.moflex'> "
+        "<p><input type=file id=f multiple> "
         "<button onclick=up()>Upload here</button></p>"
         "<p><input id=nf placeholder='new folder name'> "
         "<button onclick=mkd()>Create folder</button></p>"
@@ -154,7 +154,7 @@ static void serve_listing(int fd, const char *dir) {
             snprintf(full, sizeof(full), "%s%s", dir, e->d_name);
             struct stat st;
             int isdir = (stat(full, &st) == 0) && S_ISDIR(st.st_mode);
-            if (!isdir && !is_moflex(e->d_name)) continue;
+            (void)is_moflex;   /* transfer tool: list ALL files (upload/manage anything, not just movies) */
             html_escape(e->d_name, esc, sizeof(esc));
             if (isdir) {
                 char sub[1200]; snprintf(sub, sizeof(sub), "%s%s/", dir, e->d_name);

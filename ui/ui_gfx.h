@@ -12,6 +12,7 @@
 #define UI_WHITE UI_RGB(255,255,255)
 #define UI_BLACK UI_RGB(0,0,0)
 #define UI_GRAY  UI_RGB(140,140,140)
+#define UI_RED   UI_RGB(255,80,60)
 
 void ui_begin(gfxScreen_t screen);         /* draw to offscreen for GFX_TOP or GFX_BOTTOM */
 void ui_present(void);                     /* copy offscreen -> that screen's framebuffer */
