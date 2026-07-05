@@ -767,7 +767,7 @@ MoflexResult moflex_play(const char *path) {
        Present a stereo frame ONLY when a consecutive L+R both decode, so the
        two eyes are always the same moment (never a mismatched pair). */
     int vidx = 0, left_ok = 0, left_vidx = -2;
-    int playing = 1, dirty = 1, since_panel = 999;
+    int playing = 1, dirty = 1, since_panel = 999, vol_dirty = 0;
     int64_t cur_us = 0, dur_us = m.duration_us;
     int64_t seek_to_us = 0; int want_seek = 0, shold = 0;
     MfxPacket pkt;
@@ -790,9 +790,10 @@ MoflexResult moflex_play(const char *path) {
                Left/Right (hold) rewind/FF, Up/Down volume, B back ---- */
         if (kd & KEY_B) { result = MOFLEX_QUIT_BACK; break; }
         if (kd & KEY_A) { playing = !playing; if (have_audio) ndspChnSetPaused(0, !playing); dirty = 1;
-                          if (!playing) { resume_save_us(path, cur_us); last_save = cur_us; } }   /* checkpoint while stopped (SD write can't stall the read loop) */
-        if (kd & KEY_UP)   { if (g_vol < 4.0f)  g_vol += 0.25f; vol_save(); dirty = 1; }
-        if (kd & KEY_DOWN) { if (g_vol > 0.25f) g_vol -= 0.25f; vol_save(); dirty = 1; }
+                          if (!playing) { resume_save_us(path, cur_us); last_save = cur_us;
+                                          if (vol_dirty) { vol_save(); vol_dirty = 0; } } }   /* checkpoint + flush volume while stopped (SD write can't stall the read loop) */
+        if (kd & KEY_UP)   { if (g_vol < 4.0f)  g_vol += 0.25f; vol_dirty = 1; dirty = 1; }   /* save deferred (below) -- an SD write here would hitch the video */
+        if (kd & KEY_DOWN) { if (g_vol > 0.25f) g_vol -= 0.25f; vol_dirty = 1; dirty = 1; }
         {   /* Left/Right seek, hold to keep scrubbing (~30s steps) */
             int sdir = (kh & KEY_RIGHT) ? 1 : ((kh & KEY_LEFT) ? -1 : 0);
             if (sdir == 0) shold = 0;
@@ -811,11 +812,12 @@ MoflexResult moflex_play(const char *path) {
             } else if (px >= VOL_X - 6 && px <= VOL_X + 18 && py >= VOL_Y && py <= VOL_Y + VOL_H) {
                 float nv = (float)(VOL_Y + VOL_H - py) / VOL_H * 4.0f;
                 if (nv < 0.25f) nv = 0.25f; if (nv > 4.0f) nv = 4.0f;
-                g_vol = nv; vol_save(); dirty = 1;
+                g_vol = nv; vol_dirty = 1; dirty = 1;   /* save deferred; dragging the slider must not write to SD each tick */
             } else if (kd & KEY_TOUCH) {
                 if (py >= PLAY_CY - 20 && py <= PLAY_CY + 20) {
                     if (px >= PLAY_CX - 20 && px <= PLAY_CX + 20) { playing = !playing; if (have_audio) ndspChnSetPaused(0, !playing); dirty = 1;
-                          if (!playing) { resume_save_us(path, cur_us); last_save = cur_us; } }   /* checkpoint while stopped */
+                          if (!playing) { resume_save_us(path, cur_us); last_save = cur_us;
+                                          if (vol_dirty) { vol_save(); vol_dirty = 0; } } }   /* checkpoint + flush volume while stopped */
                     else if (px >= RW_CX - 18 && px <= RW_CX + 18) { seek_to_us = cur_us - 30000000; want_seek = 1; }
                     else if (px >= FF_CX - 18 && px <= FF_CX + 18) { seek_to_us = cur_us + 30000000; want_seek = 1; }
                 } else if (py >= BACK_Y - 4 && px <= 180) { result = MOFLEX_QUIT_BACK; break; }
@@ -924,6 +926,7 @@ MoflexResult moflex_play(const char *path) {
 
 done:
     g_old3d_warn = 0;
+    if (vol_dirty) { vol_save(); vol_dirty = 0; }   /* persist any volume change made during playback */
     /* remember where we stopped (clear it if we watched to the end) */
     if (dur_us > 0 && cur_us >= dur_us - 10000000) resume_clear(path);
     else if (cur_us > 3000000) resume_save_us(path, cur_us);
