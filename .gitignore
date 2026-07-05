@@ -18,3 +18,7 @@ pc_verify/out/
 
 # macOS
 .DS_Store
+
+# internal docs (not for the public repo)
+STATUS.md
+ASSEMBLY_PLAN.md
