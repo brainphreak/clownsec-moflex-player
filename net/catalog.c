@@ -116,6 +116,42 @@ static int fn_has_3d(const char *s) {
     return 0;
 }
 
+/* Build one CatEntry from a zackk "file object" (its filename/fileType/archiveUrl/fileSize) plus a
+ * "meta" object (title/year/category/genres/artwork/description). `dispname` overrides the display
+ * name (used for a season part). Returns 1 if it produced a playable entry. */
+static int zackk_add(CatEntry *e, cJSON *fobj, cJSON *meta, const char *dispname, const char *art_base) {
+    char enc[CAT_URLLEN];
+    const char *fn = sgets(fobj, "filename");
+    const char *ft = sgets(fobj, "fileType");
+    const char *url = sgets(fobj, "archiveUrl");
+    int iszip = ends_ci(fn, ".zip");
+    int ismof = ends_ci(fn, ".moflex") || !strcasecmp(ft, "moflex");
+    int iscia = ends_ci(fn, ".cia")    || !strcasecmp(ft, "cia");
+    int drive = is_drive_url(url);
+    if ((!iszip && !ismof && !iscia && !drive) || !url[0]) return 0;
+    fill_common(e, sgets(meta, "title"), sgeti(meta, "year"), sgets(meta, "description"),
+                sgets(meta, "dateAdded"), sgeti(meta, "runtime"), iszip);
+    if (dispname && dispname[0]) snprintf(e->name, sizeof e->name, "%s", dispname);   /* season part title */
+    e->size = sgeti64(fobj, "fileSize");
+    snprintf(e->category, sizeof e->category, "%s", sgets(meta, "category"));
+    join_genres(meta, "genres", e->genres, sizeof e->genres);
+    if (drive && !(iszip || ismof || iscia)) {
+        char id[96];
+        if (!drive_id(url, fn, id, sizeof id)) return 0;
+        snprintf(e->url, sizeof e->url, "https://drive.usercontent.google.com/download?id=%s&export=download&confirm=t", id);
+        savename(dispname && dispname[0] ? dispname : sgets(meta, "title"), sgeti(meta, "year"), e->fname, sizeof e->fname);
+    } else {
+        snprintf(e->fname, sizeof e->fname, "%s", fn);
+        url_fixup(url, e->url, sizeof e->url);
+    }
+    const char *aw = sgets(meta, "artwork");
+    if (!aw[0]) e->art[0] = 0;
+    else if (!strncmp(aw, "http", 4)) url_fixup(aw, e->art, sizeof e->art);
+    else { url_encode(aw, enc, sizeof enc); snprintf(e->art, sizeof e->art, "%s%s", art_base, enc); }
+    e->is3d = (fn_has_3d(fn) || fn_has_3d(e->name)) ? 1 : 0;
+    return 1;
+}
+
 int catalog_parse(const char *text, int kind, const char *dl_base, const char *art_base,
                   CatEntry *out, int max) {
     cJSON *root = cJSON_Parse(text);
@@ -142,6 +178,15 @@ int catalog_parse(const char *text, int kind, const char *dl_base, const char *a
                         sgets(mv, "dateAdded"), sgeti(mv, "runtime"), ends_ci(fn, ".zip"));
             e->size = sgeti64(mv, "fileSize");
             join_genres(mv, "genres", e->genres, sizeof(e->genres));
+            { const char *ty = sgets(mv, "type");   /* clownsec movies[] mixes movies / music videos / etc. */
+              if (!ty[0] || !strcasecmp(ty, "movie")) snprintf(e->category, sizeof e->category, "Movies");
+              else if (!strcasecmp(ty, "musicvideo")) snprintf(e->category, sizeof e->category, "Music Videos");
+              else {   /* any other type -> a readable label (capitalized, pluralized) so it isn't hidden */
+                  char c[32]; snprintf(c, sizeof c, "%s", ty);
+                  c[0] = (char)toupper((unsigned char)c[0]);
+                  size_t L = strlen(c); if (L && c[L - 1] != 's' && L + 1 < sizeof c) { c[L] = 's'; c[L + 1] = 0; }
+                  snprintf(e->category, sizeof e->category, "%s", c);
+              } }
             snprintf(e->fname, sizeof(e->fname), "%s", fn);
             url_encode(fn, enc, sizeof(enc));
             snprintf(e->url, sizeof(e->url), "%s%s", dl_base, enc);
@@ -178,6 +223,7 @@ int catalog_parse(const char *text, int kind, const char *dl_base, const char *a
                 size_t sl = strlen(stem); if (sl > 4 && ends_ci(stem, ".zip")) stem[sl - 4] = 0;
                 snprintf(e->name, sizeof(e->name), "%s [ZIP]", stem);
                 join_genres(sh, "genres", e->genres, sizeof(e->genres));
+                snprintf(e->category, sizeof(e->category), "TV Shows");
                 snprintf(e->fname, sizeof(e->fname), "%s", zfn);
                 url_encode(zfn, enc, sizeof(enc));
                 snprintf(e->url, sizeof(e->url), "%stv/%s/%s", dl_base, encfolder, enc);
@@ -193,38 +239,19 @@ int catalog_parse(const char *text, int kind, const char *dl_base, const char *a
         cJSON_ArrayForEach(it, items) {
             if (n >= max) break;
             if (!cJSON_IsObject(it)) continue;
-            const char *fn = sgets(it, "filename");
-            const char *ft = sgets(it, "fileType");
-            const char *url = sgets(it, "archiveUrl");
-            int iszip = ends_ci(fn, ".zip");
-            int ismof = ends_ci(fn, ".moflex") || !strcasecmp(ft, "moflex");
-            int iscia = ends_ci(fn, ".cia")    || !strcasecmp(ft, "cia");
-            int drive = is_drive_url(url);
-            if (!iszip && !ismof && !iscia && !drive) continue;   /* skip anything we can't fetch/play */
-            if (!url[0]) continue;
-            CatEntry *e = &out[n];
-            fill_common(e, sgets(it, "title"), sgeti(it, "year"), sgets(it, "description"),
-                        sgets(it, "dateAdded"), sgeti(it, "runtime"), iszip);
-            e->size = sgeti64(it, "fileSize");   /* usually absent for zackk */
-            snprintf(e->genres, sizeof(e->genres), "%s", sgets(it, "category"));
-            if (drive && !(iszip || ismof || iscia)) {   /* Google-Drive-hosted, no extension */
-                char id[96];
-                if (!drive_id(url, fn, id, sizeof id)) continue;   /* can't resolve -> skip */
-                snprintf(e->url, sizeof(e->url),
-                         "https://drive.usercontent.google.com/download?id=%s&export=download&confirm=t", id);
-                savename(sgets(it, "title"), sgeti(it, "year"), e->fname, sizeof(e->fname));  /* type sniffed on download */
-            } else {
-                snprintf(e->fname, sizeof(e->fname), "%s", fn);
-                url_fixup(url, e->url, sizeof(e->url));   /* encode raw spaces (archive.org), keep %XX intact */
+            cJSON *parts = cJSON_GetObjectItemCaseSensitive(it, "parts");
+            if (cJSON_IsArray(parts) && cJSON_GetArraySize(parts) > 0) {
+                cJSON *pt;                              /* TV shows / wrestling / anime: one entry per part */
+                cJSON_ArrayForEach(pt, parts) {
+                    if (n >= max) break;
+                    if (cJSON_IsObject(pt) && zackk_add(&out[n], pt, it, sgets(pt, "title"), art_base)) n++;
+                }
+            } else if (zackk_add(&out[n], it, it, NULL, art_base)) {   /* a single downloadable file */
+                n++;
             }
-            const char *aw = sgets(it, "artwork");
-            if (!aw[0]) e->art[0] = 0;
-            else if (!strncmp(aw, "http", 4)) url_fixup(aw, e->art, sizeof(e->art));   /* already a full URL */
-            else { url_encode(aw, enc, sizeof(enc)); snprintf(e->art, sizeof(e->art), "%s%s", art_base, enc); }
-            e->is3d = (fn_has_3d(fn) || fn_has_3d(e->name)) ? 1 : 0;   /* mixed -> from name */
-            n++;
         }
     }
+    (void)enc;
 
     cJSON_Delete(root);
     return n;

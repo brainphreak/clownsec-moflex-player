@@ -138,6 +138,7 @@ static void icon_folder(int x, int y, u16 c);
 static void icon_movie(int x, int y, u16 c);
 static void icon_file(int x, int y, u16 c);
 static void strip_ext(char *d);
+static int  ui_menu(const char *title, const char *subtitle, const char *const *items, int n);
 
 
 /* ---------- small modal helpers ---------- */
@@ -697,6 +698,98 @@ static void fix_download_ext(char *dest, size_t cap) {
     if (rename(dest, nd) == 0) snprintf(dest, cap, "%s", nd);
 }
 
+/* ---- catalog category / genre / sort helpers ---- */
+static const CatEntry *g_scat; static int g_smode;   /* 0 = title, 1 = year, 2 = date added */
+static int idx_cmp(const void *a, const void *b) {
+    const CatEntry *x = &g_scat[*(const int *)a], *y = &g_scat[*(const int *)b];
+    if (g_smode == 1) { if (x->year != y->year) return y->year - x->year; }       /* newest year first */
+    else if (g_smode == 2) { int c = strcmp(y->date, x->date); if (c) return c; }  /* newest date first */
+    return strcasecmp(x->name, y->name);                                           /* title A-Z (+ tiebreak) */
+}
+static int strrow_cmp(const void *a, const void *b) { return strcasecmp((const char *)a, (const char *)b); }
+static int distinct_categories(const CatEntry *cat, int nc, char out[][32], int max) {
+    int n = 0;
+    for (int i = 0; i < nc; i++) {
+        if (!cat[i].category[0]) continue;
+        int f = 0; for (int j = 0; j < n; j++) if (!strcasecmp(out[j], cat[i].category)) { f = 1; break; }
+        if (!f && n < max) snprintf(out[n++], 32, "%s", cat[i].category);
+    }
+    return n;
+}
+static int genre_match(const char *genres, const char *want) {
+    if (!want || !want[0]) return 1;
+    for (const char *g = genres; *g; ) {
+        while (*g == ' ' || *g == ',') g++;
+        char tok[32]; int t = 0; while (*g && *g != ',' && t < 31) tok[t++] = *g++;
+        while (t > 0 && tok[t - 1] == ' ') t--; tok[t] = 0;
+        if (t && !strcasecmp(tok, want)) return 1;
+    }
+    return 0;
+}
+static int distinct_genres(const CatEntry *cat, int nc, const char *category, char out[][32], int max) {
+    int n = 0;
+    for (int i = 0; i < nc && n < max; i++) {
+        if (category[0] && strcasecmp(cat[i].category, category)) continue;
+        for (const char *g = cat[i].genres; *g && n < max; ) {
+            while (*g == ' ' || *g == ',') g++;
+            if (!*g) break;
+            char tok[32]; int t = 0; while (*g && *g != ',' && t < 31) tok[t++] = *g++;
+            while (t > 0 && tok[t - 1] == ' ') t--; tok[t] = 0;
+            if (t) { int f = 0; for (int j = 0; j < n; j++) if (!strcasecmp(out[j], tok)) { f = 1; break; }
+                if (!f && n < max) snprintf(out[n++], 32, "%s", tok); }
+        }
+    }
+    return n;
+}
+/* neon scrolling picker for a list of short strings. Returns index, -2 (Show All), or -1 (back). */
+static int catalog_pick(const char *title, const char *subtitle, char items[][32], int n, int show_all) {
+    int total = n + (show_all ? 1 : 0);
+    int sel = 0, top = 0, redraw = 1, td = 0, tx0 = 0, ty0 = 0, tsc0 = 0, tmv = 0;
+    const int VIS = 5, ry0 = 54, rh = 30, gap = 4;
+    while (aptMainLoop()) {
+        hidScanInput();
+        u32 k = hidKeysDown(), kh = hidKeysHeld(), ku = hidKeysUp();
+        if (k & KEY_B) return -1;
+        if (k & KEY_DOWN) { if (sel < total - 1) sel++; redraw = 1; }
+        if (k & KEY_UP)   { if (sel > 0) sel--; redraw = 1; }
+        int act = (k & KEY_A) ? sel : -1;
+        touchPosition tp; hidTouchRead(&tp);
+        if (k & KEY_TOUCH) { td = 1; tx0 = tp.px; ty0 = tp.py; tsc0 = top; tmv = 0; }
+        else if ((kh & KEY_TOUCH) && td) { int dy = tp.py - ty0; if (dy > 6 || dy < -6) tmv = 1;
+            if (tmv && total > VIS) { int maxs = total - VIS, ns = tsc0 - dy / (rh + gap);
+                if (ns < 0) ns = 0; if (ns > maxs) ns = maxs; if (ns != top) { top = ns; redraw = 1; } } }
+        else if ((ku & KEY_TOUCH) && td) { td = 0; if (!tmv) for (int r = 0; r < VIS; r++) { int i = top + r; if (i >= total) break;
+            int by = ry0 + r * (rh + gap); if (ty0 >= by && ty0 < by + rh) { sel = i; act = i; break; } } }
+        (void)tx0;
+        if (act >= 0) return show_all ? (act == 0 ? -2 : act - 1) : act;
+        if (sel < top) top = sel; if (sel >= top + VIS) top = sel - VIS + 1;
+        if (redraw) {
+            ui_begin(GFX_BOTTOM);
+            ui_vgrad_round(0, 0, UI_W, UI_H, 0, UI_RGB(16, 18, 32), UI_BG);
+            ui_text_center(UI_W / 2, 12, 2, UI_NEON, title);
+            if (subtitle && subtitle[0]) ui_text_fit(UI_W / 2, 34, 1, UI_NEONP, subtitle, UI_W - 16);
+            ui_glow_round(28, 48, UI_W - 56, 2, 1, UI_NEON, 3, 30); ui_fill_round(28, 48, UI_W - 56, 2, 1, UI_NEON);
+            for (int r = 0; r < VIS; r++) { int i = top + r; if (i >= total) break;
+                int by = ry0 + r * (rh + gap), selrow = (i == sel), rw = UI_W - 16;
+                if (selrow) { ui_glow_round(8, by, rw, rh, 7, UI_NEON, 3, 16);
+                    ui_vgrad_round(8, by, rw, rh, 7, UI_RGB(30, 40, 58), UI_RGB(16, 22, 34));
+                    ui_frame_round(8, by, rw, rh, 7, UI_NEON, 1); }
+                int all = (show_all && i == 0);
+                const char *lbl = all ? "* Show All" : items[i - (show_all ? 1 : 0)];
+                ui_text_fit(UI_W / 2, by + (rh - 8) / 2, 1, selrow ? UI_WHITE : (all ? UI_NEON : UI_INK), lbl, rw - 16);
+            }
+            if (total > VIS) { int th = VIS * (rh + gap) - gap, ty = ry0, maxs = total - VIS;
+                int hh = th * VIS / total; if (hh < 12) hh = 12; int hy = ty + (th - hh) * top / maxs;
+                ui_fill_round(UI_W - 6, ty, 3, th, 1, UI_RGB(30, 34, 52));
+                ui_fill_round(UI_W - 6, hy, 3, hh, 1, UI_NEON); }
+            ui_text_center(UI_W / 2, 226, 1, UI_DIM, "tap to choose    B back");
+            ui_present(); redraw = 0;
+        }
+        gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
+    }
+    return -1;
+}
+
 static void catalog_browse(const Source *src) {
     ui_begin(GFX_BOTTOM); ui_vgrad_round(0, 0, UI_W, UI_H, 0, UI_RGB(16, 18, 32), UI_BG);
     ui_text_center(UI_W / 2, 100, 2, UI_NEON, "Fetching...");
@@ -715,45 +808,79 @@ static void catalog_browse(const Source *src) {
         msg_screen("DOWNLOAD", "No movies found here.\nThe URL must be a catalog.json file\n(Clownsec/Zackk format), not a web page.");
         free(cat); return;
     }
-    if (nc > 1) qsort(cat, nc, sizeof(CatEntry), cat_cmp);   /* alphabetical */
-
     gfxSet3D(false);   /* top screen becomes a 2D info panel while browsing */
     u16 *poster  = (u16 *)malloc((size_t)POSTER_W * POSTER_H * sizeof(u16));
     u16 *pworker = (u16 *)malloc((size_t)POSTER_W * POSTER_H * sizeof(u16));
     if (pworker) pw_start(pworker);   /* background loader -> scrolling never blocks on a poster */
-    int csel = 0, cscroll = 0, redraw = 1, hfu = 0, hfd = 0, requested = 0;
-    int shown = -1, phave = 0, settle = 0;   /* poster debounce state */
-    int td = 0, tx0 = 0, ty0 = 0, tsc0 = 0, tmv = 0, tbar = 0, quit = 0;   /* touch */
-    int marqf = 0, marqs = -1;
-    while (aptMainLoop()) {
+    static char cats[24][32]; int ncat = distinct_categories(cat, nc, cats, 24);
+    qsort(cats, ncat, 32, strrow_cmp);   /* categories alphabetical */
+    int *idx = (int *)malloc(sizeof(int) * nc);
+    int sortmode = 0;
+
+    while (idx && aptMainLoop()) {
+        /* ---- navigation: pick a category (+ optional genre), or Show All ---- */
+        char filt_cat[32] = "", filt_genre[32] = "";
+        if (ncat > 1) {
+            int c = catalog_pick("CATEGORY", src->name, cats, ncat, 1);
+            if (c == -1) break;
+            if (c >= 0) {
+                snprintf(filt_cat, sizeof filt_cat, "%s", cats[c]);
+                static char gens[64][32]; int ng = distinct_genres(cat, nc, filt_cat, gens, 64);
+                qsort(gens, ng, 32, strrow_cmp);   /* genres alphabetical */
+                if (ng > 0) {
+                    const char *mi[2] = { "View All", "Pick a Genre" };
+                    int mm = ui_menu(filt_cat, NULL, mi, 2);
+                    if (mm < 0) continue;
+                    if (mm == 1) { int g = catalog_pick("GENRE", filt_cat, gens, ng, 0);
+                                   if (g < 0) continue; snprintf(filt_genre, sizeof filt_genre, "%s", gens[g]); }
+                }
+            }
+        }
+        /* ---- build the filtered + sorted index over cat[] ---- */
+        int ni = 0;
+        for (int i = 0; i < nc; i++) {
+            if (filt_cat[0] && strcasecmp(cat[i].category, filt_cat)) continue;
+            if (filt_genre[0] && !genre_match(cat[i].genres, filt_genre)) continue;
+            idx[ni++] = i;
+        }
+        if (ni == 0) { msg_screen("CATALOG", "Nothing here."); if (ncat > 1) continue; else break; }
+        g_scat = cat; g_smode = sortmode; qsort(idx, ni, sizeof(int), idx_cmp);
+
+        int csel = 0, cscroll = 0, redraw = 1, hfu = 0, hfd = 0, requested = 0;
+        int shown = -1, phave = 0, settle = 0;
+        int td = 0, tx0 = 0, ty0 = 0, tsc0 = 0, tmv = 0, tbar = 0, leave = 0;
+        int marqf = 0, marqs = -1;
+    while (aptMainLoop() && !leave) {
         hidScanInput();
         u32 k = hidKeysDown(), kh = hidKeysHeld(), ku = hidKeysUp();
-        if (k & KEY_B) break;
+        if (k & KEY_B) { leave = (ncat > 1) ? 1 : 2; break; }
         int want_dl = 0;
-        if (nav_repeat(k, kh, NAV_DOWN, &hfd)) { if (csel < nc - 1) csel++; redraw = 1; }
+        if (nav_repeat(k, kh, NAV_DOWN, &hfd)) { if (csel < ni - 1) csel++; redraw = 1; }
         if (nav_repeat(k, kh, NAV_UP, &hfu))   { if (csel > 0) csel--; redraw = 1; }
-        if (k & KEY_RIGHT) { csel += BR_ROWS; if (csel > nc - 1) csel = nc - 1; redraw = 1; }
+        if (k & KEY_RIGHT) { csel += BR_ROWS; if (csel > ni - 1) csel = ni - 1; redraw = 1; }
         if (k & KEY_LEFT)  { csel -= BR_ROWS; if (csel < 0) csel = 0; redraw = 1; }
         if (k & KEY_R) {   /* jump to next first-letter group */
-            char c = firstc(cat[csel].name); int i = csel;
-            while (i < nc && firstc(cat[i].name) == c) i++;
-            if (i < nc) csel = i; redraw = 1;
+            char c = firstc(cat[idx[csel]].name); int i = csel;
+            while (i < ni && firstc(cat[idx[i]].name) == c) i++;
+            if (i < ni) csel = i; redraw = 1;
         }
         if (k & KEY_L) {   /* jump to start of this letter group, or previous */
-            int i = csel; char c = firstc(cat[i].name);
-            while (i > 0 && firstc(cat[i - 1].name) == c) i--;
-            if (i == csel && i > 0) { i--; char p = firstc(cat[i].name);
-                while (i > 0 && firstc(cat[i - 1].name) == p) i--; }
+            int i = csel; char c = firstc(cat[idx[i]].name);
+            while (i > 0 && firstc(cat[idx[i - 1]].name) == c) i--;
+            if (i == csel && i > 0) { i--; char p = firstc(cat[idx[i]].name);
+                while (i > 0 && firstc(cat[idx[i - 1]].name) == p) i--; }
             csel = i; redraw = 1;
         }
         if (k & KEY_A) want_dl = 1;
+        if (k & KEY_Y) { sortmode = (sortmode + 1) % 3; g_smode = sortmode;   /* cycle sort */
+            qsort(idx, ni, sizeof(int), idx_cmp); csel = 0; cscroll = 0; shown = -1; redraw = 1; }
         if (csel < cscroll) cscroll = csel;
         if (csel >= cscroll + BR_ROWS) cscroll = csel - BR_ROWS + 1;
         /* touch: list drag, scrollbar drag, tap a row, DOWNLOAD / Back buttons */
         touchPosition tp; hidTouchRead(&tp);
-        if (k & KEY_TOUCH) { td = 1; tx0 = tp.px; ty0 = tp.py; tsc0 = cscroll; tmv = 0; tbar = (tp.px >= UI_W - 14 && tp.py >= BR_LIST_Y); }
+        if (k & KEY_TOUCH) { td = 1; tx0 = tp.px; ty0 = tp.py; tsc0 = cscroll; tmv = 0; tbar = (tp.px >= UI_W - 14 && tp.py >= BR_LIST_Y && tp.py < 206); }
         else if ((kh & KEY_TOUCH) && td) {
-            int maxs = nc > BR_ROWS ? nc - BR_ROWS : 0;
+            int maxs = ni > BR_ROWS ? ni - BR_ROWS : 0;
             if (tbar) {   /* scrollbar: proportional jump through the whole list */
                 int th = BR_ROWS * BR_ROWH - 6, rel = tp.py - BR_LIST_Y; if (rel < 0) rel = 0; if (rel > th) rel = th;
                 int ns = th ? maxs * rel / th : 0; if (ns != cscroll) { cscroll = ns; csel = cscroll; redraw = 1; } tmv = 1;
@@ -762,14 +889,18 @@ static void catalog_browse(const Source *src) {
                     if (ns != cscroll) { cscroll = ns; redraw = 1; } } }
         } else if ((ku & KEY_TOUCH) && td) { td = 0;
             if (!tmv) {
-                if (ty0 >= 210 && ty0 < 236) { if (tx0 < 160) want_dl = 1; else quit = 1; }
-                else if (ty0 >= BR_LIST_Y) { int i = cscroll + (ty0 - BR_LIST_Y) / BR_ROWH;
-                    if (i >= 0 && i < nc && i < cscroll + BR_ROWS) { csel = i; redraw = 1; } }
+                if (ty0 >= 210 && ty0 < 236) {           /* DOWNLOAD / SORT / Back */
+                    if (tx0 < 104) want_dl = 1;
+                    else if (tx0 < 208) { sortmode = (sortmode + 1) % 3; g_smode = sortmode;
+                        qsort(idx, ni, sizeof(int), idx_cmp); csel = 0; cscroll = 0; shown = -1; redraw = 1; }
+                    else leave = (ncat > 1) ? 1 : 2;
+                } else if (ty0 >= BR_LIST_Y) { int i = cscroll + (ty0 - BR_LIST_Y) / BR_ROWH;
+                    if (i >= 0 && i < ni && i < cscroll + BR_ROWS) { csel = i; redraw = 1; } }
             }
         }
-        if (quit) break;
+        if (leave) break;
         if (want_dl) {
-            CatEntry *e = &cat[csel];
+            CatEntry *e = &cat[idx[csel]];
             char destdir[PATHLEN];
             if (!pick_folder(destdir, sizeof(destdir))) { redraw = 1; goto cont; }   /* cancelled */
             char dest[PATHLEN + NAMELEN];
@@ -814,54 +945,61 @@ static void catalog_browse(const Source *src) {
     cont:
         if (csel != shown) { redraw = 1; phave = 0; settle = 0; requested = 0; }   /* moved -> drop poster */
         /* debounced request to the background loader, then poll -- scrolling never blocks on a poster */
-        if (!phave && !requested && cat[csel].art[0] && ++settle >= 6) { pw_request(csel, cat[csel].art, cat[csel].fname); requested = 1; }
-        if (!phave && requested && pw_done == csel) {
+        if (!phave && !requested && cat[idx[csel]].art[0] && ++settle >= 6) { pw_request(idx[csel], cat[idx[csel]].art, cat[idx[csel]].fname); requested = 1; }
+        if (!phave && requested && pw_done == idx[csel]) {
             if (pw_ok && poster && pworker) { memcpy(poster, pworker, (size_t)POSTER_W * POSTER_H * 2); phave = 1; }
             requested = 0; redraw = 1;
         }
         /* marquee the selected long title */
         if (csel != marqs) { marqs = csel; g_marq_off = 0; marqf = 0; }
-        if (nc && csel >= cscroll && csel < cscroll + BR_ROWS && ui_text_w(1, cat[csel].name) > (UI_W - 16) - 46
+        if (ni && csel >= cscroll && csel < cscroll + BR_ROWS && ui_text_w(1, cat[idx[csel]].name) > (UI_W - 16) - 46
             && ++marqf >= 3) { marqf = 0; g_marq_off += 2; redraw = 1; }
         if (redraw) {
             ui_begin(GFX_BOTTOM);
             ui_vgrad_round(0, 0, UI_W, UI_H, 0, UI_RGB(16, 18, 32), UI_BG);
-            ui_text(10, 8, 2, UI_NEON, "DOWNLOAD");
-            char hdr[24]; snprintf(hdr, sizeof hdr, "%d / %d", csel + 1, nc);
+            ui_text(10, 8, 2, UI_NEON, "CATALOG");
+            char hdr[24]; snprintf(hdr, sizeof hdr, "%d / %d", csel + 1, ni);
             ui_text(UI_W - (int)strlen(hdr) * 8 - 10, 12, 1, UI_NEONP, hdr);
-            ui_text(10, 30, 1, UI_DIM, "L / R : jump letter");
+            char sub[80]; snprintf(sub, sizeof sub, "%s%s%s", filt_cat[0] ? filt_cat : "All", filt_genre[0] ? " / " : "", filt_genre);
+            ui_text_fit(10, 30, 1, UI_NEONC, sub, UI_W - 20);
             ui_fill_round(8, 42, UI_W - 16, 1, 0, UI_RGB(40, 46, 74));
-            for (int r = 0; r < BR_ROWS; r++) { int i = cscroll + r; if (i >= nc) break;
+            for (int r = 0; r < BR_ROWS; r++) { int i = cscroll + r; if (i >= ni) break;
+                const CatEntry *ce = &cat[idx[i]];
                 int ry = BR_LIST_Y + r * BR_ROWH, rw = UI_W - 16, rh = BR_ROWH - 4, selrow = (i == csel);
                 if (selrow) { ui_glow_round(8, ry, rw, rh, 7, UI_NEON, 3, 16);
                     ui_vgrad_round(8, ry, rw, rh, 7, UI_RGB(30, 40, 58), UI_RGB(16, 22, 34));
                     ui_frame_round(8, ry, rw, rh, 7, UI_NEON, 1); }
-                if (cat[i].is_zip) icon_folder(18, ry + 3, UI_NEONP); else icon_movie(18, ry + 3, UI_NEONC);
-                int tx = 46, txr = UI_W - 16, ty = ry + (rh - 8) / 2, tw = ui_text_w(1, cat[i].name);
+                if (ce->is_zip) icon_folder(18, ry + 3, UI_NEONP); else icon_movie(18, ry + 3, UI_NEONC);
+                int tx = 46, txr = UI_W - 16, ty = ry + (rh - 8) / 2, tw = ui_text_w(1, ce->name);
                 u16 tc = selrow ? UI_WHITE : UI_INK;
-                if (tw <= txr - tx) ui_text(tx, ty, 1, tc, cat[i].name);
+                if (tw <= txr - tx) ui_text(tx, ty, 1, tc, ce->name);
                 else if (selrow) { int period = tw + 24, off = g_marq_off % period;
-                    ui_text_clipped(tx - off, ty, 1, tc, cat[i].name, tx, txr);
-                    ui_text_clipped(tx - off + period, ty, 1, tc, cat[i].name, tx, txr); }
-                else { char disp[NAMELEN]; snprintf(disp, sizeof disp, "%s", cat[i].name);
+                    ui_text_clipped(tx - off, ty, 1, tc, ce->name, tx, txr);
+                    ui_text_clipped(tx - off + period, ty, 1, tc, ce->name, tx, txr); }
+                else { char disp[NAMELEN]; snprintf(disp, sizeof disp, "%s", ce->name);
                     int cm = (txr - tx) / 8; if ((int)strlen(disp) > cm) disp[cm] = 0; ui_text(tx, ty, 1, tc, disp); }
             }
-            if (nc > BR_ROWS) { int th = BR_ROWS * BR_ROWH - 6, ty = BR_LIST_Y, maxs = nc - BR_ROWS;
-                int hh = th * BR_ROWS / nc; if (hh < 12) hh = 12; int hy = ty + (th - hh) * cscroll / maxs;
+            if (ni > BR_ROWS) { int th = BR_ROWS * BR_ROWH - 6, ty = BR_LIST_Y, maxs = ni - BR_ROWS;
+                int hh = th * BR_ROWS / ni; if (hh < 12) hh = 12; int hy = ty + (th - hh) * cscroll / maxs;
                 ui_fill_round(UI_W - 6, ty, 3, th, 1, UI_RGB(30, 34, 52));
                 ui_fill_round(UI_W - 6, hy, 3, hh, 1, UI_NEON); }
-            ui_button(8, 210, 150, 26, "DOWNLOAD", 0, UI_NEON);
-            ui_button(166, 210, 146, 26, "Back", 0, UI_NEONP);
+            const char *sm = sortmode == 0 ? "Sort: Title" : sortmode == 1 ? "Sort: Year" : "Sort: Date";
+            ui_button(8, 210, 96, 26, "DOWNLOAD", 0, UI_NEON);
+            ui_button(108, 210, 100, 26, sm, 0, UI_NEONC);
+            ui_button(212, 210, 100, 26, "Back", 0, UI_NEONP);
             ui_present();
-            draw_info_top(&cat[csel], phave ? poster : NULL);
+            draw_info_top(&cat[idx[csel]], phave ? poster : NULL);
             shown = csel; redraw = 0;
         }
         gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
+    }
+        if (leave == 2) break;   /* B in the list with no category level -> exit the catalog */
     }
     pw_stop();
     branding_show();   /* restore the 3D logo on the top screen */
     free(poster);
     free(pworker);
+    free(idx);
     free(cat);
 }
 

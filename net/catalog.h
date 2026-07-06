@@ -12,6 +12,7 @@ typedef struct {
     char url[CAT_URLLEN];     /* download URL (fully encoded) */
     char art[CAT_URLLEN];     /* artwork/poster URL */
     char genres[96];          /* "Genre1, Genre2, ..." */
+    char category[32];        /* "Movies" / "TV Shows" / "Music" / ... (normalized across catalogs) */
     char desc[400];           /* description */
     char date[12];            /* dateAdded (YYYY-MM-DD) */
     int  year;
