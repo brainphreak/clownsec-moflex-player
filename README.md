@@ -1,11 +1,20 @@
 # CLOWNSEC VIDEO — Native moflex/MobiClip 3D Player for the 3DS
 
 A homebrew video player for the Nintendo 3DS that plays `.moflex` (MobiClip video +
-IMA-ADPCM audio) files **natively** — decoded in portable C, no on-device FFmpeg — in
-**stereoscopic 3D** on the top screen with synchronized audio.
+IMA-ADPCM audio) files **natively** — decoded in portable C, no on-device FFmpeg — with
+synchronized audio. It auto-detects **stereoscopic 3D** vs flat **2D** and plays each
+correctly, including movies embedded inside `.cia` files.
+
+Full speed on **New 3DS** (2D and 3D). On **Old 3DS**, 2D plays smoothly; 3D delivers twice
+the frames and the decode can't sustain that in real time, so it isn't smooth there (the
+player shows a note during Old-3DS 3D playback).
 
 The decoder is a standalone port of FFmpeg's MobiClip/moflex path, verified **bit-exact
 against FFmpeg on PC** before ever touching hardware.
+
+<p align="center">
+  <img src="screenshots/player-title.png" width="440" alt="Clownsec Video — home screen">
+</p>
 
 ## Download
 
@@ -44,20 +53,55 @@ If the timer won't advance past `0:00` in Citra, give the emulator the 3DS **DSP
 
 ## Features
 
-- **Stereoscopic 3D playback** — the frame-interleaved left/right eyes are paired and
-  presented atomically, so the two views are always the same moment (no eye desync).
+- **2D & 3D with auto-detection** — each file is detected as frame-interleaved 3D or flat 2D
+  and played correctly. For 3D, the left/right eyes are paired and presented atomically so the
+  two views are always the same moment (no eye desync).
+- **Plays movies embedded in `.cia` files** — the moflex inside an unencrypted movie CIA is
+  played in place (no extraction); when a CIA holds several movies you get a picker with their
+  real titles.
 - **Audio + A/V sync** via `ndsp`, audio-master pacing.
 - **Responsive seeking** — a draggable seek bar (touch + D-pad), FF/RW, and hold-to-scrub.
   After a seek the landing frame is shown immediately and audio resumes synced to it.
-- **Resume** — playback position is saved per movie and auto-resumes where you left off.
+- **Resume** — playback position is saved per movie (and per episode inside a multi-movie CIA)
+  and auto-resumes where you left off.
 - **Software volume boost** up to 400% for quiet sources.
 - **Catalog browser** — browse the Clownsec / Zackk archives from `catalog.json`, with a
-  top-screen info panel (poster art, year, runtime, genres, file size, description).
-- **Downloader** — pull movies and TV seasons directly to the SD card (zips are extracted
-  into their own folder), with a destination-folder picker and create-folder support.
-- **Built-in web server** — upload files to the console from a browser over Wi-Fi.
-- **File manager** — move / delete / create folders on the SD card.
+  top-screen info panel (poster art, year, runtime, genres, file size, description, and a
+  3D/2D badge).
+- **Downloader** — pull movies and TV seasons straight to the SD card (zips are extracted into
+  their own folder), or grab any file by direct URL, with a destination-folder picker.
+- **Built-in web server** — upload any files to the console from a browser over Wi-Fi.
+- **File manager** — browse, move, delete, and create folders on the SD card (all files, with a
+  movies-only toggle).
 - **3D branding** on the top screen while idle.
+
+## Screenshots
+
+<table>
+<tr>
+<td align="center"><img src="screenshots/player-open-video.png" width="380"><br><sub>Open a video — browse the SD card for a <code>.moflex</code> or movie <code>.cia</code></sub></td>
+<td align="center"><img src="screenshots/player-main-controls.png" width="380"><br><sub>Playback — video up top, touch controls below (play/pause, seek, volume)</sub></td>
+</tr>
+<tr>
+<td align="center"><img src="screenshots/player-add-movies-catalog.png" width="380"><br><sub>Catalog browser — info panel with the <b>3D (stereoscopic)</b> badge</sub></td>
+<td align="center"><img src="screenshots/player-add-movies-catalog-2.png" width="380"><br><sub>Catalog browser — a <b>2D</b> title</sub></td>
+</tr>
+<tr>
+<td align="center"><img src="screenshots/player-add-movies.png" width="380"><br><sub>Add videos — download from a catalog, or upload over Wi-Fi</sub></td>
+<td align="center"><img src="screenshots/player-add-movies-download.png" width="380"><br><sub>Download — pick a catalog source, a direct URL, or add your own</sub></td>
+</tr>
+<tr>
+<td align="center"><img src="screenshots/player-add-movies-catalog-save-dialog.png" width="380"><br><sub>Save-to — choose the destination folder (or make a new one)</sub></td>
+<td align="center"><img src="screenshots/player-add-movies-catalog-save-dloading.png" width="380"><br><sub>Downloading straight to the SD card</sub></td>
+</tr>
+<tr>
+<td align="center"><img src="screenshots/player-add-movies-upload.png" width="380"><br><sub>Built-in web server — upload any files from a browser over Wi-Fi</sub></td>
+<td align="center"><img src="screenshots/player-file-management.png" width="380"><br><sub>File manager — browse all files (with a movies-only toggle)</sub></td>
+</tr>
+<tr>
+<td align="center" colspan="2"><img src="screenshots/player-file-management-2.png" width="380"><br><sub>File manager — delete or move any file</sub></td>
+</tr>
+</table>
 
 ## Building
 
@@ -112,9 +156,11 @@ Produces `app/clownsec_player.cia`. Install with FBI or your CIA installer of ch
 
 ## Roadmap
 
-- **Old 3DS support** — move YUV→RGB color conversion + screen rotation off the ARM11 CPU
-  onto hardware (Y2R / GPU via citro3d). This is currently the pipeline's bottleneck and is
-  what keeps Old 3DS from hitting full speed.
+- **Smooth 3D on Old 3DS.** 2D already plays well on Old 3DS; 3D delivers twice the frames and
+  the portable-C MobiClip decode can't sustain that in real time on the Old 3DS CPU. Hardware
+  color conversion (Y2R) and a decode-ahead pipeline are already in place, so the remaining gap
+  is raw decode throughput — likely closable only with hand-tuned ARM assembly for the hot
+  decode loops (as the official player does).
 
 ## Credits & license
 
