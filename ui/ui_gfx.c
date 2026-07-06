@@ -1,6 +1,7 @@
 #include "ui_gfx.h"
 #include "font8x8_basic.h"
 #include <string.h>
+#include <stdio.h>
 #include <math.h>
 
 /* draw into an offscreen buffer (same rotated layout as the fb, height 240), then
@@ -206,5 +207,11 @@ void ui_button(int x, int y, int w, int h, const char *label, int selected, u16 
     ui_vgrad_round(x, y, w, h, r, top, bot);
     ui_frame_round(x, y, w, h, r, selected ? accent : UI_DIM, selected ? 2 : 1);
     u16 tc = selected ? accent : UI_INK;
-    ui_text_center(x + w / 2, y + (h - 8) / 2, 1, tc, label);
+    const char *lbl = label; char buf[64];   /* truncate a too-long label so it can't spill the button */
+    int maxw = w - 8;
+    if (ui_text_w(1, label) > maxw) {
+        int maxch = maxw / 8 - 2; if (maxch < 1) maxch = 1;
+        snprintf(buf, sizeof buf, "%.*s..", maxch, label); lbl = buf;
+    }
+    ui_text_center(x + w / 2, y + (h - 8) / 2, 1, tc, lbl);
 }

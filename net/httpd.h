@@ -13,4 +13,8 @@ void httpd_stop(void);
 /* Human-readable "http://x.x.x.x:8080" (or "wifi off" if no IP). */
 const char *httpd_url(void);
 
+/* If an upload is currently being received, fills done/total (bytes) + the filename and
+ * returns 1; otherwise returns 0. Lets the on-device UI show a progress bar. */
+int httpd_upload_progress(long *done, long *total, char *name, int namecap);
+
 #endif

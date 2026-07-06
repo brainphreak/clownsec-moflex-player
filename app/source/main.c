@@ -142,6 +142,46 @@ static void strip_ext(char *d);
 
 /* ---------- small modal helpers ---------- */
 
+/* center a string, truncating with ".." if it would exceed maxw pixels (never overflows) */
+static void ui_text_fit(int cx, int y, int scale, u16 c, const char *s, int maxw) {
+    if (ui_text_w(scale, s) <= maxw) { ui_text_center(cx, y, scale, c, s); return; }
+    int maxch = maxw / (8 * scale) - 2; if (maxch < 1) maxch = 1;
+    char buf[160]; snprintf(buf, sizeof buf, "%.*s..", maxch, s);
+    ui_text_center(cx, y, scale, c, buf);
+}
+/* center a string, shrinking the scale (maxscale..1) until it fits -- keeps the whole thing readable */
+static void ui_text_center_fit(int cx, int y, int maxscale, u16 c, const char *s, int maxw) {
+    int sc = maxscale;
+    while (sc > 1 && ui_text_w(sc, s) > maxw) sc--;
+    ui_text_center(cx, y, sc, c, s);
+}
+/* neon message popup with a Back button (replaces the old console result screens) */
+static void msg_screen(const char *title, const char *body) {
+    int redraw = 1, tdown = 0, tx0 = 0, ty0 = 0;
+    while (aptMainLoop()) {
+        hidScanInput();
+        u32 k = hidKeysDown(), ku = hidKeysUp();
+        if (k & (KEY_B | KEY_A)) break;
+        touchPosition tp; hidTouchRead(&tp);
+        if (k & KEY_TOUCH) { tdown = 1; tx0 = tp.px; ty0 = tp.py; }
+        else if ((ku & KEY_TOUCH) && tdown) { tdown = 0; if (ty0 >= 206 && ty0 < 234 && tx0 >= 110 && tx0 < 210) break; }
+        if (redraw) {
+            ui_begin(GFX_BOTTOM);
+            ui_vgrad_round(0, 0, UI_W, UI_H, 0, UI_RGB(16, 18, 32), UI_BG);
+            ui_text_center(UI_W / 2, 14, 2, UI_NEON, title);
+            ui_glow_round(28, 42, UI_W - 56, 2, 1, UI_NEON, 3, 30);
+            ui_fill_round(28, 42, UI_W - 56, 2, 1, UI_NEON);
+            int ly = 74; const char *p = body; char line[80];
+            while (*p) { int j = 0; while (*p && *p != '\n' && j < 79) line[j++] = *p++;
+                line[j] = 0; if (*p == '\n') p++;
+                ui_text_fit(UI_W / 2, ly, 1, UI_INK, line, UI_W - 16); ly += 16; }
+            ui_button(110, 206, 100, 28, "Back", 0, UI_NEONP);
+            ui_present(); redraw = 0;
+        }
+        gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
+    }
+}
+
 static int confirm(const char *prompt) {
     int redraw = 1, tdown = 0, tx0 = 0, ty0 = 0;
     int bw = 116, bh = 36, by = 158, yesx = 30, nox = UI_W - 30 - bw;
@@ -165,7 +205,7 @@ static int confirm(const char *prompt) {
             while (*p) {
                 int j = 0; while (*p && *p != '\n' && j < 63) line[j++] = *p++;
                 line[j] = 0; if (*p == '\n') p++;
-                ui_text_center(UI_W / 2, ly, 1, UI_INK, line); ly += 16;
+                ui_text_fit(UI_W / 2, ly, 1, UI_INK, line, UI_W - 16); ly += 16;
             }
             ui_button(yesx, by, bw, bh, "YES", 1, UI_NEON);
             ui_button(nox,  by, bw, bh, "NO",  0, UI_RED);
@@ -180,20 +220,51 @@ static int confirm(const char *prompt) {
 
 static void upload_screen(void) {
     int ok = httpd_start();
-    int drawn = 0;
+    int redraw = 1, tdown = 0, tx0 = 0, ty0 = 0, wasactive = 0;
+    long lastdone = -1;
     while (aptMainLoop()) {
         hidScanInput();
-        if (hidKeysDown() & KEY_B) break;
-        if (!drawn) {
-            printf("\x1b[2J\x1b[H=== UPLOAD (web server) ===\n\n");
-            if (ok) {
-                printf("Server ON. On a computer or phone on\nthe same Wi-Fi, open:\n\n  %s\n\n", httpd_url());
-                printf("Upload any files from the page.\nBrowse folders + delete there too.\n\n");
+        u32 k = hidKeysDown(), ku = hidKeysUp();
+        if (k & KEY_B) break;
+        touchPosition tp; hidTouchRead(&tp);
+        if (k & KEY_TOUCH) { tdown = 1; tx0 = tp.px; ty0 = tp.py; }
+        else if ((ku & KEY_TOUCH) && tdown) { tdown = 0;
+            if (ty0 >= 206 && ty0 < 234 && tx0 >= 110 && tx0 < 210) break; }
+        /* poll the server thread for live upload progress */
+        long done = 0, total = 0; char nm[128] = "";
+        int active = ok ? httpd_upload_progress(&done, &total, nm, sizeof nm) : 0;
+        if (active) { if (done != lastdone) { lastdone = done; redraw = 1; } wasactive = 1; }
+        else if (wasactive) { wasactive = 0; lastdone = -1; redraw = 1; }   /* just finished */
+        if (redraw) {
+            ui_begin(GFX_BOTTOM);
+            ui_vgrad_round(0, 0, UI_W, UI_H, 0, UI_RGB(16, 18, 32), UI_BG);
+            ui_text_center(UI_W / 2, 12, 2, UI_NEON, "UPLOAD");
+            ui_glow_round(28, 40, UI_W - 56, 2, 1, UI_NEON, 3, 30);
+            ui_fill_round(28, 40, UI_W - 56, 2, 1, UI_NEON);
+            if (!ok) {
+                ui_text_center(UI_W / 2, 92, 1, UI_RED, "Could not start server.");
+                ui_text_center(UI_W / 2, 110, 1, UI_DIM, "Is Wi-Fi connected?");
+            } else if (active) {
+                char sub[160]; snprintf(sub, sizeof sub, "Receiving: %s", nm);
+                ui_text_fit(UI_W / 2, 74, 1, UI_NEONC, sub, UI_W - 16);
+                int bx = 20, bw = UI_W - 40, by = 104, bh = 16;
+                ui_fill_round(bx, by, bw, bh, bh / 2, UI_RGB(32, 36, 56));
+                int fw = total > 0 ? (int)((long long)bw * done / total) : 0;
+                if (fw > 0) ui_fill_round(bx, by, fw, bh, bh / 2, UI_NEON);
+                int pct = total > 0 ? (int)((long long)done * 100 / total) : 0;
+                char pl[48];
+                if (total >= 1048576) snprintf(pl, sizeof pl, "%ld / %ld MB   %d%%", done / 1048576, total / 1048576, pct);
+                else                  snprintf(pl, sizeof pl, "%ld / %ld KB   %d%%", done / 1024, total / 1024, pct);
+                ui_text_center(UI_W / 2, by + bh + 8, 1, UI_INK, pl);
             } else {
-                printf("Could not start server.\nIs Wi-Fi connected?\n\n");
+                ui_text_center(UI_W / 2, 62, 1, UI_INK, "Server ON. On the same Wi-Fi, open:");
+                ui_text_center_fit(UI_W / 2, 84, 2, UI_NEONC, httpd_url(), UI_W - 16);
+                ui_text_center(UI_W / 2, 118, 1, UI_DIM, "Upload any files from the page.");
+                ui_text_center(UI_W / 2, 134, 1, UI_DIM, "Browse folders + delete there too.");
             }
-            printf("B: stop server + back\n");
-            drawn = 1;
+            ui_button(110, 206, 100, 28, "Back", 0, UI_NEONP);
+            ui_present();
+            redraw = 0;
         }
         gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
     }
@@ -209,14 +280,29 @@ static bool dl_progress(void *u, u32 d, u32 t) {
     (void)u;
     hidScanInput();
     if (hidKeysDown() & KEY_B) return false;   /* cancel */
+    if (hidKeysHeld() & KEY_TOUCH) { touchPosition tp; hidTouchRead(&tp);   /* tap CANCEL */
+        if (tp.py >= 206 && tp.py < 234 && tp.px >= 110 && tp.px < 210) return false; }
     u64 now = osGetTime();
-    if (now - g_last_prog >= 200) {
+    if (now - g_last_prog >= 100) {
         g_last_prog = now;
-        printf("\x1b[2J\x1b[H=== DOWNLOAD ===\n\n%.36s\n\n", g_dl_name);
-        if (t) printf("%lu / %lu KB  (%d%%)\n", (unsigned long)(d/1024),
-                      (unsigned long)(t/1024), (int)((u64)d * 100 / t));
-        else   printf("%lu KB\n", (unsigned long)(d/1024));
-        printf("\nB: cancel\n");
+        ui_begin(GFX_BOTTOM);
+        ui_vgrad_round(0, 0, UI_W, UI_H, 0, UI_RGB(16, 18, 32), UI_BG);
+        ui_text_center(UI_W / 2, 12, 2, UI_NEON, "DOWNLOADING");
+        ui_glow_round(28, 40, UI_W - 56, 2, 1, UI_NEON, 3, 30);
+        ui_fill_round(28, 40, UI_W - 56, 2, 1, UI_NEON);
+        ui_text_fit(UI_W / 2, 68, 1, UI_NEONC, g_dl_name, UI_W - 16);
+        int bx = 20, bw = UI_W - 40, by = 104, bh = 16;
+        ui_fill_round(bx, by, bw, bh, bh / 2, UI_RGB(32, 36, 56));
+        char pl[48];
+        if (t) {
+            int fw = (int)((long long)bw * d / t); if (fw > 0) ui_fill_round(bx, by, fw, bh, bh / 2, UI_NEON);
+            int pct = (int)((u64)d * 100 / t);
+            if (t >= 1048576) snprintf(pl, sizeof pl, "%lu / %lu MB   %d%%", (unsigned long)(d / 1048576), (unsigned long)(t / 1048576), pct);
+            else              snprintf(pl, sizeof pl, "%lu / %lu KB   %d%%", (unsigned long)(d / 1024), (unsigned long)(t / 1024), pct);
+        } else snprintf(pl, sizeof pl, "%lu KB", (unsigned long)(d / 1024));
+        ui_text_center(UI_W / 2, by + bh + 8, 1, UI_INK, pl);
+        ui_button(110, 206, 100, 28, "CANCEL", 0, UI_RED);
+        ui_present();
         gfxFlushBuffers(); gfxSwapBuffers();
     }
     return true;
@@ -612,22 +698,22 @@ static void fix_download_ext(char *dest, size_t cap) {
 }
 
 static void catalog_browse(const Source *src) {
-    printf("\x1b[2J\x1b[H=== DOWNLOAD ===\n\nFetching catalog...\n%.38s\n", src->url);
+    ui_begin(GFX_BOTTOM); ui_vgrad_round(0, 0, UI_W, UI_H, 0, UI_RGB(16, 18, 32), UI_BG);
+    ui_text_center(UI_W / 2, 100, 2, UI_NEON, "Fetching...");
+    ui_text_fit(UI_W / 2, 130, 1, UI_DIM, src->name, UI_W - 16); ui_present();
     gfxFlushBuffers(); gfxSwapBuffers();
 
     char *json = NULL; size_t len = 0;
     if (!download_to_mem(src->url, &json, &len, 32 * 1024 * 1024)) {
-        printf("\nFetch failed. Wi-Fi on? URL ok?\nB: back\n"); wait_back(); return;
+        msg_screen("DOWNLOAD", "Fetch failed.\nIs Wi-Fi on? Is the URL right?"); return;
     }
     int cap = 4096;
     CatEntry *cat = (CatEntry *)malloc(sizeof(CatEntry) * cap);
     int nc = cat ? catalog_parse(json, src->kind, src->dl_base, src->art_base, cat, cap) : 0;
     free(json);
     if (nc <= 0) {
-        printf("\nNo movies found (looked for .moflex / .cia / .zip).\n"
-               "The URL must point to a catalog.json file in the\n"
-               "Clownsec or Zackk format -- not a web page.\n\nB: back\n");
-        wait_back(); free(cat); return;
+        msg_screen("DOWNLOAD", "No movies found here.\nThe URL must be a catalog.json file\n(Clownsec/Zackk format), not a web page.");
+        free(cat); return;
     }
     if (nc > 1) qsort(cat, nc, sizeof(CatEntry), cat_cmp);   /* alphabetical */
 
@@ -698,28 +784,31 @@ static void catalog_browse(const Source *src) {
             }
             if (ok && e->is_zip && !file_is_zip(dest)) {
                 remove(dest);   /* not a real zip (likely a 404 page) */
-                printf("\x1b[2J\x1b[H=== DOWNLOAD ===\n\nDownload failed: the server did not\n"
-                       "return a zip (file not found at URL).\n\nB: back\n");
+                msg_screen("DOWNLOAD", "Download failed: the server did\nnot return a zip (not found).");
             } else if (ok && e->is_zip) {
                 if (confirm("Extract the zip now?\n(No = keep the .zip file)")) {
                     char stem[NAMELEN]; snprintf(stem, sizeof(stem), "%s", e->fname);
                     size_t sl = strlen(stem); if (sl > 4) stem[sl - 4] = 0;   /* drop .zip */
                     char folder[PATHLEN + NAMELEN];
                     snprintf(folder, sizeof(folder), "%s%s", destdir, stem);
-                    printf("\x1b[2J\x1b[H=== DOWNLOAD ===\n\nExtracting %.30s ...\n", stem);
+                    ui_begin(GFX_BOTTOM); ui_vgrad_round(0, 0, UI_W, UI_H, 0, UI_RGB(16, 18, 32), UI_BG);
+                    ui_text_center(UI_W / 2, 100, 2, UI_NEON, "Extracting...");
+                    ui_text_fit(UI_W / 2, 130, 1, UI_DIM, stem, UI_W - 16); ui_present();
                     gfxFlushBuffers(); gfxSwapBuffers();
                     int nf = unzip_to_dir(dest, folder);
                     remove(dest);   /* delete the .zip after extracting */
-                    if (nf > 0) printf("\nExtracted %d file%s.\nFolder: %.30s\n\nB: back\n", nf, nf == 1 ? "" : "s", stem);
-                    else        printf("\nExtract FAILED.\nFolder: %.30s\n\nB: back\n", stem);
+                    char m[128];
+                    if (nf > 0) snprintf(m, sizeof m, "Extracted %d file%s into:\n%s", nf, nf == 1 ? "" : "s", stem);
+                    else        snprintf(m, sizeof m, "Extract FAILED.\n%s", stem);
+                    msg_screen("DOWNLOAD", m);
                 } else {
-                    printf("\x1b[2J\x1b[H=== DOWNLOAD ===\n\nZip saved (not extracted):\n%.32s\n\nB: back\n", e->fname);
+                    char m[128]; snprintf(m, sizeof m, "Zip saved (not extracted):\n%s", e->fname);
+                    msg_screen("DOWNLOAD", m);
                 }
             } else {
-                printf("\x1b[2J\x1b[H=== DOWNLOAD ===\n\n%s\n%s\n\nB: back\n",
-                       g_dl_name, ok ? "Done." : "Failed / cancelled.");
+                char m[128]; snprintf(m, sizeof m, "%s\n%s", g_dl_name, ok ? "Download complete." : "Failed / cancelled.");
+                msg_screen("DOWNLOAD", m);
             }
-            wait_back();
             redraw = 1;
         }
     cont:
@@ -800,26 +889,24 @@ static void download_url_direct(void) {
     snprintf(dest, sizeof(dest), "%s%s", destdir, fname);
     snprintf(g_dl_name, sizeof(g_dl_name), "%s", fname);
     g_last_prog = 0;
-    consoleInit(GFX_BOTTOM, NULL);
-    printf("\x1b[2J\x1b[H=== DOWNLOAD URL ===\n\n-> %.32s\n\n", fname);
-    gfxFlushBuffers(); gfxSwapBuffers();
     bool ok = download_to_file(url, dest, dl_progress, NULL);
-    if (!ok) { remove(dest); printf("\nFailed / cancelled.\n\nB: back\n"); wait_back(); return; }
+    if (!ok) { remove(dest); msg_screen("DOWNLOAD", "Failed / cancelled."); return; }
     size_t fl = strlen(fname);
     if (fl > 4 && !strcasecmp(fname + fl - 4, ".zip") && file_is_zip(dest) &&
         confirm("Extract the zip now?\n(No = keep the .zip file)")) {
         char stem[NAMELEN]; snprintf(stem, sizeof(stem), "%s", fname); stem[fl - 4] = 0;
         char folder[PATHLEN + NAMELEN]; snprintf(folder, sizeof(folder), "%s%s", destdir, stem);
-        printf("\x1b[2J\x1b[H=== DOWNLOAD URL ===\n\nExtracting %.28s ...\n", stem);
+        ui_begin(GFX_BOTTOM); ui_vgrad_round(0, 0, UI_W, UI_H, 0, UI_RGB(16, 18, 32), UI_BG);
+        ui_text_center(UI_W / 2, 100, 2, UI_NEON, "Extracting...");
+        ui_text_fit(UI_W / 2, 130, 1, UI_DIM, stem, UI_W - 16); ui_present();
         gfxFlushBuffers(); gfxSwapBuffers();
         int nf = unzip_to_dir(dest, folder);
         remove(dest);
-        printf(nf > 0 ? "\nExtracted %d file%s.\n\nB: back\n" : "\nExtract FAILED.\n\nB: back\n",
-               nf, nf == 1 ? "" : "s");
+        char m[96]; snprintf(m, sizeof m, nf > 0 ? "Extracted %d file%s." : "Extract FAILED.", nf, nf == 1 ? "" : "s");
+        msg_screen("DOWNLOAD", m);
     } else {
-        printf("\nDone.\n\nB: back\n");
+        msg_screen("DOWNLOAD", "Download complete.");
     }
-    wait_back();
 }
 
 static void download_screen(void) {
@@ -902,8 +989,7 @@ static int ui_menu(const char *title, const char *subtitle, const char *const *i
             ui_text_center(UI_W / 2, 14, 2, UI_NEON, title);
             ui_glow_round(28, 40, UI_W - 56, 2, 1, UI_NEON, 3, 34);
             ui_fill_round(28, 40, UI_W - 56, 2, 1, UI_NEON);
-            if (subtitle && subtitle[0]) { char sub[42]; snprintf(sub, sizeof sub, "%s", subtitle);
-                ui_text_center(UI_W / 2, 50, 1, UI_NEONC, sub); }
+            if (subtitle && subtitle[0]) ui_text_fit(UI_W / 2, 50, 1, UI_NEONC, subtitle, UI_W - 16);
             for (int i = 0; i < n; i++) { int by = y0 + i * (bh + gap);
                 ui_button(bx, by, bw, bh, items[i], i == sel, UI_NEON); }
             ui_present(); redraw = 0;
@@ -1035,9 +1121,8 @@ static void scrape_folder(void) {
     }
     int got = 0;
     if (!cat || todo == 0) {
-        printf("\x1b[2J\x1b[H=== GET INFO ===\n\n%s\n\nB: back\n",
-               todo == 0 ? "Every movie here already has info." : "Out of memory.");
-        wait_back(); free(pb); free(cat); return;
+        msg_screen("GET INFO", todo == 0 ? "Every movie here already has info." : "Out of memory.");
+        free(pb); free(cat); return;
     }
     int cancelled = 0;
     for (int s = 0; s < nsources && got < todo && !cancelled; s++) {
@@ -1070,10 +1155,10 @@ static void scrape_folder(void) {
         }
     }
     free(pb); free(cat);
-    printf("\x1b[2J\x1b[H=== GET INFO (all) ===\n\n%sMatched %d of %d movie%s.\n%s\n\nB: back\n",
+    char m[128]; snprintf(m, sizeof m, "%sMatched %d of %d movie%s.\n%s",
            cancelled ? "Cancelled.\n" : "", got, todo, todo == 1 ? "" : "s",
            (got < todo && !cancelled) ? "(no catalog match for the rest)" : "");
-    wait_back();
+    msg_screen("GET INFO", m);
 }
 
 /* GET INFO chooser (X in Open Video): fetch metadata for just this movie, or every movie in
@@ -1092,10 +1177,9 @@ static void getinfo_menu(void) {
         char full[PATHLEN + NAMELEN]; snprintf(full, sizeof full, "%s%s", cwd, entries[sel].name);
         int r = scrape_one(full);   /* forces a refresh, even if it already has info */
         const char *msg = r == 1 ? "Info + artwork saved."
-                        : r == 2 ? "Info saved, but the poster didn't download.\nTry Get Info again for the artwork."
+                        : r == 2 ? "Info saved, but the poster\ndidn't download. Try again for the art."
                                  : "No catalog had this title.";
-        printf("\x1b[2J\x1b[H=== GET INFO ===\n\n%s\n\nB: back\n", msg);
-        wait_back();
+        msg_screen("GET INFO", msg);
     } else if (a == 1) {
         scrape_folder();
     }
@@ -1186,15 +1270,12 @@ static MoflexResult play_movie(const char *path) {
         CiaMoflex list[64];
         int nc = cia_list_moflex(path, list, 64);
         if (nc == 0) {
-            consoleInit(GFX_BOTTOM, NULL);
-            printf("\x1b[2J\x1b[H=== NOT A MOVIE ===\n\nThis CIA has no playable video inside\n"
-                   "(it's an app, or its content is\nencrypted).\n\nB: back\n");
-            wait_back(); branding_show();
+            msg_screen("NOT A MOVIE", "This CIA has no playable video inside\n(it's an app, or the content is encrypted).");
+            branding_show();
             return MOFLEX_QUIT_BACK;
         }
         int sel = 0;
         if (nc > 1) {                                   /* several videos -> let the user choose */
-            consoleInit(GFX_BOTTOM, NULL);
             sel = pick_moflex(list, nc);
             if (sel < 0) { branding_show(); return MOFLEX_QUIT_BACK; }
         }
@@ -1406,10 +1487,14 @@ static int browser(int mode, char *sel_out, size_t sel_cap) {
                     if (!acted && ty0 >= BR_LIST_Y && nentries) {   /* tap a list row */
                         int i = scroll + (ty0 - BR_LIST_Y) / BR_ROWH;
                         if (i >= 0 && i < nentries && i < scroll + BR_ROWS) {
-                            sel = i; top_sel = -1; top_pending = 1;
-                            if (entries[i].is_dir) { enter_dir(entries[i].name); browser_redraw(mode); }
-                            else if (mode == MODE_MANAGE) { manage_menu(); scan(); browser_redraw(mode); }
-                            else { if (sel_out) snprintf(sel_out, sel_cap, "%s%s", cwd, entries[i].name); return 2; }
+                            if (i != sel) {   /* first tap: just select (so you can then tap INFO / OPEN) */
+                                sel = i; top_sel = -1; top_pending = 1; browser_redraw(mode);
+                            } else {          /* tap the already-selected row: open it */
+                                top_sel = -1; top_pending = 1;
+                                if (entries[i].is_dir) { enter_dir(entries[i].name); browser_redraw(mode); }
+                                else if (mode == MODE_MANAGE) { manage_menu(); scan(); browser_redraw(mode); }
+                                else { if (sel_out) snprintf(sel_out, sel_cap, "%s%s", cwd, entries[i].name); return 2; }
+                            }
                         }
                     }
                 }

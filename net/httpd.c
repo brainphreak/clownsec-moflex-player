@@ -205,6 +205,18 @@ static void serve_listing(int fd, const char *dir) {
 
 /* ---------- PUT upload ---------- */
 
+/* live upload progress, polled by the on-device UI (the web page has its own bar) */
+static volatile long g_up_done = 0, g_up_total = 0;
+static volatile int  g_up_active = 0;
+static char g_up_name[128];
+int httpd_upload_progress(long *done, long *total, char *name, int namecap) {
+    if (!g_up_active) return 0;
+    if (done)  *done  = g_up_done;
+    if (total) *total = g_up_total;
+    if (name && namecap) snprintf(name, namecap, "%s", g_up_name);
+    return 1;
+}
+
 static void handle_put(int fd, const char *path, char *hdrbuf, int hdr_total, int body_start) {
     char fpath[1024];
     get_query(path, "path", fpath, sizeof(fpath));
@@ -226,13 +238,16 @@ static void handle_put(int fd, const char *path, char *hdrbuf, int hdr_total, in
     FILE *out = fopen(fpath, "wb");
     if (!out) { send_status(fd, "500 Error", "text/plain", "open failed"); return; }
 
+    { const char *b = strrchr(fpath, '/'); b = b ? b + 1 : fpath; snprintf(g_up_name, sizeof g_up_name, "%s", b); }
+    g_up_total = content_len; g_up_done = 0; g_up_active = 1;   /* -> on-device progress bar */
+
     long remaining = content_len;
     /* bytes already read past the header */
     int have = hdr_total - body_start;
     if (have > 0) {
         int w = (int)((have < remaining) ? have : remaining);
         fwrite(hdrbuf + body_start, 1, w, out);
-        remaining -= w;
+        remaining -= w; g_up_done += w;
     }
 
     char *buf = (char *)malloc(IOCHUNK);
@@ -241,10 +256,11 @@ static void handle_put(int fd, const char *path, char *hdrbuf, int hdr_total, in
         int n = recv(fd, buf, want, 0);
         if (n <= 0) break;
         fwrite(buf, 1, n, out);
-        remaining -= n;
+        remaining -= n; g_up_done += n;
     }
     free(buf);
     fclose(out);
+    g_up_active = 0;
 
     if (remaining == 0) send_status(fd, "200 OK", "text/plain", "ok");
     else                send_status(fd, "500 Error", "text/plain", "incomplete");
