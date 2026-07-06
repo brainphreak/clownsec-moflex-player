@@ -402,6 +402,15 @@ static void fmt_size(long long b, char *o, int cap) {
 
 /* rich movie info on the TOP screen (2D) while scrolling the catalog.
  * poster (row-major RGB565, POSTER_W x POSTER_H) may be NULL. */
+/* 3D moflex are distributed with "3D" in the filename (e.g. "Title (2025) (3D).moflex");
+ * 2D ones don't. Used to flag stereoscopic movies in the catalog info panel. */
+static int cat_is_3d(const CatEntry *e) {
+    const char *hay = e->fname[0] ? e->fname : e->name;
+    for (const char *p = hay; p[0] && p[1]; p++)
+        if (p[0] == '3' && (p[1] == 'D' || p[1] == 'd')) return 1;
+    return 0;
+}
+
 static void draw_info_top(const CatEntry *e, const u16 *poster) {
     ui_begin(GFX_TOP);
     ui_clear(UI_RGB(8, 10, 16));
@@ -429,6 +438,11 @@ static void draw_info_top(const CatEntry *e, const u16 *poster) {
     else                       meta[0] = 0;
     if (meta[0]) { ui_text(tx, ty, 1, UI_RGB(120, 200, 255), meta); ty += 14; }
     if (sz[0])   { ui_text(tx, ty, 1, UI_RGB(120, 255, 160), sz);   ty += 14; }
+    if (!e->is_zip) {   /* stereoscopic flag so you can tell 3D from 2D before downloading */
+        int is3d = cat_is_3d(e);
+        ui_text(tx, ty, 1, is3d ? UI_RGB(255, 120, 200) : UI_RGB(150, 150, 150),
+                is3d ? "3D  (stereoscopic)" : "2D"); ty += 14;
+    }
     if (e->genres[0]) { ui_text_wrap(tx, &ty, 1, UI_GRAY, e->genres, 30, 3); ty += 4; }
     if (e->desc[0])   ui_text_wrap(tx, &ty, 1, UI_RGB(205, 205, 205), e->desc, 30, 12);
     ui_present();
