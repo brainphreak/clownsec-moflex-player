@@ -7,6 +7,22 @@ IMA-ADPCM audio) files **natively** — decoded in portable C, no on-device FFmp
 The decoder is a standalone port of FFmpeg's MobiClip/moflex path, verified **bit-exact
 against FFmpeg on PC** before ever touching hardware.
 
+## Download
+
+Grab the latest prebuilt binaries from the
+[**Releases**](https://github.com/brainphreak/clownsec-moflex-player/releases/latest) page —
+no building required:
+
+- **`clownsec_player.3dsx`** — copy to your SD card's `/3ds/` folder and run from the
+  Homebrew Launcher.
+- **`clownsec_player.cia`** — install with FBI (or any CIA installer) for a HOME-menu icon.
+
+> **Testing in Citra?** The player paces the video to the audio clock, so it needs the
+> emulator's **DSP audio** to actually work — otherwise the picture sits frozen at `0:00`.
+> Use Citra's default **HLE audio**; if the timer still won't advance, place a `dspfirm.cdc`
+> dump (from a real 3DS) at `sdmc:/3ds/dspfirm.cdc`. This only affects the emulator — it
+> always plays correctly on real hardware.
+
 ## Features
 
 - **Stereoscopic 3D playback** — the frame-interleaved left/right eyes are paired and
