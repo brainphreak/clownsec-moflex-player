@@ -57,7 +57,8 @@ int movieinfo_load(const char *moviepath, CatEntry *out) {
                                                  snprintf(out->name,  sizeof out->name,  "%s", val); }
         else if (!strcasecmp(key, "year"))    out->year    = atoi(val);
         else if (!strcasecmp(key, "runtime")) out->runtime = atoi(val);
-        else if (!strcasecmp(key, "genres"))  snprintf(out->genres, sizeof out->genres, "%s", val);
+        else if (!strcasecmp(key, "genres"))   snprintf(out->genres,   sizeof out->genres,   "%s", val);
+        else if (!strcasecmp(key, "category")) snprintf(out->category, sizeof out->category, "%s", val);
         else if (!strcasecmp(key, "desc"))    snprintf(out->desc,   sizeof out->desc,   "%s", val);
         else if (!strcasecmp(key, "3d"))      out->is3d = (!strcasecmp(val, "yes") || val[0] == '1' ||
                                                            !strcasecmp(val, "true")) ? 1 : 0;
@@ -99,6 +100,7 @@ void movieinfo_save(const char *moviepath, const CatEntry *e, const u16 *poster,
         fprintf(f, "title: %s\n", title);
         if (e->year)    fprintf(f, "year: %d\n",    e->year);
         if (e->runtime) fprintf(f, "runtime: %d\n", e->runtime);
+        if (e->category[0]) fprintf(f, "category: %s\n", e->category);
         if (e->genres[0]) fprintf(f, "genres: %s\n", e->genres);
         if (e->is3d >= 0) fprintf(f, "3d: %s\n", e->is3d ? "yes" : "no");
         if (e->desc[0])   fprintf(f, "desc: %s\n",   e->desc);

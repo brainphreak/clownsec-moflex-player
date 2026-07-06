@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <malloc.h>
 #include <ctype.h>
+#include <time.h>
 
 #include "moflex_playback.h"
 #include "httpd.h"
@@ -139,6 +140,7 @@ static void icon_movie(int x, int y, u16 c);
 static void icon_file(int x, int y, u16 c);
 static void strip_ext(char *d);
 static int  ui_menu(const char *title, const char *subtitle, const char *const *items, int n);
+static int  scrape_one(const char *moviepath);   /* Get Info for one movie (defined later) */
 
 
 /* ---------- small modal helpers ---------- */
@@ -149,6 +151,13 @@ static void ui_text_fit(int cx, int y, int scale, u16 c, const char *s, int maxw
     int maxch = maxw / (8 * scale) - 2; if (maxch < 1) maxch = 1;
     char buf[160]; snprintf(buf, sizeof buf, "%.*s..", maxch, s);
     ui_text_center(cx, y, scale, c, buf);
+}
+/* left-aligned truncate-to-fit (x is the LEFT edge, unlike ui_text_fit which centers on cx) */
+static void ui_text_left_fit(int x, int y, int scale, u16 c, const char *s, int maxw) {
+    if (ui_text_w(scale, s) <= maxw) { ui_text(x, y, scale, c, s); return; }
+    int maxch = maxw / (8 * scale) - 2; if (maxch < 1) maxch = 1;
+    char buf[160]; snprintf(buf, sizeof buf, "%.*s..", maxch, s);
+    ui_text(x, y, scale, c, buf);
 }
 /* center a string, shrinking the scale (maxscale..1) until it fits -- keeps the whole thing readable */
 static void ui_text_center_fit(int cx, int y, int maxscale, u16 c, const char *s, int maxw) {
@@ -742,8 +751,9 @@ static int distinct_genres(const CatEntry *cat, int nc, const char *category, ch
     return n;
 }
 /* neon scrolling picker for a list of short strings. Returns index, -2 (Show All), or -1 (back). */
-static int catalog_pick(const char *title, const char *subtitle, char items[][32], int n, int show_all) {
-    int total = n + (show_all ? 1 : 0);
+static int catalog_pick(const char *title, const char *subtitle, char items[][32], int n, int show_all, const char *extra) {
+    int has_extra = (extra && extra[0]) ? 1 : 0;
+    int total = n + (show_all ? 1 : 0) + has_extra;
     int sel = 0, top = 0, redraw = 1, td = 0, tx0 = 0, ty0 = 0, tsc0 = 0, tmv = 0;
     const int VIS = 5, ry0 = 54, rh = 30, gap = 4;
     while (aptMainLoop()) {
@@ -761,7 +771,11 @@ static int catalog_pick(const char *title, const char *subtitle, char items[][32
         else if ((ku & KEY_TOUCH) && td) { td = 0; if (!tmv) for (int r = 0; r < VIS; r++) { int i = top + r; if (i >= total) break;
             int by = ry0 + r * (rh + gap); if (ty0 >= by && ty0 < by + rh) { sel = i; act = i; break; } } }
         (void)tx0;
-        if (act >= 0) return show_all ? (act == 0 ? -2 : act - 1) : act;
+        if (act >= 0) {
+            if (has_extra && act == total - 1) return -3;        /* the extra (e.g. Rescan) item */
+            if (show_all && act == 0) return -2;
+            return act - (show_all ? 1 : 0);
+        }
         if (sel < top) top = sel; if (sel >= top + VIS) top = sel - VIS + 1;
         if (redraw) {
             ui_begin(GFX_BOTTOM);
@@ -774,9 +788,9 @@ static int catalog_pick(const char *title, const char *subtitle, char items[][32
                 if (selrow) { ui_glow_round(8, by, rw, rh, 7, UI_NEON, 3, 16);
                     ui_vgrad_round(8, by, rw, rh, 7, UI_RGB(30, 40, 58), UI_RGB(16, 22, 34));
                     ui_frame_round(8, by, rw, rh, 7, UI_NEON, 1); }
-                int all = (show_all && i == 0);
-                const char *lbl = all ? "* Show All" : items[i - (show_all ? 1 : 0)];
-                ui_text_fit(UI_W / 2, by + (rh - 8) / 2, 1, selrow ? UI_WHITE : (all ? UI_NEON : UI_INK), lbl, rw - 16);
+                int all = (show_all && i == 0), ex = (has_extra && i == total - 1);
+                const char *lbl = all ? "* Show All" : ex ? extra : items[i - (show_all ? 1 : 0)];
+                ui_text_fit(UI_W / 2, by + (rh - 8) / 2, 1, selrow ? UI_WHITE : (all || ex ? UI_NEON : UI_INK), lbl, rw - 16);
             }
             if (total > VIS) { int th = VIS * (rh + gap) - gap, ty = ry0, maxs = total - VIS;
                 int hh = th * VIS / total; if (hh < 12) hh = 12; int hy = ty + (th - hh) * top / maxs;
@@ -821,7 +835,7 @@ static void catalog_browse(const Source *src) {
         /* ---- navigation: pick a category (+ optional genre), or Show All ---- */
         char filt_cat[32] = "", filt_genre[32] = "";
         if (ncat > 1) {
-            int c = catalog_pick("CATEGORY", src->name, cats, ncat, 1);
+            int c = catalog_pick("CATEGORY", src->name, cats, ncat, 1, NULL);
             if (c == -1) break;
             if (c >= 0) {
                 snprintf(filt_cat, sizeof filt_cat, "%s", cats[c]);
@@ -831,7 +845,7 @@ static void catalog_browse(const Source *src) {
                     const char *mi[2] = { "View All", "Pick a Genre" };
                     int mm = ui_menu(filt_cat, NULL, mi, 2);
                     if (mm < 0) continue;
-                    if (mm == 1) { int g = catalog_pick("GENRE", filt_cat, gens, ng, 0);
+                    if (mm == 1) { int g = catalog_pick("GENRE", filt_cat, gens, ng, 0, NULL);
                                    if (g < 0) continue; snprintf(filt_genre, sizeof filt_genre, "%s", gens[g]); }
                 }
             }
@@ -961,7 +975,7 @@ static void catalog_browse(const Source *src) {
             char hdr[24]; snprintf(hdr, sizeof hdr, "%d / %d", csel + 1, ni);
             ui_text(UI_W - (int)strlen(hdr) * 8 - 10, 12, 1, UI_NEONP, hdr);
             char sub[80]; snprintf(sub, sizeof sub, "%s%s%s", filt_cat[0] ? filt_cat : "All", filt_genre[0] ? " / " : "", filt_genre);
-            ui_text_fit(10, 30, 1, UI_NEONC, sub, UI_W - 20);
+            ui_text_left_fit(10, 30, 1, UI_NEONC, sub, UI_W - 20);
             ui_fill_round(8, 42, UI_W - 16, 1, 0, UI_RGB(40, 46, 74));
             for (int r = 0; r < BR_ROWS; r++) { int i = cscroll + r; if (i >= ni) break;
                 const CatEntry *ce = &cat[idx[i]];
@@ -1001,6 +1015,255 @@ static void catalog_browse(const Source *src) {
     free(pworker);
     free(idx);
     free(cat);
+}
+
+/* ================= Library: one flat, categorized view of every local movie ================= */
+#define LIB_MAX   3000
+#define LIB_CACHE "sdmc:/moflex_player/library.cache"
+#define LIB_MAGIC 0x4C494233   /* 'LIB3' -- bump to invalidate old caches when the scan changes */
+static CatEntry *g_lib = NULL;   /* every playable movie on the SD, with its .nfo metadata */
+static int       g_lib_n = 0;
+
+/* recurse the SD (skipping the hidden system folders), collecting .moflex / movie-.cia files */
+static void lib_scan_dir(const char *dir, int depth) {
+    if (g_lib_n >= LIB_MAX || depth > 8) return;
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d)) && g_lib_n < LIB_MAX) {
+        if (e->d_name[0] == '.') continue;
+        char full[PATHLEN + NAMELEN];
+        snprintf(full, sizeof full, "%s%s", dir, e->d_name);
+        struct stat st;
+        if (stat(full, &st)) continue;
+        if (S_ISDIR(st.st_mode)) {
+            if (is_hidden_dir(e->d_name)) continue;          /* skip 3DS / Nintendo / luma / etc. */
+            char sub[PATHLEN];
+            snprintf(sub, sizeof sub, "%s/", full);
+            lib_scan_dir(sub, depth + 1);
+        } else if (is_moflex(e->d_name)) {
+            if (cia_is_cia(e->d_name) && !cia_has_moflex(full)) continue;   /* skip non-movie CIAs */
+            CatEntry *c = &g_lib[g_lib_n];
+            movieinfo_load(full, c);                          /* name/genres/category/year/is3d from .nfo, if any */
+            snprintf(c->url, sizeof c->url, "%s", full);      /* the path we play + the poster key */
+            snprintf(c->fname, sizeof c->fname, "%s", e->d_name);
+            if (!c->name[0]) { snprintf(c->name, sizeof c->name, "%s", e->d_name); strip_ext(c->name); }
+            if (!c->category[0]) snprintf(c->category, sizeof c->category, "Uncategorized");   /* Get Info fills the real one */
+            c->is_zip = 0;
+            time_t mt = st.st_mtime; struct tm *tmv = localtime(&mt);
+            if (tmv) strftime(c->date, sizeof c->date, "%Y-%m-%d", tmv);   /* file date -> "sort by date added" */
+            g_lib_n++;
+            if ((g_lib_n & 7) == 0) {                          /* live progress */
+                ui_begin(GFX_BOTTOM); ui_vgrad_round(0, 0, UI_W, UI_H, 0, UI_RGB(16, 18, 32), UI_BG);
+                ui_text_center(UI_W / 2, 96, 2, UI_NEON, "Scanning...");
+                char m[32]; snprintf(m, sizeof m, "%d found", g_lib_n);
+                ui_text_center(UI_W / 2, 128, 1, UI_DIM, m); ui_present();
+                gfxFlushBuffers(); gfxSwapBuffers();
+            }
+        }
+    }
+    closedir(d);
+}
+
+static void lib_save_cache(void) {
+    mkdir("sdmc:/moflex_player", 0777);                       /* cache so later opens are instant */
+    FILE *f = fopen(LIB_CACHE, "wb");
+    if (f) { int magic = LIB_MAGIC; fwrite(&magic, sizeof magic, 1, f);
+        fwrite(&g_lib_n, sizeof g_lib_n, 1, f); fwrite(g_lib, sizeof(CatEntry), g_lib_n, f); fclose(f); }
+}
+
+static void lib_rescan(void) {
+    if (!g_lib) g_lib = (CatEntry *)malloc(sizeof(CatEntry) * LIB_MAX);
+    if (!g_lib) return;
+    g_lib_n = 0;
+    ui_begin(GFX_BOTTOM); ui_vgrad_round(0, 0, UI_W, UI_H, 0, UI_RGB(16, 18, 32), UI_BG);
+    ui_text_center(UI_W / 2, 96, 2, UI_NEON, "Scanning...");
+    ui_text_center(UI_W / 2, 128, 1, UI_DIM, "searching the SD card for movies"); ui_present();
+    gfxFlushBuffers(); gfxSwapBuffers();
+    lib_scan_dir("sdmc:/", 0);
+    lib_save_cache();
+}
+
+/* Get Info for one library entry, then refresh it in-place (title/category/genres/poster). */
+static void lib_getinfo(int i) {
+    if (i < 0 || i >= g_lib_n) return;
+    CatEntry *ce = &g_lib[i];
+    char path[CAT_URLLEN]; snprintf(path, sizeof path, "%s", ce->url);
+    char date[12];         snprintf(date, sizeof date, "%s", ce->date);
+    int r = scrape_one(path);
+    if (r) {                                                  /* reload the .nfo we just wrote */
+        movieinfo_load(path, ce);
+        snprintf(ce->url, sizeof ce->url, "%s", path);
+        snprintf(ce->date, sizeof ce->date, "%s", date);
+        if (!ce->category[0]) snprintf(ce->category, sizeof ce->category, "Uncategorized");
+        ce->is_zip = 0;
+        lib_save_cache();
+    }
+    msg_screen("GET INFO", r == 1 ? "Info + artwork saved."
+                         : r == 2 ? "Info saved, but the poster\ndidn't download. Try again for the art."
+                                  : "No catalog had this title.");
+}
+
+static int lib_load(void) {   /* returns the movie count; loads the cache, else scans once */
+    if (g_lib_n > 0) return g_lib_n;                          /* already in RAM this session */
+    if (!g_lib) g_lib = (CatEntry *)malloc(sizeof(CatEntry) * LIB_MAX);
+    if (!g_lib) return 0;
+    FILE *f = fopen(LIB_CACHE, "rb");
+    if (f) { int magic = 0, n = 0;
+        if (fread(&magic, sizeof magic, 1, f) == 1 && magic == LIB_MAGIC &&   /* stale/old cache -> rescan */
+            fread(&n, sizeof n, 1, f) == 1 && n > 0 && n <= LIB_MAX &&
+            (int)fread(g_lib, sizeof(CatEntry), n, f) == n) g_lib_n = n;
+        fclose(f); }
+    if (g_lib_n == 0) lib_rescan();
+    return g_lib_n;
+}
+
+/* Browse every local movie by category/genre and pick one to play.
+ * Returns 1 with the path in out[] if a movie was chosen, else 0. */
+static int library_view(char *out, size_t cap) {
+    if (lib_load() == 0) {
+        msg_screen("LIBRARY", "No movies found on the SD card.\nDownload or add some first.");
+        return 0;
+    }
+    gfxSet3D(false);
+    u16 *poster = (u16 *)malloc((size_t)POSTER_W * POSTER_H * sizeof(u16));
+    int *idx = (int *)malloc(sizeof(int) * LIB_MAX);   /* room for a bigger rescan */
+    int sortmode = 0, chose = 0;
+
+    while (idx && aptMainLoop() && !chose) {
+        /* ---- category (+ optional genre), Show All, or Rescan ---- */
+        static char cats[24][32]; int ncat = distinct_categories(g_lib, g_lib_n, cats, 24);
+        qsort(cats, ncat, 32, strrow_cmp);
+        char filt_cat[32] = "", filt_genre[32] = "";
+        char sub[24]; snprintf(sub, sizeof sub, "%d movies", g_lib_n);
+        int c = catalog_pick("LIBRARY", sub, cats, ncat, 1, "* Rescan Library");
+        if (c == -1) break;                                   /* B -> leave the library */
+        if (c == -3) { lib_rescan(); if (g_lib_n == 0) { msg_screen("LIBRARY", "No movies found."); break; } continue; }
+        if (c >= 0) {
+            snprintf(filt_cat, sizeof filt_cat, "%s", cats[c]);
+            static char gens[64][32]; int ng = distinct_genres(g_lib, g_lib_n, filt_cat, gens, 64);
+            qsort(gens, ng, 32, strrow_cmp);
+            if (ng > 0) {
+                const char *mi[2] = { "View All", "Pick a Genre" };
+                int mm = ui_menu(filt_cat, NULL, mi, 2);
+                if (mm < 0) continue;
+                if (mm == 1) { int g = catalog_pick("GENRE", filt_cat, gens, ng, 0, NULL);
+                               if (g < 0) continue; snprintf(filt_genre, sizeof filt_genre, "%s", gens[g]); }
+            }
+        }
+        /* ---- filtered + sorted index over g_lib[] ---- */
+        int ni = 0;
+        for (int i = 0; i < g_lib_n; i++) {
+            if (filt_cat[0] && strcasecmp(g_lib[i].category, filt_cat)) continue;
+            if (filt_genre[0] && !genre_match(g_lib[i].genres, filt_genre)) continue;
+            idx[ni++] = i;
+        }
+        if (ni == 0) { msg_screen("LIBRARY", "Nothing here."); continue; }
+        g_scat = g_lib; g_smode = sortmode; qsort(idx, ni, sizeof(int), idx_cmp);
+
+        int csel = 0, cscroll = 0, redraw = 1, hfu = 0, hfd = 0;
+        int shown = -1, phave = 0, settle = 0;
+        int td = 0, tx0 = 0, ty0 = 0, tsc0 = 0, tmv = 0, tbar = 0, leave = 0;
+        int marqf = 0, marqs = -1;
+    while (aptMainLoop() && !leave) {
+        hidScanInput();
+        u32 k = hidKeysDown(), kh = hidKeysHeld(), ku = hidKeysUp();
+        if (k & KEY_B) { leave = 1; break; }
+        int play = 0, info = 0;
+        if (nav_repeat(k, kh, NAV_DOWN, &hfd)) { if (csel < ni - 1) csel++; redraw = 1; }
+        if (nav_repeat(k, kh, NAV_UP, &hfu))   { if (csel > 0) csel--; redraw = 1; }
+        if (k & KEY_RIGHT) { csel += BR_ROWS; if (csel > ni - 1) csel = ni - 1; redraw = 1; }
+        if (k & KEY_LEFT)  { csel -= BR_ROWS; if (csel < 0) csel = 0; redraw = 1; }
+        if (k & KEY_R) { char cc = firstc(g_lib[idx[csel]].name); int i = csel;
+            while (i < ni && firstc(g_lib[idx[i]].name) == cc) i++; if (i < ni) csel = i; redraw = 1; }
+        if (k & KEY_L) { int i = csel; char cc = firstc(g_lib[idx[i]].name);
+            while (i > 0 && firstc(g_lib[idx[i - 1]].name) == cc) i--;
+            if (i == csel && i > 0) { i--; char p = firstc(g_lib[idx[i]].name);
+                while (i > 0 && firstc(g_lib[idx[i - 1]].name) == p) i--; }
+            csel = i; redraw = 1; }
+        if (k & KEY_A) play = 1;
+        if (k & KEY_X) { lib_rescan(); leave = 1; break; }   /* rescan -> back to the category screen */
+        if (k & KEY_Y) { sortmode = (sortmode + 1) % 3; g_smode = sortmode;
+            qsort(idx, ni, sizeof(int), idx_cmp); csel = 0; cscroll = 0; shown = -1; redraw = 1; }
+        if (csel < cscroll) cscroll = csel;
+        if (csel >= cscroll + BR_ROWS) cscroll = csel - BR_ROWS + 1;
+        touchPosition tp; hidTouchRead(&tp);
+        if (k & KEY_TOUCH) { td = 1; tx0 = tp.px; ty0 = tp.py; tsc0 = cscroll; tmv = 0; tbar = (tp.px >= UI_W - 14 && tp.py >= BR_LIST_Y && tp.py < 206); }
+        else if ((kh & KEY_TOUCH) && td) {
+            int maxs = ni > BR_ROWS ? ni - BR_ROWS : 0;
+            if (tbar) { int th = BR_ROWS * BR_ROWH - 6, rel = tp.py - BR_LIST_Y; if (rel < 0) rel = 0; if (rel > th) rel = th;
+                int ns = th ? maxs * rel / th : 0; if (ns != cscroll) { cscroll = ns; csel = cscroll; redraw = 1; } tmv = 1;
+            } else { int dy = tp.py - ty0; if (dy > 6 || dy < -6) tmv = 1;
+                if (tmv && maxs) { int ns = tsc0 - dy / BR_ROWH; if (ns < 0) ns = 0; if (ns > maxs) ns = maxs;
+                    if (ns != cscroll) { cscroll = ns; redraw = 1; } } }
+        } else if ((ku & KEY_TOUCH) && td) { td = 0;
+            if (!tmv) {
+                if (ty0 >= 210 && ty0 < 236) {               /* PLAY / INFO / SORT */
+                    if (tx0 < 104) play = 1;
+                    else if (tx0 < 208) info = 1;
+                    else { sortmode = (sortmode + 1) % 3; g_smode = sortmode;
+                        qsort(idx, ni, sizeof(int), idx_cmp); csel = 0; cscroll = 0; shown = -1; redraw = 1; }
+                } else if (ty0 >= BR_LIST_Y) { int i = cscroll + (ty0 - BR_LIST_Y) / BR_ROWH;
+                    if (i >= 0 && i < ni && i < cscroll + BR_ROWS) {
+                        if (i == csel) play = 1; else { csel = i; redraw = 1; } }   /* tap to select, tap again to play */
+                }
+            }
+        }
+        if (leave) break;
+        if (play) { snprintf(out, cap, "%s", g_lib[idx[csel]].url); chose = 1; break; }
+        if (info) { lib_getinfo(idx[csel]); shown = -1; redraw = 1; }   /* update .nfo + poster in place */
+        if (csel != shown) { redraw = 1; phave = 0; settle = 0; }   /* moved -> reload local poster */
+        if (phave == 0 && ++settle >= 4) {
+            phave = (poster && movieinfo_poster(g_lib[idx[csel]].url, poster, POSTER_W, POSTER_H)) ? 1 : 2;
+            redraw = 1;
+        }
+        if (csel != marqs) { marqs = csel; g_marq_off = 0; marqf = 0; }
+        if (ni && csel >= cscroll && csel < cscroll + BR_ROWS && ui_text_w(1, g_lib[idx[csel]].name) > (UI_W - 16) - 46
+            && ++marqf >= 3) { marqf = 0; g_marq_off += 2; redraw = 1; }
+        if (redraw) {
+            ui_begin(GFX_BOTTOM);
+            ui_vgrad_round(0, 0, UI_W, UI_H, 0, UI_RGB(16, 18, 32), UI_BG);
+            ui_text(10, 8, 2, UI_NEON, "LIBRARY");
+            char hdr[24]; snprintf(hdr, sizeof hdr, "%d / %d", csel + 1, ni);
+            ui_text(UI_W - (int)strlen(hdr) * 8 - 10, 12, 1, UI_NEONP, hdr);
+            char sh[80]; snprintf(sh, sizeof sh, "%s%s%s", filt_cat[0] ? filt_cat : "All", filt_genre[0] ? " / " : "", filt_genre);
+            ui_text_left_fit(10, 30, 1, UI_NEONC, sh, UI_W - 20);
+            ui_fill_round(8, 42, UI_W - 16, 1, 0, UI_RGB(40, 46, 74));
+            for (int r = 0; r < BR_ROWS; r++) { int i = cscroll + r; if (i >= ni) break;
+                const CatEntry *ce = &g_lib[idx[i]];
+                int ry = BR_LIST_Y + r * BR_ROWH, rw = UI_W - 16, rh = BR_ROWH - 4, selrow = (i == csel);
+                if (selrow) { ui_glow_round(8, ry, rw, rh, 7, UI_NEON, 3, 16);
+                    ui_vgrad_round(8, ry, rw, rh, 7, UI_RGB(30, 40, 58), UI_RGB(16, 22, 34));
+                    ui_frame_round(8, ry, rw, rh, 7, UI_NEON, 1); }
+                icon_movie(18, ry + 3, UI_NEONC);
+                int tx = 46, txr = UI_W - 16, ty = ry + (rh - 8) / 2, tw = ui_text_w(1, ce->name);
+                u16 tc = selrow ? UI_WHITE : UI_INK;
+                if (tw <= txr - tx) ui_text(tx, ty, 1, tc, ce->name);
+                else if (selrow) { int period = tw + 24, off = g_marq_off % period;
+                    ui_text_clipped(tx - off, ty, 1, tc, ce->name, tx, txr);
+                    ui_text_clipped(tx - off + period, ty, 1, tc, ce->name, tx, txr); }
+                else { char disp[NAMELEN]; snprintf(disp, sizeof disp, "%s", ce->name);
+                    int cm = (txr - tx) / 8; if ((int)strlen(disp) > cm) disp[cm] = 0; ui_text(tx, ty, 1, tc, disp); }
+            }
+            if (ni > BR_ROWS) { int th = BR_ROWS * BR_ROWH - 6, ty = BR_LIST_Y, maxs = ni - BR_ROWS;
+                int hh = th * BR_ROWS / ni; if (hh < 12) hh = 12; int hy = ty + (th - hh) * cscroll / maxs;
+                ui_fill_round(UI_W - 6, ty, 3, th, 1, UI_RGB(30, 34, 52));
+                ui_fill_round(UI_W - 6, hy, 3, hh, 1, UI_NEON); }
+            const char *sm = sortmode == 0 ? "Sort: Title" : sortmode == 1 ? "Sort: Year" : "Sort: Date";
+            ui_button(8, 210, 96, 26, "PLAY", 0, UI_NEON);
+            ui_button(108, 210, 100, 26, "INFO", 0, UI_NEONC);
+            ui_button(212, 210, 100, 26, sm, 0, UI_NEONP);
+            ui_present();
+            draw_info_top(&g_lib[idx[csel]], phave == 1 ? poster : NULL);
+            shown = csel; redraw = 0;
+        }
+        gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
+    }
+    }
+    branding_show();
+    free(poster);
+    free(idx);
+    return chose;
 }
 
 /* Enter any URL on the keyboard and download it straight to a chosen folder (cia, moflex, anything). */
@@ -1473,7 +1736,7 @@ static void browser_draw_gfx(int mode) {
     int manage = (mode == MODE_MANAGE);
     ui_begin(GFX_BOTTOM);
     ui_vgrad_round(0, 0, UI_W, UI_H, 0, UI_RGB(16, 18, 32), UI_BG);
-    ui_text(10, 8, 2, UI_NEON, manage ? "MANAGE" : "OPEN VIDEO");
+    ui_text(10, 8, 2, UI_NEON, manage ? "MANAGE" : "FILESYSTEM");
     if (manage && move_pending) ui_text(UI_W - 96, 9, 1, UI_NEONC, "MOVE ready");
     else if (!manage && s_show_hidden) ui_text(UI_W - 74, 9, 1, UI_NEONP, "SYS on");
     /* current path (tail-trimmed to fit) */
@@ -1763,14 +2026,53 @@ static int home_gui(void) {
     return -1;
 }
 
-/* Play a movie; if the user taps OPEN in the player, jump straight to the browser to pick
+/* OPEN VIDEO chooser: Library (categorized) or Filesystem (folders). Returns 0 = back, 1 = Library, -1 = cancel. */
+static int open_pick(void) {
+    int sel = 0, redraw = 1;
+    while (aptMainLoop()) {
+        hidScanInput();
+        u32 k = hidKeysDown();
+        if (k & KEY_B) return -1;
+        if (k & (KEY_DOWN | KEY_RIGHT)) { sel = 1; redraw = 1; }
+        if (k & (KEY_UP | KEY_LEFT))    { sel = 0; redraw = 1; }
+        if (k & KEY_A) return sel;
+        if (k & KEY_TOUCH) { touchPosition tp; hidTouchRead(&tp);
+            if (tp.py >= 66 && tp.py < 118)  return 0;
+            if (tp.py >= 134 && tp.py < 186) return 1; }
+        if (redraw) {
+            ui_begin(GFX_BOTTOM);
+            ui_vgrad_round(0, 0, UI_W, UI_H, 0, UI_RGB(16, 18, 32), UI_BG);
+            ui_text_center(UI_W / 2, 18, 2, UI_NEON, "OPEN VIDEO");
+            ui_button(34, 66, UI_W - 68, 52, "LIBRARY", sel == 0, UI_NEON);
+            ui_button(34, 134, UI_W - 68, 52, "FILESYSTEM", sel == 1, UI_NEONP);
+            ui_text_center(UI_W / 2, 226, 1, UI_DIM, "A choose    B back");
+            ui_present(); redraw = 0;
+        }
+        gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
+    }
+    return -1;
+}
+
+/* OPEN VIDEO: pick a source, then a movie. Returns 0 = home, 1 = exit app, 2 = play out[]. */
+static int open_video(char *out, size_t cap) {
+    for (;;) {
+        int pick = open_pick();
+        if (pick < 0) return 0;                                 /* back -> home */
+        if (pick == 0) { if (library_view(out, cap)) return 2;  /* Library; backed out -> chooser */ }
+        else { int r = browser(MODE_PLAY, out, cap);            /* Filesystem */
+               if (r == 1) return 1;
+               if (r == 2) return 2; }                           /* r==0 backed out -> chooser */
+    }
+}
+
+/* Play a movie; if the user taps OPEN in the player, jump straight to the chooser to pick
  * another (looping). Returns 1 if the app should exit. */
 static int play_and_handle(const char *path) {
     MoflexResult r = play_movie(path);
     while (r == MOFLEX_QUIT_OPEN) {
         char np[PATHLEN + NAMELEN];
-        int b = browser(MODE_PLAY, np, sizeof np);
-        if (b == 1) return 1;             /* START in browser -> exit */
+        int b = open_video(np, sizeof np);
+        if (b == 1) return 1;             /* exit */
         if (b == 2) r = play_movie(np);   /* picked a file -> play it */
         else return 0;                    /* backed out -> home screen */
     }
@@ -1798,9 +2100,9 @@ int main(void) {
     while (running && aptMainLoop()) {
         int choice = home_gui();
         if (choice < 0) break;
-        if (choice == 0) {                       /* OPEN / PLAY-empty -> browser -> play -> back home */
+        if (choice == 0) {                       /* OPEN -> Library/Filesystem chooser -> play -> home */
             char path[PATHLEN + NAMELEN];
-            int r = browser(MODE_PLAY, path, sizeof(path));
+            int r = open_video(path, sizeof(path));
             if (r == 1) running = 0;
             else if (r == 2 && play_and_handle(path)) running = 0;
         }
