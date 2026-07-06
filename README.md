@@ -17,11 +17,30 @@ no building required:
   Homebrew Launcher.
 - **`clownsec_player.cia`** — install with FBI (or any CIA installer) for a HOME-menu icon.
 
-> **Testing in Citra?** The player paces the video to the audio clock, so it needs the
-> emulator's **DSP audio** to actually work — otherwise the picture sits frozen at `0:00`.
-> Use Citra's default **HLE audio**; if the timer still won't advance, place a `dspfirm.cdc`
-> dump (from a real 3DS) at `sdmc:/3ds/dspfirm.cdc`. This only affects the emulator — it
-> always plays correctly on real hardware.
+### Testing in an emulator (Citra)
+
+The player paces the video to the audio clock, so it needs the emulator's **DSP audio** to
+actually work — otherwise the picture sits frozen at `0:00`. On real hardware this is never
+an issue; it only affects emulators.
+
+If the timer won't advance past `0:00` in Citra, give the emulator the 3DS **DSP firmware**:
+
+1. Dump it from your own 3DS with [**DSP1**](https://github.com/zoogie/DSP1/releases) (run
+   the `.3dsx`/`.cia` on the console; it writes `dspfirm.cdc` to the SD card's `/3ds/` folder).
+   *(The firmware is copyrighted — dump your own; don't share the file.)*
+2. Copy that `dspfirm.cdc` into the **`3ds` folder** of your emulator's virtual SD card, i.e.
+   `<emulator SD>/3ds/dspfirm.cdc`. The SD-card location depends on your OS and install type:
+
+   | OS / install | Virtual SD card path |
+   |--------------|----------------------|
+   | macOS | `~/Library/Application Support/Citra/sdmc/` |
+   | Windows (installed) | `%APPDATA%\Citra\sdmc\` |
+   | Windows (portable) | `<Citra folder>\user\sdmc\` |
+   | Linux | `~/.local/share/citra-emu/sdmc/` |
+
+   So on macOS the file goes at `~/Library/Application Support/Citra/sdmc/3ds/dspfirm.cdc`.
+   (Citra forks such as Lime3DS/Azahar use their own folders — check that emulator's SD path.)
+3. Restart the emulator; audio (and the video pacing) will work.
 
 ## Features
 
