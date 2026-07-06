@@ -13,7 +13,7 @@ The decoder is a standalone port of FFmpeg's MobiClip/moflex path, verified **bi
 against FFmpeg on PC** before ever touching hardware.
 
 <p align="center">
-  <img src="screenshots/player-title.png" width="440" alt="Clownsec Video — home screen">
+  <img src="screenshots/01-player-main-screen.png" width="420" alt="Clownsec Video — home screen">
 </p>
 
 ## Download
@@ -83,31 +83,27 @@ If the timer won't advance past `0:00` in Citra, give the emulator the 3DS **DSP
 
 <table>
 <tr>
-<td align="center"><img src="screenshots/player-open-video.png" width="380"><br><sub>Open a video — browse the SD card for a <code>.moflex</code> or movie <code>.cia</code></sub></td>
-<td align="center"><img src="screenshots/player-main-controls.png" width="380"><br><sub>Playback — video up top, touch controls below (play/pause, seek, volume)</sub></td>
+<td align="center"><img src="screenshots/02-player-open-video.png" width="340"><br><sub>Open Video — browse the SD card; tap to select, tap again to play</sub></td>
+<td align="center"><img src="screenshots/08-player-playing-video.png" width="340"><br><sub>Playback — video on the top screen, neon touch controls below</sub></td>
 </tr>
 <tr>
-<td align="center"><img src="screenshots/player-cia-contents.png" width="380"><br><sub>Multi-movie <code>.cia</code> — pick which video to play (real titles + sizes)</sub></td>
-<td align="center"><img src="screenshots/player-cia-contents-player.png" width="380"><br><sub>Playing a movie straight from inside a <code>.cia</code></sub></td>
+<td align="center"><img src="screenshots/07-player-download-from-catalog.png" width="340"><br><sub>Catalog browser — poster + details on top, download from the list</sub></td>
+<td align="center"><img src="screenshots/03-player-scrape-info.png" width="340"><br><sub>Get Info — auto-fetch poster + details from the catalogs</sub></td>
 </tr>
 <tr>
-<td align="center"><img src="screenshots/player-add-movies-catalog.png" width="380"><br><sub>Catalog browser — info panel with the <b>3D (stereoscopic)</b> badge</sub></td>
-<td align="center"><img src="screenshots/player-add-movies-catalog-2.png" width="380"><br><sub>Catalog browser — a <b>2D</b> title</sub></td>
+<td align="center"><img src="screenshots/04-player-manage-files.png" width="340"><br><sub>Manage — move, delete, and organize files on the SD card</sub></td>
+<td align="center"><img src="screenshots/05-player-add-videos.png" width="340"><br><sub>Add Videos — download from a catalog, or upload over Wi-Fi</sub></td>
 </tr>
 <tr>
-<td align="center"><img src="screenshots/player-add-movies.png" width="380"><br><sub>Add videos — download from a catalog, or upload over Wi-Fi</sub></td>
-<td align="center"><img src="screenshots/player-add-movies-download.png" width="380"><br><sub>Download — pick a catalog source, a direct URL, or add your own</sub></td>
+<td align="center"><img src="screenshots/06-player-download-sources.png" width="340"><br><sub>Download — pick a catalog source (or add your own)</sub></td>
+<td align="center"><img src="screenshots/12-player-downloading-file.png" width="340"><br><sub>Downloading a movie straight to the SD card</sub></td>
 </tr>
 <tr>
-<td align="center"><img src="screenshots/player-add-movies-catalog-save-dialog.png" width="380"><br><sub>Save-to — choose the destination folder (or make a new one)</sub></td>
-<td align="center"><img src="screenshots/player-add-movies-catalog-save-dloading.png" width="380"><br><sub>Downloading straight to the SD card</sub></td>
+<td align="center"><img src="screenshots/09-player-upload.png" width="340"><br><sub>Upload — the built-in Wi-Fi server (open the URL on a computer)</sub></td>
+<td align="center"><img src="screenshots/10-player-upload-from-browser.png" width="340"><br><sub>…the upload page from your computer/phone browser</sub></td>
 </tr>
 <tr>
-<td align="center"><img src="screenshots/player-add-movies-upload.png" width="380"><br><sub>Built-in web server — upload any files from a browser over Wi-Fi</sub></td>
-<td align="center"><img src="screenshots/player-file-management.png" width="380"><br><sub>File manager — browse all files (with a movies-only toggle)</sub></td>
-</tr>
-<tr>
-<td align="center" colspan="2"><img src="screenshots/player-file-management-2.png" width="380"><br><sub>File manager — delete or move any file</sub></td>
+<td align="center" colspan="2"><img src="screenshots/11-player-upload-to-3ds.png" width="340"><br><sub>Live upload progress on the 3DS as the file arrives</sub></td>
 </tr>
 </table>
 
