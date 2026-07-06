@@ -42,6 +42,7 @@ int movieinfo_have(const char *moviepath) {
 
 int movieinfo_load(const char *moviepath, CatEntry *out) {
     memset(out, 0, sizeof *out);
+    out->is3d = -1;   /* unknown unless the .nfo says so -> caller falls back to the filename */
     char p[320]; data_path(moviepath, ".nfo", p, sizeof p);
     FILE *f = fopen(p, "rb");
     if (!f) return 0;
@@ -58,6 +59,8 @@ int movieinfo_load(const char *moviepath, CatEntry *out) {
         else if (!strcasecmp(key, "runtime")) out->runtime = atoi(val);
         else if (!strcasecmp(key, "genres"))  snprintf(out->genres, sizeof out->genres, "%s", val);
         else if (!strcasecmp(key, "desc"))    snprintf(out->desc,   sizeof out->desc,   "%s", val);
+        else if (!strcasecmp(key, "3d"))      out->is3d = (!strcasecmp(val, "yes") || val[0] == '1' ||
+                                                           !strcasecmp(val, "true")) ? 1 : 0;
     }
     fclose(f);
     if (!out->name[0]) stem_of(moviepath, out->name, sizeof out->name);   /* fall back to the filename */
@@ -97,6 +100,7 @@ void movieinfo_save(const char *moviepath, const CatEntry *e, const u16 *poster,
         if (e->year)    fprintf(f, "year: %d\n",    e->year);
         if (e->runtime) fprintf(f, "runtime: %d\n", e->runtime);
         if (e->genres[0]) fprintf(f, "genres: %s\n", e->genres);
+        if (e->is3d >= 0) fprintf(f, "3d: %s\n", e->is3d ? "yes" : "no");
         if (e->desc[0])   fprintf(f, "desc: %s\n",   e->desc);
         fclose(f);
     }

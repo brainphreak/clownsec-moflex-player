@@ -15,6 +15,7 @@ typedef enum {
     MOFLEX_QUIT_BACK = 0,   /* user pressed B/START -> return to your menu   */
     MOFLEX_QUIT_EXIT = 1,   /* aptMainLoop() ended -> your app should exit   */
     MOFLEX_EOF       = 2,   /* file played to the end                        */
+    MOFLEX_QUIT_OPEN = 3,   /* user tapped OPEN -> host should open the browser */
     MOFLEX_ERROR     = -1   /* open/decode error                            */
 } MoflexResult;
 

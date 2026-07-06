@@ -129,43 +129,48 @@ static void enter_dir(const char *name) {
 
 enum { MODE_PLAY = 0, MODE_MANAGE = 1 };
 
-static void draw_browser(int mode) {
-    /* Redraw in place: home cursor, erase each line to EOL as we overwrite it (\x1b[K), and clear any
-     * leftover lines at the end (\x1b[J). Avoids the \x1b[2J full-clear flash that tore during scrolling. */
-    printf("\x1b[H");
-    printf("=== %s ===\x1b[K\n", mode == MODE_MANAGE ? "MANAGE" : "OPEN");
-    printf("%.38s\x1b[K\n", cwd);
-    if (move_pending) printf("[MOVE] %.24s  R:paste\x1b[K\n", move_name);
-    else if (mode == MODE_MANAGE) printf("A:open X:manage Y:%s B:up\x1b[K\n", s_manage_movies_only ? "show all" : "movies only");
-    else printf("A:play B:up/home X:get info Y:%s\x1b[K\n", s_show_hidden ? "hide sys" : "show all");
-    printf("START:exit  SELECT:refresh\x1b[K\n\x1b[K\n");
-    if (nentries == 0) { printf("(empty - no folders or .moflex)\x1b[K\n\x1b[J"); return; }
-    if (sel < scroll) scroll = sel;
-    if (sel >= scroll + ROWS) scroll = sel - ROWS + 1;
-    for (int i = scroll; i < nentries && i < scroll + ROWS; i++) {
-        char disp[NAMELEN];
-        snprintf(disp, sizeof(disp), "%s", entries[i].name);
-        if (!entries[i].is_dir && mode != MODE_MANAGE) {   /* play mode: clean movie titles (no ext);
-                                                            * manage mode: show real filenames + ext */
-            size_t L = strlen(disp);
-            if (L > 7 && !strcasecmp(disp + L - 7, ".moflex")) disp[L - 7] = 0;
-            else if (L > 4 && !strcasecmp(disp + L - 4, ".zip")) disp[L - 4] = 0;
-            else if (L > 4 && !strcasecmp(disp + L - 4, ".cia")) disp[L - 4] = 0;
-        }
-        printf("%c%s%.35s\x1b[K\n", i == sel ? '>' : ' ', entries[i].is_dir ? "[" : " ", disp);
-    }
-    printf("\x1b[J");   /* clear any lines left over from a previously longer view */
-}
+/* graphical-list layout + shared row helpers (defined further down with the browser) */
+#define BR_ROWS   6
+#define BR_ROWH   27
+#define BR_LIST_Y 46
+static int g_marq_off = 0;   /* horizontal scroll of a selected long title */
+static void icon_folder(int x, int y, u16 c);
+static void icon_movie(int x, int y, u16 c);
+static void icon_file(int x, int y, u16 c);
+static void strip_ext(char *d);
+
 
 /* ---------- small modal helpers ---------- */
 
 static int confirm(const char *prompt) {
-    printf("\x1b[2J\x1b[H\n%s\n\nA: yes    B: no\n", prompt);
+    int redraw = 1, tdown = 0, tx0 = 0, ty0 = 0;
+    int bw = 116, bh = 36, by = 158, yesx = 30, nox = UI_W - 30 - bw;
     while (aptMainLoop()) {
         hidScanInput();
-        u32 k = hidKeysDown();
+        u32 k = hidKeysDown(), ku = hidKeysUp();
         if (k & KEY_A) return 1;
         if (k & KEY_B) return 0;
+        touchPosition tp; hidTouchRead(&tp);
+        if (k & KEY_TOUCH) { tdown = 1; tx0 = tp.px; ty0 = tp.py; }
+        else if ((ku & KEY_TOUCH) && tdown) { tdown = 0;
+            if (ty0 >= by && ty0 < by + bh) {
+                if (tx0 >= yesx && tx0 < yesx + bw) return 1;
+                if (tx0 >= nox  && tx0 < nox + bw)  return 0;
+            }
+        }
+        if (redraw) {
+            ui_begin(GFX_BOTTOM);
+            ui_vgrad_round(0, 0, UI_W, UI_H, 0, UI_RGB(16, 18, 32), UI_BG);
+            int ly = 66; const char *p = prompt; char line[64];   /* draw prompt lines (split on '\n') */
+            while (*p) {
+                int j = 0; while (*p && *p != '\n' && j < 63) line[j++] = *p++;
+                line[j] = 0; if (*p == '\n') p++;
+                ui_text_center(UI_W / 2, ly, 1, UI_INK, line); ly += 16;
+            }
+            ui_button(yesx, by, bw, bh, "YES", 1, UI_NEON);
+            ui_button(nox,  by, bw, bh, "NO",  0, UI_RED);
+            ui_present(); redraw = 0;
+        }
         gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
     }
     return 0;
@@ -245,7 +250,13 @@ static void load_sources(void) {
     sources[1].dl_base[0] = 0;   /* zackk entries carry their own archiveUrl */
     snprintf(sources[1].art_base, 128, "https://clownsec.com/3ds/zackks/artwork/");
     sources[1].kind = 1;
-    nsources = 2;
+    snprintf(sources[2].name, 64, "3DSmovies Archive");
+    snprintf(sources[2].url, CAT_URLLEN,
+             "https://drive.google.com/uc?export=download&id=1I0OO_f_7pZxBbG249ivEufUV6vJ2oXC-");
+    sources[2].dl_base[0] = 0;   /* items carry their own (archive.org / Drive) URL */
+    sources[2].art_base[0] = 0;  /* items carry full artwork URLs */
+    sources[2].kind = 1;         /* items[] shape (auto-detected anyway) */
+    nsources = 3;
     FILE *f = fopen(SOURCES_FILE, "rb");
     if (f) {
         char line[CAT_URLLEN + 80];
@@ -283,6 +294,22 @@ static void add_source_swkbd(void) {
     ensure_cfg_dir();
     FILE *f = fopen(SOURCES_FILE, "ab");
     if (f) { fprintf(f, "%s|%s\n", name, url); fclose(f); }
+    load_sources();
+}
+
+/* Remove a user-added source (index >= 3; the built-in Clownsec/Zackk/3DSmovies stay). */
+#define BUILTIN_SOURCES 3
+static void remove_source(int idx) {
+    if (idx < BUILTIN_SOURCES || idx >= nsources) return;
+    FILE *f = fopen(SOURCES_FILE, "wb");
+    if (f) {
+        for (int i = BUILTIN_SOURCES; i < nsources; i++) {
+            if (i == idx) continue;
+            Source *s = &sources[i];
+            fprintf(f, "%s|%s|%s|%s|%d\n", s->name, s->url, s->dl_base, s->art_base, s->kind);
+        }
+        fclose(f);
+    }
     load_sources();
 }
 
@@ -335,48 +362,77 @@ static int pick_folder(char *out, size_t cap) {
         if (psel < 0) psel = 0;
 
         hidScanInput();
-        u32 k = hidKeysDown(), kh = hidKeysHeld();
+        u32 k = hidKeysDown(), kh = hidKeysHeld(), ku = hidKeysUp();
+        static int td = 0, tx0 = 0, ty0 = 0, tsc0 = 0, tmv = 0;
+        const int VIS = 5, ry0 = 54, rh = 28, gap = 4;
         if (nav_repeat(k, kh, NAV_DOWN, &hd)) { if (psel < total - 1) psel++; redraw = 1; }
         if (nav_repeat(k, kh, NAV_UP,   &hu)) { if (psel > 0) psel--;         redraw = 1; }
         if (k & KEY_B) return 0;
-        if (k & KEY_X) {                          /* create a new folder here */
+        int newf = (k & KEY_X) ? 1 : 0, act = (k & KEY_A) ? psel : -1;
+        touchPosition tp; hidTouchRead(&tp);
+        if (k & KEY_TOUCH) { td = 1; tx0 = tp.px; ty0 = tp.py; tsc0 = pscroll; tmv = 0; }
+        else if ((kh & KEY_TOUCH) && td) { int dy = tp.py - ty0; if (dy > 6 || dy < -6) tmv = 1;
+            if (tmv && total > VIS) { int maxs = total - VIS, ns = tsc0 - dy / (rh + gap);
+                if (ns < 0) ns = 0; if (ns > maxs) ns = maxs; if (ns != pscroll) { pscroll = ns; redraw = 1; } } }
+        else if ((ku & KEY_TOUCH) && td) { td = 0;
+            if (!tmv) {
+                if (ty0 >= 210 && ty0 < 236) { if (tx0 < 100) act = 0; else if (tx0 < 206) newf = 1; else return 0; }
+                else if (ty0 >= ry0) { int i = pscroll + (ty0 - ry0) / (rh + gap);
+                    if (i >= 0 && i < total && i < pscroll + VIS) { psel = i; act = i; } }
+            }
+        }
+        if (newf) {                                /* create a new folder here */
             char nm[NAMELEN] = "";
             SwkbdState s; swkbdInit(&s, SWKBD_TYPE_NORMAL, 2, -1);
             swkbdSetHintText(&s, "New folder name");
             if (swkbdInputText(&s, nm, sizeof(nm)) == SWKBD_BUTTON_RIGHT && nm[0]) {
                 char np[PATHLEN]; snprintf(np, sizeof(np), "%s%s", dir, nm);
-                mkdir(np, 0777);
-                rescan = 1;
+                mkdir(np, 0777); rescan = 1;
             }
         }
-        if (k & KEY_A) {
-            if (psel == 0) { snprintf(out, cap, "%s", dir); return 1; }   /* save here */
-            else if (!is_root && psel == 1) {                            /* go up */
-                size_t L = strlen(dir);
-                if (L && dir[L - 1] == '/') dir[L - 1] = 0;
+        if (act >= 0) {
+            if (act == 0) { snprintf(out, cap, "%s", dir); return 1; }    /* save here */
+            else if (!is_root && act == 1) {                             /* go up */
+                size_t L = strlen(dir); if (L && dir[L - 1] == '/') dir[L - 1] = 0;
                 char *sl = strrchr(dir, '/'); if (sl) sl[1] = 0;
                 psel = 0; rescan = 1;
             } else {                                                     /* enter folder */
-                int fi = psel - base;
+                int fi = act - base;
                 if (fi >= 0 && fi < nd) {
                     char nx[PATHLEN]; snprintf(nx, sizeof(nx), "%s%s/", dir, list[fi]);
-                    snprintf(dir, sizeof(dir), "%s", nx);
-                    psel = 0; rescan = 1;
+                    snprintf(dir, sizeof(dir), "%s", nx); psel = 0; rescan = 1;
                 }
             }
         }
+        if (psel < pscroll) pscroll = psel; if (psel >= pscroll + VIS) pscroll = psel - VIS + 1;
         if (redraw) {
-            printf("\x1b[2J\x1b[H=== SAVE TO ===\n%.38s\n\n", dir);
-            printf("A:open/select  X:new folder  B:cancel\n\n");
-            if (psel < pscroll) pscroll = psel;
-            if (psel >= pscroll + ROWS) pscroll = psel - ROWS + 1;
-            for (int i = pscroll; i < total && i < pscroll + ROWS; i++) {
-                char lb[NAMELEN + 8];
-                if (i == 0)                     snprintf(lb, sizeof(lb), "[ Save in this folder ]");
-                else if (!is_root && i == 1)    snprintf(lb, sizeof(lb), ".. (up)");
-                else                            snprintf(lb, sizeof(lb), "[D] %s", list[i - base]);
-                printf("%c%.38s\n", i == psel ? '>' : ' ', lb);
+            ui_begin(GFX_BOTTOM);
+            ui_vgrad_round(0, 0, UI_W, UI_H, 0, UI_RGB(16, 18, 32), UI_BG);
+            ui_text_center(UI_W / 2, 12, 2, UI_NEON, "SAVE TO");
+            char pth[64]; int mc = (UI_W - 20) / 8;
+            if ((int)strlen(dir) > mc) snprintf(pth, sizeof pth, "...%s", dir + strlen(dir) - (mc - 3));
+            else snprintf(pth, sizeof pth, "%s", dir);
+            ui_text(10, 34, 1, UI_DIM, pth);
+            ui_fill_round(8, 46, UI_W - 16, 1, 0, UI_RGB(40, 46, 74));
+            for (int r = 0; r < VIS; r++) { int i = pscroll + r; if (i >= total) break;
+                int by = ry0 + r * (rh + gap), selrow = (i == psel), rw = UI_W - 16;
+                if (selrow) { ui_glow_round(8, by, rw, rh, 7, UI_NEON, 3, 16);
+                    ui_vgrad_round(8, by, rw, rh, 7, UI_RGB(30, 40, 58), UI_RGB(16, 22, 34));
+                    ui_frame_round(8, by, rw, rh, 7, UI_NEON, 1); }
+                char lb[NAMELEN]; int textx = 18; u16 tc = selrow ? UI_WHITE : UI_INK;
+                if (i == 0) { snprintf(lb, sizeof lb, "Save in this folder"); tc = UI_NEON; }
+                else if (!is_root && i == 1) snprintf(lb, sizeof lb, ".. (up a folder)");
+                else { snprintf(lb, sizeof lb, "%s", list[i - base]); icon_folder(18, by + (rh - 16) / 2, UI_RGB(240, 205, 110)); textx = 46; }
+                ui_text(textx, by + (rh - 8) / 2, 1, tc, lb);
             }
+            if (total > VIS) { int th = VIS * (rh + gap) - gap, ty = ry0, maxs = total - VIS;
+                int hh = th * VIS / total; if (hh < 12) hh = 12; int hy = ty + (th - hh) * pscroll / maxs;
+                ui_fill_round(UI_W - 6, ty, 3, th, 1, UI_RGB(30, 34, 52));
+                ui_fill_round(UI_W - 6, hy, 3, hh, 1, UI_NEON); }
+            ui_button(8, 210, 90, 26, "SAVE", 0, UI_NEON);
+            ui_button(102, 210, 100, 26, "NEW +", 0, UI_NEONC);
+            ui_button(206, 210, 106, 26, "Back", 0, UI_NEONP);
+            ui_present();
             redraw = 0;
         }
         gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
@@ -453,8 +509,8 @@ static void draw_info_top(const CatEntry *e, const u16 *poster) {
     else                       meta[0] = 0;
     if (meta[0]) { ui_text(tx, ty, 1, UI_RGB(120, 200, 255), meta); ty += 14; }
     if (sz[0])   { ui_text(tx, ty, 1, UI_RGB(120, 255, 160), sz);   ty += 14; }
-    if (!e->is_zip) {   /* stereoscopic flag so you can tell 3D from 2D before downloading */
-        int is3d = cat_is_3d(e);
+    {   /* stereoscopic flag (also shown for TV/zip entries) */
+        int is3d = (e->is3d >= 0) ? e->is3d : cat_is_3d(e);   /* catalog/.nfo flag, else the filename */
         ui_text(tx, ty, 1, is3d ? UI_RGB(255, 120, 200) : UI_RGB(150, 150, 150),
                 is3d ? "3D  (stereoscopic)" : "2D"); ty += 14;
     }
@@ -490,6 +546,7 @@ static void browser_show_top(int is_dir, const char *name, const char *fullpath)
     if (!haveinfo && !haveposter) { branding_show_2d(); return; }   /* no metadata -> logo */
     if (!haveinfo) {   /* poster only: build a minimal entry from the filename */
         memset(&meta, 0, sizeof meta);
+        meta.is3d = -1;                                           /* -> fall back to the filename */
         snprintf(meta.name,  sizeof meta.name,  "%s", name);
         char *dot = strrchr(meta.name, '.'); if (dot) *dot = 0;   /* drop extension for the title */
         snprintf(meta.fname, sizeof meta.fname, "%s", name);      /* keeps the 2D/3D badge */
@@ -537,6 +594,23 @@ static void pw_request(int id, const char *url, const char *key) {
     LightLock_Unlock(&pw_lock);
 }
 
+/* Google Drive (and similar) serve files with no extension in the name; give the saved file the
+ * right extension by sniffing its magic bytes so the browser recognizes and plays it. */
+static void fix_download_ext(char *dest, size_t cap) {
+    size_t L = strlen(dest);
+    if ((L > 7 && !strcasecmp(dest + L - 7, ".moflex")) ||
+        (L > 4 && !strcasecmp(dest + L - 4, ".cia"))    ||
+        (L > 4 && !strcasecmp(dest + L - 4, ".zip"))) return;   /* already typed */
+    FILE *f = fopen(dest, "rb"); if (!f) return;
+    unsigned char b[4] = {0}; size_t r = fread(b, 1, 4, f); fclose(f);
+    if (r < 4) return;
+    const char *ext = ".moflex";
+    if (b[0] == 0x20 && b[1] == 0x20 && b[2] == 0 && b[3] == 0) ext = ".cia";
+    else if (b[0] == 'P' && b[1] == 'K' && b[2] == 3 && b[3] == 4) ext = ".zip";
+    char nd[PATHLEN + NAMELEN]; snprintf(nd, sizeof nd, "%s%s", dest, ext);
+    if (rename(dest, nd) == 0) snprintf(dest, cap, "%s", nd);
+}
+
 static void catalog_browse(const Source *src) {
     printf("\x1b[2J\x1b[H=== DOWNLOAD ===\n\nFetching catalog...\n%.38s\n", src->url);
     gfxFlushBuffers(); gfxSwapBuffers();
@@ -550,8 +624,10 @@ static void catalog_browse(const Source *src) {
     int nc = cat ? catalog_parse(json, src->kind, src->dl_base, src->art_base, cat, cap) : 0;
     free(json);
     if (nc <= 0) {
-        printf("\nNo .moflex/.zip found in this catalog.\nB: back\n"); wait_back();
-        free(cat); return;
+        printf("\nNo movies found (looked for .moflex / .cia / .zip).\n"
+               "The URL must point to a catalog.json file in the\n"
+               "Clownsec or Zackk format -- not a web page.\n\nB: back\n");
+        wait_back(); free(cat); return;
     }
     if (nc > 1) qsort(cat, nc, sizeof(CatEntry), cat_cmp);   /* alphabetical */
 
@@ -561,15 +637,17 @@ static void catalog_browse(const Source *src) {
     if (pworker) pw_start(pworker);   /* background loader -> scrolling never blocks on a poster */
     int csel = 0, cscroll = 0, redraw = 1, hfu = 0, hfd = 0, requested = 0;
     int shown = -1, phave = 0, settle = 0;   /* poster debounce state */
+    int td = 0, tx0 = 0, ty0 = 0, tsc0 = 0, tmv = 0, tbar = 0, quit = 0;   /* touch */
+    int marqf = 0, marqs = -1;
     while (aptMainLoop()) {
         hidScanInput();
-        u32 k = hidKeysDown();
-        u32 kh = hidKeysHeld();
+        u32 k = hidKeysDown(), kh = hidKeysHeld(), ku = hidKeysUp();
         if (k & KEY_B) break;
+        int want_dl = 0;
         if (nav_repeat(k, kh, NAV_DOWN, &hfd)) { if (csel < nc - 1) csel++; redraw = 1; }
         if (nav_repeat(k, kh, NAV_UP, &hfu))   { if (csel > 0) csel--; redraw = 1; }
-        if (k & KEY_RIGHT) { csel += ROWS; if (csel > nc - 1) csel = nc - 1; redraw = 1; }
-        if (k & KEY_LEFT)  { csel -= ROWS; if (csel < 0) csel = 0; redraw = 1; }
+        if (k & KEY_RIGHT) { csel += BR_ROWS; if (csel > nc - 1) csel = nc - 1; redraw = 1; }
+        if (k & KEY_LEFT)  { csel -= BR_ROWS; if (csel < 0) csel = 0; redraw = 1; }
         if (k & KEY_R) {   /* jump to next first-letter group */
             char c = firstc(cat[csel].name); int i = csel;
             while (i < nc && firstc(cat[i].name) == c) i++;
@@ -582,16 +660,39 @@ static void catalog_browse(const Source *src) {
                 while (i > 0 && firstc(cat[i - 1].name) == p) i--; }
             csel = i; redraw = 1;
         }
-        if (k & KEY_A) {
+        if (k & KEY_A) want_dl = 1;
+        if (csel < cscroll) cscroll = csel;
+        if (csel >= cscroll + BR_ROWS) cscroll = csel - BR_ROWS + 1;
+        /* touch: list drag, scrollbar drag, tap a row, DOWNLOAD / Back buttons */
+        touchPosition tp; hidTouchRead(&tp);
+        if (k & KEY_TOUCH) { td = 1; tx0 = tp.px; ty0 = tp.py; tsc0 = cscroll; tmv = 0; tbar = (tp.px >= UI_W - 14 && tp.py >= BR_LIST_Y); }
+        else if ((kh & KEY_TOUCH) && td) {
+            int maxs = nc > BR_ROWS ? nc - BR_ROWS : 0;
+            if (tbar) {   /* scrollbar: proportional jump through the whole list */
+                int th = BR_ROWS * BR_ROWH - 6, rel = tp.py - BR_LIST_Y; if (rel < 0) rel = 0; if (rel > th) rel = th;
+                int ns = th ? maxs * rel / th : 0; if (ns != cscroll) { cscroll = ns; csel = cscroll; redraw = 1; } tmv = 1;
+            } else { int dy = tp.py - ty0; if (dy > 6 || dy < -6) tmv = 1;
+                if (tmv && maxs) { int ns = tsc0 - dy / BR_ROWH; if (ns < 0) ns = 0; if (ns > maxs) ns = maxs;
+                    if (ns != cscroll) { cscroll = ns; redraw = 1; } } }
+        } else if ((ku & KEY_TOUCH) && td) { td = 0;
+            if (!tmv) {
+                if (ty0 >= 210 && ty0 < 236) { if (tx0 < 160) want_dl = 1; else quit = 1; }
+                else if (ty0 >= BR_LIST_Y) { int i = cscroll + (ty0 - BR_LIST_Y) / BR_ROWH;
+                    if (i >= 0 && i < nc && i < cscroll + BR_ROWS) { csel = i; redraw = 1; } }
+            }
+        }
+        if (quit) break;
+        if (want_dl) {
             CatEntry *e = &cat[csel];
             char destdir[PATHLEN];
-            if (!pick_folder(destdir, sizeof(destdir))) { redraw = 1; continue; }   /* cancelled */
+            if (!pick_folder(destdir, sizeof(destdir))) { redraw = 1; goto cont; }   /* cancelled */
             char dest[PATHLEN + NAMELEN];
             snprintf(dest, sizeof(dest), "%s%s", destdir, e->fname);
             snprintf(g_dl_name, sizeof(g_dl_name), "%s", e->fname);
             g_last_prog = 0;
             bool ok = download_to_file(e->url, dest, dl_progress, NULL);
             if (ok && !e->is_zip) {   /* persist metadata + poster so the info panel shows for the local file */
+                fix_download_ext(dest, sizeof dest);   /* Drive items have no extension -> sniff + add it */
                 if (!phave && e->art[0] && poster) phave = poster_get(e->art, e->fname, poster, POSTER_W, POSTER_H);
                 movieinfo_save(dest, e, phave ? poster : NULL, POSTER_W, POSTER_H);
             }
@@ -621,28 +722,50 @@ static void catalog_browse(const Source *src) {
             wait_back();
             redraw = 1;
         }
+    cont:
         if (csel != shown) { redraw = 1; phave = 0; settle = 0; requested = 0; }   /* moved -> drop poster */
-        if (redraw) {
-            printf("\x1b[2J\x1b[HDOWNLOAD  %d/%d  [%c]\n", csel + 1, nc, firstc(cat[csel].name));
-            printf("Up/Dn:1  <>:page  L/R:letter\n");
-            printf("A:get  B:back  save:%.14s\n\n", cwd);
-            if (csel < cscroll) cscroll = csel;
-            if (csel >= cscroll + ROWS) cscroll = csel - ROWS + 1;
-            for (int i = cscroll; i < nc && i < cscroll + ROWS; i++)
-                printf("%c%.37s\n", i == csel ? '>' : ' ', cat[i].name);
-            draw_info_top(&cat[csel], phave ? poster : NULL);
-            shown = csel;
-            redraw = 0;
-        }
-        /* debounced request to the background loader (a few idle frames), then poll for its result --
-         * NOTHING here blocks, so scrolling is always fluid no matter how slow the poster is. */
-        if (!phave && !requested && cat[csel].art[0] && ++settle >= 6) {
-            pw_request(csel, cat[csel].art, cat[csel].fname);
-            requested = 1;
-        }
+        /* debounced request to the background loader, then poll -- scrolling never blocks on a poster */
+        if (!phave && !requested && cat[csel].art[0] && ++settle >= 6) { pw_request(csel, cat[csel].art, cat[csel].fname); requested = 1; }
         if (!phave && requested && pw_done == csel) {
             if (pw_ok && poster && pworker) { memcpy(poster, pworker, (size_t)POSTER_W * POSTER_H * 2); phave = 1; }
-            requested = 0; redraw = 1;   /* redraw to show the poster (or leave the panel text-only) */
+            requested = 0; redraw = 1;
+        }
+        /* marquee the selected long title */
+        if (csel != marqs) { marqs = csel; g_marq_off = 0; marqf = 0; }
+        if (nc && csel >= cscroll && csel < cscroll + BR_ROWS && ui_text_w(1, cat[csel].name) > (UI_W - 16) - 46
+            && ++marqf >= 3) { marqf = 0; g_marq_off += 2; redraw = 1; }
+        if (redraw) {
+            ui_begin(GFX_BOTTOM);
+            ui_vgrad_round(0, 0, UI_W, UI_H, 0, UI_RGB(16, 18, 32), UI_BG);
+            ui_text(10, 8, 2, UI_NEON, "DOWNLOAD");
+            char hdr[24]; snprintf(hdr, sizeof hdr, "%d / %d", csel + 1, nc);
+            ui_text(UI_W - (int)strlen(hdr) * 8 - 10, 12, 1, UI_NEONP, hdr);
+            ui_text(10, 30, 1, UI_DIM, "L / R : jump letter");
+            ui_fill_round(8, 42, UI_W - 16, 1, 0, UI_RGB(40, 46, 74));
+            for (int r = 0; r < BR_ROWS; r++) { int i = cscroll + r; if (i >= nc) break;
+                int ry = BR_LIST_Y + r * BR_ROWH, rw = UI_W - 16, rh = BR_ROWH - 4, selrow = (i == csel);
+                if (selrow) { ui_glow_round(8, ry, rw, rh, 7, UI_NEON, 3, 16);
+                    ui_vgrad_round(8, ry, rw, rh, 7, UI_RGB(30, 40, 58), UI_RGB(16, 22, 34));
+                    ui_frame_round(8, ry, rw, rh, 7, UI_NEON, 1); }
+                if (cat[i].is_zip) icon_folder(18, ry + 3, UI_NEONP); else icon_movie(18, ry + 3, UI_NEONC);
+                int tx = 46, txr = UI_W - 16, ty = ry + (rh - 8) / 2, tw = ui_text_w(1, cat[i].name);
+                u16 tc = selrow ? UI_WHITE : UI_INK;
+                if (tw <= txr - tx) ui_text(tx, ty, 1, tc, cat[i].name);
+                else if (selrow) { int period = tw + 24, off = g_marq_off % period;
+                    ui_text_clipped(tx - off, ty, 1, tc, cat[i].name, tx, txr);
+                    ui_text_clipped(tx - off + period, ty, 1, tc, cat[i].name, tx, txr); }
+                else { char disp[NAMELEN]; snprintf(disp, sizeof disp, "%s", cat[i].name);
+                    int cm = (txr - tx) / 8; if ((int)strlen(disp) > cm) disp[cm] = 0; ui_text(tx, ty, 1, tc, disp); }
+            }
+            if (nc > BR_ROWS) { int th = BR_ROWS * BR_ROWH - 6, ty = BR_LIST_Y, maxs = nc - BR_ROWS;
+                int hh = th * BR_ROWS / nc; if (hh < 12) hh = 12; int hy = ty + (th - hh) * cscroll / maxs;
+                ui_fill_round(UI_W - 6, ty, 3, th, 1, UI_RGB(30, 34, 52));
+                ui_fill_round(UI_W - 6, hy, 3, hh, 1, UI_NEON); }
+            ui_button(8, 210, 150, 26, "DOWNLOAD", 0, UI_NEON);
+            ui_button(166, 210, 146, 26, "Back", 0, UI_NEONP);
+            ui_present();
+            draw_info_top(&cat[csel], phave ? poster : NULL);
+            shown = csel; redraw = 0;
         }
         gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
     }
@@ -701,29 +824,52 @@ static void download_url_direct(void) {
 
 static void download_screen(void) {
     load_sources();
-    int m = 0, redraw = 1;
+    int m = 0, top = 0, redraw = 1, tdown = 0, tx0 = 0, ty0 = 0, tmoved = 0;
+    const int VIS = 5, bx = 16, bw = UI_W - 32, bh = 26, gap = 6, y0 = 56;
     while (aptMainLoop()) {
         hidScanInput();
-        u32 k = hidKeysDown();
-        if (k & KEY_B) break;
+        u32 k = hidKeysDown(), kh = hidKeysHeld(), ku = hidKeysUp();
         int total = nsources + 2;   /* + URL download + add source */
+        if (k & KEY_B) break;
         if (k & KEY_DOWN) { m = (m + 1) % total; redraw = 1; }
         if (k & KEY_UP)   { m = (m - 1 + total) % total; redraw = 1; }
-        if (k & KEY_A) {
-            if (m < nsources) catalog_browse(&sources[m]);
-            else if (m == nsources) download_url_direct();
-            else add_source_swkbd();
+        if (k & KEY_X && m >= BUILTIN_SOURCES && m < nsources) {   /* remove a user-added source */
+            if (confirm("Remove this source?")) { remove_source(m); total = nsources + 2; if (m >= total) m = total - 1; }
             redraw = 1;
         }
+        int act = -1;
+        if (k & KEY_A) act = m;
+        touchPosition tp; hidTouchRead(&tp);
+        if (k & KEY_TOUCH) { tdown = 1; tx0 = tp.px; ty0 = tp.py; tmoved = 0; }
+        else if ((kh & KEY_TOUCH) && tdown) { if (abs(tp.px - tx0) > 8 || abs(tp.py - ty0) > 8) tmoved = 1; }
+        else if ((ku & KEY_TOUCH) && tdown) { tdown = 0;
+            if (!tmoved) for (int r = 0; r < VIS; r++) { int i = top + r; if (i >= total) break;
+                int by = y0 + r * (bh + gap);
+                if (tx0 >= bx && tx0 < bx + bw && ty0 >= by && ty0 < by + bh) { m = i; act = i; break; } }
+        }
+        if (act >= 0) {
+            if (act < nsources) catalog_browse(&sources[act]);
+            else if (act == nsources) download_url_direct();
+            else add_source_swkbd();
+            load_sources(); redraw = 1;
+        }
+        if (m < top) top = m; if (m >= top + VIS) top = m - VIS + 1;
         if (redraw) {
-            printf("\x1b[2J\x1b[H=== DOWNLOAD: choose source ===\n");
-            printf("Save to: %.30s\n", cwd);
-            printf("A:open  B:back\n\n");
-            for (int i = 0; i < nsources; i++)
-                printf("%c %.36s\n", i == m ? '>' : ' ', sources[i].name);
-            printf("%c + Download from URL\n", m == nsources ? '>' : ' ');
-            printf("%c + Add source (keyboard)\n", m == nsources + 1 ? '>' : ' ');
-            redraw = 0;
+            ui_begin(GFX_BOTTOM);
+            ui_vgrad_round(0, 0, UI_W, UI_H, 0, UI_RGB(16, 18, 32), UI_BG);
+            ui_text_center(UI_W / 2, 12, 2, UI_NEON, "DOWNLOAD");
+            ui_text_center(UI_W / 2, 34, 1, UI_NEONP, "choose a source");
+            ui_glow_round(28, 48, UI_W - 56, 2, 1, UI_NEON, 3, 30);
+            ui_fill_round(28, 48, UI_W - 56, 2, 1, UI_NEON);
+            for (int r = 0; r < VIS; r++) { int i = top + r; if (i >= total) break;
+                int by = y0 + r * (bh + gap); char lbl[64];
+                if (i < nsources) snprintf(lbl, sizeof lbl, "%s%s", sources[i].name, i >= BUILTIN_SOURCES ? "  *" : "");
+                else if (i == nsources) snprintf(lbl, sizeof lbl, "+ Download from URL");
+                else snprintf(lbl, sizeof lbl, "+ Add source");
+                ui_button(bx, by, bw, bh, lbl, i == m, i >= nsources ? UI_NEONC : UI_NEON);
+            }
+            ui_text_center(UI_W / 2, 224, 1, UI_DIM, "* added by you   X removes");
+            ui_present(); redraw = 0;
         }
         gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
     }
@@ -731,24 +877,48 @@ static void download_screen(void) {
 
 /* ---------- ADD MOVIES menu ---------- */
 
-static void add_movies_menu(void) {
-    const char *items[] = { "DOWNLOAD  (from your website)", "UPLOAD    (from a computer)" };
-    int m = 0, redraw = 1;
+/* Reusable neon menu page: title (+ optional subtitle) + vertical touch buttons.
+ * Returns the chosen index, or -1 on B/cancel. Draws the bottom screen only. */
+static int ui_menu(const char *title, const char *subtitle, const char *const *items, int n) {
+    int sel = 0, redraw = 1, tdown = 0, tx0 = 0, ty0 = 0, tmoved = 0;
+    int bx = 24, bw = UI_W - 48, bh = 32, gap = 8, y0 = subtitle ? 74 : 62;
     while (aptMainLoop()) {
         hidScanInput();
-        u32 k = hidKeysDown();
-        if (k & KEY_B) break;
-        if (k & (KEY_UP | KEY_DOWN)) { m ^= 1; redraw = 1; }
-        if (k & KEY_A) {
-            if (m == 0) download_screen(); else upload_screen();
-            redraw = 1;
+        u32 k = hidKeysDown(), kh = hidKeysHeld(), ku = hidKeysUp();
+        if (k & KEY_B) return -1;
+        if (k & KEY_DOWN) { sel = (sel + 1) % n; redraw = 1; }
+        if (k & KEY_UP)   { sel = (sel + n - 1) % n; redraw = 1; }
+        if (k & KEY_A) return sel;
+        touchPosition tp; hidTouchRead(&tp);
+        if (k & KEY_TOUCH) { tdown = 1; tx0 = tp.px; ty0 = tp.py; tmoved = 0; }
+        else if ((kh & KEY_TOUCH) && tdown) { if (abs(tp.px - tx0) > 8 || abs(tp.py - ty0) > 8) tmoved = 1; }
+        else if ((ku & KEY_TOUCH) && tdown) { tdown = 0;
+            if (!tmoved) for (int i = 0; i < n; i++) { int by = y0 + i * (bh + gap);
+                if (tx0 >= bx && tx0 < bx + bw && ty0 >= by && ty0 < by + bh) return i; }
         }
         if (redraw) {
-            printf("\x1b[2J\x1b[H=== ADD MOVIES ===\n\nUp/Down select   A: open   B: back\n\n");
-            for (int i = 0; i < 2; i++) printf("%c %s\n", i == m ? '>' : ' ', items[i]);
-            redraw = 0;
+            ui_begin(GFX_BOTTOM);
+            ui_vgrad_round(0, 0, UI_W, UI_H, 0, UI_RGB(16, 18, 32), UI_BG);
+            ui_text_center(UI_W / 2, 14, 2, UI_NEON, title);
+            ui_glow_round(28, 40, UI_W - 56, 2, 1, UI_NEON, 3, 34);
+            ui_fill_round(28, 40, UI_W - 56, 2, 1, UI_NEON);
+            if (subtitle && subtitle[0]) { char sub[42]; snprintf(sub, sizeof sub, "%s", subtitle);
+                ui_text_center(UI_W / 2, 50, 1, UI_NEONC, sub); }
+            for (int i = 0; i < n; i++) { int by = y0 + i * (bh + gap);
+                ui_button(bx, by, bw, bh, items[i], i == sel, UI_NEON); }
+            ui_present(); redraw = 0;
         }
         gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
+    }
+    return -1;
+}
+
+static void add_movies_menu(void) {
+    for (;;) {
+        const char *items[] = { "DOWNLOAD  (catalog / URL)", "UPLOAD  (over Wi-Fi)" };
+        int c = ui_menu("ADD VIDEOS", NULL, items, 2);
+        if (c < 0) break;
+        if (c == 0) download_screen(); else upload_screen();
     }
 }
 
@@ -913,38 +1083,21 @@ static void getinfo_menu(void) {
     int is_movie = !entries[sel].is_dir && is_moflex(entries[sel].name);
     const char *items[3]; int act[3]; int n = 0;
     if (is_movie) { items[n] = "This movie";                act[n++] = 0; }
-    items[n] = "All movies in this folder (missing only)"; act[n++] = 1;
-    items[n] = "Cancel";                                   act[n++] = 2;
-    int m = 0, redraw = 1;
-    while (aptMainLoop()) {
-        hidScanInput();
-        u32 k = hidKeysDown();
-        if (k & KEY_B) break;
-        if (k & KEY_DOWN) { m = (m + 1) % n; redraw = 1; }
-        if (k & KEY_UP)   { m = (m + n - 1) % n; redraw = 1; }
-        if (k & KEY_A) {
-            int a = act[m];
-            if (a == 0) {
-                char full[PATHLEN + NAMELEN]; snprintf(full, sizeof full, "%s%s", cwd, entries[sel].name);
-                int r = scrape_one(full);   /* forces a refresh, even if it already has info */
-                const char *msg = r == 1 ? "Info + artwork saved."
-                                : r == 2 ? "Info saved, but the poster didn't download.\nTry Get Info again for the artwork."
-                                         : "No catalog had this title.";
-                printf("\x1b[2J\x1b[H=== GET INFO ===\n\n%s\n\nB: back\n", msg);
-                wait_back();
-            } else if (a == 1) {
-                scrape_folder();
-            }
-            break;   /* Cancel (a==2) also lands here */
-        }
-        if (redraw) {
-            printf("\x1b[2J\x1b[H=== GET INFO ===\n\nFetch poster + details from the\ncatalogs (Clownsec, then Zackk).\n\n");
-            if (is_movie) printf("%.38s\n\n", entries[sel].name);
-            for (int i = 0; i < n; i++) printf("%c %s\n", i == m ? '>' : ' ', items[i]);
-            printf("\nB: back\n");
-            redraw = 0;
-        }
-        gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
+    items[n] = "All movies here (missing only)"; act[n++] = 1;
+    items[n] = "Cancel";                         act[n++] = 2;
+    int c = ui_menu("GET INFO", is_movie ? entries[sel].name : NULL, items, n);
+    if (c < 0) return;
+    int a = act[c];
+    if (a == 0) {
+        char full[PATHLEN + NAMELEN]; snprintf(full, sizeof full, "%s%s", cwd, entries[sel].name);
+        int r = scrape_one(full);   /* forces a refresh, even if it already has info */
+        const char *msg = r == 1 ? "Info + artwork saved."
+                        : r == 2 ? "Info saved, but the poster didn't download.\nTry Get Info again for the artwork."
+                                 : "No catalog had this title.";
+        printf("\x1b[2J\x1b[H=== GET INFO ===\n\n%s\n\nB: back\n", msg);
+        wait_back();
+    } else if (a == 1) {
+        scrape_folder();
     }
 }
 
@@ -953,29 +1106,12 @@ static void manage_menu(void) {
     char full[PATHLEN + NAMELEN];
     snprintf(full, sizeof(full), "%s%s", cwd, entries[sel].name);
     const char *items[] = { "DELETE", "MOVE (cut)", "CANCEL" };
-    int m = 0, redraw = 1;
-    while (aptMainLoop()) {
-        hidScanInput();
-        u32 k = hidKeysDown();
-        if (k & KEY_B) break;
-        if (k & KEY_DOWN) { m = (m + 1) % 3; redraw = 1; }
-        if (k & KEY_UP)   { m = (m + 2) % 3; redraw = 1; }
-        if (k & KEY_A) {
-            if (m == 0) { if (confirm("Delete this item?")) { remove(full); scan(); } }
-            else if (m == 1) {
-                snprintf(move_src, sizeof(move_src), "%s", full);
-                snprintf(move_name, sizeof(move_name), "%s", entries[sel].name);
-                move_pending = 1;
-            }
-            break;
-        }
-        if (redraw) {
-            printf("\x1b[2J\x1b[H=== MANAGE ===\n\n%.38s\n\n", entries[sel].name);
-            for (int i = 0; i < 3; i++) printf("%c %s\n", i == m ? '>' : ' ', items[i]);
-            printf("\nB: back\n");
-            redraw = 0;
-        }
-        gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
+    int c = ui_menu("MANAGE", entries[sel].name, items, 3);
+    if (c == 0) { if (confirm("Delete this item?")) { remove(full); scan(); } }
+    else if (c == 1) {
+        snprintf(move_src, sizeof(move_src), "%s", full);
+        snprintf(move_name, sizeof(move_name), "%s", entries[sel].name);
+        move_pending = 1;
     }
 }
 
@@ -990,32 +1126,57 @@ static void do_paste(void) {
 /* play a movie file, then restore the menu screens. returns the play result. */
 /* Choose which embedded moflex to play when a CIA holds several. Returns index, or -1 = back. */
 static int pick_moflex(const CiaMoflex *list, int n) {
-    int sel = 0, top = 0, prev = -1, hold = 0;
-    for (;;) {
-        if (!aptMainLoop()) return -1;
-        if (sel != prev) {                                  /* redraw only on change (in place, no flash) */
-            if (sel < top) top = sel; if (sel >= top + 20) top = sel - 19;
-            printf("\x1b[H=== CHOOSE VIDEO ===\x1b[K\n%d in this CIA\x1b[K\nUp/Dn  A:play  B:back\x1b[K\n\x1b[K\n", n);
-            for (int i = top; i < top + 20; i++) {
-                if (i < n) {
-                    char nm[64]; snprintf(nm, sizeof nm, "%s", list[i].name);
-                    size_t L = strlen(nm); if (L > 7 && !strcasecmp(nm + L - 7, ".moflex")) nm[L - 7] = 0;
-                    printf("%c%.30s %lldMB\x1b[K\n", i == sel ? '>' : ' ', nm, (long long)(list[i].size / 1000000));
-                } else printf("\x1b[K\n");
+    int sel = 0, top = 0, redraw = 1, tdown = 0, tx0 = 0, ty0 = 0, tsc0 = 0, tmoved = 0;
+    const int VIS = 5, ry0 = 54, rh = 30, gap = 4;
+    while (aptMainLoop()) {
+        hidScanInput();
+        u32 k = hidKeysDown(), kh = hidKeysHeld(), ku = hidKeysUp();
+        if (k & KEY_B) return -1;
+        if (k & KEY_DOWN) { if (sel < n - 1) sel++; redraw = 1; }
+        if (k & KEY_UP)   { if (sel > 0) sel--; redraw = 1; }
+        if (k & KEY_A) return sel;
+        touchPosition tp; hidTouchRead(&tp);
+        if (k & KEY_TOUCH) { tdown = 1; tx0 = tp.px; ty0 = tp.py; tsc0 = top; tmoved = 0; }
+        else if ((kh & KEY_TOUCH) && tdown) { int dy = tp.py - ty0;
+            if (dy > 6 || dy < -6) tmoved = 1;
+            if (tmoved && n > VIS) { int maxs = n - VIS, ns = tsc0 - dy / (rh + gap);
+                if (ns < 0) ns = 0; if (ns > maxs) ns = maxs; if (ns != top) { top = ns; redraw = 1; } } }
+        else if ((ku & KEY_TOUCH) && tdown) { tdown = 0;
+            if (!tmoved) for (int r = 0; r < VIS; r++) { int i = top + r; if (i >= n) break;
+                int by = ry0 + r * (rh + gap);
+                if (ty0 >= by && ty0 < by + rh) return i; } }
+        if (sel < top) top = sel; if (sel >= top + VIS) top = sel - VIS + 1;
+        if (redraw) {
+            ui_begin(GFX_BOTTOM);
+            ui_vgrad_round(0, 0, UI_W, UI_H, 0, UI_RGB(16, 18, 32), UI_BG);
+            ui_text_center(UI_W / 2, 12, 2, UI_NEON, "CHOOSE VIDEO");
+            char sub[32]; snprintf(sub, sizeof sub, "%d in this CIA", n);
+            ui_text_center(UI_W / 2, 34, 1, UI_NEONP, sub);
+            ui_glow_round(28, 48, UI_W - 56, 2, 1, UI_NEON, 3, 30);
+            ui_fill_round(28, 48, UI_W - 56, 2, 1, UI_NEON);
+            for (int r = 0; r < VIS; r++) { int i = top + r; if (i >= n) break;
+                int by = ry0 + r * (rh + gap), selrow = (i == sel), rw = UI_W - 16;
+                if (selrow) { ui_glow_round(8, by, rw, rh, 7, UI_NEON, 3, 16);
+                    ui_vgrad_round(8, by, rw, rh, 7, UI_RGB(30, 40, 58), UI_RGB(16, 22, 34));
+                    ui_frame_round(8, by, rw, rh, 7, UI_NEON, 1); }
+                icon_movie(18, by + (rh - 16) / 2, UI_NEONC);
+                char nm[64]; snprintf(nm, sizeof nm, "%s", list[i].name); strip_ext(nm);
+                char sz[16]; snprintf(sz, sizeof sz, "%lldMB", (long long)(list[i].size / 1000000));
+                int nmax = (rw - 46 - (int)strlen(sz) * 8 - 16) / 8;
+                if (nmax > 0 && (int)strlen(nm) > nmax) nm[nmax] = 0;
+                ui_text(46, by + (rh - 8) / 2, 1, selrow ? UI_WHITE : UI_INK, nm);
+                ui_text(8 + rw - (int)strlen(sz) * 8 - 8, by + (rh - 8) / 2, 1, UI_DIM, sz);
             }
-            printf("\x1b[J");
-            prev = sel;
+            if (n > VIS) { int th = VIS * (rh + gap) - gap, ty = ry0, maxs = n - VIS;
+                int hh = th * VIS / n; if (hh < 12) hh = 12; int hy = ty + (th - hh) * top / maxs;
+                ui_fill_round(UI_W - 6, ty, 3, th, 1, UI_RGB(30, 34, 52));
+                ui_fill_round(UI_W - 6, hy, 3, hh, 1, UI_NEON); }
+            ui_text_center(UI_W / 2, 226, 1, UI_DIM, "tap a video   B back");
+            ui_present(); redraw = 0;
         }
         gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
-        hidScanInput();
-        u32 k = hidKeysDown(), kh = hidKeysHeld();
-        if (kh & (KEY_DOWN | KEY_UP)) hold++; else hold = 0;
-        int step = (k & (KEY_DOWN | KEY_UP)) || (hold > 12 && hold % 4 == 0);
-        if (step && (kh & KEY_DOWN) && sel < n - 1) sel++;
-        if (step && (kh & KEY_UP)   && sel > 0)     sel--;
-        if (k & KEY_A) return sel;
-        if (k & KEY_B) return -1;
     }
+    return -1;
 }
 
 static MoflexResult play_movie(const char *path) {
@@ -1062,57 +1223,208 @@ static MoflexResult play_movie(const char *path) {
 /* ---------- browser (used by OPEN and MANAGE) ---------- */
 /* returns: 1 = exit app, 0 = back to the player home, 2 = a file was picked (sel_out set) */
 
+/* ---------- graphical (touch) Open-Video browser ---------- */
+typedef struct { int x, y, w, h; const char *label; u16 accent; } ActBtn;
+static ActBtn g_act[3] = {
+    {   8, 210, 94, 26, "OPEN", UI_NEON },
+    { 112, 210, 94, 26, "INFO", UI_NEONC },
+    { 216, 210, 96, 26, "Back", UI_NEONP },
+};
+static void icon_folder(int x, int y, u16 c) {
+    ui_fill_round(x, y, 9, 4, 1, c);          /* tab */
+    ui_fill_round(x, y + 3, 20, 13, 3, c);    /* body */
+}
+static void icon_movie(int x, int y, u16 c) {
+    ui_frame_round(x, y + 1, 20, 14, 3, c, 1);
+    ui_play(x + 11, y + 8, 8, c);
+}
+static void icon_file(int x, int y, u16 c) {   /* generic document (manage: non-movie files) */
+    ui_frame_round(x + 2, y, 16, 16, 2, c, 1);
+    ui_fill_round(x + 5, y + 4, 10, 1, 0, c);
+    ui_fill_round(x + 5, y + 7, 10, 1, 0, c);
+    ui_fill_round(x + 5, y + 10, 7, 1, 0, c);
+}
+static void strip_ext(char *d) {
+    size_t L = strlen(d);
+    if (L > 7 && !strcasecmp(d + L - 7, ".moflex")) d[L - 7] = 0;
+    else if (L > 4 && !strcasecmp(d + L - 4, ".zip")) d[L - 4] = 0;
+    else if (L > 4 && !strcasecmp(d + L - 4, ".cia")) d[L - 4] = 0;
+}
+static void browser_draw_gfx(int mode) {
+    int manage = (mode == MODE_MANAGE);
+    ui_begin(GFX_BOTTOM);
+    ui_vgrad_round(0, 0, UI_W, UI_H, 0, UI_RGB(16, 18, 32), UI_BG);
+    ui_text(10, 8, 2, UI_NEON, manage ? "MANAGE" : "OPEN VIDEO");
+    if (manage && move_pending) ui_text(UI_W - 96, 9, 1, UI_NEONC, "MOVE ready");
+    else if (!manage && s_show_hidden) ui_text(UI_W - 74, 9, 1, UI_NEONP, "SYS on");
+    /* current path (tail-trimmed to fit) */
+    char pth[64]; int mc = (UI_W - 20) / 8;
+    if ((int)strlen(cwd) > mc) snprintf(pth, sizeof pth, "...%s", cwd + strlen(cwd) - (mc - 3));
+    else snprintf(pth, sizeof pth, "%s", cwd);
+    ui_text(10, 30, 1, UI_DIM, pth);
+    ui_fill_round(8, 42, UI_W - 16, 1, 0, UI_RGB(40, 46, 74));
+
+    int maxs = nentries > BR_ROWS ? nentries - BR_ROWS : 0;
+    if (scroll > maxs) scroll = maxs; if (scroll < 0) scroll = 0;
+    if (nentries == 0) ui_text_center(UI_W / 2, 116, 1, UI_DIM, "(nothing here)");
+    for (int r = 0; r < BR_ROWS; r++) {
+        int i = scroll + r; if (i >= nentries) break;
+        int ry = BR_LIST_Y + r * BR_ROWH, rw = UI_W - 16, rh = BR_ROWH - 4, selrow = (i == sel);
+        if (selrow) {
+            ui_glow_round(8, ry, rw, rh, 7, UI_NEON, 3, 16);
+            ui_vgrad_round(8, ry, rw, rh, 7, UI_RGB(30, 40, 58), UI_RGB(16, 22, 34));
+            ui_frame_round(8, ry, rw, rh, 7, UI_NEON, 1);
+        }
+        if (entries[i].is_dir)      icon_folder(18, ry + 3, UI_RGB(240, 205, 110));
+        else if (is_moflex(entries[i].name)) icon_movie(18, ry + 3, UI_NEONC);
+        else                        icon_file(18, ry + 3, UI_DIM);
+        char disp[NAMELEN]; snprintf(disp, sizeof disp, "%s", entries[i].name);
+        if (!entries[i].is_dir && !manage) strip_ext(disp);   /* manage shows real filenames */
+        int tx = 46, txr = UI_W - 16, ty = ry + (rh - 8) / 2, tw = ui_text_w(1, disp);
+        u16 tc = selrow ? UI_WHITE : UI_INK;
+        if (tw <= txr - tx) {
+            ui_text(tx, ty, 1, tc, disp);
+        } else if (selrow) {   /* marquee the selected long title */
+            int period = tw + 24, off = g_marq_off % period;
+            ui_text_clipped(tx - off, ty, 1, tc, disp, tx, txr);
+            ui_text_clipped(tx - off + period, ty, 1, tc, disp, tx, txr);   /* wrap copy */
+        } else {
+            int cmax = (txr - tx) / 8; if ((int)strlen(disp) > cmax) disp[cmax] = 0;
+            ui_text(tx, ty, 1, tc, disp);
+        }
+    }
+    if (nentries > BR_ROWS) {   /* scrollbar */
+        int th = BR_ROWS * BR_ROWH - 6, ty = BR_LIST_Y;
+        int hh = th * BR_ROWS / nentries; if (hh < 12) hh = 12;
+        int hy = ty + (th - hh) * scroll / maxs;
+        ui_fill_round(UI_W - 6, ty, 3, th, 1, UI_RGB(30, 34, 52));
+        ui_fill_round(UI_W - 6, hy, 3, hh, 1, UI_NEON);
+    }
+    const char *bl0 = manage ? (move_pending ? "PASTE" : "EDIT") : "OPEN";
+    const char *bl1 = manage ? (s_manage_movies_only ? "MOVIES" : "ALL") : "INFO";
+    ui_button(g_act[0].x, g_act[0].y, g_act[0].w, g_act[0].h, bl0, 0, UI_NEON);
+    ui_button(g_act[1].x, g_act[1].y, g_act[1].w, g_act[1].h, bl1, 0, UI_NEONC);
+    ui_button(g_act[2].x, g_act[2].y, g_act[2].w, g_act[2].h, "Back", 0, UI_NEONP);
+    ui_present();
+}
+static void browser_redraw(int mode) { browser_draw_gfx(mode); }
+#define BR_FOLLOW() do { \
+        if (sel < scroll) scroll = sel; else if (sel >= scroll + BR_ROWS) scroll = sel - BR_ROWS + 1; } while (0)
+
 static int browser(int mode, char *sel_out, size_t sel_cap) {
     s_filter_movies = (mode != MODE_MANAGE) ? 1 : s_manage_movies_only;   /* play=movies; manage=toggle */
     scan();
-    draw_browser(mode);
+    browser_redraw(mode);
     if (mode == MODE_PLAY) gfxSet3D(false);   /* top becomes a 2D poster/info panel while browsing */
     int hfu = 0, hfd = 0;
     int top_sel = -1, top_settle = 0, top_pending = 1;   /* debounced top-screen render (play mode) */
+    int tdown = 0, tx0 = 0, ty0 = 0, tsc0 = 0, tmoved = 0;   /* touch state (play mode) */
+    int marq_frame = 0, marq_sel = -1;                       /* title marquee */
     while (aptMainLoop()) {
         hidScanInput();
         u32 k = hidKeysDown();
         u32 kh = hidKeysHeld();
+        u32 ku = hidKeysUp();
         if (k & KEY_START) { if (mode == MODE_PLAY) branding_show(); return 1; }
 
         if (nentries) {
-            if (nav_repeat(k, kh, NAV_DOWN, &hfd)) { if (sel < nentries - 1) sel++; draw_browser(mode); }
-            if (nav_repeat(k, kh, NAV_UP,   &hfu)) { if (sel > 0) sel--;           draw_browser(mode); }
-            if (k & KEY_RIGHT) { sel += ROWS; if (sel > nentries - 1) sel = nentries - 1; draw_browser(mode); }
-            if (k & KEY_LEFT)  { sel -= ROWS; if (sel < 0) sel = 0; draw_browser(mode); }
+            if (nav_repeat(k, kh, NAV_DOWN, &hfd)) { if (sel < nentries - 1) sel++; BR_FOLLOW(); browser_redraw(mode); }
+            if (nav_repeat(k, kh, NAV_UP,   &hfu)) { if (sel > 0) sel--;           BR_FOLLOW(); browser_redraw(mode); }
+            if (k & KEY_RIGHT) { sel += BR_ROWS; if (sel > nentries - 1) sel = nentries - 1; BR_FOLLOW(); browser_redraw(mode); }
+            if (k & KEY_LEFT)  { sel -= BR_ROWS; if (sel < 0) sel = 0; BR_FOLLOW(); browser_redraw(mode); }
         }
-        if (k & KEY_SELECT) { scan(); draw_browser(mode); top_pending = 1; top_sel = -1; }
+        if (k & KEY_SELECT) { scan(); browser_redraw(mode); top_pending = 1; top_sel = -1; }
         if (k & KEY_Y) {
             if (mode == MODE_MANAGE) {   /* toggle: all files vs movies only */
                 s_manage_movies_only = !s_manage_movies_only;
                 s_filter_movies = s_manage_movies_only;
                 if (sel > 0) sel = 0;
-                scan(); draw_browser(mode);
+                scan(); browser_redraw(mode);
             } else {                     /* play mode: reveal / hide system folders + dotfiles */
                 s_show_hidden = !s_show_hidden;
-                sel = 0; scan(); draw_browser(mode); top_pending = 1; top_sel = -1;
+                sel = 0; scroll = 0; scan(); browser_redraw(mode); top_pending = 1; top_sel = -1;
             }
         }
-        if (k & KEY_R && move_pending) { do_paste(); draw_browser(mode); }
+        if (k & KEY_R && move_pending) { do_paste(); browser_redraw(mode); }
         if (k & KEY_B) {
             if (at_root()) { if (mode == MODE_PLAY) branding_show(); return 0; }   /* leave -> home menu */
-            go_up(); draw_browser(mode); top_pending = 1; top_sel = -1;
+            go_up(); browser_redraw(mode); top_pending = 1; top_sel = -1;
         }
         if (k & KEY_X && nentries) {
             if (mode == MODE_PLAY) getinfo_menu();   /* Open Video: X = Get Info (Manage lives in its own screen) */
             else                   manage_menu();
-            scan(); draw_browser(mode); top_pending = 1; top_sel = -1;
+            scan(); browser_redraw(mode); top_pending = 1; top_sel = -1;
         }
         if (k & KEY_A && nentries) {
             if (entries[sel].is_dir) {
                 enter_dir(entries[sel].name);
-                draw_browser(mode); top_pending = 1; top_sel = -1;
+                browser_redraw(mode); top_pending = 1; top_sel = -1;
             } else if (mode == MODE_MANAGE) {
-                manage_menu(); scan(); draw_browser(mode);
+                manage_menu(); scan(); browser_redraw(mode);
             } else {   /* MODE_PLAY: hand the selection back to main to play */
                 if (sel_out) snprintf(sel_out, sel_cap, "%s%s", cwd, entries[sel].name);
                 return 2;
             }
+        }
+        /* ---- touch: drag to scroll, tap a row, tap an action button (both modes) ---- */
+        {
+            touchPosition tp; hidTouchRead(&tp);
+            if (k & KEY_TOUCH) { tdown = 1; tx0 = tp.px; ty0 = tp.py; tsc0 = scroll; tmoved = 0; }
+            else if ((kh & KEY_TOUCH) && tdown) {
+                int dy = tp.py - ty0;
+                if (dy > 6 || dy < -6) tmoved = 1;
+                if (tmoved && nentries > BR_ROWS) {
+                    int maxs = nentries - BR_ROWS, ns = tsc0 - dy / BR_ROWH;
+                    if (ns < 0) ns = 0; if (ns > maxs) ns = maxs;
+                    if (ns != scroll) { scroll = ns; browser_redraw(mode); }
+                }
+            } else if ((ku & KEY_TOUCH) && tdown) {
+                tdown = 0;
+                if (!tmoved) {
+                    int acted = 0;
+                    for (int i = 0; i < 3 && !acted; i++) {   /* action buttons */
+                        ActBtn *b = &g_act[i];
+                        if (tx0 < b->x || tx0 >= b->x + b->w || ty0 < b->y || ty0 >= b->y + b->h) continue;
+                        acted = 1;
+                        if (i == 2) {   /* Back */
+                            if (at_root()) { if (mode == MODE_PLAY) branding_show(); return 0; }
+                            go_up(); browser_redraw(mode); top_pending = 1; top_sel = -1;
+                        } else if (i == 1) {   /* INFO (play) / FILTER (manage) */
+                            if (mode == MODE_MANAGE) { s_manage_movies_only = !s_manage_movies_only;
+                                s_filter_movies = s_manage_movies_only; sel = 0; scroll = 0; scan(); browser_redraw(mode); }
+                            else if (nentries) { getinfo_menu(); scan(); browser_redraw(mode); top_pending = 1; top_sel = -1; }
+                        } else {   /* i==0: OPEN (play) / PASTE|EDIT (manage) */
+                            if (mode == MODE_MANAGE) {
+                                if (move_pending) { do_paste(); browser_redraw(mode); }
+                                else if (nentries) { manage_menu(); scan(); browser_redraw(mode); }
+                            } else if (nentries) {
+                                if (entries[sel].is_dir) { enter_dir(entries[sel].name); browser_redraw(mode); top_pending = 1; top_sel = -1; }
+                                else { if (sel_out) snprintf(sel_out, sel_cap, "%s%s", cwd, entries[sel].name); return 2; }
+                            }
+                        }
+                    }
+                    if (!acted && ty0 >= BR_LIST_Y && nentries) {   /* tap a list row */
+                        int i = scroll + (ty0 - BR_LIST_Y) / BR_ROWH;
+                        if (i >= 0 && i < nentries && i < scroll + BR_ROWS) {
+                            sel = i; top_sel = -1; top_pending = 1;
+                            if (entries[i].is_dir) { enter_dir(entries[i].name); browser_redraw(mode); }
+                            else if (mode == MODE_MANAGE) { manage_menu(); scan(); browser_redraw(mode); }
+                            else { if (sel_out) snprintf(sel_out, sel_cap, "%s%s", cwd, entries[i].name); return 2; }
+                        }
+                    }
+                }
+            }
+        }
+        /* marquee: scroll the selected row's title when it's too long to fit (both modes) */
+        {
+            if (sel != marq_sel) { marq_sel = sel; g_marq_off = 0; marq_frame = 0; }
+            int over = 0;
+            if (nentries && sel >= scroll && sel < scroll + BR_ROWS) {
+                char d[NAMELEN]; snprintf(d, sizeof d, "%s", entries[sel].name);
+                if (!entries[sel].is_dir && mode == MODE_PLAY) strip_ext(d);
+                if (ui_text_w(1, d) > (UI_W - 16) - 46) over = 1;
+            }
+            if (over && ++marq_frame >= 3) { marq_frame = 0; g_marq_off += 2; browser_redraw(mode); }
         }
         /* debounced top-screen panel for the highlighted entry (play mode only) */
         if (mode == MODE_PLAY) {
@@ -1137,53 +1449,59 @@ static int browser(int mode, char *sel_out, size_t sel_cap) {
 
 typedef struct { int x, y, w, h; const char *label; int choice; } HomeBtn;
 static HomeBtn g_btns[3] = {
-    {   6, 210,  92, 24, "OPEN VIDEO",    0 },
-    { 106, 210, 108, 24, "MANAGE VIDEOS", 2 },
-    { 222, 210,  92, 24, "ADD VIDEOS",    1 },
+    {   8, 200,  94, 32, "OPEN VIDEO", 0 },
+    { 110, 200, 100, 32, "MANAGE",     2 },
+    { 218, 200,  94, 32, "ADD VIDEOS", 1 },
 };
+#define HOME_PCX (UI_W / 2)   /* PLAY circle centre */
+#define HOME_PCY 120
+#define HOME_PR  27
 
 static void home_draw(int bsel, long long rpos) {
     ui_begin(GFX_BOTTOM);
-    ui_clear(UI_BLACK);
+    ui_vgrad_round(0, 0, UI_W, UI_H, 0, UI_RGB(16, 18, 32), UI_BG);   /* dark gradient backdrop */
 
     int loaded = g_now_playing[0] != 0;
 
-    /* app title */
-    ui_text_center(UI_W / 2, 12, 2, UI_WHITE, "CLOWNSEC VIDEO");
-    ui_text(UI_W - 52, 2, 1, UI_RGB(90, 90, 90), APP_VERSION);   /* version (bump for releases) */
+    /* title + neon divider */
+    ui_text_center(UI_W / 2, 12, 2, UI_NEON, "CLOWNSEC");
+    ui_text(UI_W - 52, 3, 1, UI_DIM, APP_VERSION);
+    ui_text_center(UI_W / 2, 32, 1, UI_NEONP, "3DS VIDEO PLAYER");
+    ui_glow_round(28, 46, UI_W - 56, 2, 1, UI_NEON, 3, 34);
+    ui_fill_round(28, 46, UI_W - 56, 2, 1, UI_NEON);
 
-    /* loaded movie name, or a prompt */
+    /* now-playing card */
+    int cx = 16, cy = 58, cw = UI_W - 32, ch = 128;
+    ui_fill_round(cx, cy, cw, ch, 12, UI_BG2);
+    ui_frame_round(cx, cy, cw, ch, 12, UI_RGB(42, 48, 74), 1);
+
     if (loaded) {
         char nm[80]; snprintf(nm, sizeof(nm), "%s", g_now_playing);
-        int maxc = (UI_W - 12) / 8;
-        if ((int)strlen(nm) > maxc) nm[maxc] = 0;
-        ui_text_center(UI_W / 2, 44, 1, UI_RGB(120, 200, 255), nm);
+        int maxc = (cw - 16) / 8; if ((int)strlen(nm) > maxc) nm[maxc] = 0;
+        ui_text_center(UI_W / 2, cy + 12, 1, UI_NEONC, nm);
     } else {
-        ui_text_center(UI_W / 2, 44, 1, UI_GRAY, "No video loaded");
+        ui_text_center(UI_W / 2, cy + 12, 1, UI_DIM, "No video loaded");
     }
 
-    /* big PLAY button (not a scrubber) */
-    int pcx = UI_W / 2, pcy = 104;
-    ui_play(pcx, pcy, 46, loaded ? UI_RGB(120, 255, 160) : UI_WHITE);
-    ui_text_center(pcx, pcy + 36, 1, UI_GRAY,
-                   loaded ? "PLAY / RESUME" : "PLAY - choose a video");
+    /* big glowing PLAY circle */
+    int pcx = HOME_PCX, pcy = HOME_PCY, R = HOME_PR;
+    u16 pcol = loaded ? UI_NEON : UI_INK;
+    ui_glow_round(pcx - R, pcy - R, 2 * R, 2 * R, R, pcol, 6, 22);
+    ui_vgrad_round(pcx - R, pcy - R, 2 * R, 2 * R, R, UI_RGB(26, 32, 48), UI_RGB(14, 18, 28));
+    ui_frame_round(pcx - R, pcy - R, 2 * R, 2 * R, R, pcol, 2);
+    ui_play(pcx + 3, pcy, 22, pcol);
 
-    /* real resume time as plain text (no fake progress bar) */
+    ui_text_center(pcx, cy + ch - 30, 1, UI_INK, loaded ? "PLAY / RESUME" : "PLAY - choose a video");
     if (loaded && rpos > 0) {
         long t = (long)(rpos / 1000000);
         char rt[40]; snprintf(rt, sizeof(rt), "resume at %ld:%02ld", t / 60, t % 60);
-        ui_text_center(pcx, pcy + 50, 1, UI_RGB(150, 150, 150), rt);
+        ui_text_center(pcx, cy + ch - 16, 1, UI_DIM, rt);
     }
 
-    /* three buttons */
+    /* three neon buttons */
     for (int i = 0; i < 3; i++) {
         HomeBtn *b = &g_btns[i];
-        if (i == bsel) {
-            ui_fill(b->x, b->y, b->w, b->h, UI_WHITE);
-            ui_text(b->x + 4, b->y + 8, 1, UI_BLACK, b->label);
-        } else {
-            ui_text(b->x + 4, b->y + 8, 1, UI_WHITE, b->label);
-        }
+        ui_button(b->x, b->y, b->w, b->h, b->label, i == bsel, UI_NEON);
     }
 }
 
@@ -1207,7 +1525,8 @@ static int home_gui(void) {
                     return b->choice;
             }
             /* PLAY button: resume the loaded movie, or open the browser if none */
-            if (t.px > UI_W/2 - 34 && t.px < UI_W/2 + 34 && t.py > 78 && t.py < 148)
+            if (t.px > HOME_PCX - HOME_PR - 6 && t.px < HOME_PCX + HOME_PR + 6 &&
+                t.py > HOME_PCY - HOME_PR - 6 && t.py < HOME_PCY + HOME_PR + 6)
                 return g_now_playing_path[0] ? 3 : 0;
         }
 
@@ -1219,6 +1538,20 @@ static int home_gui(void) {
         gspWaitForVBlank();
     }
     return -1;
+}
+
+/* Play a movie; if the user taps OPEN in the player, jump straight to the browser to pick
+ * another (looping). Returns 1 if the app should exit. */
+static int play_and_handle(const char *path) {
+    MoflexResult r = play_movie(path);
+    while (r == MOFLEX_QUIT_OPEN) {
+        char np[PATHLEN + NAMELEN];
+        int b = browser(MODE_PLAY, np, sizeof np);
+        if (b == 1) return 1;             /* START in browser -> exit */
+        if (b == 2) r = play_movie(np);   /* picked a file -> play it */
+        else return 0;                    /* backed out -> home screen */
+    }
+    return (r == MOFLEX_QUIT_EXIT) ? 1 : 0;
 }
 
 /* ---------- main ---------- */
@@ -1246,12 +1579,12 @@ int main(void) {
             char path[PATHLEN + NAMELEN];
             int r = browser(MODE_PLAY, path, sizeof(path));
             if (r == 1) running = 0;
-            else if (r == 2 && play_movie(path) == MOFLEX_QUIT_EXIT) running = 0;
+            else if (r == 2 && play_and_handle(path)) running = 0;
         }
         else if (choice == 1) { add_movies_menu(); }
         else if (choice == 2) { if (browser(MODE_MANAGE, NULL, 0) == 1) running = 0; }
         else if (choice == 3) {                  /* PLAY: resume the loaded movie */
-            if (g_now_playing_path[0] && play_movie(g_now_playing_path) == MOFLEX_QUIT_EXIT) running = 0;
+            if (g_now_playing_path[0] && play_and_handle(g_now_playing_path)) running = 0;
         }
     }
 

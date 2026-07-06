@@ -18,6 +18,7 @@ typedef struct {
     int  runtime;             /* minutes */
     long long size;           /* file size in bytes (0 if unknown) */
     int  is_zip;              /* 1 = .zip (TV season) */
+    int  is3d;                /* 1 = 3D, 0 = 2D, -1 = unknown (guess from filename) */
 } CatEntry;
 
 /* kind: 0 = clownsec shape (movies[]/tvShows[]), 1 = zackk shape (items[]).

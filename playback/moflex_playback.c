@@ -170,6 +170,15 @@ static void bw_exit(void) {
 #define VOL_H 108
 #define BACK_X 6
 #define BACK_Y 220
+/* bottom action buttons: BACK (home) / OPEN (new file) / EXIT (quit app) */
+#define BTN_Y 208
+#define BTN_H 28
+#define BKB_X 8
+#define BKB_W 86
+#define OPB_X 98
+#define OPB_W 86
+#define EXB_X 188
+#define EXB_W 88
 
 static void fmt_time(int64_t us, char *o, int cap) {
     if (us < 0) us = 0;
@@ -184,42 +193,49 @@ static int g_dbg_fps = 0, g_dbg_dec10 = 0, g_dbg_blit10 = 0, g_dbg_aud10 = 0;
 
 static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing) {
     ui_begin(GFX_BOTTOM);
-    ui_clear(UI_BLACK);
+    ui_vgrad_round(0, 0, UI_W, UI_H, 0, UI_RGB(16, 18, 32), UI_BG);
 
-    ui_text(6, 6, 1, UI_WHITE, title);
-
-    if (g_old3d_warn)   /* Old 3DS can't keep up with 3D's doubled frame rate */
-        ui_text(6, 44, 1, UI_RED, "3D Has Performance Issues on Old3DS");
+    ui_text_clipped(10, 8, 1, UI_NEON, title, 10, VOL_X - 12);   /* clipped so it can't run into volume */
 
     char tc[16], td[16], line[40];
     fmt_time(cur, tc, sizeof(tc));
     fmt_time(dur, td, sizeof(td));
     snprintf(line, sizeof(line), "%s / %s", tc, td);
-    ui_text(6, 28, 1, UI_GRAY, line);
+    ui_text(10, 26, 1, UI_NEONC, line);
+    if (g_old3d_warn)   /* Old 3DS can't keep up with 3D's doubled frame rate */
+        ui_text(10, 42, 1, UI_RED, "3D Has Performance Issues on Old3DS");
 
-    /* progress bar */
+    /* progress bar: rounded track + neon fill + glowing knob */
     double frac = dur > 0 ? (double)cur / (double)dur : 0.0;
     if (frac > 1) frac = 1;
-    ui_fill(BAR_X, BAR_Y, BAR_W, BAR_H, UI_RGB(60, 60, 60));
-    ui_fill(BAR_X, BAR_Y, (int)(BAR_W * frac), BAR_H, UI_WHITE);
-    int kx = BAR_X + (int)(BAR_W * frac);
-    ui_fill(kx - 2, BAR_Y - 3, 5, BAR_H + 6, UI_RGB(80, 160, 255));
+    ui_fill_round(BAR_X, BAR_Y, BAR_W, BAR_H, BAR_H / 2, UI_RGB(32, 36, 56));
+    int fw = (int)(BAR_W * frac);
+    if (fw > 0) ui_fill_round(BAR_X, BAR_Y, fw, BAR_H, BAR_H / 2, UI_NEON);
+    int kx = BAR_X + fw, ky = BAR_Y + BAR_H / 2, kr = 8;
+    ui_glow_round(kx - kr, ky - kr, 2 * kr, 2 * kr, kr, UI_NEON, 4, 26);
+    ui_fill_round(kx - kr, ky - kr, 2 * kr, 2 * kr, kr, UI_WHITE);
 
-    /* transport: RW (<<)   play/pause   FF (>>) */
-    ui_play_l(RW_CX - 5, PLAY_CY, 15, UI_WHITE); ui_play_l(RW_CX + 6, PLAY_CY, 15, UI_WHITE);
-    if (playing) ui_pause(PLAY_CX, PLAY_CY, 26, UI_WHITE);
-    else         ui_play(PLAY_CX, PLAY_CY, 30, UI_WHITE);
-    ui_play(FF_CX - 6, PLAY_CY, 15, UI_WHITE); ui_play(FF_CX + 5, PLAY_CY, 15, UI_WHITE);
+    /* transport: RW (<<)   glowing play/pause   FF (>>) */
+    ui_play_l(RW_CX - 5, PLAY_CY, 14, UI_NEONC); ui_play_l(RW_CX + 6, PLAY_CY, 14, UI_NEONC);
+    ui_play(FF_CX - 6, PLAY_CY, 14, UI_NEONC);   ui_play(FF_CX + 5, PLAY_CY, 14, UI_NEONC);
+    int R = 24;
+    ui_glow_round(PLAY_CX - R, PLAY_CY - R, 2 * R, 2 * R, R, UI_NEON, 6, 22);
+    ui_vgrad_round(PLAY_CX - R, PLAY_CY - R, 2 * R, 2 * R, R, UI_RGB(26, 32, 48), UI_RGB(14, 18, 28));
+    ui_frame_round(PLAY_CX - R, PLAY_CY - R, 2 * R, 2 * R, R, UI_NEON, 2);
+    if (playing) ui_pause(PLAY_CX, PLAY_CY, 22, UI_NEON);
+    else         ui_play(PLAY_CX + 2, PLAY_CY, 22, UI_NEON);
 
     /* volume slider (vertical, right) */
-    ui_fill(VOL_X, VOL_Y, 12, VOL_H, UI_RGB(60, 60, 60));
+    ui_fill_round(VOL_X, VOL_Y, 12, VOL_H, 6, UI_RGB(32, 36, 56));
     int vf = (int)(VOL_H * (g_vol / 4.0f));
-    ui_fill(VOL_X, VOL_Y + VOL_H - vf, 12, vf, UI_RGB(80, 160, 255));
+    if (vf > 0) ui_fill_round(VOL_X, VOL_Y + VOL_H - vf, 12, vf, 6, UI_NEON);
     char vs[8]; snprintf(vs, sizeof(vs), "%d%%", (int)(g_vol * 100 + 0.5f));
-    ui_text(VOL_X - 18, VOL_Y + VOL_H + 4, 1, UI_WHITE, vs);
+    ui_text(VOL_X - 16, VOL_Y + VOL_H + 4, 1, UI_INK, vs);
 
-    /* control hint */
-    ui_text_center(UI_W / 2, 225, 1, UI_GRAY, "A play/pause  <> seek  ^v vol  B back");
+    /* action buttons (touch): BACK / OPEN / EXIT */
+    ui_button(BKB_X, BTN_Y, BKB_W, BTN_H, "BACK", 0, UI_NEONP);
+    ui_button(OPB_X, BTN_Y, OPB_W, BTN_H, "OPEN", 0, UI_NEON);
+    ui_button(EXB_X, BTN_Y, EXB_W, BTN_H, "EXIT", 0, UI_RED);
     ui_present();
 }
 
@@ -529,7 +545,11 @@ static MoflexResult moflex_play_gpu(const char *path) {
                     if (px >= PLAY_CX - 20 && px <= PLAY_CX + 20) { playing = !playing; if (have_audio) g_aw_paused = !playing; t0_wall = 0; dirty = 1; }
                     else if (px >= RW_CX - 18 && px <= RW_CX + 18) { seek_to_us = cur_us - 30000000; want_seek = 1; }
                     else if (px >= FF_CX - 18 && px <= FF_CX + 18) { seek_to_us = cur_us + 30000000; want_seek = 1; }
-                } else if (py >= BACK_Y - 4 && px <= 180) { result = MOFLEX_QUIT_BACK; break; }
+                } else if (py >= BTN_Y && py < BTN_Y + BTN_H) {   /* BACK / OPEN / EXIT */
+                    if      (px >= BKB_X && px < BKB_X + BKB_W) { result = MOFLEX_QUIT_BACK; break; }
+                    else if (px >= OPB_X && px < OPB_X + OPB_W) { result = MOFLEX_QUIT_OPEN; break; }
+                    else if (px >= EXB_X && px < EXB_X + EXB_W) { result = MOFLEX_QUIT_EXIT; break; }
+                }
             }
         }
         if (want_seek) {
@@ -792,8 +812,8 @@ MoflexResult moflex_play(const char *path) {
         if (kd & KEY_A) { playing = !playing; if (have_audio) ndspChnSetPaused(0, !playing); dirty = 1;
                           if (!playing) { resume_save_us(path, cur_us); last_save = cur_us;
                                           if (vol_dirty) { vol_save(); vol_dirty = 0; } } }   /* checkpoint + flush volume while stopped (SD write can't stall the read loop) */
-        if (kd & KEY_UP)   { if (g_vol < 4.0f)  g_vol += 0.25f; vol_dirty = 1; dirty = 1; }   /* save deferred (below) -- an SD write here would hitch the video */
-        if (kd & KEY_DOWN) { if (g_vol > 0.25f) g_vol -= 0.25f; vol_dirty = 1; dirty = 1; }
+        if (kd & KEY_UP)   { int s = (int)(g_vol / 0.25f + 0.0001f); g_vol = (s + 1) * 0.25f; if (g_vol > 4.0f) g_vol = 4.0f; vol_dirty = 1; dirty = 1; }   /* snap up to the 25% grid, capped at 400% */
+        if (kd & KEY_DOWN) { int s = (int)(g_vol / 0.25f + 0.9999f); g_vol = (s - 1) * 0.25f; if (g_vol < 0.25f) g_vol = 0.25f; vol_dirty = 1; dirty = 1; }
         {   /* Left/Right seek, hold to keep scrubbing (~30s steps) */
             int sdir = (kh & KEY_RIGHT) ? 1 : ((kh & KEY_LEFT) ? -1 : 0);
             if (sdir == 0) shold = 0;
@@ -809,8 +829,8 @@ MoflexResult moflex_play(const char *path) {
             int px = tp.px, py = tp.py;
             if (py >= BAR_Y - 8 && py <= BAR_Y + BAR_H + 8 && px >= BAR_X && px <= BAR_X + BAR_W) {
                 if (kd & KEY_TOUCH) { seek_to_us = (int64_t)((double)(px - BAR_X) / BAR_W * dur_us); want_seek = 1; }
-            } else if (px >= VOL_X - 6 && px <= VOL_X + 18 && py >= VOL_Y && py <= VOL_Y + VOL_H) {
-                float nv = (float)(VOL_Y + VOL_H - py) / VOL_H * 4.0f;
+            } else if (px >= VOL_X - 6 && px <= VOL_X + 18 && py >= VOL_Y - 10 && py <= VOL_Y + VOL_H + 10) {
+                float nv = (float)(VOL_Y + VOL_H - py) / VOL_H * 4.0f;   /* extends past the ends so 0% and 400% are reachable */
                 if (nv < 0.25f) nv = 0.25f; if (nv > 4.0f) nv = 4.0f;
                 g_vol = nv; vol_dirty = 1; dirty = 1;   /* save deferred; dragging the slider must not write to SD each tick */
             } else if (kd & KEY_TOUCH) {
@@ -820,7 +840,11 @@ MoflexResult moflex_play(const char *path) {
                                           if (vol_dirty) { vol_save(); vol_dirty = 0; } } }   /* checkpoint + flush volume while stopped */
                     else if (px >= RW_CX - 18 && px <= RW_CX + 18) { seek_to_us = cur_us - 30000000; want_seek = 1; }
                     else if (px >= FF_CX - 18 && px <= FF_CX + 18) { seek_to_us = cur_us + 30000000; want_seek = 1; }
-                } else if (py >= BACK_Y - 4 && px <= 180) { result = MOFLEX_QUIT_BACK; break; }
+                } else if (py >= BTN_Y && py < BTN_Y + BTN_H) {   /* BACK / OPEN / EXIT */
+                    if      (px >= BKB_X && px < BKB_X + BKB_W) { result = MOFLEX_QUIT_BACK; break; }
+                    else if (px >= OPB_X && px < OPB_X + OPB_W) { result = MOFLEX_QUIT_OPEN; break; }
+                    else if (px >= EXB_X && px < EXB_X + EXB_W) { result = MOFLEX_QUIT_EXIT; break; }
+                }
             }
         }
 
@@ -829,10 +853,9 @@ MoflexResult moflex_play(const char *path) {
             if (y2r_started) { y2r_video_drain(); y2r_started = 0; }   /* drop any in-flight Y2R */
             do_seek(&m, &ctx, seek_to_us);
             vidx = 0; left_ok = 0;          /* re-establish L/R pairing after seek */
-            playing = 1;
             if (have_audio) {
                 ndspChnWaveBufClear(0);
-                ndspChnSetPaused(0, false);
+                ndspChnSetPaused(0, !playing);   /* keep paused if we were paused (seek doesn't auto-play) */
                 for (int i = 0; i < NWB; i++) wbuf[i].status = NDSP_WBUF_DONE;
                 wb_idx = 0;
             }
