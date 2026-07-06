@@ -17,3 +17,15 @@ void branding_show(void) {
     gfxFlushBuffers();
     gfxSwapBuffers();
 }
+
+/* Flat 2D logo: the browser keeps the top screen in 2D while showing info panels, so the
+ * "no metadata" fallback shows the same logo image without switching stereo mode. */
+void branding_show_2d(void) {
+    gfxSetScreenFormat(GFX_TOP, GSP_RGB565_OES);
+    gfxSetDoubleBuffering(GFX_TOP, false);
+    gfxSet3D(false);
+    u16 *fb = (u16 *)gfxGetFramebuffer(GFX_TOP, GFX_LEFT, NULL, NULL);
+    memcpy(fb, clownsec_logo_left, CLOWNSEC_LOGO_BYTES);
+    gfxFlushBuffers();
+    gfxSwapBuffers();
+}

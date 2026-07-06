@@ -73,6 +73,10 @@ If the timer won't advance past `0:00` in Citra, give the emulator the 3DS **DSP
 - **Built-in web server** — upload any files to the console from a browser over Wi-Fi.
 - **File manager** — browse, move, delete, and create folders on the SD card (all files, with a
   movies-only toggle).
+- **Local artwork + info** — poster and details show on the top screen for your own movies in
+  Open Video, and a **Get Info** action fetches them from the catalogs for anything missing.
+- **Hidden system folders** — the browser hides `3DS`, `DCIM`, `Nintendo 3DS`, etc. by default
+  (press **Y** to reveal them), so you only see your movies and folders.
 - **3D branding** on the top screen while idle.
 
 ## Screenshots
@@ -106,6 +110,39 @@ If the timer won't advance past `0:00` in Citra, give the emulator the 3DS **DSP
 <td align="center" colspan="2"><img src="screenshots/player-file-management-2.png" width="380"><br><sub>File manager — delete or move any file</sub></td>
 </tr>
 </table>
+
+## Movie info & artwork
+
+When you highlight a movie in **Open Video**, its poster and details show on the top screen.
+That metadata lives in one hidden folder, **`sdmc:/moflex_player/moviedata/`**, keyed by the
+movie's filename (extension dropped) — so it works wherever the movie is on the card, and moving
+the file doesn't lose its art. For `Some Movie (2001).moflex`:
+
+- **`Some Movie (2001).nfo`** — plain text, hand-writable:
+  ```
+  title: Some Movie
+  year: 2001
+  runtime: 108
+  genres: Drama, Thriller
+  desc: A one-line description shown on the info panel.
+  ```
+- **`Some Movie (2001).jpg`** (or `.png`) — the poster (optional). Decoded and cached on first view.
+
+**Get Info (fetch it automatically):** highlight a movie and press **X** in Open Video:
+
+- **This movie** — matches it against the catalogs (Clownsec first, then Zackk, then any sources
+  you've added) and writes the `.nfo` + poster. Forces a refresh even if it already has info.
+- **All movies in this folder** — batch: fills in every movie that's missing art + description,
+  fetching each catalog only once. Skips ones already complete.
+
+Catalog **downloads** write this automatically, so those movies show their art with no extra step.
+
+**Matching / naming:** a filename is reduced to `Title` + `year` for matching — all bracketed
+groups are dropped (`(Extended)`, `(Subtitled)`, `(3D)`, `[HD]`), everything after the year is
+ignored, and separators (spaces, `_`, `.`, `-`) and case don't matter. So
+`A_Goofy_Movie_(1995)_x264...`, `A.Goofy.Movie.1995`, and `A Goofy Movie (1995)` all match the
+same catalog entry, and a TV episode like `Doctor Who (2005) - S01E03` collapses to the show.
+For best results (and to disambiguate remakes) name files **`Title (YEAR).moflex`**.
 
 ## Building
 

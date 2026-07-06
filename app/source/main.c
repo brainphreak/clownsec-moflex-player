@@ -16,6 +16,7 @@
 #include "downloader.h"
 #include "catalog.h"
 #include "poster.h"
+#include "movieinfo.h"
 #include "unzip.h"
 #include "cia_moflex.h"
 #include "ui_gfx.h"
@@ -71,17 +72,31 @@ static int cmp_entry(const void *a, const void *b) {
 }
 static int s_filter_movies = 1;        /* when set, only show playable movies (moflex + movie CIAs) */
 static int s_manage_movies_only = 0;   /* manage-mode toggle (Y): all files vs movies only */
+static int s_show_hidden = 0;          /* play-mode toggle (Y): reveal system/hidden folders + dotfiles */
+
+/* System / app folders hidden by default so the browser isn't cluttered with things that are
+ * never movies. The Y toggle reveals them (along with dotfiles). */
+static int is_hidden_dir(const char *n) {
+    static const char *sys[] = {
+        "3ds", "dcim", "fbi", "gm9", "cheats", "cias", "luma", "nintendo 3ds",
+        "roms", "system volume information", "themes", "moviedata", NULL
+    };
+    for (int i = 0; sys[i]; i++) if (!strcasecmp(n, sys[i])) return 1;
+    return 0;
+}
+
 static void scan(void) {
     nentries = 0;
     DIR *d = opendir(cwd);
     if (d) {
         struct dirent *e;
         while ((e = readdir(d)) && nentries < MAXE) {
-            if (e->d_name[0] == '.') continue;
+            if (e->d_name[0] == '.' && !s_show_hidden) continue;   /* dotfiles hidden unless revealed */
             char full[PATHLEN + NAMELEN];
             snprintf(full, sizeof(full), "%s%s", cwd, e->d_name);
             struct stat st;
             int isdir = (stat(full, &st) == 0) && S_ISDIR(st.st_mode);
+            if (isdir && !s_show_hidden && is_hidden_dir(e->d_name)) continue;   /* system folders */
             if (!isdir && s_filter_movies) {                 /* movies-only view (play, or manage toggle) */
                 if (!is_moflex(e->d_name)) continue;          /* only .moflex / .cia */
                 if (cia_is_cia(e->d_name) && !cia_has_moflex(full)) continue;   /* only movie CIAs */
@@ -122,7 +137,7 @@ static void draw_browser(int mode) {
     printf("%.38s\x1b[K\n", cwd);
     if (move_pending) printf("[MOVE] %.24s  R:paste\x1b[K\n", move_name);
     else if (mode == MODE_MANAGE) printf("A:open X:manage Y:%s B:up\x1b[K\n", s_manage_movies_only ? "show all" : "movies only");
-    else printf("A:play/open  B:up/home  X:manage\x1b[K\n");
+    else printf("A:play B:up/home X:get info Y:%s\x1b[K\n", s_show_hidden ? "hide sys" : "show all");
     printf("START:exit  SELECT:refresh\x1b[K\n\x1b[K\n");
     if (nentries == 0) { printf("(empty - no folders or .moflex)\x1b[K\n\x1b[J"); return; }
     if (sel < scroll) scroll = sel;
@@ -448,6 +463,40 @@ static void draw_info_top(const CatEntry *e, const u16 *poster) {
     ui_present();
 }
 
+/* Top-screen panel for a highlighted folder: a simple drawn folder icon + its name. */
+static void draw_folder_top(const char *name) {
+    ui_begin(GFX_TOP);
+    ui_clear(UI_RGB(8, 10, 16));
+    int cx = UI_TW / 2, iy = 70, w = 108, h = 78, x = cx - w / 2;
+    u16 tab = UI_RGB(210, 180, 90), body = UI_RGB(240, 205, 110);
+    ui_fill(x, iy - 14, 46, 16, tab);                 /* folder tab */
+    ui_fill(x, iy, w, h, body);                       /* folder body */
+    ui_fill(x + 4, iy + 4, w - 8, h - 8, UI_RGB(250, 224, 150));   /* inner highlight */
+    ui_text_center(cx, iy + h + 16, 1, UI_GRAY, "folder");
+    char nm[48]; snprintf(nm, sizeof nm, "%.46s", name);
+    ui_text_center(cx, iy + h + 32, 1, UI_WHITE, nm);
+    ui_present();
+}
+
+/* The browser's top screen for the highlighted entry: folder icon, movie info panel (poster +
+ * metadata from moviedata/), or the flat CLOWNSEC logo when a movie has no metadata. All 2D. */
+static u16 g_top_poster[POSTER_W * POSTER_H];
+static void browser_show_top(int is_dir, const char *name, const char *fullpath) {
+    gfxSet3D(false);
+    if (is_dir) { draw_folder_top(name); return; }
+    CatEntry meta;
+    int haveinfo   = movieinfo_load(fullpath, &meta);
+    int haveposter = movieinfo_poster(fullpath, g_top_poster, POSTER_W, POSTER_H);
+    if (!haveinfo && !haveposter) { branding_show_2d(); return; }   /* no metadata -> logo */
+    if (!haveinfo) {   /* poster only: build a minimal entry from the filename */
+        memset(&meta, 0, sizeof meta);
+        snprintf(meta.name,  sizeof meta.name,  "%s", name);
+        char *dot = strrchr(meta.name, '.'); if (dot) *dot = 0;   /* drop extension for the title */
+        snprintf(meta.fname, sizeof meta.fname, "%s", name);      /* keeps the 2D/3D badge */
+    }
+    draw_info_top(&meta, haveposter ? g_top_poster : NULL);
+}
+
 /* ---- background poster loader: keeps scrolling perfectly fluid (the main loop never blocks on a
  * poster download/decode; a worker thread does it and the UI just polls for the result). ---- */
 static volatile int pw_run = 0, pw_req = -1, pw_done = -2, pw_ok = 0;
@@ -542,6 +591,10 @@ static void catalog_browse(const Source *src) {
             snprintf(g_dl_name, sizeof(g_dl_name), "%s", e->fname);
             g_last_prog = 0;
             bool ok = download_to_file(e->url, dest, dl_progress, NULL);
+            if (ok && !e->is_zip) {   /* persist metadata + poster so the info panel shows for the local file */
+                if (!phave && e->art[0] && poster) phave = poster_get(e->art, e->fname, poster, POSTER_W, POSTER_H);
+                movieinfo_save(dest, e, phave ? poster : NULL, POSTER_W, POSTER_H);
+            }
             if (ok && e->is_zip && !file_is_zip(dest)) {
                 remove(dest);   /* not a real zip (likely a 404 page) */
                 printf("\x1b[2J\x1b[H=== DOWNLOAD ===\n\nDownload failed: the server did not\n"
@@ -701,6 +754,200 @@ static void add_movies_menu(void) {
 
 /* ---------- MANAGE menu (move / delete) ---------- */
 
+/* ---- metadata scraper: fill moviedata/ from the catalogs already known to the app
+ * (Clownsec first, then Zackk, then user-added sources) -- no external DB, no API keys. ---- */
+static void local_stem(const char *path, char *o, size_t cap) {   /* basename without extension */
+    const char *b = strrchr(path, '/'); b = b ? b + 1 : path;
+    snprintf(o, cap, "%s", b);
+    char *d = strrchr(o, '.'); if (d && d != o) *d = 0;
+}
+static int four_digits(const char *p) {
+    return isdigit((unsigned char)p[0]) && isdigit((unsigned char)p[1]) &&
+           isdigit((unsigned char)p[2]) && isdigit((unsigned char)p[3]);
+}
+static int year_val(const char *p) { return (p[0]-'0')*1000 + (p[1]-'0')*100 + (p[2]-'0')*10 + (p[3]-'0'); }
+
+/* Split a movie/show name into a normalized title (letters+digits, lower-case) and a year.
+ * ALL bracketed groups -- (Extended), (Subtitled), (3D), (2001), [HD] -- are dropped, and the
+ * title is taken from the text BEFORE the year. So "Black Hawk Down (Extended) (2001) (3D)" and
+ * "Black Hawk Down (2001)" both reduce to title="blackhawkdown", year="2001"; a TV episode
+ * "Doctor Who (2005) Season 1 ..." and a catalog "Doctor Who (2005) (3D) - Season 1" both reduce
+ * to "doctorwho"/"2005". Punctuation (dashes, colons, dots) is stripped either way. */
+static void parse_title_year(const char *name, char *tnorm, size_t cap, char yr[5]) {
+    yr[0] = 0;
+    const char *ypos = NULL;
+    for (const char *p = name; *p; p++)                     /* parenthesized year preferred */
+        if (p[0] == '(' && four_digits(p + 1) && p[5] == ')') {
+            int y = year_val(p + 1); if (y >= 1900 && y <= 2099) { memcpy(yr, p + 1, 4); yr[4] = 0; ypos = p; break; }
+        }
+    if (!yr[0])                                             /* else a bare year token */
+        for (const char *p = name; *p; p++)
+            if (four_digits(p) && !isdigit((unsigned char)p[4]) && (p == name || !isdigit((unsigned char)p[-1]))) {
+                int y = year_val(p); if (y >= 1900 && y <= 2099) { memcpy(yr, p, 4); yr[4] = 0; ypos = p; break; }
+            }
+    const char *end = ypos ? ypos : name + strlen(name);
+    size_t j = 0; int depth = 0;
+    for (const char *p = name; p < end; p++) {
+        char c = *p;
+        if (c == '(' || c == '[' || c == '{') { depth++; continue; }
+        if (c == ')' || c == ']' || c == '}') { if (depth > 0) depth--; continue; }
+        if (depth > 0) continue;                            /* skip anything inside brackets */
+        if (isalnum((unsigned char)c) && j + 1 < cap) tnorm[j++] = (char)tolower((unsigned char)c);
+    }
+    tnorm[j] = 0;
+}
+static int scr_match(const char *localstem, const CatEntry *e) {
+    char lt[256], et[256], ft[256], ly[5], ey[5], fy[5];
+    parse_title_year(localstem, lt, sizeof lt, ly);
+    if (!lt[0]) return 0;
+    parse_title_year(e->name, et, sizeof et, ey);
+    char fstem[NAMELEN]; snprintf(fstem, sizeof fstem, "%s", e->fname);
+    char *d = strrchr(fstem, '.'); if (d) *d = 0;
+    parse_title_year(fstem, ft, sizeof ft, fy);
+
+    char ls[262], es[262], fs[262];                         /* "titleyear" keys */
+    snprintf(ls, sizeof ls, "%s%s", lt, ly);
+    snprintf(es, sizeof es, "%s%s", et, ey);
+    snprintf(fs, sizeof fs, "%s%s", ft, fy);
+    if (!strcmp(ls, es) || !strcmp(ls, fs)) return 1;       /* title+year match (movies & TV) */
+    /* no year in the filename -> match title only (remakes may pick the wrong year; add a year to be exact) */
+    if (!ly[0] && strlen(lt) >= 4 && (!strcmp(lt, et) || !strcmp(lt, ft))) return 1;
+    return 0;
+}
+/* Fetch a catalog entry's poster into pb, with one retry for transient network failures.
+ * Returns 1 if a poster was decoded, 0 if there's no art or the download kept failing. */
+static int fetch_poster(const CatEntry *e, u16 *pb) {
+    if (!pb || !e->art[0]) return 0;
+    if (poster_get(e->art, e->fname, pb, POSTER_W, POSTER_H)) return 1;
+    return poster_get(e->art, e->fname, pb, POSTER_W, POSTER_H);   /* retry once */
+}
+
+/* Try to find + save catalog metadata for ONE movie (forces a refresh; used by X:Get info).
+ * Returns 0 = no match, 1 = saved with poster, 2 = saved but the poster wouldn't download. */
+static int scrape_one(const char *moviepath) {
+    load_sources();
+    char lstem[192]; local_stem(moviepath, lstem, sizeof lstem);
+    int cap = 4096; CatEntry *cat = (CatEntry *)malloc(sizeof(CatEntry) * cap);
+    u16 *pb = (u16 *)malloc((size_t)POSTER_W * POSTER_H * sizeof(u16));
+    if (!cat) { free(pb); return 0; }
+    int found = 0;
+    for (int s = 0; s < nsources && !found; s++) {
+        printf("\x1b[2J\x1b[H=== GET INFO ===\n\nChecking %.28s ...\n", sources[s].name);
+        gfxFlushBuffers(); gfxSwapBuffers();
+        char *json = NULL; size_t len = 0;
+        if (!download_to_mem(sources[s].url, &json, &len, 32 * 1024 * 1024)) continue;
+        int nc = catalog_parse(json, sources[s].kind, sources[s].dl_base, sources[s].art_base, cat, cap);
+        free(json);
+        for (int i = 0; i < nc; i++) if (scr_match(lstem, &cat[i])) {
+            int poster_ok = fetch_poster(&cat[i], pb);
+            movieinfo_save(moviepath, &cat[i], poster_ok ? pb : NULL, POSTER_W, POSTER_H);
+            found = poster_ok ? 1 : 2;
+            break;
+        }
+    }
+    free(pb); free(cat);
+    return found;
+}
+/* Batch: fill in every movie in the current folder that is MISSING metadata (skips ones that
+ * already have art + description). Each catalog is fetched only once. */
+static void scrape_folder(void) {
+    load_sources();
+    int cap = 4096; CatEntry *cat = (CatEntry *)malloc(sizeof(CatEntry) * cap);
+    u16 *pb = (u16 *)malloc((size_t)POSTER_W * POSTER_H * sizeof(u16));
+    static char done[MAXE];
+    int todo = 0;
+    for (int i = 0; i < nentries; i++) {
+        done[i] = 1;
+        if (!entries[i].is_dir && is_moflex(entries[i].name)) {
+            char full[PATHLEN + NAMELEN]; snprintf(full, sizeof full, "%s%s", cwd, entries[i].name);
+            if (!movieinfo_have(full)) { done[i] = 0; todo++; }   /* skip ones that already have info */
+        }
+    }
+    int got = 0;
+    if (!cat || todo == 0) {
+        printf("\x1b[2J\x1b[H=== GET INFO ===\n\n%s\n\nB: back\n",
+               todo == 0 ? "Every movie here already has info." : "Out of memory.");
+        wait_back(); free(pb); free(cat); return;
+    }
+    int cancelled = 0;
+    for (int s = 0; s < nsources && got < todo && !cancelled; s++) {
+        printf("\x1b[2J\x1b[H=== GET INFO (all) ===\n\nFetching %.24s catalog...\n(%d/%d matched)\n",
+               sources[s].name, got, todo);
+        gfxFlushBuffers(); gfxSwapBuffers();
+        char *json = NULL; size_t len = 0;
+        if (!download_to_mem(sources[s].url, &json, &len, 32 * 1024 * 1024)) continue;
+        int nc = catalog_parse(json, sources[s].kind, sources[s].dl_base, sources[s].art_base, cat, cap);
+        free(json);
+        int scanned = 0;
+        for (int i = 0; i < nentries && got < todo; i++) {
+            if (done[i]) continue;
+            hidScanInput();
+            if (hidKeysDown() & KEY_B) { cancelled = 1; break; }
+            scanned++;
+            /* live progress (redraw in place, no flash) -- shown while this title's poster downloads */
+            printf("\x1b[H=== GET INFO (all) ===\x1b[K\n\nSource: %.24s\x1b[K\nMatched: %d / %d\x1b[K\n"
+                   "Checking %d: %.28s\x1b[K\n\nB: cancel\x1b[K\n\x1b[J",
+                   sources[s].name, got, todo, scanned, entries[i].name);
+            gfxFlushBuffers(); gfxSwapBuffers();
+            char full[PATHLEN + NAMELEN]; snprintf(full, sizeof full, "%s%s", cwd, entries[i].name);
+            char lstem[192]; local_stem(full, lstem, sizeof lstem);
+            for (int c = 0; c < nc; c++) if (scr_match(lstem, &cat[c])) {
+                int poster_ok = fetch_poster(&cat[c], pb);
+                movieinfo_save(full, &cat[c], poster_ok ? pb : NULL, POSTER_W, POSTER_H);
+                done[i] = 1; got++; break;   /* matched (priority-first); a missing poster is
+                                              * refetched next run since movieinfo_have needs one */
+            }
+        }
+    }
+    free(pb); free(cat);
+    printf("\x1b[2J\x1b[H=== GET INFO (all) ===\n\n%sMatched %d of %d movie%s.\n%s\n\nB: back\n",
+           cancelled ? "Cancelled.\n" : "", got, todo, todo == 1 ? "" : "s",
+           (got < todo && !cancelled) ? "(no catalog match for the rest)" : "");
+    wait_back();
+}
+
+/* GET INFO chooser (X in Open Video): fetch metadata for just this movie, or every movie in
+ * the folder that's missing it. */
+static void getinfo_menu(void) {
+    if (nentries == 0) return;
+    int is_movie = !entries[sel].is_dir && is_moflex(entries[sel].name);
+    const char *items[3]; int act[3]; int n = 0;
+    if (is_movie) { items[n] = "This movie";                act[n++] = 0; }
+    items[n] = "All movies in this folder (missing only)"; act[n++] = 1;
+    items[n] = "Cancel";                                   act[n++] = 2;
+    int m = 0, redraw = 1;
+    while (aptMainLoop()) {
+        hidScanInput();
+        u32 k = hidKeysDown();
+        if (k & KEY_B) break;
+        if (k & KEY_DOWN) { m = (m + 1) % n; redraw = 1; }
+        if (k & KEY_UP)   { m = (m + n - 1) % n; redraw = 1; }
+        if (k & KEY_A) {
+            int a = act[m];
+            if (a == 0) {
+                char full[PATHLEN + NAMELEN]; snprintf(full, sizeof full, "%s%s", cwd, entries[sel].name);
+                int r = scrape_one(full);   /* forces a refresh, even if it already has info */
+                const char *msg = r == 1 ? "Info + artwork saved."
+                                : r == 2 ? "Info saved, but the poster didn't download.\nTry Get Info again for the artwork."
+                                         : "No catalog had this title.";
+                printf("\x1b[2J\x1b[H=== GET INFO ===\n\n%s\n\nB: back\n", msg);
+                wait_back();
+            } else if (a == 1) {
+                scrape_folder();
+            }
+            break;   /* Cancel (a==2) also lands here */
+        }
+        if (redraw) {
+            printf("\x1b[2J\x1b[H=== GET INFO ===\n\nFetch poster + details from the\ncatalogs (Clownsec, then Zackk).\n\n");
+            if (is_movie) printf("%.38s\n\n", entries[sel].name);
+            for (int i = 0; i < n; i++) printf("%c %s\n", i == m ? '>' : ' ', items[i]);
+            printf("\nB: back\n");
+            redraw = 0;
+        }
+        gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
+    }
+}
+
 static void manage_menu(void) {
     if (nentries == 0) return;
     char full[PATHLEN + NAMELEN];
@@ -714,9 +961,8 @@ static void manage_menu(void) {
         if (k & KEY_DOWN) { m = (m + 1) % 3; redraw = 1; }
         if (k & KEY_UP)   { m = (m + 2) % 3; redraw = 1; }
         if (k & KEY_A) {
-            if (m == 0) {
-                if (confirm("Delete this item?")) { remove(full); scan(); }
-            } else if (m == 1) {
+            if (m == 0) { if (confirm("Delete this item?")) { remove(full); scan(); } }
+            else if (m == 1) {
                 snprintf(move_src, sizeof(move_src), "%s", full);
                 snprintf(move_name, sizeof(move_name), "%s", entries[sel].name);
                 move_pending = 1;
@@ -820,12 +1066,14 @@ static int browser(int mode, char *sel_out, size_t sel_cap) {
     s_filter_movies = (mode != MODE_MANAGE) ? 1 : s_manage_movies_only;   /* play=movies; manage=toggle */
     scan();
     draw_browser(mode);
+    if (mode == MODE_PLAY) gfxSet3D(false);   /* top becomes a 2D poster/info panel while browsing */
     int hfu = 0, hfd = 0;
+    int top_sel = -1, top_settle = 0, top_pending = 1;   /* debounced top-screen render (play mode) */
     while (aptMainLoop()) {
         hidScanInput();
         u32 k = hidKeysDown();
         u32 kh = hidKeysHeld();
-        if (k & KEY_START) return 1;
+        if (k & KEY_START) { if (mode == MODE_PLAY) branding_show(); return 1; }
 
         if (nentries) {
             if (nav_repeat(k, kh, NAV_DOWN, &hfd)) { if (sel < nentries - 1) sel++; draw_browser(mode); }
@@ -833,28 +1081,50 @@ static int browser(int mode, char *sel_out, size_t sel_cap) {
             if (k & KEY_RIGHT) { sel += ROWS; if (sel > nentries - 1) sel = nentries - 1; draw_browser(mode); }
             if (k & KEY_LEFT)  { sel -= ROWS; if (sel < 0) sel = 0; draw_browser(mode); }
         }
-        if (k & KEY_SELECT) { scan(); draw_browser(mode); }
-        if (k & KEY_Y && mode == MODE_MANAGE) {   /* toggle: all files vs movies only */
-            s_manage_movies_only = !s_manage_movies_only;
-            s_filter_movies = s_manage_movies_only;
-            if (sel > 0) sel = 0;
-            scan(); draw_browser(mode);
+        if (k & KEY_SELECT) { scan(); draw_browser(mode); top_pending = 1; top_sel = -1; }
+        if (k & KEY_Y) {
+            if (mode == MODE_MANAGE) {   /* toggle: all files vs movies only */
+                s_manage_movies_only = !s_manage_movies_only;
+                s_filter_movies = s_manage_movies_only;
+                if (sel > 0) sel = 0;
+                scan(); draw_browser(mode);
+            } else {                     /* play mode: reveal / hide system folders + dotfiles */
+                s_show_hidden = !s_show_hidden;
+                sel = 0; scan(); draw_browser(mode); top_pending = 1; top_sel = -1;
+            }
         }
         if (k & KEY_R && move_pending) { do_paste(); draw_browser(mode); }
         if (k & KEY_B) {
-            if (at_root()) return 0;           /* leave browser -> home menu */
-            go_up(); draw_browser(mode);
+            if (at_root()) { if (mode == MODE_PLAY) branding_show(); return 0; }   /* leave -> home menu */
+            go_up(); draw_browser(mode); top_pending = 1; top_sel = -1;
         }
-        if (k & KEY_X && nentries) { manage_menu(); scan(); draw_browser(mode); }
+        if (k & KEY_X && nentries) {
+            if (mode == MODE_PLAY) getinfo_menu();   /* Open Video: X = Get Info (Manage lives in its own screen) */
+            else                   manage_menu();
+            scan(); draw_browser(mode); top_pending = 1; top_sel = -1;
+        }
         if (k & KEY_A && nentries) {
             if (entries[sel].is_dir) {
                 enter_dir(entries[sel].name);
-                draw_browser(mode);
+                draw_browser(mode); top_pending = 1; top_sel = -1;
             } else if (mode == MODE_MANAGE) {
                 manage_menu(); scan(); draw_browser(mode);
             } else {   /* MODE_PLAY: hand the selection back to main to play */
                 if (sel_out) snprintf(sel_out, sel_cap, "%s%s", cwd, entries[sel].name);
                 return 2;
+            }
+        }
+        /* debounced top-screen panel for the highlighted entry (play mode only) */
+        if (mode == MODE_PLAY) {
+            if (sel != top_sel) { top_sel = sel; top_settle = 0; top_pending = 1; }
+            if (top_pending && ++top_settle >= 5) {
+                if (!nentries) branding_show_2d();
+                else {
+                    char full[PATHLEN + NAMELEN];
+                    snprintf(full, sizeof full, "%s%s", cwd, entries[sel].name);
+                    browser_show_top(entries[sel].is_dir, entries[sel].name, full);
+                }
+                top_pending = 0;
             }
         }
         gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
