@@ -199,6 +199,55 @@ Produces `app/clownsec_player.cia`. Install with FBI or your CIA installer of ch
   is raw decode throughput — likely closable only with hand-tuned ARM assembly for the hot
   decode loops (as the official player does).
 
+## Adding your own info & artwork (for movies not in a catalog)
+
+If a movie isn't in any catalog, you can hand-author its poster and details. Everything lives in
+one hidden folder on the SD card:
+
+```
+sdmc:/moflex_player/moviedata/
+```
+
+Files are named after the **movie's filename with the extension removed**. For a movie
+`My Home Video (2024).moflex`, add either or both of:
+
+| File | What it is |
+|------|------------|
+| `moviedata/My Home Video (2024).nfo`             | text details (see below) |
+| `moviedata/My Home Video (2024).jpg` (or `.png`) | the poster image |
+
+Because it's keyed by filename, the metadata follows the movie wherever it is on the card. You can
+prepare these on a computer and drop them in over the **Wi-Fi upload page** (browse into `moviedata/`)
+or by putting them straight on the SD card.
+
+### The `.nfo` file
+
+Plain text, one `field: value` per line. Every field is optional — include what you have:
+
+```
+title: My Home Video
+year: 2024
+runtime: 96
+genres: Comedy, Family
+3d: yes
+desc: A one-line-ish description shown on the info panel.
+```
+
+- **title** — the heading (falls back to the filename if omitted)
+- **year** — release year · **runtime** — minutes
+- **genres** — comma-separated
+- **3d** — `yes` or `no`; if omitted, it's guessed from `(3D)` in the filename
+- **desc** — the description (keep it to a single line)
+
+### The poster
+
+A **`.jpg` or `.png`** with the same base name. Any size works — it's scaled to fit and cached — but
+a portrait image around **132×188** or larger looks best. It's decoded the first time you view the
+movie and cached after that, so it shows instantly on repeat views.
+
+Then just highlight the movie in **Open Video** and your poster + details appear on the top screen.
+(If the movie *is* in a catalog, **X → Get Info** writes all of this for you automatically.)
+
 ## Credits & license
 
 - The MobiClip/moflex decode path is derived from **FFmpeg** (LGPL) — see `ffmpeg_support/`
