@@ -1477,6 +1477,19 @@ static int four_digits(const char *p) {
 }
 static int year_val(const char *p) { return (p[0]-'0')*1000 + (p[1]-'0')*100 + (p[2]-'0')*10 + (p[3]-'0'); }
 
+/* position of a TV episode marker "SxxExx" at a word boundary, or NULL. Everything from here on
+ * (the episode number + episode title) is dropped so a local episode reduces to its show name. */
+static const char *episode_pos(const char *name) {
+    for (const char *p = name; *p; p++) {
+        if (p != name && isalnum((unsigned char)p[-1])) continue;
+        if ((p[0] == 's' || p[0] == 'S') && isdigit((unsigned char)p[1])) {
+            const char *q = p + 1; while (isdigit((unsigned char)*q)) q++;
+            if ((*q == 'e' || *q == 'E') && isdigit((unsigned char)q[1])) return p;
+        }
+    }
+    return NULL;
+}
+
 /* Split a movie/show name into a normalized title (letters+digits, lower-case) and a year.
  * ALL bracketed groups -- (Extended), (Subtitled), (3D), (2001), [HD] -- are dropped, and the
  * title is taken from the text BEFORE the year. So "Black Hawk Down (Extended) (2001) (3D)" and
@@ -1496,6 +1509,8 @@ static void parse_title_year(const char *name, char *tnorm, size_t cap, char yr[
                 int y = year_val(p); if (y >= 1900 && y <= 2099) { memcpy(yr, p, 4); yr[4] = 0; ypos = p; break; }
             }
     const char *end = ypos ? ypos : name + strlen(name);
+    const char *epos = episode_pos(name);                  /* TV episode -> keep only the show name */
+    if (epos && epos < end) end = epos;
     size_t j = 0; int depth = 0;
     for (const char *p = name; p < end; p++) {
         char c = *p;
@@ -1507,21 +1522,24 @@ static void parse_title_year(const char *name, char *tnorm, size_t cap, char yr[
     tnorm[j] = 0;
 }
 static int scr_match(const char *localstem, const CatEntry *e) {
-    char lt[256], et[256], ft[256], ly[5], ey[5], fy[5];
+    char lt[256], et[256], ft[256], tt[256], ly[5], ey[5], fy[5], ty[5];
     parse_title_year(localstem, lt, sizeof lt, ly);
     if (!lt[0]) return 0;
     parse_title_year(e->name, et, sizeof et, ey);
     char fstem[NAMELEN]; snprintf(fstem, sizeof fstem, "%s", e->fname);
     char *d = strrchr(fstem, '.'); if (d) *d = 0;
     parse_title_year(fstem, ft, sizeof ft, fy);
+    parse_title_year(e->title, tt, sizeof tt, ty);          /* the clean show/movie title (no "Season N [ZIP]") */
 
-    char ls[262], es[262], fs[262];                         /* "titleyear" keys */
+    char ls[262], es[262], fs[262], ts[270];                /* "titleyear" keys */
     snprintf(ls, sizeof ls, "%s%s", lt, ly);
     snprintf(es, sizeof es, "%s%s", et, ey);
     snprintf(fs, sizeof fs, "%s%s", ft, fy);
-    if (!strcmp(ls, es) || !strcmp(ls, fs)) return 1;       /* title+year match (movies & TV) */
+    if (e->year > 0) snprintf(ts, sizeof ts, "%s%d", tt, e->year);   /* title[] has no year -> use the year field */
+    else             snprintf(ts, sizeof ts, "%s%s", tt, ty);
+    if (!strcmp(ls, es) || !strcmp(ls, fs) || !strcmp(ls, ts)) return 1;   /* title+year match (movies & TV) */
     /* no year in the filename -> match title only (remakes may pick the wrong year; add a year to be exact) */
-    if (!ly[0] && strlen(lt) >= 4 && (!strcmp(lt, et) || !strcmp(lt, ft))) return 1;
+    if (!ly[0] && strlen(lt) >= 4 && (!strcmp(lt, et) || !strcmp(lt, ft) || !strcmp(lt, tt))) return 1;
     return 0;
 }
 /* Fetch a catalog entry's poster into pb, with one retry for transient network failures.
