@@ -83,6 +83,10 @@ If the timer won't advance past `0:00` in Citra, give the emulator the 3DS **DSP
 <td align="center"><img src="screenshots/player-main-controls.png" width="380"><br><sub>Playback — video up top, touch controls below (play/pause, seek, volume)</sub></td>
 </tr>
 <tr>
+<td align="center"><img src="screenshots/player-cia-contents.png" width="380"><br><sub>Multi-movie <code>.cia</code> — pick which video to play (real titles + sizes)</sub></td>
+<td align="center"><img src="screenshots/player-cia-contents-player.png" width="380"><br><sub>Playing a movie straight from inside a <code>.cia</code></sub></td>
+</tr>
+<tr>
 <td align="center"><img src="screenshots/player-add-movies-catalog.png" width="380"><br><sub>Catalog browser — info panel with the <b>3D (stereoscopic)</b> badge</sub></td>
 <td align="center"><img src="screenshots/player-add-movies-catalog-2.png" width="380"><br><sub>Catalog browser — a <b>2D</b> title</sub></td>
 </tr>
