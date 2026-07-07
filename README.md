@@ -65,6 +65,9 @@ If the timer won't advance past `0:00` in Citra, give the emulator the 3DS **DSP
 - **Resume** — playback position is saved per movie (and per episode inside a multi-movie CIA)
   and auto-resumes where you left off.
 - **Software volume boost** up to 400% for quiet sources.
+- **Subtitles (closed captions)** — drop a `.srt` next to a movie (works on **2D and 3D**) and it
+  loads automatically. The in-player **CC** button toggles them and adjusts position, size,
+  timing/delay, and — on 3D video — the subtitle depth. See [Subtitles](#subtitles-closed-captions).
 - **Catalog browser** — browse the Clownsec / Zackk archives from `catalog.json`, with a
   top-screen info panel (poster art, year, runtime, genres, file size, description, and a
   3D/2D badge).
@@ -247,6 +250,39 @@ movie and cached after that, so it shows instantly on repeat views.
 
 Then just highlight the movie in **Open Video** and your poster + details appear on the top screen.
 (If the movie *is* in a catalog, **X → Get Info** writes all of this for you automatically.)
+
+## Subtitles (closed captions)
+
+The player can overlay external **SubRip (`.srt`)** subtitles on any movie — **2D or 3D**. There is
+no embedded subtitle track in moflex, so subtitles always come from a sidecar file you supply.
+
+### Adding a subtitle file
+
+Name the `.srt` after the movie and put it in **either** place:
+
+| File | Where |
+|------|-------|
+| `My Home Video (2024).srt`               | right next to the movie file |
+| `moviedata/My Home Video (2024).srt`     | in the hidden `sdmc:/moflex_player/moviedata/` folder |
+
+When you start the movie, a matching `.srt` is **loaded automatically** and turned on. You can copy
+files over the Wi-Fi upload page or straight onto the SD card. (Only 16-bit standard SubRip text is
+needed — the same `.srt` files used by any video player. UTF-8 smart quotes, dashes, accents, and
+the ♪ music note are handled.)
+
+### The CC button
+
+During playback, tap **CC** on the bottom screen (or press **SELECT**) to open subtitle options:
+
+- **Subtitles: on / off**
+- **Position: bottom / top** of the screen
+- **Size: small / medium / large**
+- **Delay:** shift subtitles earlier or later in **0.25 s** steps for lip-sync (per movie)
+- **Depth (3D):** push the captions into the screen or out toward you — *3D video only*
+- **Load SRT file…:** pick any `.srt` in the movie's folder or `moviedata/` (handy when the
+  sidecar isn't named to match)
+
+Position, size, and depth are remembered across movies; the delay resets per movie.
 
 ## Credits & license
 
