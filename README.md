@@ -90,6 +90,9 @@ If the timer won't advance past `0:00` in Citra, give the emulator the 3DS **DSP
 <td align="center"><img src="screenshots/08-player-playing-video.png" width="340"><br><sub>Playback — video on the top screen, neon touch controls below</sub></td>
 </tr>
 <tr>
+<td align="center" colspan="2"><img src="screenshots/13-player-subtitles.png" width="300"><br><sub>Subtitles — a `.srt` overlaid on the video (2D or 3D), with the CC options menu below</sub></td>
+</tr>
+<tr>
 <td align="center"><img src="screenshots/07-player-download-from-catalog.png" width="340"><br><sub>Catalog browser — poster + details on top, download from the list</sub></td>
 <td align="center"><img src="screenshots/03-player-scrape-info.png" width="340"><br><sub>Get Info — auto-fetch poster + details from the catalogs</sub></td>
 </tr>
@@ -255,6 +258,8 @@ Then just highlight the movie in **Open Video** and your poster + details appear
 
 The player can overlay external **SubRip (`.srt`)** subtitles on any movie — **2D or 3D**. There is
 no embedded subtitle track in moflex, so subtitles always come from a sidecar file you supply.
+
+<p align="center"><img src="screenshots/13-player-subtitles.png" width="300"></p>
 
 ### Adding a subtitle file
 
