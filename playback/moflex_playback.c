@@ -6,6 +6,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
+#include <dirent.h>
 
 #include "moflex_demux.h"
 #include "cia_moflex.h"
@@ -179,6 +180,11 @@ static void bw_exit(void) {
 #define OPB_W 86
 #define EXB_X 188
 #define EXB_W 88
+/* CC (subtitles) toggle button -- between the FF control and the volume slider */
+#define CC_X 244
+#define CC_Y 104
+#define CC_W 48
+#define CC_H 28
 
 static void fmt_time(int64_t us, char *o, int cap) {
     if (us < 0) us = 0;
@@ -186,6 +192,196 @@ static void fmt_time(int64_t us, char *o, int cap) {
     int h = t / 3600, m = (t / 60) % 60, s = t % 60;
     if (h > 0) snprintf(o, cap, "%d:%02d:%02d", h, m, s);
     else       snprintf(o, cap, "%d:%02d", m, s);
+}
+
+/* ---------- subtitles: external .srt (sidecar next to the movie, or in moviedata/) ---------- */
+extern char font8x8_basic[128][8];   /* defined once in ui_gfx.c */
+#define SUB_MAX 4000
+#define SUB_TXT 160
+typedef struct { int64_t s, e; char t[SUB_TXT]; } SubCue;
+static SubCue *g_subs = NULL;
+static int  g_nsubs = 0;
+static int  g_sub_on = 0;      /* enabled */
+static int  g_sub_top = 0;     /* 0 = bottom of the top screen, 1 = top */
+static int  g_sub_depth = 0;   /* 3D parallax: per-eye horizontal shift (-=out toward you, +=into screen) */
+static int  g_sub_size = 1;    /* font scale: 1 = small (sharpest), 2 = medium, 3 = large */
+static int64_t g_sub_off = 0;  /* timing offset in us (+ = show later, - = show earlier) */
+static char g_sub_file[512] = "";
+
+static int sub_parse_ts(const char *p, int64_t *us) {
+    int h, m, s, ms;
+    if (sscanf(p, "%d:%d:%d,%d", &h, &m, &s, &ms) == 4 ||
+        sscanf(p, "%d:%d:%d.%d", &h, &m, &s, &ms) == 4) {
+        *us = ((int64_t)h * 3600 + m * 60 + s) * 1000000LL + (int64_t)ms * 1000; return 1;
+    }
+    return 0;
+}
+/* accented Latin-1 letter -> its base ASCII (so European names read, not '?') */
+static char latin1_ascii(unsigned c) {
+    switch (c) {
+        case 0xC0:case 0xC1:case 0xC2:case 0xC3:case 0xC4:case 0xC5:case 0xC6: return 'A';
+        case 0xC7: return 'C';
+        case 0xC8:case 0xC9:case 0xCA:case 0xCB: return 'E';
+        case 0xCC:case 0xCD:case 0xCE:case 0xCF: return 'I';
+        case 0xD0: return 'D'; case 0xD1: return 'N';
+        case 0xD2:case 0xD3:case 0xD4:case 0xD5:case 0xD6:case 0xD8: return 'O';
+        case 0xD9:case 0xDA:case 0xDB:case 0xDC: return 'U';
+        case 0xDD: return 'Y'; case 0xDF: return 's';
+        case 0xE0:case 0xE1:case 0xE2:case 0xE3:case 0xE4:case 0xE5:case 0xE6: return 'a';
+        case 0xE7: return 'c';
+        case 0xE8:case 0xE9:case 0xEA:case 0xEB: return 'e';
+        case 0xEC:case 0xED:case 0xEE:case 0xEF: return 'i';
+        case 0xF1: return 'n';
+        case 0xF2:case 0xF3:case 0xF4:case 0xF5:case 0xF6:case 0xF8: return 'o';
+        case 0xF9:case 0xFA:case 0xFB:case 0xFC: return 'u';
+        case 0xFD:case 0xFF: return 'y';
+        default: return 0;
+    }
+}
+/* strip HTML-ish tags and fold UTF-8 / Windows-1252 punctuation + accents to plain ASCII */
+static void sub_clean(const char *in, char *out, int cap) {
+    const unsigned char *p = (const unsigned char *)in; int o = 0;
+    while (*p && o < cap - 4) {
+        unsigned char c = *p;
+        if (c == '<') { p++; while (*p && *p != '>') p++; if (*p) p++; continue; }   /* <i>, <font ...> */
+        if (c < 0x80) { out[o++] = (char)c; p++; continue; }
+        if (c == 0xE2 && p[1] == 0x80) {                    /* UTF-8 general punctuation */
+            unsigned char d = p[2];
+            const char *r = (d==0x98||d==0x99||d==0x9B) ? "'" : (d==0x9C||d==0x9D) ? "\"" :
+                            (d==0x93||d==0x94) ? "-" : (d==0xA6) ? "..." : "?";
+            for (const char *q = r; *q && o < cap - 1; q++) out[o++] = *q; p += 3; continue;
+        }
+        if (c == 0xE2 && p[1] == 0x99 && (p[2] == 0xAA || p[2] == 0xAB)) { out[o++] = 0x0E; p += 3; continue; }  /* music note */
+        if (c == 0xC3 && p[1] >= 0x80 && p[1] <= 0xBF) {     /* UTF-8 Latin-1 supplement */
+            char a = latin1_ascii(0xC0 + (p[1] - 0x80)); out[o++] = a ? a : '?'; p += 2; continue;
+        }
+        if (c == 0xC2 && p[1] >= 0x80 && p[1] <= 0xBF) { out[o++] = ' '; p += 2; continue; }
+        if ((c & 0xE0) == 0xC0 && p[1]) { out[o++] = '?'; p += 2; continue; }         /* other 2-byte */
+        if ((c & 0xF0) == 0xE0 && p[1] && p[2]) { out[o++] = '?'; p += 3; continue; } /* other 3-byte */
+        if (c == 0x91 || c == 0x92) out[o++] = '\'';         /* Windows-1252 singles */
+        else if (c == 0x93 || c == 0x94) out[o++] = '"';
+        else if (c == 0x96 || c == 0x97) out[o++] = '-';
+        else if (c == 0x85) { if (o < cap - 3) { out[o++]='.'; out[o++]='.'; out[o++]='.'; } }
+        else { char a = latin1_ascii(c); out[o++] = a ? a : '?'; }
+        p++;
+    }
+    out[o] = 0;
+}
+static int subs_load(const char *path) {
+    FILE *f = fopen(path, "rb"); if (!f) return 0;
+    if (!g_subs) g_subs = (SubCue *)malloc(sizeof(SubCue) * SUB_MAX);
+    if (!g_subs) { fclose(f); return 0; }
+    g_nsubs = 0;
+    char line[512];
+    while (g_nsubs < SUB_MAX && fgets(line, sizeof line, f)) {
+        if (!strstr(line, "-->")) continue;                       /* the timing line of a cue */
+        char sb[40], eb[40]; int64_t s, e;
+        if (sscanf(line, "%39s --> %39s", sb, eb) != 2) continue;
+        if (!sub_parse_ts(sb, &s) || !sub_parse_ts(eb, &e)) continue;
+        char txt[SUB_TXT]; txt[0] = 0;
+        while (fgets(line, sizeof line, f)) {                     /* text lines until a blank line */
+            char *nl = strpbrk(line, "\r\n"); if (nl) *nl = 0;
+            if (!line[0]) break;
+            char clean[256]; sub_clean(line, clean, sizeof clean);   /* tags + smart quotes/accents -> ASCII */
+            size_t tl = strlen(txt);
+            if (tl && tl + 1 < SUB_TXT) txt[tl++] = '\n';
+            snprintf(txt + tl, SUB_TXT - tl, "%s", clean);
+        }
+        SubCue *c = &g_subs[g_nsubs++]; c->s = s; c->e = e; snprintf(c->t, sizeof c->t, "%s", txt);
+    }
+    fclose(f);
+    snprintf(g_sub_file, sizeof g_sub_file, "%s", path);
+    return g_nsubs;
+}
+static const char *subs_active(int64_t us) {
+    if (!g_sub_on) return NULL;
+    int64_t u = us - g_sub_off;   /* +offset delays the cue window (subs appear later) */
+    for (int i = 0; i < g_nsubs; i++) if (u >= g_subs[i].s && u < g_subs[i].e) return g_subs[i].t;
+    return NULL;
+}
+/* auto-load a matching track at playback start: "<movie>.srt" beside the file, else moviedata/ */
+static void subs_autoload(const char *moviepath) {
+    g_nsubs = 0; g_sub_on = 0; g_sub_off = 0; g_sub_file[0] = 0;   /* offset is per-movie */
+    const char *b = strrchr(moviepath, '/'); b = b ? b + 1 : moviepath;
+    char stem[256]; snprintf(stem, sizeof stem, "%s", b);
+    char *dot = strrchr(stem, '.'); if (dot) *dot = 0;
+    char cand[600];
+    snprintf(cand, sizeof cand, "%.*s%s.srt", (int)(b - moviepath), moviepath, stem);   /* sidecar */
+    if (subs_load(cand)) { g_sub_on = 1; return; }
+    snprintf(cand, sizeof cand, "sdmc:/moflex_player/moviedata/%s.srt", stem);           /* moviedata */
+    if (subs_load(cand)) { g_sub_on = 1; return; }
+}
+
+/* draw the active cue straight onto the (rotated) TOP framebuffer, both eyes in 3D */
+static void sub_fbpx(u16 *fb, int x, int y, u16 c) {
+    if ((unsigned)x < SCR_W && (unsigned)y < SCR_H) fb[x * SCR_H + (SCR_H - 1 - y)] = c;
+}
+static const char sub_note_glyph[8] = { 0x08, 0x08, 0x08, 0x08, 0x08, 0x0E, 0x0F, 0x06 };  /* a music note (for ♪) */
+static void sub_fbtext(u16 *fb, int x, int y, int sc, u16 c, const char *s) {
+    for (; *s; s++) {
+        unsigned ch = (unsigned char)*s;
+        const char *g = (ch == 0x0E) ? sub_note_glyph : font8x8_basic[ch > 127 ? '?' : ch];
+        for (int row = 0; row < 8; row++) { char bits = g[row];
+            for (int col = 0; col < 8; col++) if (bits & (1 << col))
+                for (int a = 0; a < sc; a++) for (int b = 0; b < sc; b++)
+                    sub_fbpx(fb, x + col * sc + a, y + row * sc + b, c);
+        }
+        x += 8 * sc;
+    }
+}
+static void sub_fbfill(u16 *fb, u16 c) { int n = SCR_W * SCR_H; for (int i = 0; i < n; i++) fb[i] = c; }
+
+#define SUB_MAXLN 4
+#define SUB_LNW  56                         /* line buffer (small size fits ~48 chars) */
+
+/* Wrap a cue into display lines: keep the SRT's own line breaks (dialogue dashes),
+ * and word-wrap only within each of those lines. Returns line count. */
+static int sub_wrap(const char *t, char lines[SUB_MAXLN][SUB_LNW], int maxch) {
+    if (maxch > SUB_LNW - 1) maxch = SUB_LNW - 1;
+    if (maxch < 1) maxch = 1;
+    int nl = 0;
+    for (const char *seg = t; *seg && nl < SUB_MAXLN; ) {
+        const char *segend = seg; while (*segend && *segend != '\n') segend++;   /* one source line */
+        char cur[SUB_LNW]; int cl = 0;
+        for (const char *p = seg; p < segend && nl < SUB_MAXLN; ) {
+            while (p < segend && (*p == ' ' || *p == '\t' || *p == '\r')) p++;
+            if (p >= segend) break;
+            const char *w = p; while (p < segend && *p != ' ' && *p != '\t' && *p != '\r') p++;
+            int wl = (int)(p - w); if (wl > maxch) wl = maxch;
+            if (cl == 0) { memcpy(cur, w, wl); cl = wl; }
+            else if (cl + 1 + wl <= maxch) { cur[cl++] = ' '; memcpy(cur + cl, w, wl); cl += wl; }
+            else { cur[cl] = 0; snprintf(lines[nl++], SUB_LNW, "%s", cur); cl = wl; memcpy(cur, w, wl); }
+        }
+        if (cl > 0 && nl < SUB_MAXLN) { cur[cl] = 0; snprintf(lines[nl++], SUB_LNW, "%s", cur); }
+        seg = (*segend == '\n') ? segend + 1 : segend;
+    }
+    return nl;
+}
+/* draw the wrapped lines centered at cx (white text + a thin black outline, no box) */
+static void sub_draw_lines(u16 *fb, int cx, int y0, char lines[SUB_MAXLN][SUB_LNW], int nl, int sc) {
+    int lh = 8 * sc + 4;
+    for (int i = 0; i < nl; i++) {
+        const char *s = lines[i];
+        int x = cx - (int)strlen(s) * 8 * sc / 2, y = y0 + i * lh;
+        sub_fbtext(fb, x - 1, y, sc, 0, s); sub_fbtext(fb, x + 1, y, sc, 0, s);
+        sub_fbtext(fb, x, y - 1, sc, 0, s); sub_fbtext(fb, x, y + 1, sc, 0, s);
+        sub_fbtext(fb, x, y, sc, 0xFFFF, s);
+    }
+}
+static void sub_overlay(int is3d, int64_t us) {
+    const char *t = subs_active(us);
+    if (!t || !t[0]) return;
+    int sc = g_sub_size < 1 ? 1 : g_sub_size > 3 ? 3 : g_sub_size;
+    int maxch = (SCR_W - 20) / (8 * sc);
+    char lines[SUB_MAXLN][SUB_LNW]; int nl = sub_wrap(t, lines, maxch);
+    if (nl == 0) return;
+    int total = nl * (8 * sc + 4);
+    int y0 = g_sub_top ? 12 : (SCR_H - 12 - total);
+    for (int eye = 0; eye < (is3d ? 2 : 1); eye++) {
+        u16 *fb = (u16 *)gfxGetFramebuffer(GFX_TOP, eye ? GFX_RIGHT : GFX_LEFT, NULL, NULL);
+        int dx = is3d ? ((eye == 0) ? -g_sub_depth : g_sub_depth) : 0;   /* parallax between eyes */
+        sub_draw_lines(fb, SCR_W / 2 + dx, y0, lines, nl, sc);
+    }
 }
 
 /* debug timing overlay (per stereo pair), updated ~1x/sec from the loop */
@@ -236,7 +432,176 @@ static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing)
     ui_button(BKB_X, BTN_Y, BKB_W, BTN_H, "BACK", 0, UI_NEONP);
     ui_button(OPB_X, BTN_Y, OPB_W, BTN_H, "OPEN", 0, UI_NEON);
     ui_button(EXB_X, BTN_Y, EXB_W, BTN_H, "EXIT", 0, UI_RED);
+    /* subtitles: CC toggle/options (glows when on) */
+    ui_button(CC_X, CC_Y, CC_W, CC_H, "CC", g_sub_on, g_sub_on ? UI_NEON : UI_DIM);
     ui_present();
+}
+
+/* ---- subtitle options (modal, bottom screen; top keeps showing the frozen frame) ---- */
+static int sub_modal(const char *title, const char *const *items, int n) {
+    int sel = 0;
+    while (aptMainLoop()) {
+        hidScanInput();
+        u32 k = hidKeysDown();
+        if (k & KEY_B) return -1;
+        if (k & KEY_DOWN) sel = (sel + 1) % n;
+        if (k & KEY_UP)   sel = (sel + n - 1) % n;
+        if (k & KEY_A) return sel;
+        touchPosition tp; hidTouchRead(&tp);
+        if (k & KEY_TOUCH)
+            for (int i = 0; i < n; i++) { int by = 44 + i * 30;
+                if (tp.py >= by && tp.py < by + 26 && tp.px >= 18 && tp.px < UI_W - 18) return i; }
+        ui_begin(GFX_BOTTOM);
+        ui_vgrad_round(0, 0, UI_W, UI_H, 0, UI_RGB(16, 18, 32), UI_BG);
+        ui_text_center(UI_W / 2, 14, 2, UI_NEON, title);
+        for (int i = 0; i < n; i++) { int by = 44 + i * 30;
+            ui_button(18, by, UI_W - 36, 26, items[i], i == sel, UI_NEONC); }
+        ui_text_center(UI_W / 2, 228, 1, UI_DIM, "A choose   B back");
+        ui_present();
+        gspWaitForVBlank();
+    }
+    return -1;
+}
+static void sub_msg(const char *msg) {
+    while (aptMainLoop()) {
+        hidScanInput();
+        if (hidKeysDown() & (KEY_A | KEY_B | KEY_TOUCH)) break;
+        ui_begin(GFX_BOTTOM);
+        ui_vgrad_round(0, 0, UI_W, UI_H, 0, UI_RGB(16, 18, 32), UI_BG);
+        char b[256]; snprintf(b, sizeof b, "%s", msg); int y = 90;
+        for (char *p = b; p; ) { char *e = strchr(p, '\n'); if (e) *e = 0;
+            ui_text_center(UI_W / 2, y, 1, UI_INK, p); y += 16; if (!e) break; p = e + 1; }
+        ui_text_center(UI_W / 2, 210, 1, UI_DIM, "tap / A to continue");
+        ui_present();
+        gspWaitForVBlank();
+    }
+}
+static int sub_srt_scan(const char *dir, char names[][128], char paths[][512], int start, int max) {
+    DIR *d = opendir(dir); if (!d) return start;
+    struct dirent *e; int n = start;
+    while ((e = readdir(d)) && n < max) {
+        size_t L = strlen(e->d_name);
+        if (L > 4 && !strcasecmp(e->d_name + L - 4, ".srt")) {
+            snprintf(names[n], 128, "%s", e->d_name);
+            snprintf(paths[n], 512, "%s%s", dir, e->d_name);
+            n++;
+        }
+    }
+    closedir(d);
+    return n;
+}
+static void sub_load_menu(const char *moviepath) {
+    static char names[5][128]; static char paths[5][512];
+    const char *b = strrchr(moviepath, '/');
+    char dir[512]; int dl = b ? (int)(b - moviepath + 1) : 0;
+    snprintf(dir, sizeof dir, "%.*s", dl, moviepath);        /* the movie's own folder */
+    int nf = sub_srt_scan(dir, names, paths, 0, 5);
+    nf = sub_srt_scan("sdmc:/moflex_player/moviedata/", names, paths, nf, 5);
+    if (nf == 0) { sub_msg("No .srt files found in the\nmovie folder or moviedata."); return; }
+    const char *items[5]; for (int i = 0; i < nf; i++) items[i] = names[i];
+    int c = sub_modal("LOAD SRT", items, nf);
+    if (c < 0) return;
+    if (subs_load(paths[c])) { g_sub_on = 1; sub_msg("Subtitles loaded."); }
+    else sub_msg("Could not read that file.");
+}
+/* live depth (parallax) adjuster: sample caption previewed in 3D on the top screen */
+static void sub_depth_menu(int is3d) {
+    const char *sample = "Subtitle depth";
+    int sc = g_sub_size < 1 ? 1 : g_sub_size > 3 ? 3 : g_sub_size;
+    char lines[SUB_MAXLN][SUB_LNW]; int nl = sub_wrap(sample, lines, (SCR_W - 20) / (8 * sc));
+    int hrep = 0;
+    while (aptMainLoop()) {
+        hidScanInput();
+        u32 k = hidKeysDown(), kh = hidKeysHeld();
+        if (k & (KEY_A | KEY_B)) break;
+        int lr = (kh & KEY_LEFT) ? -1 : (kh & KEY_RIGHT) ? 1 : 0;   /* hold to repeat */
+        if (!lr) hrep = 0;
+        else { int fire = (k & (KEY_LEFT | KEY_RIGHT)) ? 1 : 0;
+               if (!fire) { hrep++; if (hrep > 10 && hrep % 3 == 0) fire = 1; }
+               if (fire) { g_sub_depth += lr; if (g_sub_depth < -16) g_sub_depth = -16; if (g_sub_depth > 16) g_sub_depth = 16; } }
+        touchPosition tp; hidTouchRead(&tp);
+        if ((k & KEY_TOUCH) && tp.py >= 150 && tp.py < 188) {
+            if (tp.px >= 30 && tp.px < 150 && g_sub_depth > -16) g_sub_depth--;
+            else if (tp.px >= 170 && tp.px < 290 && g_sub_depth < 16) g_sub_depth++;
+        }
+        /* top: neutral background + the sample caption at the current depth (both eyes) */
+        for (int eye = 0; eye < (is3d ? 2 : 1); eye++) {
+            u16 *fb = (u16 *)gfxGetFramebuffer(GFX_TOP, eye ? GFX_RIGHT : GFX_LEFT, NULL, NULL);
+            sub_fbfill(fb, UI_RGB(28, 32, 46));
+            int dx = is3d ? ((eye == 0) ? -g_sub_depth : g_sub_depth) : 0;
+            sub_draw_lines(fb, SCR_W / 2 + dx, SCR_H - 48, lines, nl, sc);
+        }
+        ui_begin(GFX_BOTTOM);
+        ui_vgrad_round(0, 0, UI_W, UI_H, 0, UI_RGB(16, 18, 32), UI_BG);
+        ui_text_center(UI_W / 2, 20, 2, UI_NEON, "SUBTITLE DEPTH");
+        char v[16]; snprintf(v, sizeof v, "%+d", g_sub_depth);
+        ui_text_center(UI_W / 2, 74, 3, UI_NEONC, v);
+        ui_button(30, 150, 120, 36, "< OUT", 0, UI_NEONP);
+        ui_button(170, 150, 120, 36, "IN >", 0, UI_NEON);
+        ui_text_center(UI_W / 2, 212, 1, UI_DIM, "LEFT / RIGHT adjust    A done");
+        ui_present();
+        gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
+    }
+}
+/* subtitle timing offset, in 0.25s steps (for lip-sync fine-tuning) */
+static void sub_offset_menu(void) {
+    int hrep = 0;
+    while (aptMainLoop()) {
+        hidScanInput();
+        u32 k = hidKeysDown(), kh = hidKeysHeld();
+        if (k & (KEY_A | KEY_B)) break;
+        int lr = (kh & KEY_LEFT) ? -1 : (kh & KEY_RIGHT) ? 1 : 0;   /* hold to repeat */
+        if (!lr) hrep = 0;
+        else { int fire = (k & (KEY_LEFT | KEY_RIGHT)) ? 1 : 0;
+               if (!fire) { hrep++; if (hrep > 10 && hrep % 3 == 0) fire = 1; }
+               if (fire) { g_sub_off += (int64_t)lr * 250000;
+                           if (g_sub_off < -60000000) g_sub_off = -60000000;
+                           if (g_sub_off >  60000000) g_sub_off =  60000000; } }
+        touchPosition tp; hidTouchRead(&tp);
+        if ((k & KEY_TOUCH) && tp.py >= 150 && tp.py < 188) {
+            if (tp.px >= 20 && tp.px < 155 && g_sub_off > -60000000) g_sub_off -= 250000;
+            else if (tp.px >= 165 && tp.px < 300 && g_sub_off < 60000000) g_sub_off += 250000;
+        }
+        int64_t a = g_sub_off < 0 ? -g_sub_off : g_sub_off;   /* format without float printf */
+        char v[24]; snprintf(v, sizeof v, "%c%d.%02d s", g_sub_off < 0 ? '-' : '+',
+                             (int)(a / 1000000), (int)((a % 1000000) / 10000));
+        ui_begin(GFX_BOTTOM);
+        ui_vgrad_round(0, 0, UI_W, UI_H, 0, UI_RGB(16, 18, 32), UI_BG);
+        ui_text_center(UI_W / 2, 20, 2, UI_NEON, "SUBTITLE DELAY");
+        ui_text_center(UI_W / 2, 74, 3, UI_NEONC, v);
+        ui_button(20, 150, 135, 36, "< EARLIER", 0, UI_NEONP);
+        ui_button(165, 150, 135, 36, "LATER >", 0, UI_NEON);
+        ui_text_center(UI_W / 2, 212, 1, UI_DIM, "LEFT / RIGHT adjust    A done");
+        ui_present();
+        gspWaitForVBlank();
+    }
+}
+static void sub_menu(const char *moviepath, int is3d) {
+    for (;;) {
+        char i0[28], i1[28], i2[28], i3[28], i4[28];
+        snprintf(i0, sizeof i0, "Subtitles: %s", g_sub_on ? "ON" : "OFF");
+        snprintf(i1, sizeof i1, "Position: %s", g_sub_top ? "TOP" : "BOTTOM");
+        snprintf(i2, sizeof i2, "Size: %s", g_sub_size == 1 ? "Small" : g_sub_size == 2 ? "Medium" : "Large");
+        int64_t da = g_sub_off < 0 ? -g_sub_off : g_sub_off;
+        snprintf(i3, sizeof i3, "Delay: %c%d.%02d s", g_sub_off < 0 ? '-' : '+',
+                 (int)(da / 1000000), (int)((da % 1000000) / 10000));
+        const char *items[6]; int act[6], n = 0;
+        items[n] = i0; act[n++] = 0;
+        items[n] = i1; act[n++] = 1;
+        items[n] = i2; act[n++] = 2;
+        items[n] = i3; act[n++] = 3;
+        if (is3d) { snprintf(i4, sizeof i4, "Depth (3D): %+d", g_sub_depth); items[n] = i4; act[n++] = 4; }
+        items[n] = "Load SRT file..."; act[n++] = 5;
+        int c = sub_modal("SUBTITLES", items, n);
+        if (c < 0) return;                                   /* B closes the menu */
+        int a = act[c];
+        if (a == 0) { if (g_nsubs > 0) g_sub_on = !g_sub_on; else sub_msg("No subtitles loaded.\nUse 'Load SRT file'."); }
+        else if (a == 1) g_sub_top = !g_sub_top;
+        else if (a == 2) g_sub_size = g_sub_size >= 3 ? 1 : g_sub_size + 1;
+        else if (a == 3) sub_offset_menu();
+        else if (a == 4) sub_depth_menu(is3d);
+        else if (a == 5) sub_load_menu(moviepath);
+    }
 }
 
 static void mp_wait_key(void) {
@@ -760,6 +1125,8 @@ MoflexResult moflex_play(const char *path) {
         else if (L > 4 && !strcasecmp(title + L - 4, ".cia")) title[L - 4] = 0;
     }
 
+    subs_autoload(path);   /* load a matching .srt (sidecar or moviedata/) if one exists */
+
     /* audio */
     #undef NWB
     #define NWB 16
@@ -824,6 +1191,13 @@ MoflexResult moflex_play(const char *path) {
             }
         }
 
+        if (kd & KEY_SELECT) {   /* SELECT: subtitle options */
+            if (have_audio) ndspChnSetPaused(0, true);
+            sub_menu(path, is3d);
+            if (have_audio) ndspChnSetPaused(0, !playing);
+            dirty = 1;
+        }
+
         /* ---- touch (always active) ---- */
         if ((kd | kh) & KEY_TOUCH) {
             int px = tp.px, py = tp.py;
@@ -834,7 +1208,12 @@ MoflexResult moflex_play(const char *path) {
                 if (nv < 0.25f) nv = 0.25f; if (nv > 4.0f) nv = 4.0f;
                 g_vol = nv; vol_dirty = 1; dirty = 1;   /* save deferred; dragging the slider must not write to SD each tick */
             } else if (kd & KEY_TOUCH) {
-                if (py >= PLAY_CY - 20 && py <= PLAY_CY + 20) {
+                if (px >= CC_X && px < CC_X + CC_W && py >= CC_Y && py < CC_Y + CC_H) {   /* CC: subtitle options */
+                    if (have_audio) ndspChnSetPaused(0, true);
+                    sub_menu(path, is3d);
+                    if (have_audio) ndspChnSetPaused(0, !playing);
+                    dirty = 1;
+                } else if (py >= PLAY_CY - 20 && py <= PLAY_CY + 20) {
                     if (px >= PLAY_CX - 20 && px <= PLAY_CX + 20) { playing = !playing; if (have_audio) ndspChnSetPaused(0, !playing); dirty = 1;
                           if (!playing) { resume_save_us(path, cur_us); last_save = cur_us;
                                           if (vol_dirty) { vol_save(); vol_dirty = 0; } } }   /* checkpoint + flush volume while stopped */
@@ -910,6 +1289,7 @@ MoflexResult moflex_play(const char *path) {
                     (void)y2r_started; (void)use_y2r;
                     if (!is3d) {                           /* 2D: every frame is a full flat frame -> present it */
                         if (ok) { u64 tb = svcGetSystemTick(); blit_eye(out, GFX_LEFT, W, H); dbg_blit += svcGetSystemTick() - tb;
+                                  sub_overlay(0, cur_us);
                                   gfxFlushBuffers(); gfxSwapBuffers(); dbg_pairs++; }
                     } else if (eye == 0) {                 /* left eye */
                         if (ok) { u64 tb = svcGetSystemTick(); blit_eye(out, GFX_LEFT, W, H); dbg_blit += svcGetSystemTick() - tb; left_ok = 1; left_vidx = vidx; }
@@ -917,6 +1297,7 @@ MoflexResult moflex_play(const char *path) {
                     } else {                              /* right eye: present only a matched pair */
                         if (ok && left_ok && vidx == left_vidx + 1) {
                             u64 tb = svcGetSystemTick(); blit_eye(out, GFX_RIGHT, W, H); dbg_blit += svcGetSystemTick() - tb;
+                            sub_overlay(1, cur_us);        /* draw the cue on both eyes */
                             gfxFlushBuffers(); gfxSwapBuffers();
                             dbg_pairs++;
                         }
