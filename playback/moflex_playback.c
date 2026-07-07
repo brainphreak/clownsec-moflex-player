@@ -238,7 +238,19 @@ static char latin1_ascii(unsigned c) {
         default: return 0;
     }
 }
-/* strip HTML-ish tags and fold UTF-8 / Windows-1252 punctuation + accents to plain ASCII */
+static char win1254_turkish_ascii(unsigned c) {
+    switch (c) {
+        case 0xD0: return 'G';   /* Windows-1254: Ğ */
+        case 0xDD: return 'I';   /* Windows-1254: İ */
+        case 0xDE: return 'S';   /* Windows-1254: Ş */
+        case 0xF0: return 'g';   /* Windows-1254: ğ */
+        case 0xFD: return 'i';   /* Windows-1254: ı (avoid Latin-1 ý -> y) */
+        case 0xFE: return 's';   /* Windows-1254: ş */
+        default: return 0;
+    }
+}
+static inline int sub_utf8_cont(unsigned char c) { return (c & 0xC0) == 0x80; }
+/* strip HTML-ish tags and fold UTF-8 / Windows-1252/Windows-1254 punctuation + accents to plain ASCII */
 static void sub_clean(const char *in, char *out, int cap) {
     const unsigned char *p = (const unsigned char *)in; int o = 0;
     while (*p && o < cap - 4) {
@@ -255,9 +267,22 @@ static void sub_clean(const char *in, char *out, int cap) {
         if (c == 0xC3 && p[1] >= 0x80 && p[1] <= 0xBF) {     /* UTF-8 Latin-1 supplement */
             char a = latin1_ascii(0xC0 + (p[1] - 0x80)); out[o++] = a ? a : '?'; p += 2; continue;
         }
+        if (c == 0xC4 && sub_utf8_cont(p[1])) {                  /* UTF-8 Turkish Latin Extended-A */
+            unsigned char d = p[1];
+            if (d == 0x9E) { out[o++] = 'G'; p += 2; continue; } /* Ğ */
+            if (d == 0x9F) { out[o++] = 'g'; p += 2; continue; } /* ğ */
+            if (d == 0xB0) { out[o++] = 'I'; p += 2; continue; } /* İ */
+            if (d == 0xB1) { out[o++] = 'i'; p += 2; continue; } /* ı */
+        }
+        if (c == 0xC5 && sub_utf8_cont(p[1])) {                  /* UTF-8 Turkish s-cedilla */
+            unsigned char d = p[1];
+            if (d == 0x9E) { out[o++] = 'S'; p += 2; continue; } /* Ş */
+            if (d == 0x9F) { out[o++] = 's'; p += 2; continue; } /* ş */
+        }
         if (c == 0xC2 && p[1] >= 0x80 && p[1] <= 0xBF) { out[o++] = ' '; p += 2; continue; }
-        if ((c & 0xE0) == 0xC0 && p[1]) { out[o++] = '?'; p += 2; continue; }         /* other 2-byte */
-        if ((c & 0xF0) == 0xE0 && p[1] && p[2]) { out[o++] = '?'; p += 3; continue; } /* other 3-byte */
+        { char t = win1254_turkish_ascii(c); if (t) { out[o++] = t; p++; continue; } }
+        if ((c & 0xE0) == 0xC0 && p[1] && sub_utf8_cont(p[1])) { out[o++] = '?'; p += 2; continue; }         /* other 2-byte UTF-8 */
+        if ((c & 0xF0) == 0xE0 && p[1] && p[2] && sub_utf8_cont(p[1]) && sub_utf8_cont(p[2])) { out[o++] = '?'; p += 3; continue; } /* other 3-byte UTF-8 */
         if (c == 0x91 || c == 0x92) out[o++] = '\'';         /* Windows-1252 singles */
         else if (c == 0x93 || c == 0x94) out[o++] = '"';
         else if (c == 0x96 || c == 0x97) out[o++] = '-';
