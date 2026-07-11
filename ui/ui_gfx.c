@@ -14,14 +14,27 @@ static const ThemePreset g_presets[] = {
     /* name        accent(1)          accent2            accent3            red               hi(bright text)     ink(text)          dim(muted)         bg(base)         */
     {"Clownsec", UI_RGB( 60,255,150), UI_RGB(180, 90,255), UI_RGB( 60,210,255), UI_RGB(255, 80, 60), UI_RGB(255,255,255), UI_RGB(205,214,235), UI_RGB( 90,100,130), UI_RGB(  9, 10, 18)},
     {"Matrix",   UI_RGB(  0,255, 65), UI_RGB(  0,200, 60), UI_RGB(120,255,140), UI_RGB(255, 70, 60), UI_RGB(190,255,190), UI_RGB(  0,225, 70), UI_RGB(  0,110, 40), UI_RGB(  0,  9,  2)},
-    {"Game Boy", UI_RGB( 32, 84, 40), UI_RGB( 15, 56, 15), UI_RGB( 96,150, 70), UI_RGB( 15, 56, 15), UI_RGB( 15, 56, 15), UI_RGB( 15, 56, 15), UI_RGB( 42, 92, 46), UI_RGB(120,170, 70)},
     {"Nintendo", UI_RGB( 50,150,255), UI_RGB(195,200,210), UI_RGB(120,180,255), UI_RGB(228, 25, 35), UI_RGB(245,247,252), UI_RGB(220,224,232), UI_RGB(120,126,140), UI_RGB( 34, 37, 45)},
     {"Light",    UI_RGB( 30,170,110), UI_RGB(140, 80,210), UI_RGB( 40,140,210), UI_RGB(210, 55, 45), UI_RGB( 15, 18, 26), UI_RGB( 38, 44, 60), UI_RGB(120,128,145), UI_RGB(232,235,242)},
     {"Amber",    UI_RGB(255,176,  0), UI_RGB(255,120,  0), UI_RGB(255,210,120), UI_RGB(255, 70, 50), UI_RGB(255,232,175), UI_RGB(255,190, 90), UI_RGB(150,100, 20), UI_RGB( 16, 11,  3)},
     {"Ice",      UI_RGB(120,220,255), UI_RGB(160,180,255), UI_RGB(200,240,255), UI_RGB(255, 90,110), UI_RGB(240,250,255), UI_RGB(200,225,245), UI_RGB( 90,120,160), UI_RGB(  6, 12, 26)},
 };
 #define THEME_N ((int)(sizeof(g_presets)/sizeof(g_presets[0])))
+#define CUSTOM_I THEME_N            /* the editable "Custom" theme sits after the presets */
 static int g_theme_i = 0;
+
+/* ---- editable Custom palette: 8 elements x RGB (0..255), the source of truth ---- */
+#define ELEM_N 8
+static const char *g_elem_name[ELEM_N] =
+    { "Accent 1", "Accent 2", "Accent 3", "Danger", "Bright text", "Text", "Muted", "Background" };
+static const u8 k_cust_default[ELEM_N][3] = {   /* defaults to the Clownsec palette */
+    { 60,255,150}, {180, 90,255}, { 60,210,255}, {255, 80, 60},
+    {255,255,255}, {205,214,235}, { 90,100,130}, {  9, 10, 18},
+};
+static u8  g_cust[ELEM_N][3];
+static int g_cust_init = 0;
+static void custom_reset(void) { memcpy(g_cust, k_cust_default, sizeof g_cust); g_cust_init = 1; }
+static u16 cust565(int e) { return UI_RGB(g_cust[e][0], g_cust[e][1], g_cust[e][2]); }
 
 /* blend a->b in RGB565, t=0..255 (0=a, 255=b) */
 static u16 blend565(u16 a, u16 b, int t) {
@@ -31,27 +44,45 @@ static u16 blend565(u16 a, u16 b, int t) {
     return (u16)((r<<11)|(g<<5)|l);
 }
 
-int  theme_count(void)       { return THEME_N; }
-const char *theme_name(int i) { return (i>=0 && i<THEME_N) ? g_presets[i].name : ""; }
+/* set the live palette from 8 base colours + derive the structural shades */
+static void theme_apply(u16 accent, u16 accent2, u16 accent3, u16 red,
+                        u16 hi, u16 ink, u16 dim, u16 bg) {
+    g_theme.accent=accent; g_theme.accent2=accent2; g_theme.accent3=accent3;
+    g_theme.red=red; g_theme.hi=hi; g_theme.ink=ink; g_theme.dim=dim; g_theme.bg=bg;
+    /* panels nudge toward the text colour, selection tints toward the accent -- so a
+       light OR dark base bg both stay coherent. */
+    g_theme.bg1   = blend565(bg, ink,    18);
+    g_theme.bg2   = blend565(bg, ink,    40);
+    g_theme.sel   = blend565(bg, accent, 55);
+    g_theme.sello = blend565(bg, accent, 20);
+    g_theme.line  = blend565(bg, ink,    70);
+    g_theme.track = blend565(bg, ink,    45);
+}
+
+int  theme_count(void)       { return THEME_N + 1; }   /* presets + Custom */
+const char *theme_name(int i) { return (i == CUSTOM_I) ? "Custom" : (i>=0 && i<THEME_N) ? g_presets[i].name : ""; }
 int  theme_current(void)     { return g_theme_i; }
 
 void theme_set(int i) {
-    if (i < 0) i = 0; if (i >= THEME_N) i = THEME_N - 1;
+    if (i < 0) i = 0; if (i > CUSTOM_I) i = CUSTOM_I;
     g_theme_i = i;
-    const ThemePreset *p = &g_presets[i];
-    g_theme.accent=p->accent; g_theme.accent2=p->accent2; g_theme.accent3=p->accent3;
-    g_theme.red=p->red; g_theme.hi=p->hi; g_theme.ink=p->ink; g_theme.dim=p->dim; g_theme.bg=p->bg;
-    /* structural shades derived from the base so any bg (dark OR light) stays coherent:
-       panels nudge toward the text colour, selection tints toward the accent. */
-    g_theme.bg1   = blend565(p->bg, p->ink,    18);
-    g_theme.bg2   = blend565(p->bg, p->ink,    40);
-    g_theme.sel   = blend565(p->bg, p->accent, 55);
-    g_theme.sello = blend565(p->bg, p->accent, 20);
-    g_theme.line  = blend565(p->bg, p->ink,    70);
-    g_theme.track = blend565(p->bg, p->ink,    45);
+    if (i == CUSTOM_I) {
+        if (!g_cust_init) custom_reset();
+        theme_apply(cust565(0), cust565(1), cust565(2), cust565(3),
+                    cust565(4), cust565(5), cust565(6), cust565(7));
+    } else {
+        const ThemePreset *p = &g_presets[i];
+        theme_apply(p->accent, p->accent2, p->accent3, p->red, p->hi, p->ink, p->dim, p->bg);
+    }
 }
 
 void theme_preview(int i, u16 *accent, u16 *accent2, u16 *accent3, u16 *bg) {
+    if (i == CUSTOM_I) {
+        if (!g_cust_init) custom_reset();
+        if (accent) *accent=cust565(0); if (accent2) *accent2=cust565(1);
+        if (accent3) *accent3=cust565(2); if (bg) *bg=cust565(7);
+        return;
+    }
     if (i < 0 || i >= THEME_N) i = 0;
     const ThemePreset *p = &g_presets[i];
     if (accent)  *accent  = p->accent;
@@ -60,8 +91,39 @@ void theme_preview(int i, u16 *accent, u16 *accent2, u16 *accent3, u16 *bg) {
     if (bg)      *bg      = p->bg;
 }
 
+/* ---- Custom-editor API ---- */
+int theme_custom_index(void)      { return CUSTOM_I; }
+int theme_elem_count(void)        { return ELEM_N; }
+const char *theme_elem_name(int e){ return (e>=0 && e<ELEM_N) ? g_elem_name[e] : ""; }
+int theme_custom_get(int e, int c){
+    if (!g_cust_init) custom_reset();
+    return (e>=0 && e<ELEM_N && c>=0 && c<3) ? g_cust[e][c] : 0;
+}
+void theme_custom_set(int e, int c, int v) {
+    if (e<0 || e>=ELEM_N || c<0 || c>=3) return;
+    if (v<0) v=0; if (v>255) v=255;
+    if (!g_cust_init) custom_reset();
+    g_cust[e][c] = (u8)v;
+    if (g_theme_i == CUSTOM_I) theme_set(CUSTOM_I);   /* live re-apply */
+}
+void theme_custom_reset(void) {
+    custom_reset();
+    if (g_theme_i == CUSTOM_I) theme_set(CUSTOM_I);
+}
+
 #define THEME_CFG "sdmc:/moflex_player/theme.cfg"
+#define CUST_CFG  "sdmc:/moflex_player/custom.cfg"
+static void custom_load(void) {
+    custom_reset();
+    FILE *f = fopen(CUST_CFG, "rb");
+    if (!f) return;
+    for (int e=0; e<ELEM_N; e++) for (int c=0; c<3; c++) {
+        int v; if (fscanf(f, "%d", &v) == 1) { if (v<0) v=0; if (v>255) v=255; g_cust[e][c]=(u8)v; }
+    }
+    fclose(f);
+}
 void theme_load(void) {
+    custom_load();
     int i = 0;
     FILE *f = fopen(THEME_CFG, "rb");
     if (f) { if (fscanf(f, "%d", &i) != 1) i = 0; fclose(f); }
@@ -71,6 +133,8 @@ void theme_save(void) {
     mkdir("sdmc:/moflex_player", 0777);   /* may not exist yet on a fresh card */
     FILE *f = fopen(THEME_CFG, "wb");
     if (f) { fprintf(f, "%d\n", g_theme_i); fclose(f); }
+    FILE *g = fopen(CUST_CFG, "wb");
+    if (g) { for (int e=0; e<ELEM_N; e++) fprintf(g, "%d %d %d\n", g_cust[e][0], g_cust[e][1], g_cust[e][2]); fclose(g); }
 }
 /* ============================================================= */
 

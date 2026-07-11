@@ -2081,6 +2081,84 @@ static HomeBtn g_btns[3] = {
 #define THSW_W 54
 #define THSW_H 16
 
+/* CUSTOM colour editor. Its own chrome is fixed (stays readable whatever colours
+ * you pick); a small preview panel shows the live theme. Selecting Custom is
+ * implied on entry, and everything is saved on the way out. */
+static void custom_editor(void) {
+    theme_set(theme_custom_index());        /* activate Custom so the preview is live */
+    int ne = theme_elem_count();
+    int elem = 0, ch = 0, redraw = 1;
+    /* fixed editor chrome (deliberately NOT themed) */
+    const u16 CBG = UI_RGB(14,15,20), CFG = UI_RGB(232,236,244), CMUT = UI_RGB(120,128,145),
+              CACC = UI_RGB(70,210,255), CTRK = UI_RGB(40,42,52);
+    const u16 chcol[3] = { UI_RGB(255,90,90), UI_RGB(90,220,110), UI_RGB(96,150,255) };
+    const int TKX = 44, TKW = 208, ROWY = 60, ROWH = 32;
+    while (aptMainLoop()) {
+        hidScanInput();
+        u32 kd = hidKeysDown(), kr = hidKeysDownRepeat();
+        if (kd & (KEY_B | KEY_START | KEY_X)) break;
+        if (kd & KEY_L) { elem = (elem + ne - 1) % ne; redraw = 1; }
+        if (kd & KEY_R) { elem = (elem + 1) % ne;      redraw = 1; }
+        if (kd & KEY_UP)   { ch = (ch + 2) % 3; redraw = 1; }
+        if (kd & KEY_DOWN) { ch = (ch + 1) % 3; redraw = 1; }
+        if (kr & KEY_LEFT)  { theme_custom_set(elem, ch, theme_custom_get(elem, ch) - 3); redraw = 1; }
+        if (kr & KEY_RIGHT) { theme_custom_set(elem, ch, theme_custom_get(elem, ch) + 3); redraw = 1; }
+        if (kd & KEY_Y) { theme_custom_reset(); redraw = 1; }
+        if (kd & KEY_TOUCH) {
+            touchPosition t; hidTouchRead(&t);
+            if (t.py < 52) {                              /* element arrows */
+                if (t.px < 60)       { elem = (elem + ne - 1) % ne; redraw = 1; }
+                else if (t.px > 260) { elem = (elem + 1) % ne;      redraw = 1; }
+            }
+            for (int c = 0; c < 3; c++) {                 /* tap a slider track to set it */
+                int y = ROWY + c * ROWH;
+                if ((int)t.py >= y - 4 && (int)t.py < y + 22) {
+                    int v = ((int)t.px - TKX) * 255 / TKW;
+                    ch = c; theme_custom_set(elem, c, v); redraw = 1;
+                }
+            }
+        }
+        if (redraw) {
+            ui_begin(GFX_BOTTOM);
+            ui_clear(CBG);
+            ui_text_center(UI_W / 2, 8, 2, CACC, "CUSTOM COLORS");
+            /* element selector */
+            ui_text(20, 32, 2, CMUT, "<");
+            ui_text_center(UI_W / 2 - 8, 32, 2, CFG, theme_elem_name(elem));
+            ui_text(UI_W - 30, 32, 2, CMUT, ">");
+            { u16 ec = UI_RGB(theme_custom_get(elem,0), theme_custom_get(elem,1), theme_custom_get(elem,2));
+              ui_fill_round(UI_W - 70, 32, 30, 16, 4, ec); ui_frame_round(UI_W - 70, 32, 30, 16, 4, CMUT, 1); }
+            /* R/G/B sliders */
+            for (int c = 0; c < 3; c++) {
+                int y = ROWY + c * ROWH;
+                ui_text(22, y, 2, c == ch ? CACC : CFG, c == 0 ? "R" : c == 1 ? "G" : "B");
+                ui_fill_round(TKX, y + 4, TKW, 8, 4, CTRK);
+                int val = theme_custom_get(elem, c);
+                int fw = val * TKW / 255;
+                if (fw > 0) ui_fill_round(TKX, y + 4, fw, 8, 4, chcol[c]);
+                int kx = TKX + fw;
+                ui_fill_round(kx - 4, y + 1, 8, 14, 4, c == ch ? CACC : CFG);
+                char vb[8]; snprintf(vb, sizeof vb, "%d", val);
+                ui_text(TKX + TKW + 8, y, 2, CFG, vb);
+            }
+            /* live preview panel (uses the actual theme) */
+            ui_text(20, ROWY + 3 * ROWH + 2, 1, CMUT, "PREVIEW");
+            int py = ROWY + 3 * ROWH + 14;
+            ui_fill_round(16, py, UI_W - 32, 34, 8, UI_BG2);
+            ui_frame_round(16, py, UI_W - 32, 34, 8, TH_LINE, 1);
+            ui_text(26, py + 6, 1, UI_INK, "Sample");
+            ui_fill_round(26, py + 20, 8, 8, 3, UI_NEON);
+            ui_fill_round(38, py + 20, 8, 8, 3, UI_NEONP);
+            ui_fill_round(50, py + 20, 8, 8, 3, UI_NEONC);
+            ui_button(UI_W - 116, py + 4, 92, 26, "PLAY", 1, UI_NEON);
+            ui_text_center(UI_W / 2, 228, 1, CMUT, "L/R item  dpad adjust  Y reset  B done");
+            ui_present(); redraw = 0;
+        }
+        gspWaitForVBlank();
+    }
+    theme_save();
+}
+
 /* THEMES picker: a live-previewing list -- moving the selection recolors the
  * whole UI instantly, and the choice is saved to SD on the way out. */
 static void themes_screen(void) {
@@ -2092,6 +2170,7 @@ static void themes_screen(void) {
         hidScanInput();
         u32 k = hidKeysDown();
         if (k & (KEY_A | KEY_B | KEY_START | KEY_Y)) break;
+        if (k & KEY_X) { custom_editor(); sel = theme_current(); redraw = 1; }   /* jump to + edit Custom */
         if (k & KEY_DOWN) { sel = (sel + 1) % n;     theme_set(sel); redraw = 1; }
         if (k & KEY_UP)   { sel = (sel + n - 1) % n; theme_set(sel); redraw = 1; }
         if (k & KEY_TOUCH) {
@@ -2119,7 +2198,7 @@ static void themes_screen(void) {
                 ui_fill_round(sx + 20, sy + sh / 2 - 2, 5, 5, 2, a3);
                 ui_text(58, ry + 6, 1, i == sel ? UI_WHITE : UI_INK, theme_name(i));
             }
-            ui_text_center(UI_W / 2, 224, 1, UI_DIM, "up/down preview    A/B apply");
+            ui_text_center(UI_W / 2, 224, 1, UI_DIM, "up/down preview   A/B apply   X edit Custom");
             ui_present(); redraw = 0;
         }
         gspWaitForVBlank();

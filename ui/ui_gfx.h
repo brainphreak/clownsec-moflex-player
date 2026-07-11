@@ -29,6 +29,13 @@ const char *theme_name(int i);
 int  theme_current(void);
 void theme_set(int i);      /* apply preset i (also derives the structural shades) */
 void theme_preview(int i, u16 *accent, u16 *accent2, u16 *accent3, u16 *bg);  /* colors for a swatch */
+/* editable "Custom" theme (index == theme_custom_index(), the last theme) */
+int  theme_custom_index(void);
+int  theme_elem_count(void);            /* editable palette entries (accents/text/bg...) */
+const char *theme_elem_name(int elem);
+int  theme_custom_get(int elem, int ch);        /* ch: 0=R 1=G 2=B, returns 0..255 */
+void theme_custom_set(int elem, int ch, int val); /* live-applies if Custom is active */
+void theme_custom_reset(void);
 void theme_load(void);      /* load saved index from SD (call once at startup) */
 void theme_save(void);
 
