@@ -14,7 +14,7 @@ static const ThemePreset g_presets[] = {
     /* name        accent(1)          accent2            accent3            red               hi(bright text)     ink(text)          dim(muted)         bg(base)         */
     {"Clownsec", UI_RGB( 60,255,150), UI_RGB(180, 90,255), UI_RGB( 60,210,255), UI_RGB(255, 80, 60), UI_RGB(255,255,255), UI_RGB(205,214,235), UI_RGB( 90,100,130), UI_RGB(  9, 10, 18)},
     {"Matrix",   UI_RGB(  0,255, 65), UI_RGB(  0,200, 60), UI_RGB(120,255,140), UI_RGB(255, 70, 60), UI_RGB(190,255,190), UI_RGB(  0,225, 70), UI_RGB(  0,110, 40), UI_RGB(  0,  9,  2)},
-    {"Game Boy", UI_RGB( 48, 98, 48), UI_RGB( 15, 56, 15), UI_RGB(107,140, 15), UI_RGB( 15, 56, 15), UI_RGB( 15, 56, 15), UI_RGB( 15, 56, 15), UI_RGB( 48, 98, 48), UI_RGB(155,188, 15)},
+    {"Game Boy", UI_RGB( 32, 84, 40), UI_RGB( 15, 56, 15), UI_RGB( 96,150, 70), UI_RGB( 15, 56, 15), UI_RGB( 15, 56, 15), UI_RGB( 15, 56, 15), UI_RGB( 42, 92, 46), UI_RGB(120,170, 70)},
     {"Nintendo", UI_RGB( 50,150,255), UI_RGB(195,200,210), UI_RGB(120,180,255), UI_RGB(228, 25, 35), UI_RGB(245,247,252), UI_RGB(220,224,232), UI_RGB(120,126,140), UI_RGB( 34, 37, 45)},
     {"Light",    UI_RGB( 30,170,110), UI_RGB(140, 80,210), UI_RGB( 40,140,210), UI_RGB(210, 55, 45), UI_RGB( 15, 18, 26), UI_RGB( 38, 44, 60), UI_RGB(120,128,145), UI_RGB(232,235,242)},
     {"Amber",    UI_RGB(255,176,  0), UI_RGB(255,120,  0), UI_RGB(255,210,120), UI_RGB(255, 70, 50), UI_RGB(255,232,175), UI_RGB(255,190, 90), UI_RGB(150,100, 20), UI_RGB( 16, 11,  3)},
