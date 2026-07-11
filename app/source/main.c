@@ -578,6 +578,19 @@ static void fmt_size(long long b, char *o, int cap) {
     else                snprintf(o, cap, "%lld KB", b / 1024);
 }
 
+/* If an earlier download of `url` was interrupted, a central partial remains (keyed by URL, so
+ * it's found even if you now pick a different folder). Ask whether to resume it or start over.
+ * Returns 1 to proceed (download_to_file resumes any kept partial). */
+static int download_resume_check(const char *url) {
+    long long have = download_partial_bytes(url);
+    if (have <= 0) return 1;                       /* nothing partial -> fresh download */
+    char sz[24]; fmt_size(have, sz, sizeof sz);
+    char msg[128];
+    snprintf(msg, sizeof msg, "Unfinished download found\n(%s already saved).\n\nA = Resume    B = Start over", sz);
+    if (!confirm(msg)) download_discard_partial(url);   /* B -> start over: drop the partial */
+    return 1;
+}
+
 #define POSTER_W 132
 #define POSTER_H 188
 
@@ -818,6 +831,8 @@ static int catalog_pick(const char *title, const char *subtitle, char items[][32
     return -1;
 }
 
+static void lib_add_downloaded(const char *path, const CatEntry *src);   /* defined with the library code */
+
 static void catalog_browse(const Source *src) {
     ui_begin(GFX_BOTTOM); ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
     ui_text_center(UI_W / 2, 100, 2, UI_NEON, "Fetching...");
@@ -934,11 +949,13 @@ static void catalog_browse(const Source *src) {
             snprintf(dest, sizeof(dest), "%s%s", destdir, e->fname);
             snprintf(g_dl_name, sizeof(g_dl_name), "%s", e->fname);
             g_last_prog = 0;
+            download_resume_check(e->url);   /* offer Resume / Start-over if a partial is left over */
             bool ok = download_to_file(e->url, dest, dl_progress, NULL);
             if (ok && !e->is_zip) {   /* persist metadata + poster so the info panel shows for the local file */
                 fix_download_ext(dest, sizeof dest);   /* Drive items have no extension -> sniff + add it */
                 if (!phave && e->art[0] && poster) phave = poster_get(e->art, e->fname, poster, POSTER_W, POSTER_H);
                 movieinfo_save(dest, e, phave ? poster : NULL, POSTER_W, POSTER_H);
+                lib_add_downloaded(dest, e);   /* show it in the library right away (info + poster already saved) */
             }
             if (ok && e->is_zip && !file_is_zip(dest)) {
                 remove(dest);   /* not a real zip (likely a 404 page) */
@@ -964,7 +981,8 @@ static void catalog_browse(const Source *src) {
                     msg_screen("DOWNLOAD", m);
                 }
             } else {
-                char m[128]; snprintf(m, sizeof m, "%s\n%s", g_dl_name, ok ? "Download complete." : "Failed / cancelled.");
+                char m[160]; snprintf(m, sizeof m, "%s\n%s", g_dl_name,
+                    ok ? "Download complete." : "Failed / cancelled.\n(Progress saved -- pick it again to resume.)");
                 msg_screen("DOWNLOAD", m);
             }
             redraw = 1;
@@ -1139,6 +1157,44 @@ static int lib_load(void) {   /* returns the movie count; loads the cache, else 
     return g_lib_n;
 }
 
+/* load the library cache into RAM if present, WITHOUT falling back to a full SD scan */
+static int lib_load_cache_only(void) {
+    if (g_lib_n > 0) return g_lib_n;
+    if (!g_lib) g_lib = (CatEntry *)malloc(sizeof(CatEntry) * LIB_MAX);
+    if (!g_lib) return 0;
+    FILE *f = fopen(LIB_CACHE, "rb");
+    if (f) { int magic = 0, n = 0;
+        if (fread(&magic, sizeof magic, 1, f) == 1 && magic == LIB_MAGIC &&
+            fread(&n, sizeof n, 1, f) == 1 && n > 0 && n <= LIB_MAX &&
+            (int)fread(g_lib, sizeof(CatEntry), n, f) == n) g_lib_n = n;
+        fclose(f); }
+    return g_lib_n;
+}
+
+/* Add (or update) a just-downloaded catalog movie in the library so it shows immediately
+ * with its info + poster -- no rescan needed. Skips if no library exists yet (the file has a
+ * .nfo, so the first library scan will include it correctly). */
+static void lib_add_downloaded(const char *path, const CatEntry *src) {
+    if (g_lib_n == 0) { lib_load_cache_only(); if (g_lib_n == 0) return; }  /* no cache -> leave to scan */
+    if (!g_lib) return;
+    int at = -1;
+    for (int i = 0; i < g_lib_n; i++) if (!strcmp(g_lib[i].url, path)) { at = i; break; }  /* re-download */
+    if (at < 0) { if (g_lib_n >= LIB_MAX) return; at = g_lib_n++; }
+    CatEntry *c = &g_lib[at];
+    *c = *src;                                          /* title/genres/category/year/runtime/is3d/desc/art */
+    snprintf(c->url, sizeof c->url, "%s", path);        /* local path we play + poster key */
+    const char *bn = strrchr(path, '/'); bn = bn ? bn + 1 : path;
+    snprintf(c->fname, sizeof c->fname, "%s", bn);
+    const char *title = src->title[0] ? src->title : src->name;
+    if (title[0]) snprintf(c->name, sizeof c->name, "%s", title);
+    else { snprintf(c->name, sizeof c->name, "%s", bn); strip_ext(c->name); }
+    if (!c->category[0]) snprintf(c->category, sizeof c->category, "Uncategorized");
+    c->is_zip = 0;
+    time_t now = time(NULL); struct tm *tmv = localtime(&now);
+    if (tmv) strftime(c->date, sizeof c->date, "%Y-%m-%d", tmv);
+    lib_save_cache();
+}
+
 /* ---- the scrollable movie list for one category/genre filter ----
  * returns LL_BACK (back a level), LL_PLAY (out[] set), or LL_RESCAN (X). */
 enum { LL_BACK = 0, LL_PLAY = 1, LL_RESCAN = 2 };
@@ -1204,7 +1260,11 @@ static int library_list(const char *filt_cat, const char *filt_genre, u16 *poste
         if (play) { snprintf(out, cap, "%s", g_lib[idx[csel]].url); result = LL_PLAY; break; }
         if (info) { lib_getinfo_menu(idx, ni, csel); shown = -1; redraw = 1; }   /* This / All-missing */
         if (csel != shown) { redraw = 1; phave = 0; settle = 0; }   /* moved -> reload local poster */
-        if (phave == 0 && ++settle >= 4) {
+        /* Don't hit the SD for a poster while scrolling: a no-artwork ("Uncategorized") item
+         * costs 3 failed FAT lookups (.p565/.jpg/.png) that would stall a held scroll. Load
+         * only once the list has settled and no nav key is held / no drag is in progress. */
+        int scrolling = (kh & (NAV_UP | NAV_DOWN)) || td;
+        if (!scrolling && phave == 0 && ++settle >= 4) {
             phave = (poster && movieinfo_poster(g_lib[idx[csel]].url, poster, POSTER_W, POSTER_H)) ? 1 : 2;
             redraw = 1;
         }
@@ -1343,8 +1403,9 @@ static void download_url_direct(void) {
     snprintf(dest, sizeof(dest), "%s%s", destdir, fname);
     snprintf(g_dl_name, sizeof(g_dl_name), "%s", fname);
     g_last_prog = 0;
+    download_resume_check(url);   /* offer Resume / Start-over if a partial is left over */
     bool ok = download_to_file(url, dest, dl_progress, NULL);
-    if (!ok) { remove(dest); msg_screen("DOWNLOAD", "Failed / cancelled."); return; }
+    if (!ok) { msg_screen("DOWNLOAD", "Failed / cancelled.\n(Progress saved -- start this\ndownload again to resume.)"); return; }
     size_t fl = strlen(fname);
     if (fl > 4 && !strcasecmp(fname + fl - 4, ".zip") && file_is_zip(dest) &&
         confirm("Extract the zip now?\n(No = keep the .zip file)")) {

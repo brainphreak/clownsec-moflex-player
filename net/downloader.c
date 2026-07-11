@@ -1,9 +1,11 @@
 #include "downloader.h"
 
+#include <3ds.h>            /* svcSleepThread for retry backoff */
 #include <curl/curl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 /* soc service is initialized once by the app (net_soc_init in main); curl uses it. */
 
@@ -34,43 +36,104 @@ static void setup(CURL *e, const char *url) {
 }
 
 /* ---- progress bridge ---- */
-typedef struct { dl_progress_cb cb; void *user; } Prog;
+typedef struct { dl_progress_cb cb; void *user; curl_off_t resume_off; } Prog;
 static int (*g_abort_cb)(void) = NULL;
 void download_set_abort(int (*abort_cb)(void)) { g_abort_cb = abort_cb; }
 static int xfer_cb(void *p, curl_off_t dltotal, curl_off_t dlnow, curl_off_t ul, curl_off_t un) {
     (void)ul; (void)un;
     if (g_abort_cb && g_abort_cb()) return 1;   /* user wants to move on -> abort this transfer */
     Prog *pr = (Prog *)p;
-    if (pr && pr->cb && !pr->cb(pr->user, (uint32_t)dlnow, (uint32_t)dltotal)) return 1; /* abort */
+    curl_off_t off = pr ? pr->resume_off : 0;   /* bytes already on disk (resumed transfers) */
+    curl_off_t now = off + dlnow;
+    curl_off_t tot = (dltotal > 0) ? off + dltotal : 0;
+    if (pr && pr->cb && !pr->cb(pr->user, (uint32_t)now, (uint32_t)tot)) return 1; /* abort */
     return 0;
 }
 
-/* ---- to file ---- */
+/* ---- to file (resumable) ---- */
+typedef struct { FILE *f; curl_off_t resume_off; long status; int range_ignored; } DlFile;
+
+/* Sniff the HTTP status so we can tell a real resume (206) from a server that ignored our
+ * Range and is re-sending the whole file (200) -- appending that would corrupt the .part. */
+static size_t hdr_cb(char *buf, size_t sz, size_t nm, void *ud) {
+    size_t n = sz * nm;
+    DlFile *d = (DlFile *)ud;
+    if (n >= 12 && buf[0]=='H' && buf[1]=='T' && buf[2]=='T' && buf[3]=='P') {
+        for (size_t i = 0; i + 3 < n; i++)
+            if (buf[i] == ' ') { d->status = (buf[i+1]-'0')*100 + (buf[i+2]-'0')*10 + (buf[i+3]-'0'); break; }
+        if (d->resume_off > 0 && d->status == 200) d->range_ignored = 1;   /* Range ignored */
+    }
+    return n;
+}
 static size_t file_cb(void *ptr, size_t sz, size_t nm, void *ud) {
-    return fwrite(ptr, sz, nm, (FILE *)ud);
+    DlFile *d = (DlFile *)ud;
+    if (d->range_ignored) return 0;   /* abort now rather than append a full body onto the partial */
+    return fwrite(ptr, sz, nm, d->f);
+}
+
+/* Partial downloads live in ONE central dir, keyed by a hash of the URL (not the destination)
+ * so a download resumes no matter which folder you send it to, and stubs never litter movie
+ * folders. Completed files are moved (SD->SD rename) to the chosen destination. */
+#define DL_TMP_DIR "sdmc:/moflex_player/downloads"
+static void part_path_for_url(const char *url, char *out, size_t cap) {
+    uint64_t h = 1469598103934665603ULL;                 /* FNV-1a 64 */
+    for (const unsigned char *p = (const unsigned char *)url; *p; p++) { h ^= *p; h *= 1099511628211ULL; }
+    mkdir("sdmc:/moflex_player", 0777);
+    mkdir(DL_TMP_DIR, 0777);
+    snprintf(out, cap, "%s/%016llx.part", DL_TMP_DIR, (unsigned long long)h);
+}
+
+long long download_partial_bytes(const char *url) {
+    char part[512]; part_path_for_url(url, part, sizeof part);
+    struct stat st;
+    return (stat(part, &st) == 0) ? (long long)st.st_size : 0;
+}
+void download_discard_partial(const char *url) {
+    char part[512]; part_path_for_url(url, part, sizeof part);
+    remove(part);
 }
 
 bool download_to_file(const char *url, const char *dest, dl_progress_cb cb, void *user) {
     if (!downloader_init()) return false;
-    CURL *e = curl_easy_init();
-    if (!e) return false;
-    FILE *f = fopen(dest, "wb");
-    if (!f) { curl_easy_cleanup(e); return false; }
+    char part[512]; part_path_for_url(url, part, sizeof part);
 
-    Prog pr = { cb, user };
-    setup(e, url);
-    curl_easy_setopt(e, CURLOPT_WRITEFUNCTION, file_cb);
-    curl_easy_setopt(e, CURLOPT_WRITEDATA, f);
-    if (cb) {
-        curl_easy_setopt(e, CURLOPT_NOPROGRESS, 0L);
-        curl_easy_setopt(e, CURLOPT_XFERINFOFUNCTION, xfer_cb);
-        curl_easy_setopt(e, CURLOPT_XFERINFODATA, &pr);
+    const int MAX_TRIES = 5;
+    for (int attempt = 0; attempt < MAX_TRIES; attempt++) {
+        struct stat st;
+        curl_off_t off = (stat(part, &st) == 0) ? (curl_off_t)st.st_size : 0;
+        FILE *f = fopen(part, off > 0 ? "ab" : "wb");
+        if (!f) return false;
+        CURL *e = curl_easy_init();
+        if (!e) { fclose(f); return false; }
+
+        DlFile df = { f, off, 0, 0 };
+        Prog pr = { cb, user, off };
+        setup(e, url);
+        curl_easy_setopt(e, CURLOPT_WRITEFUNCTION, file_cb);
+        curl_easy_setopt(e, CURLOPT_WRITEDATA, &df);
+        curl_easy_setopt(e, CURLOPT_HEADERFUNCTION, hdr_cb);
+        curl_easy_setopt(e, CURLOPT_HEADERDATA, &df);
+        if (off > 0) curl_easy_setopt(e, CURLOPT_RESUME_FROM_LARGE, off);   /* resume via Range */
+        if (cb) {
+            curl_easy_setopt(e, CURLOPT_NOPROGRESS, 0L);
+            curl_easy_setopt(e, CURLOPT_XFERINFOFUNCTION, xfer_cb);
+            curl_easy_setopt(e, CURLOPT_XFERINFODATA, &pr);
+        }
+        CURLcode r = curl_easy_perform(e);
+        long code = 0; curl_easy_getinfo(e, CURLINFO_RESPONSE_CODE, &code);
+        curl_easy_cleanup(e);
+        fclose(f);
+
+        if (r == CURLE_OK && (code == 200 || code == 206)) {
+            remove(dest);                 /* replace any stale final */
+            rename(part, dest);           /* .part -> dest only when complete */
+            return true;
+        }
+        if (r == CURLE_ABORTED_BY_CALLBACK) return false;   /* user cancelled -> keep .part */
+        if (df.range_ignored) remove(part);                 /* server can't resume -> start clean */
+        svcSleepThread((s64)(attempt + 1) * 500000000LL);   /* backoff, then resume/retry */
     }
-    CURLcode r = curl_easy_perform(e);
-    fclose(f);
-    curl_easy_cleanup(e);
-    if (r != CURLE_OK) { remove(dest); return false; }
-    return true;
+    return false;   /* give up for now; .part stays for a later Resume / Start-over */
 }
 
 /* ---- to memory ---- */

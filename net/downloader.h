@@ -14,8 +14,20 @@ typedef bool (*dl_progress_cb)(void *user, uint32_t downloaded, uint32_t total);
 bool downloader_init(void);
 void downloader_exit(void);
 
-/* Download url -> dest file path. Returns true on success. */
+/* Download url -> dest file path. Returns true on success.
+ * Resumable: data streams to a central temp file keyed by the URL
+ * (sdmc:/moflex_player/downloads/<hash>.part) and is moved to dest only when complete -- so a
+ * dropped transfer is retried automatically (resuming via HTTP Range), the partial survives app
+ * restarts, and it resumes even if you later pick a DIFFERENT destination folder. A user cancel
+ * keeps the partial for a later resume. */
 bool download_to_file(const char *url, const char *dest, dl_progress_cb cb, void *user);
+
+/* Bytes already downloaded for `url` (size of its leftover central partial), 0 if none.
+ * Keyed by URL, so it finds the partial regardless of destination folder. */
+long long download_partial_bytes(const char *url);
+
+/* Delete the leftover partial for `url` (for "start over"). */
+void download_discard_partial(const char *url);
 
 /* Download url -> malloc'd buffer (NUL-terminated). Caller frees *out.
  * Good for fetching the catalog JSON. Caps at max_bytes. */
