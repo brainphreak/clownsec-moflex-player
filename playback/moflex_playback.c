@@ -71,6 +71,24 @@ static void resume_clear(const char *movie) {
     char p[256]; resume_path(movie, p, sizeof(p));
     remove(p);
 }
+
+/* ---- per-movie subtitle encoding, persisted next to the resume file ---- */
+static void subenc_path(const char *movie, char *out, size_t cap) {
+    resume_path(movie, out, cap);                       /* .../<key>.pos */
+    size_t L = strlen(out);
+    if (L >= 4) snprintf(out + L - 4, cap - (L - 4), ".enc");   /* -> .../<key>.enc */
+}
+static int subenc_load(const char *movie) {             /* 0..4, or -1 if none saved */
+    char p[256]; subenc_path(movie, p, sizeof p);
+    FILE *f = fopen(p, "rb"); if (!f) return -1;
+    int e = -1; if (fscanf(f, "%d", &e) != 1) e = -1; fclose(f);
+    return (e >= 0 && e < 5) ? e : -1;
+}
+static void subenc_save(const char *movie, int enc) {
+    mkdir("sdmc:/moflex_player", 0777); mkdir("sdmc:/moflex_player/resume", 0777);
+    char p[256]; subenc_path(movie, p, sizeof p);
+    FILE *f = fopen(p, "wb"); if (f) { fprintf(f, "%d\n", enc); fclose(f); }
+}
 long long moflex_resume_get(const char *path) { return (long long)resume_load(path); }
 
 /* ---- YUV->RGB565 LUTs ---- */
@@ -352,6 +370,7 @@ static const char *subs_active(int64_t us) {
 /* auto-load a matching track at playback start: "<movie>.srt" beside the file, else moviedata/ */
 static void subs_autoload(const char *moviepath) {
     g_nsubs = 0; g_sub_on = 0; g_sub_off = 0; g_sub_file[0] = 0;   /* offset is per-movie */
+    { int e = subenc_load(moviepath); if (e >= 0) g_sub_enc = e; }  /* this movie's saved encoding (else keep last-used) */
     const char *b = strrchr(moviepath, '/'); b = b ? b + 1 : moviepath;
     char stem[256]; snprintf(stem, sizeof stem, "%s", b);
     char *dot = strrchr(stem, '.'); if (dot) *dot = 0;
@@ -664,6 +683,7 @@ static void sub_menu(const char *moviepath, int is3d) {
         else if (a == 4) sub_depth_menu(is3d);
         else if (a == 5) sub_load_menu(moviepath);
         else if (a == 6) { g_sub_enc = (g_sub_enc + 1) % 5;   /* re-decode the loaded SRT with the new codepage */
+                           subenc_save(moviepath, g_sub_enc);   /* remember this movie's encoding */
                            if (g_sub_file[0]) subs_load(g_sub_file); }
     }
 }
