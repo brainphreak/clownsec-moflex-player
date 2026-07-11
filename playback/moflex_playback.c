@@ -519,6 +519,9 @@ static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing)
 /* ---- subtitle options (modal, bottom screen; top keeps showing the frozen frame) ---- */
 static int sub_modal(const char *title, const char *const *items, int n) {
     int sel = 0;
+    int top = 40, step = (218 - top) / (n > 0 ? n : 1);   /* adaptive: fit n items above the footer */
+    if (step > 30) step = 30;
+    int bh = step - 4; if (bh > 26) bh = 26; if (bh < 15) bh = 15;
     while (aptMainLoop()) {
         hidScanInput();
         u32 k = hidKeysDown();
@@ -528,13 +531,13 @@ static int sub_modal(const char *title, const char *const *items, int n) {
         if (k & KEY_A) return sel;
         touchPosition tp; hidTouchRead(&tp);
         if (k & KEY_TOUCH)
-            for (int i = 0; i < n; i++) { int by = 44 + i * 30;
-                if (tp.py >= by && tp.py < by + 26 && tp.px >= 18 && tp.px < UI_W - 18) return i; }
+            for (int i = 0; i < n; i++) { int by = top + i * step;
+                if (tp.py >= by && tp.py < by + bh && tp.px >= 18 && tp.px < UI_W - 18) return i; }
         ui_begin(GFX_BOTTOM);
         ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
         ui_text_center(UI_W / 2, 14, 2, UI_NEON, title);
-        for (int i = 0; i < n; i++) { int by = 44 + i * 30;
-            ui_button(18, by, UI_W - 36, 26, items[i], i == sel, UI_NEONC); }
+        for (int i = 0; i < n; i++) { int by = top + i * step;
+            ui_button(18, by, UI_W - 36, bh, items[i], i == sel, UI_NEONC); }
         ui_text_center(UI_W / 2, 228, 1, UI_DIM, "A choose   B back");
         ui_present();
         gspWaitForVBlank();
