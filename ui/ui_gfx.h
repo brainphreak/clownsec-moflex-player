@@ -9,18 +9,46 @@
 #define UI_TW 400          /* top screen width */
 #define UI_H 240
 #define UI_RGB(r,g,b) ((u16)((((r)&0xF8)<<8)|(((g)&0xFC)<<3)|((b)>>3)))
-#define UI_WHITE UI_RGB(255,255,255)
 #define UI_BLACK UI_RGB(0,0,0)
-#define UI_GRAY  UI_RGB(140,140,140)
-#define UI_RED   UI_RGB(255,80,60)
-/* neon / cyberpunk palette */
-#define UI_NEON  UI_RGB(60,255,150)    /* CLOWNSEC green */
-#define UI_NEONP UI_RGB(180,90,255)    /* purple accent */
-#define UI_NEONC UI_RGB(60,210,255)    /* cyan accent */
-#define UI_BG    UI_RGB(9,10,18)       /* near-black background */
-#define UI_BG2   UI_RGB(20,22,36)      /* panel background */
-#define UI_INK   UI_RGB(205,214,235)   /* light text */
-#define UI_DIM   UI_RGB(90,100,130)    /* muted text / borders */
+
+/* ---- runtime theme: the whole UI palette is a struct so it can be changed at
+ * runtime (Themes screen). The accents + base bg/text come from a preset; the
+ * structural shades (panels/rows/borders) are derived so any base bg stays coherent. */
+typedef struct {
+    u16 accent, accent2, accent3;  /* the three accents (green/purple/cyan on the default) */
+    u16 red;                        /* danger / exit */
+    u16 hi;                         /* brightest text (selected rows, knobs) */
+    u16 ink;                        /* normal text */
+    u16 dim;                        /* muted text / borders */
+    u16 bg;                         /* screen base (darkest) */
+    u16 bg1, bg2, sel, sello, line, track;   /* derived by theme_set() */
+} UiTheme;
+extern UiTheme g_theme;
+int  theme_count(void);
+const char *theme_name(int i);
+int  theme_current(void);
+void theme_set(int i);      /* apply preset i (also derives the structural shades) */
+void theme_preview(int i, u16 *accent, u16 *accent2, u16 *accent3, u16 *bg);  /* colors for a swatch */
+void theme_load(void);      /* load saved index from SD (call once at startup) */
+void theme_save(void);
+
+/* palette macros now read the runtime theme (all ~200 existing usages just work) */
+#define UI_NEON   (g_theme.accent)
+#define UI_NEONP  (g_theme.accent2)
+#define UI_NEONC  (g_theme.accent3)
+#define UI_RED    (g_theme.red)
+#define UI_WHITE  (g_theme.hi)
+#define UI_GRAY   (g_theme.dim)
+#define UI_INK    (g_theme.ink)
+#define UI_DIM    (g_theme.dim)
+#define UI_BG     (g_theme.bg)
+#define UI_BG2    (g_theme.bg2)
+/* structural tiers (the hardcoded dark shades map to these) */
+#define TH_BG1    (g_theme.bg1)
+#define TH_SEL    (g_theme.sel)
+#define TH_SELLO  (g_theme.sello)
+#define TH_LINE   (g_theme.line)
+#define TH_TRACK  (g_theme.track)
 
 void ui_begin(gfxScreen_t screen);         /* draw to offscreen for GFX_TOP or GFX_BOTTOM */
 void ui_present(void);                     /* copy offscreen -> that screen's framebuffer */

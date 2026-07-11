@@ -191,7 +191,7 @@ static void msg_screen(const char *title, const char *body) {
         else if ((ku & KEY_TOUCH) && tdown) { tdown = 0; if (ty0 >= 206 && ty0 < 234 && tx0 >= 110 && tx0 < 210) break; }
         if (redraw) {
             ui_begin(GFX_BOTTOM);
-            ui_vgrad_round(0, 0, UI_W, UI_H, 0, UI_RGB(16, 18, 32), UI_BG);
+            ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
             ui_text_center(UI_W / 2, 14, 2, UI_NEON, title);
             ui_glow_round(28, 42, UI_W - 56, 2, 1, UI_NEON, 3, 30);
             ui_fill_round(28, 42, UI_W - 56, 2, 1, UI_NEON);
@@ -224,7 +224,7 @@ static int confirm(const char *prompt) {
         }
         if (redraw) {
             ui_begin(GFX_BOTTOM);
-            ui_vgrad_round(0, 0, UI_W, UI_H, 0, UI_RGB(16, 18, 32), UI_BG);
+            ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
             int ly = 66; const char *p = prompt; char line[64];   /* draw prompt lines (split on '\n') */
             while (*p) {
                 int j = 0; while (*p && *p != '\n' && j < 63) line[j++] = *p++;
@@ -261,7 +261,7 @@ static void upload_screen(void) {
         else if (wasactive) { wasactive = 0; lastdone = -1; redraw = 1; }   /* just finished */
         if (redraw) {
             ui_begin(GFX_BOTTOM);
-            ui_vgrad_round(0, 0, UI_W, UI_H, 0, UI_RGB(16, 18, 32), UI_BG);
+            ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
             ui_text_center(UI_W / 2, 12, 2, UI_NEON, "UPLOAD");
             ui_glow_round(28, 40, UI_W - 56, 2, 1, UI_NEON, 3, 30);
             ui_fill_round(28, 40, UI_W - 56, 2, 1, UI_NEON);
@@ -272,7 +272,7 @@ static void upload_screen(void) {
                 char sub[160]; snprintf(sub, sizeof sub, "Receiving: %s", nm);
                 ui_text_fit(UI_W / 2, 74, 1, UI_NEONC, sub, UI_W - 16);
                 int bx = 20, bw = UI_W - 40, by = 104, bh = 16;
-                ui_fill_round(bx, by, bw, bh, bh / 2, UI_RGB(32, 36, 56));
+                ui_fill_round(bx, by, bw, bh, bh / 2, TH_TRACK);
                 int fw = total > 0 ? (int)((long long)bw * done / total) : 0;
                 if (fw > 0) ui_fill_round(bx, by, fw, bh, bh / 2, UI_NEON);
                 int pct = total > 0 ? (int)((long long)done * 100 / total) : 0;
@@ -310,13 +310,13 @@ static bool dl_progress(void *u, u32 d, u32 t) {
     if (now - g_last_prog >= 100) {
         g_last_prog = now;
         ui_begin(GFX_BOTTOM);
-        ui_vgrad_round(0, 0, UI_W, UI_H, 0, UI_RGB(16, 18, 32), UI_BG);
+        ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
         ui_text_center(UI_W / 2, 12, 2, UI_NEON, "DOWNLOADING");
         ui_glow_round(28, 40, UI_W - 56, 2, 1, UI_NEON, 3, 30);
         ui_fill_round(28, 40, UI_W - 56, 2, 1, UI_NEON);
         ui_text_fit(UI_W / 2, 68, 1, UI_NEONC, g_dl_name, UI_W - 16);
         int bx = 20, bw = UI_W - 40, by = 104, bh = 16;
-        ui_fill_round(bx, by, bw, bh, bh / 2, UI_RGB(32, 36, 56));
+        ui_fill_round(bx, by, bw, bh, bh / 2, TH_TRACK);
         char pl[48];
         if (t) {
             int fw = (int)((long long)bw * d / t); if (fw > 0) ui_fill_round(bx, by, fw, bh, bh / 2, UI_NEON);
@@ -517,17 +517,17 @@ static int pick_folder(char *out, size_t cap) {
         if (psel < pscroll) pscroll = psel; if (psel >= pscroll + VIS) pscroll = psel - VIS + 1;
         if (redraw) {
             ui_begin(GFX_BOTTOM);
-            ui_vgrad_round(0, 0, UI_W, UI_H, 0, UI_RGB(16, 18, 32), UI_BG);
+            ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
             ui_text_center(UI_W / 2, 12, 2, UI_NEON, "SAVE TO");
             char pth[64]; int mc = (UI_W - 20) / 8;
             if ((int)strlen(dir) > mc) snprintf(pth, sizeof pth, "...%s", dir + strlen(dir) - (mc - 3));
             else snprintf(pth, sizeof pth, "%s", dir);
             ui_text(10, 34, 1, UI_DIM, pth);
-            ui_fill_round(8, 46, UI_W - 16, 1, 0, UI_RGB(40, 46, 74));
+            ui_fill_round(8, 46, UI_W - 16, 1, 0, TH_LINE);
             for (int r = 0; r < VIS; r++) { int i = pscroll + r; if (i >= total) break;
                 int by = ry0 + r * (rh + gap), selrow = (i == psel), rw = UI_W - 16;
                 if (selrow) { ui_glow_round(8, by, rw, rh, 7, UI_NEON, 3, 16);
-                    ui_vgrad_round(8, by, rw, rh, 7, UI_RGB(30, 40, 58), UI_RGB(16, 22, 34));
+                    ui_vgrad_round(8, by, rw, rh, 7, TH_SEL, TH_SELLO);
                     ui_frame_round(8, by, rw, rh, 7, UI_NEON, 1); }
                 char lb[NAMELEN]; int textx = 18; u16 tc = selrow ? UI_WHITE : UI_INK;
                 if (i == 0) { snprintf(lb, sizeof lb, "Save in this folder"); tc = UI_NEON; }
@@ -537,7 +537,7 @@ static int pick_folder(char *out, size_t cap) {
             }
             if (total > VIS) { int th = VIS * (rh + gap) - gap, ty = ry0, maxs = total - VIS;
                 int hh = th * VIS / total; if (hh < 12) hh = 12; int hy = ty + (th - hh) * pscroll / maxs;
-                ui_fill_round(UI_W - 6, ty, 3, th, 1, UI_RGB(30, 34, 52));
+                ui_fill_round(UI_W - 6, ty, 3, th, 1, TH_TRACK);
                 ui_fill_round(UI_W - 6, hy, 3, hh, 1, UI_NEON); }
             ui_button(8, 210, 90, 26, "SAVE", 0, UI_NEON);
             ui_button(102, 210, 100, 26, "NEW +", 0, UI_NEONC);
@@ -594,7 +594,7 @@ static int cat_is_3d(const CatEntry *e) {
 
 static void draw_info_top(const CatEntry *e, const u16 *poster) {
     ui_begin(GFX_TOP);
-    ui_clear(UI_RGB(8, 10, 16));
+    ui_clear(UI_BG);
     int y = 8;
     ui_text_wrap(10, &y, 2, UI_WHITE, e->name, 24, 2);       /* title (16px, ~24/line) */
 
@@ -605,7 +605,7 @@ static void draw_info_top(const CatEntry *e, const u16 *poster) {
             for (int i = 0; i < POSTER_W; i++)
                 ui_px(px0 + i, py0 + j, poster[j * POSTER_W + i]);
     } else {
-        ui_fill(px0, py0, POSTER_W, POSTER_H, UI_RGB(24, 28, 40));
+        ui_fill(px0, py0, POSTER_W, POSTER_H, UI_BG2);
         ui_text_center(px0 + POSTER_W / 2, py0 + POSTER_H / 2 - 4, 1, UI_GRAY,
                        e->art[0] ? "loading..." : "no art");
     }
@@ -617,22 +617,22 @@ static void draw_info_top(const CatEntry *e, const u16 *poster) {
     if (e->runtime && e->year) snprintf(meta, sizeof(meta), "%d   %d min", e->year, e->runtime);
     else if (e->year)          snprintf(meta, sizeof(meta), "%d", e->year);
     else                       meta[0] = 0;
-    if (meta[0]) { ui_text(tx, ty, 1, UI_RGB(120, 200, 255), meta); ty += 14; }
-    if (sz[0])   { ui_text(tx, ty, 1, UI_RGB(120, 255, 160), sz);   ty += 14; }
+    if (meta[0]) { ui_text(tx, ty, 1, UI_NEONC, meta); ty += 14; }
+    if (sz[0])   { ui_text(tx, ty, 1, UI_NEON, sz);   ty += 14; }
     {   /* stereoscopic flag (also shown for TV/zip entries) */
         int is3d = (e->is3d >= 0) ? e->is3d : cat_is_3d(e);   /* catalog/.nfo flag, else the filename */
-        ui_text(tx, ty, 1, is3d ? UI_RGB(255, 120, 200) : UI_RGB(150, 150, 150),
+        ui_text(tx, ty, 1, is3d ? UI_NEONP : UI_DIM,
                 is3d ? "3D  (stereoscopic)" : "2D"); ty += 14;
     }
     if (e->genres[0]) { ui_text_wrap(tx, &ty, 1, UI_GRAY, e->genres, 30, 3); ty += 4; }
-    if (e->desc[0])   ui_text_wrap(tx, &ty, 1, UI_RGB(205, 205, 205), e->desc, 30, 12);
+    if (e->desc[0])   ui_text_wrap(tx, &ty, 1, UI_INK, e->desc, 30, 12);
     ui_present();
 }
 
 /* Top-screen panel for a highlighted folder: a simple drawn folder icon + its name. */
 static void draw_folder_top(const char *name) {
     ui_begin(GFX_TOP);
-    ui_clear(UI_RGB(8, 10, 16));
+    ui_clear(UI_BG);
     int cx = UI_TW / 2, iy = 70, w = 108, h = 78, x = cx - w / 2;
     u16 tab = UI_RGB(210, 180, 90), body = UI_RGB(240, 205, 110);
     ui_fill(x, iy - 14, 46, 16, tab);                 /* folder tab */
@@ -793,14 +793,14 @@ static int catalog_pick(const char *title, const char *subtitle, char items[][32
         if (sel < top) top = sel; if (sel >= top + VIS) top = sel - VIS + 1;
         if (redraw) {
             ui_begin(GFX_BOTTOM);
-            ui_vgrad_round(0, 0, UI_W, UI_H, 0, UI_RGB(16, 18, 32), UI_BG);
+            ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
             ui_text_center(UI_W / 2, 12, 2, UI_NEON, title);
             if (subtitle && subtitle[0]) ui_text_fit(UI_W / 2, 34, 1, UI_NEONP, subtitle, UI_W - 16);
             ui_glow_round(28, 48, UI_W - 56, 2, 1, UI_NEON, 3, 30); ui_fill_round(28, 48, UI_W - 56, 2, 1, UI_NEON);
             for (int r = 0; r < VIS; r++) { int i = top + r; if (i >= total) break;
                 int by = ry0 + r * (rh + gap), selrow = (i == sel), rw = UI_W - 16;
                 if (selrow) { ui_glow_round(8, by, rw, rh, 7, UI_NEON, 3, 16);
-                    ui_vgrad_round(8, by, rw, rh, 7, UI_RGB(30, 40, 58), UI_RGB(16, 22, 34));
+                    ui_vgrad_round(8, by, rw, rh, 7, TH_SEL, TH_SELLO);
                     ui_frame_round(8, by, rw, rh, 7, UI_NEON, 1); }
                 int all = (show_all && i == 0), ex = (has_extra && i == total - 1);
                 const char *lbl = all ? "* Show All" : ex ? extra : items[i - (show_all ? 1 : 0)];
@@ -808,7 +808,7 @@ static int catalog_pick(const char *title, const char *subtitle, char items[][32
             }
             if (total > VIS) { int th = VIS * (rh + gap) - gap, ty = ry0, maxs = total - VIS;
                 int hh = th * VIS / total; if (hh < 12) hh = 12; int hy = ty + (th - hh) * top / maxs;
-                ui_fill_round(UI_W - 6, ty, 3, th, 1, UI_RGB(30, 34, 52));
+                ui_fill_round(UI_W - 6, ty, 3, th, 1, TH_TRACK);
                 ui_fill_round(UI_W - 6, hy, 3, hh, 1, UI_NEON); }
             ui_text_center(UI_W / 2, 226, 1, UI_DIM, "tap to choose    B back");
             ui_present(); redraw = 0;
@@ -819,7 +819,7 @@ static int catalog_pick(const char *title, const char *subtitle, char items[][32
 }
 
 static void catalog_browse(const Source *src) {
-    ui_begin(GFX_BOTTOM); ui_vgrad_round(0, 0, UI_W, UI_H, 0, UI_RGB(16, 18, 32), UI_BG);
+    ui_begin(GFX_BOTTOM); ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
     ui_text_center(UI_W / 2, 100, 2, UI_NEON, "Fetching...");
     ui_text_fit(UI_W / 2, 130, 1, UI_DIM, src->name, UI_W - 16); ui_present();
     gfxFlushBuffers(); gfxSwapBuffers();
@@ -949,7 +949,7 @@ static void catalog_browse(const Source *src) {
                     size_t sl = strlen(stem); if (sl > 4) stem[sl - 4] = 0;   /* drop .zip */
                     char folder[PATHLEN + NAMELEN];
                     snprintf(folder, sizeof(folder), "%s%s", destdir, stem);
-                    ui_begin(GFX_BOTTOM); ui_vgrad_round(0, 0, UI_W, UI_H, 0, UI_RGB(16, 18, 32), UI_BG);
+                    ui_begin(GFX_BOTTOM); ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
                     ui_text_center(UI_W / 2, 100, 2, UI_NEON, "Extracting...");
                     ui_text_fit(UI_W / 2, 130, 1, UI_DIM, stem, UI_W - 16); ui_present();
                     gfxFlushBuffers(); gfxSwapBuffers();
@@ -985,18 +985,18 @@ static void catalog_browse(const Source *src) {
           if (nr) redraw = 1; }
         if (redraw) {
             ui_begin(GFX_BOTTOM);
-            ui_vgrad_round(0, 0, UI_W, UI_H, 0, UI_RGB(16, 18, 32), UI_BG);
+            ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
             ui_text(10, 8, 2, UI_NEON, "CATALOG");
             char hdr[24]; snprintf(hdr, sizeof hdr, "%d / %d", csel + 1, ni);
             ui_text(UI_W - (int)strlen(hdr) * 8 - 10, 12, 1, UI_NEONP, hdr);
             char sub[80]; snprintf(sub, sizeof sub, "%s%s%s", filt_cat[0] ? filt_cat : "All", filt_genre[0] ? " / " : "", filt_genre);
             ui_text_left_fit(10, 30, 1, UI_NEONC, sub, UI_W - 20);
-            ui_fill_round(8, 42, UI_W - 16, 1, 0, UI_RGB(40, 46, 74));
+            ui_fill_round(8, 42, UI_W - 16, 1, 0, TH_LINE);
             for (int r = 0; r < BR_ROWS; r++) { int i = cscroll + r; if (i >= ni) break;
                 const CatEntry *ce = &cat[idx[i]];
                 int ry = BR_LIST_Y + r * BR_ROWH, rw = UI_W - 16, rh = BR_ROWH - 4, selrow = (i == csel);
                 if (selrow) { ui_glow_round(8, ry, rw, rh, 7, UI_NEON, 3, 16);
-                    ui_vgrad_round(8, ry, rw, rh, 7, UI_RGB(30, 40, 58), UI_RGB(16, 22, 34));
+                    ui_vgrad_round(8, ry, rw, rh, 7, TH_SEL, TH_SELLO);
                     ui_frame_round(8, ry, rw, rh, 7, UI_NEON, 1); }
                 if (ce->is_zip) icon_folder(18, ry + 3, UI_NEONP); else icon_movie(18, ry + 3, UI_NEONC);
                 int tx = 46, txr = UI_W - 16, ty = ry + (rh - 8) / 2, tw = ui_text_w(1, ce->name);
@@ -1008,7 +1008,7 @@ static void catalog_browse(const Source *src) {
             }
             if (ni > BR_ROWS) { int th = BR_ROWS * BR_ROWH - 6, ty = BR_LIST_Y, maxs = ni - BR_ROWS;
                 int hh = th * BR_ROWS / ni; if (hh < 12) hh = 12; int hy = ty + (th - hh) * cscroll / maxs;
-                ui_fill_round(UI_W - 6, ty, 3, th, 1, UI_RGB(30, 34, 52));
+                ui_fill_round(UI_W - 6, ty, 3, th, 1, TH_TRACK);
                 ui_fill_round(UI_W - 6, hy, 3, hh, 1, UI_NEON); }
             const char *sm = sortmode == 0 ? "Sort: Title" : sortmode == 1 ? "Sort: Year" : "Sort: Date";
             ui_button(8, 210, 96, 26, "DOWNLOAD", 0, UI_NEON);
@@ -1067,7 +1067,7 @@ static void lib_scan_dir(const char *dir, int depth) {
             if (tmv) strftime(c->date, sizeof c->date, "%Y-%m-%d", tmv);   /* file date -> "sort by date added" */
             g_lib_n++;
             if ((g_lib_n & 7) == 0) {                          /* live progress */
-                ui_begin(GFX_BOTTOM); ui_vgrad_round(0, 0, UI_W, UI_H, 0, UI_RGB(16, 18, 32), UI_BG);
+                ui_begin(GFX_BOTTOM); ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
                 ui_text_center(UI_W / 2, 96, 2, UI_NEON, "Scanning...");
                 char m[32]; snprintf(m, sizeof m, "%d found", g_lib_n);
                 ui_text_center(UI_W / 2, 128, 1, UI_DIM, m); ui_present();
@@ -1089,7 +1089,7 @@ static void lib_rescan(void) {
     if (!g_lib) g_lib = (CatEntry *)malloc(sizeof(CatEntry) * LIB_MAX);
     if (!g_lib) return;
     g_lib_n = 0;
-    ui_begin(GFX_BOTTOM); ui_vgrad_round(0, 0, UI_W, UI_H, 0, UI_RGB(16, 18, 32), UI_BG);
+    ui_begin(GFX_BOTTOM); ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
     ui_text_center(UI_W / 2, 96, 2, UI_NEON, "Scanning...");
     ui_text_center(UI_W / 2, 128, 1, UI_DIM, "searching the SD card for movies"); ui_present();
     gfxFlushBuffers(); gfxSwapBuffers();
@@ -1216,18 +1216,18 @@ static int library_list(const char *filt_cat, const char *filt_genre, u16 *poste
         }
         if (redraw) {
             ui_begin(GFX_BOTTOM);
-            ui_vgrad_round(0, 0, UI_W, UI_H, 0, UI_RGB(16, 18, 32), UI_BG);
+            ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
             ui_text(10, 8, 2, UI_NEON, "LIBRARY");
             char hdr[24]; snprintf(hdr, sizeof hdr, "%d / %d", csel + 1, ni);
             ui_text(UI_W - (int)strlen(hdr) * 8 - 10, 12, 1, UI_NEONP, hdr);
             char sh[80]; snprintf(sh, sizeof sh, "%s%s%s", filt_cat[0] ? filt_cat : "All", filt_genre[0] ? " / " : "", filt_genre);
             ui_text_left_fit(10, 30, 1, UI_NEONC, sh, UI_W - 20);
-            ui_fill_round(8, 42, UI_W - 16, 1, 0, UI_RGB(40, 46, 74));
+            ui_fill_round(8, 42, UI_W - 16, 1, 0, TH_LINE);
             for (int r = 0; r < BR_ROWS; r++) { int i = cscroll + r; if (i >= ni) break;
                 const CatEntry *ce = &g_lib[idx[i]];
                 int ry = BR_LIST_Y + r * BR_ROWH, rw = UI_W - 16, rh = BR_ROWH - 4, selrow = (i == csel);
                 if (selrow) { ui_glow_round(8, ry, rw, rh, 7, UI_NEON, 3, 16);
-                    ui_vgrad_round(8, ry, rw, rh, 7, UI_RGB(30, 40, 58), UI_RGB(16, 22, 34));
+                    ui_vgrad_round(8, ry, rw, rh, 7, TH_SEL, TH_SELLO);
                     ui_frame_round(8, ry, rw, rh, 7, UI_NEON, 1); }
                 icon_movie(18, ry + 3, UI_NEONC);
                 int tx = 46, txr = UI_W - 16, ty = ry + (rh - 8) / 2;
@@ -1243,7 +1243,7 @@ static int library_list(const char *filt_cat, const char *filt_genre, u16 *poste
             }
             if (ni > BR_ROWS) { int th = BR_ROWS * BR_ROWH - 6, ty = BR_LIST_Y, maxs = ni - BR_ROWS;
                 int hh = th * BR_ROWS / ni; if (hh < 12) hh = 12; int hy = ty + (th - hh) * cscroll / maxs;
-                ui_fill_round(UI_W - 6, ty, 3, th, 1, UI_RGB(30, 34, 52));
+                ui_fill_round(UI_W - 6, ty, 3, th, 1, TH_TRACK);
                 ui_fill_round(UI_W - 6, hy, 3, hh, 1, UI_NEON); }
             const char *sm = *sortmode == 0 ? "Sort: Title" : *sortmode == 1 ? "Sort: Year" : "Sort: Date";
             ui_button(8, 210, 96, 26, "PLAY", 0, UI_NEON);
@@ -1350,7 +1350,7 @@ static void download_url_direct(void) {
         confirm("Extract the zip now?\n(No = keep the .zip file)")) {
         char stem[NAMELEN]; snprintf(stem, sizeof(stem), "%s", fname); stem[fl - 4] = 0;
         char folder[PATHLEN + NAMELEN]; snprintf(folder, sizeof(folder), "%s%s", destdir, stem);
-        ui_begin(GFX_BOTTOM); ui_vgrad_round(0, 0, UI_W, UI_H, 0, UI_RGB(16, 18, 32), UI_BG);
+        ui_begin(GFX_BOTTOM); ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
         ui_text_center(UI_W / 2, 100, 2, UI_NEON, "Extracting...");
         ui_text_fit(UI_W / 2, 130, 1, UI_DIM, stem, UI_W - 16); ui_present();
         gfxFlushBuffers(); gfxSwapBuffers();
@@ -1397,7 +1397,7 @@ static void download_screen(void) {
         if (m < top) top = m; if (m >= top + VIS) top = m - VIS + 1;
         if (redraw) {
             ui_begin(GFX_BOTTOM);
-            ui_vgrad_round(0, 0, UI_W, UI_H, 0, UI_RGB(16, 18, 32), UI_BG);
+            ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
             ui_text_center(UI_W / 2, 12, 2, UI_NEON, "DOWNLOAD");
             ui_text_center(UI_W / 2, 34, 1, UI_NEONP, "choose a source");
             ui_glow_round(28, 48, UI_W - 56, 2, 1, UI_NEON, 3, 30);
@@ -1439,7 +1439,7 @@ static int ui_menu(const char *title, const char *subtitle, const char *const *i
         }
         if (redraw) {
             ui_begin(GFX_BOTTOM);
-            ui_vgrad_round(0, 0, UI_W, UI_H, 0, UI_RGB(16, 18, 32), UI_BG);
+            ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
             ui_text_center(UI_W / 2, 14, 2, UI_NEON, title);
             ui_glow_round(28, 40, UI_W - 56, 2, 1, UI_NEON, 3, 34);
             ui_fill_round(28, 40, UI_W - 56, 2, 1, UI_NEON);
@@ -1769,7 +1769,7 @@ static int pick_moflex(const CiaMoflex *list, int n) {
         if (sel < top) top = sel; if (sel >= top + VIS) top = sel - VIS + 1;
         if (redraw) {
             ui_begin(GFX_BOTTOM);
-            ui_vgrad_round(0, 0, UI_W, UI_H, 0, UI_RGB(16, 18, 32), UI_BG);
+            ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
             ui_text_center(UI_W / 2, 12, 2, UI_NEON, "CHOOSE VIDEO");
             char sub[32]; snprintf(sub, sizeof sub, "%d in this CIA", n);
             ui_text_center(UI_W / 2, 34, 1, UI_NEONP, sub);
@@ -1778,7 +1778,7 @@ static int pick_moflex(const CiaMoflex *list, int n) {
             for (int r = 0; r < VIS; r++) { int i = top + r; if (i >= n) break;
                 int by = ry0 + r * (rh + gap), selrow = (i == sel), rw = UI_W - 16;
                 if (selrow) { ui_glow_round(8, by, rw, rh, 7, UI_NEON, 3, 16);
-                    ui_vgrad_round(8, by, rw, rh, 7, UI_RGB(30, 40, 58), UI_RGB(16, 22, 34));
+                    ui_vgrad_round(8, by, rw, rh, 7, TH_SEL, TH_SELLO);
                     ui_frame_round(8, by, rw, rh, 7, UI_NEON, 1); }
                 icon_movie(18, by + (rh - 16) / 2, UI_NEONC);
                 char nm[64]; snprintf(nm, sizeof nm, "%s", list[i].name); strip_ext(nm);
@@ -1790,7 +1790,7 @@ static int pick_moflex(const CiaMoflex *list, int n) {
             }
             if (n > VIS) { int th = VIS * (rh + gap) - gap, ty = ry0, maxs = n - VIS;
                 int hh = th * VIS / n; if (hh < 12) hh = 12; int hy = ty + (th - hh) * top / maxs;
-                ui_fill_round(UI_W - 6, ty, 3, th, 1, UI_RGB(30, 34, 52));
+                ui_fill_round(UI_W - 6, ty, 3, th, 1, TH_TRACK);
                 ui_fill_round(UI_W - 6, hy, 3, hh, 1, UI_NEON); }
             ui_text_center(UI_W / 2, 226, 1, UI_DIM, "tap a video   B back");
             ui_present(); redraw = 0;
@@ -1843,10 +1843,10 @@ static MoflexResult play_movie(const char *path) {
 
 /* ---------- graphical (touch) Open-Video browser ---------- */
 typedef struct { int x, y, w, h; const char *label; u16 accent; } ActBtn;
-static ActBtn g_act[3] = {
-    {   8, 210, 94, 26, "OPEN", UI_NEON },
-    { 112, 210, 94, 26, "INFO", UI_NEONC },
-    { 216, 210, 96, 26, "Back", UI_NEONP },
+static ActBtn g_act[3] = {   /* .accent set live at draw time (theme colours aren't compile-time constant) */
+    {   8, 210, 94, 26, "OPEN", 0 },
+    { 112, 210, 94, 26, "INFO", 0 },
+    { 216, 210, 96, 26, "Back", 0 },
 };
 static void icon_folder(int x, int y, u16 c) {
     ui_fill_round(x, y, 9, 4, 1, c);          /* tab */
@@ -1871,7 +1871,7 @@ static void strip_ext(char *d) {
 static void browser_draw_gfx(int mode) {
     int manage = (mode == MODE_MANAGE);
     ui_begin(GFX_BOTTOM);
-    ui_vgrad_round(0, 0, UI_W, UI_H, 0, UI_RGB(16, 18, 32), UI_BG);
+    ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
     ui_text(10, 8, 2, UI_NEON, manage ? "MANAGE" : "FILESYSTEM");
     if (manage && move_pending) ui_text(UI_W - 96, 9, 1, UI_NEONC, "MOVE ready");
     else if (!manage && s_show_hidden) ui_text(UI_W - 74, 9, 1, UI_NEONP, "SYS on");
@@ -1880,7 +1880,7 @@ static void browser_draw_gfx(int mode) {
     if ((int)strlen(cwd) > mc) snprintf(pth, sizeof pth, "...%s", cwd + strlen(cwd) - (mc - 3));
     else snprintf(pth, sizeof pth, "%s", cwd);
     ui_text(10, 30, 1, UI_DIM, pth);
-    ui_fill_round(8, 42, UI_W - 16, 1, 0, UI_RGB(40, 46, 74));
+    ui_fill_round(8, 42, UI_W - 16, 1, 0, TH_LINE);
 
     int maxs = nentries > BR_ROWS ? nentries - BR_ROWS : 0;
     if (scroll > maxs) scroll = maxs; if (scroll < 0) scroll = 0;
@@ -1890,7 +1890,7 @@ static void browser_draw_gfx(int mode) {
         int ry = BR_LIST_Y + r * BR_ROWH, rw = UI_W - 16, rh = BR_ROWH - 4, selrow = (i == sel);
         if (selrow) {
             ui_glow_round(8, ry, rw, rh, 7, UI_NEON, 3, 16);
-            ui_vgrad_round(8, ry, rw, rh, 7, UI_RGB(30, 40, 58), UI_RGB(16, 22, 34));
+            ui_vgrad_round(8, ry, rw, rh, 7, TH_SEL, TH_SELLO);
             ui_frame_round(8, ry, rw, rh, 7, UI_NEON, 1);
         }
         if (entries[i].is_dir)      icon_folder(18, ry + 3, UI_RGB(240, 205, 110));
@@ -1913,7 +1913,7 @@ static void browser_draw_gfx(int mode) {
         int th = BR_ROWS * BR_ROWH - 6, ty = BR_LIST_Y;
         int hh = th * BR_ROWS / nentries; if (hh < 12) hh = 12;
         int hy = ty + (th - hh) * scroll / maxs;
-        ui_fill_round(UI_W - 6, ty, 3, th, 1, UI_RGB(30, 34, 52));
+        ui_fill_round(UI_W - 6, ty, 3, th, 1, TH_TRACK);
         ui_fill_round(UI_W - 6, hy, 3, hh, 1, UI_NEON);
     }
     const char *bl0 = manage ? (move_pending ? "PASTE" : "EDIT") : "OPEN";
@@ -2075,15 +2075,78 @@ static HomeBtn g_btns[3] = {
 #define HOME_PCY 120
 #define HOME_PR  27
 
+/* the little theme swatch on the home screen (tap it, or press Y, to open Themes) */
+#define THSW_X 8
+#define THSW_Y 6
+#define THSW_W 54
+#define THSW_H 16
+
+/* THEMES picker: a live-previewing list -- moving the selection recolors the
+ * whole UI instantly, and the choice is saved to SD on the way out. */
+static void themes_screen(void) {
+    int n = theme_count();
+    int sel = theme_current();
+    int redraw = 1;
+    const int ROW_Y0 = 46, ROW_H = 24;
+    while (aptMainLoop()) {
+        hidScanInput();
+        u32 k = hidKeysDown();
+        if (k & (KEY_A | KEY_B | KEY_START | KEY_Y)) break;
+        if (k & KEY_DOWN) { sel = (sel + 1) % n;     theme_set(sel); redraw = 1; }
+        if (k & KEY_UP)   { sel = (sel + n - 1) % n; theme_set(sel); redraw = 1; }
+        if (k & KEY_TOUCH) {
+            touchPosition t; hidTouchRead(&t);
+            int i = ((int)t.py - ROW_Y0) / ROW_H;
+            if (i >= 0 && i < n) { sel = i; theme_set(sel); redraw = 1; }
+        }
+        if (redraw) {
+            ui_begin(GFX_BOTTOM);
+            ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
+            ui_text_center(UI_W / 2, 14, 2, UI_NEON, "THEMES");
+            for (int i = 0; i < n; i++) {
+                int ry = ROW_Y0 + i * ROW_H;
+                if (i == sel) {
+                    ui_fill_round(10, ry, UI_W - 20, ROW_H - 4, 6, TH_SEL);
+                    ui_frame_round(10, ry, UI_W - 20, ROW_H - 4, 6, UI_NEON, 1);
+                }
+                u16 a, a2, a3, bg;
+                theme_preview(i, &a, &a2, &a3, &bg);
+                int sx = 18, sy = ry + 3, sw = 30, sh = ROW_H - 10;
+                ui_fill_round(sx, sy, sw, sh, 3, bg);
+                ui_frame_round(sx, sy, sw, sh, 3, TH_LINE, 1);
+                ui_fill_round(sx + 4,  sy + sh / 2 - 2, 5, 5, 2, a);
+                ui_fill_round(sx + 12, sy + sh / 2 - 2, 5, 5, 2, a2);
+                ui_fill_round(sx + 20, sy + sh / 2 - 2, 5, 5, 2, a3);
+                ui_text(58, ry + 6, 1, i == sel ? UI_WHITE : UI_INK, theme_name(i));
+            }
+            ui_text_center(UI_W / 2, 224, 1, UI_DIM, "up/down preview    A/B apply");
+            ui_present(); redraw = 0;
+        }
+        gspWaitForVBlank();
+    }
+    theme_save();
+}
+
 static void home_draw(int bsel, long long rpos) {
     ui_begin(GFX_BOTTOM);
-    ui_vgrad_round(0, 0, UI_W, UI_H, 0, UI_RGB(16, 18, 32), UI_BG);   /* dark gradient backdrop */
+    ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);   /* dark gradient backdrop */
 
     int loaded = g_now_playing[0] != 0;
 
     /* title + neon divider */
     ui_text_center(UI_W / 2, 12, 2, UI_NEON, "CLOWNSEC");
     ui_text(UI_W - 52, 3, 1, UI_DIM, APP_VERSION);
+
+    /* theme swatch button (tap or press Y) */
+    {
+        u16 a, a2, a3, bg; theme_preview(theme_current(), &a, &a2, &a3, &bg);
+        ui_fill_round(THSW_X, THSW_Y, THSW_W, THSW_H, 4, UI_BG2);
+        ui_frame_round(THSW_X, THSW_Y, THSW_W, THSW_H, 4, TH_LINE, 1);
+        ui_fill_round(THSW_X + 6,  THSW_Y + 5, 6, 6, 2, a);
+        ui_fill_round(THSW_X + 15, THSW_Y + 5, 6, 6, 2, a2);
+        ui_fill_round(THSW_X + 24, THSW_Y + 5, 6, 6, 2, a3);
+        ui_text(THSW_X + 36, THSW_Y + 4, 1, UI_DIM, "Y");
+    }
     ui_text_center(UI_W / 2, 32, 1, UI_NEONP, "3DS VIDEO PLAYER");
     ui_glow_round(28, 46, UI_W - 56, 2, 1, UI_NEON, 3, 34);
     ui_fill_round(28, 46, UI_W - 56, 2, 1, UI_NEON);
@@ -2091,7 +2154,7 @@ static void home_draw(int bsel, long long rpos) {
     /* now-playing card */
     int cx = 16, cy = 58, cw = UI_W - 32, ch = 128;
     ui_fill_round(cx, cy, cw, ch, 12, UI_BG2);
-    ui_frame_round(cx, cy, cw, ch, 12, UI_RGB(42, 48, 74), 1);
+    ui_frame_round(cx, cy, cw, ch, 12, TH_LINE, 1);
 
     if (loaded) {
         char nm[80]; snprintf(nm, sizeof(nm), "%s", g_now_playing);
@@ -2105,7 +2168,7 @@ static void home_draw(int bsel, long long rpos) {
     int pcx = HOME_PCX, pcy = HOME_PCY, R = HOME_PR;
     u16 pcol = loaded ? UI_NEON : UI_INK;
     ui_glow_round(pcx - R, pcy - R, 2 * R, 2 * R, R, pcol, 6, 22);
-    ui_vgrad_round(pcx - R, pcy - R, 2 * R, 2 * R, R, UI_RGB(26, 32, 48), UI_RGB(14, 18, 28));
+    ui_vgrad_round(pcx - R, pcy - R, 2 * R, 2 * R, R, UI_BG2, TH_BG1);
     ui_frame_round(pcx - R, pcy - R, 2 * R, 2 * R, R, pcol, 2);
     ui_play(pcx + 3, pcy, 22, pcol);
 
@@ -2131,12 +2194,15 @@ static int home_gui(void) {
         hidScanInput();
         u32 k = hidKeysDown();
         if (k & KEY_START) return -1;
+        if (k & KEY_Y) { themes_screen(); redraw = 1; }
         if (k & KEY_RIGHT) { bsel = (bsel + 1) % 3; redraw = 1; }
         if (k & KEY_LEFT)  { bsel = (bsel + 2) % 3; redraw = 1; }
         if (k & KEY_A) return g_btns[bsel].choice;
 
         if (k & KEY_TOUCH) {
             touchPosition t; hidTouchRead(&t);
+            if (t.px >= THSW_X && t.px < THSW_X + THSW_W &&
+                t.py >= THSW_Y && t.py < THSW_Y + THSW_H) { themes_screen(); redraw = 1; continue; }
             for (int i = 0; i < 3; i++) {
                 HomeBtn *b = &g_btns[i];
                 if (t.px >= b->x && t.px < b->x + b->w && t.py >= b->y && t.py < b->y + b->h)
@@ -2173,7 +2239,7 @@ static int open_pick(void) {
             if (tp.py >= 134 && tp.py < 186) return 1; }
         if (redraw) {
             ui_begin(GFX_BOTTOM);
-            ui_vgrad_round(0, 0, UI_W, UI_H, 0, UI_RGB(16, 18, 32), UI_BG);
+            ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
             ui_text_center(UI_W / 2, 18, 2, UI_NEON, "OPEN VIDEO");
             ui_button(34, 66, UI_W - 68, 52, "LIBRARY", sel == 0, UI_NEON);
             ui_button(34, 134, UI_W - 68, 52, "FILESYSTEM", sel == 1, UI_NEONP);
@@ -2218,6 +2284,7 @@ int main(void) {
     osSetSpeedupEnable(true);   /* unlock New 3DS 804MHz clock (no-op on old 3DS) */
     gfxInitDefault();
     ndspInit();
+    theme_load();               /* restore the saved theme before anything draws */
 
     /* sockets: init once, shared by the web server (UPLOAD) and curl (DOWNLOAD) */
     u32 *soc_buf = (u32 *)memalign(0x1000, SOC_BUF_SZ);

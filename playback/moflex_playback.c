@@ -396,7 +396,7 @@ static int g_dbg_fps = 0, g_dbg_dec10 = 0, g_dbg_blit10 = 0, g_dbg_aud10 = 0;
 
 static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing) {
     ui_begin(GFX_BOTTOM);
-    ui_vgrad_round(0, 0, UI_W, UI_H, 0, UI_RGB(16, 18, 32), UI_BG);
+    ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
 
     ui_text_clipped(10, 8, 1, UI_NEON, title, 10, VOL_X - 12);   /* clipped so it can't run into volume */
 
@@ -411,7 +411,7 @@ static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing)
     /* progress bar: rounded track + neon fill + glowing knob */
     double frac = dur > 0 ? (double)cur / (double)dur : 0.0;
     if (frac > 1) frac = 1;
-    ui_fill_round(BAR_X, BAR_Y, BAR_W, BAR_H, BAR_H / 2, UI_RGB(32, 36, 56));
+    ui_fill_round(BAR_X, BAR_Y, BAR_W, BAR_H, BAR_H / 2, TH_TRACK);
     int fw = (int)(BAR_W * frac);
     if (fw > 0) ui_fill_round(BAR_X, BAR_Y, fw, BAR_H, BAR_H / 2, UI_NEON);
     int kx = BAR_X + fw, ky = BAR_Y + BAR_H / 2, kr = 8;
@@ -423,13 +423,13 @@ static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing)
     ui_play(FF_CX - 6, PLAY_CY, 14, UI_NEONC);   ui_play(FF_CX + 5, PLAY_CY, 14, UI_NEONC);
     int R = 24;
     ui_glow_round(PLAY_CX - R, PLAY_CY - R, 2 * R, 2 * R, R, UI_NEON, 6, 22);
-    ui_vgrad_round(PLAY_CX - R, PLAY_CY - R, 2 * R, 2 * R, R, UI_RGB(26, 32, 48), UI_RGB(14, 18, 28));
+    ui_vgrad_round(PLAY_CX - R, PLAY_CY - R, 2 * R, 2 * R, R, UI_BG2, TH_BG1);
     ui_frame_round(PLAY_CX - R, PLAY_CY - R, 2 * R, 2 * R, R, UI_NEON, 2);
     if (playing) ui_pause(PLAY_CX, PLAY_CY, 22, UI_NEON);
     else         ui_play(PLAY_CX + 2, PLAY_CY, 22, UI_NEON);
 
     /* volume slider (vertical, right) */
-    ui_fill_round(VOL_X, VOL_Y, 12, VOL_H, 6, UI_RGB(32, 36, 56));
+    ui_fill_round(VOL_X, VOL_Y, 12, VOL_H, 6, TH_TRACK);
     int vf = (int)(VOL_H * (g_vol / 4.0f));
     if (vf > 0) ui_fill_round(VOL_X, VOL_Y + VOL_H - vf, 12, vf, 6, UI_NEON);
     char vs[8]; snprintf(vs, sizeof(vs), "%d%%", (int)(g_vol * 100 + 0.5f));
@@ -446,7 +446,7 @@ static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing)
         ui_button(DIM_X, DIM_Y, DIM_W, DIM_H, "", 0, UI_NEONP);
         int mx = DIM_X + DIM_W / 2, my = DIM_Y + DIM_H / 2, mr = 8;
         ui_fill_round(mx - mr, my - mr, 2 * mr, 2 * mr, mr, UI_NEONC);                 /* full disc */
-        ui_fill_round(mx - mr + 6, my - mr - 2, 2 * mr, 2 * mr, mr, UI_RGB(18, 21, 33)); /* carve -> crescent */
+        ui_fill_round(mx - mr + 6, my - mr - 2, 2 * mr, 2 * mr, mr, UI_BG2); /* carve -> crescent */
     }
     ui_present();
 }
@@ -466,7 +466,7 @@ static int sub_modal(const char *title, const char *const *items, int n) {
             for (int i = 0; i < n; i++) { int by = 44 + i * 30;
                 if (tp.py >= by && tp.py < by + 26 && tp.px >= 18 && tp.px < UI_W - 18) return i; }
         ui_begin(GFX_BOTTOM);
-        ui_vgrad_round(0, 0, UI_W, UI_H, 0, UI_RGB(16, 18, 32), UI_BG);
+        ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
         ui_text_center(UI_W / 2, 14, 2, UI_NEON, title);
         for (int i = 0; i < n; i++) { int by = 44 + i * 30;
             ui_button(18, by, UI_W - 36, 26, items[i], i == sel, UI_NEONC); }
@@ -481,7 +481,7 @@ static void sub_msg(const char *msg) {
         hidScanInput();
         if (hidKeysDown() & (KEY_A | KEY_B | KEY_TOUCH)) break;
         ui_begin(GFX_BOTTOM);
-        ui_vgrad_round(0, 0, UI_W, UI_H, 0, UI_RGB(16, 18, 32), UI_BG);
+        ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
         char b[256]; snprintf(b, sizeof b, "%s", msg); int y = 90;
         for (char *p = b; p; ) { char *e = strchr(p, '\n'); if (e) *e = 0;
             ui_text_center(UI_W / 2, y, 1, UI_INK, p); y += 16; if (!e) break; p = e + 1; }
@@ -541,12 +541,12 @@ static void sub_depth_menu(int is3d) {
         /* top: neutral background + the sample caption at the current depth (both eyes) */
         for (int eye = 0; eye < (is3d ? 2 : 1); eye++) {
             u16 *fb = (u16 *)gfxGetFramebuffer(GFX_TOP, eye ? GFX_RIGHT : GFX_LEFT, NULL, NULL);
-            sub_fbfill(fb, UI_RGB(28, 32, 46));
+            sub_fbfill(fb, UI_BG2);
             int dx = is3d ? ((eye == 0) ? -g_sub_depth : g_sub_depth) : 0;
             sub_draw_lines(fb, SCR_W / 2 + dx, SCR_H - 48, lines, nl, sc);
         }
         ui_begin(GFX_BOTTOM);
-        ui_vgrad_round(0, 0, UI_W, UI_H, 0, UI_RGB(16, 18, 32), UI_BG);
+        ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
         ui_text_center(UI_W / 2, 20, 2, UI_NEON, "SUBTITLE DEPTH");
         char v[16]; snprintf(v, sizeof v, "%+d", g_sub_depth);
         ui_text_center(UI_W / 2, 74, 3, UI_NEONC, v);
@@ -580,7 +580,7 @@ static void sub_offset_menu(void) {
         char v[24]; snprintf(v, sizeof v, "%c%d.%02d s", g_sub_off < 0 ? '-' : '+',
                              (int)(a / 1000000), (int)((a % 1000000) / 10000));
         ui_begin(GFX_BOTTOM);
-        ui_vgrad_round(0, 0, UI_W, UI_H, 0, UI_RGB(16, 18, 32), UI_BG);
+        ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
         ui_text_center(UI_W / 2, 20, 2, UI_NEON, "SUBTITLE DELAY");
         ui_text_center(UI_W / 2, 74, 3, UI_NEONC, v);
         ui_button(20, 150, 135, 36, "< EARLIER", 0, UI_NEONP);
