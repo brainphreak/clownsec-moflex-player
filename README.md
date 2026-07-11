@@ -1,5 +1,9 @@
 # CLOWNSEC VIDEO — Native moflex/MobiClip 3D Player for the 3DS
 
+<p align="center">
+  <img src="screenshots/00-clownsec-hero.jpg" width="440" alt="CLOWNSEC 3DS Video Player — MOFLEX Player">
+</p>
+
 A homebrew video player for the Nintendo 3DS that plays `.moflex` (MobiClip video +
 IMA-ADPCM audio) files **natively** — decoded in portable C, no on-device FFmpeg — with
 synchronized audio. It auto-detects **stereoscopic 3D** vs flat **2D** and plays each
@@ -11,10 +15,6 @@ player shows a note during Old-3DS 3D playback).
 
 The decoder is a standalone port of FFmpeg's MobiClip/moflex path, verified **bit-exact
 against FFmpeg on PC** before ever touching hardware.
-
-<p align="center">
-  <img src="screenshots/01-player-main-screen.png" width="420" alt="Clownsec Video — home screen">
-</p>
 
 ## Download
 
