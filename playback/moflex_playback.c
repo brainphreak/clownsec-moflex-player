@@ -203,8 +203,33 @@ static void fmt_time(int64_t us, char *o, int cap) {
 
 /* ---------- subtitles: external .srt (sidecar next to the movie, or in moviedata/) ---------- */
 extern char font8x8_basic[128][8];   /* defined once in ui_gfx.c */
+#include "font8x8_ext.h"             /* Latin-1 Supplement + Greek glyphs (foreign languages) */
+
+/* decode one UTF-8 codepoint from *ps and advance past it */
+static uint32_t u8_next(const char **ps) {
+    const unsigned char *s = (const unsigned char *)*ps; uint32_t cp; int n;
+    if (s[0] < 0x80) { cp = s[0]; n = 1; }
+    else if ((s[0] & 0xE0) == 0xC0 && s[1]) { cp = ((uint32_t)(s[0] & 0x1F) << 6) | (s[1] & 0x3F); n = 2; }
+    else if ((s[0] & 0xF0) == 0xE0 && s[1] && s[2]) { cp = ((uint32_t)(s[0] & 0x0F) << 12) | ((s[1] & 0x3F) << 6) | (s[2] & 0x3F); n = 3; }
+    else if ((s[0] & 0xF8) == 0xF0 && s[1] && s[2] && s[3]) { cp = ((uint32_t)(s[0] & 0x07) << 18) | ((s[1] & 0x3F) << 12) | ((s[2] & 0x3F) << 6) | (s[3] & 0x3F); n = 4; }
+    else { cp = '?'; n = 1; }
+    *ps += n; return cp;
+}
+static int u8_cplen(const char *s) { int n = 0; while (*s) { u8_next(&s); n++; } return n; }
+
+static const char sub_note_glyph[8] = { 0x08, 0x08, 0x08, 0x08, 0x08, 0x0E, 0x0F, 0x06 };  /* ♪ */
+
+/* 8x8 bitmap for a Unicode codepoint, across our font tables; NULL if we can't render it. */
+static const char *sub_glyph(uint32_t cp) {
+    if (cp == 0x266A || cp == 0x266B) return sub_note_glyph;             /* ♪ ♫ */
+    if (cp < 0x80)                    return font8x8_basic[cp];          /* ASCII */
+    if (cp >= 0xA0 && cp <= 0xFF)     return font8x8_ext_latin[cp - 0xA0]; /* Latin-1 supplement */
+    if (cp >= 0x390 && cp <= 0x3C9)   return font8x8_greek[cp - 0x390];  /* Greek */
+    return NULL;                                                          /* Cyrillic/CJK/etc: unsupported */
+}
+
 #define SUB_MAX 4000
-#define SUB_TXT 160
+#define SUB_TXT 256   /* bytes: UTF-8 cues run longer than their glyph count */
 typedef struct { int64_t s, e; char t[SUB_TXT]; } SubCue;
 static SubCue *g_subs = NULL;
 static int  g_nsubs = 0;
@@ -223,54 +248,43 @@ static int sub_parse_ts(const char *p, int64_t *us) {
     }
     return 0;
 }
-/* accented Latin-1 letter -> its base ASCII (so European names read, not '?') */
-static char latin1_ascii(unsigned c) {
+/* a stray high byte (non-UTF-8 SRT) -> Unicode, treating it as Windows-1252 / Latin-1 */
+static uint32_t cp1252(unsigned char c) {
     switch (c) {
-        case 0xC0:case 0xC1:case 0xC2:case 0xC3:case 0xC4:case 0xC5:case 0xC6: return 'A';
-        case 0xC7: return 'C';
-        case 0xC8:case 0xC9:case 0xCA:case 0xCB: return 'E';
-        case 0xCC:case 0xCD:case 0xCE:case 0xCF: return 'I';
-        case 0xD0: return 'D'; case 0xD1: return 'N';
-        case 0xD2:case 0xD3:case 0xD4:case 0xD5:case 0xD6:case 0xD8: return 'O';
-        case 0xD9:case 0xDA:case 0xDB:case 0xDC: return 'U';
-        case 0xDD: return 'Y'; case 0xDF: return 's';
-        case 0xE0:case 0xE1:case 0xE2:case 0xE3:case 0xE4:case 0xE5:case 0xE6: return 'a';
-        case 0xE7: return 'c';
-        case 0xE8:case 0xE9:case 0xEA:case 0xEB: return 'e';
-        case 0xEC:case 0xED:case 0xEE:case 0xEF: return 'i';
-        case 0xF1: return 'n';
-        case 0xF2:case 0xF3:case 0xF4:case 0xF5:case 0xF6:case 0xF8: return 'o';
-        case 0xF9:case 0xFA:case 0xFB:case 0xFC: return 'u';
-        case 0xFD:case 0xFF: return 'y';
-        default: return 0;
+        case 0x91: case 0x92: return 0x2019;   /* curly ' */
+        case 0x93: case 0x94: return 0x201C;   /* curly " */
+        case 0x96: case 0x97: return 0x2013;   /* en/em dash */
+        case 0x85: return 0x2026;              /* ellipsis */
+        default: break;
     }
+    return (c >= 0xA0) ? c : '?';              /* 0xA0-0xFF map 1:1 to Latin-1 Unicode */
 }
-/* strip HTML-ish tags and fold UTF-8 / Windows-1252 punctuation + accents to plain ASCII */
+/* strip HTML-ish tags; normalize smart punctuation to ASCII; KEEP renderable UTF-8 (Latin-1,
+ * Greek, ♪) so foreign languages display; anything we have no glyph for becomes '?'. Accepts
+ * both UTF-8 and CP1252/Latin-1 single-byte SRTs, and re-emits everything as UTF-8. */
 static void sub_clean(const char *in, char *out, int cap) {
     const unsigned char *p = (const unsigned char *)in; int o = 0;
-    while (*p && o < cap - 4) {
+    while (*p && o < cap - 6) {
         unsigned char c = *p;
         if (c == '<') { p++; while (*p && *p != '>') p++; if (*p) p++; continue; }   /* <i>, <font ...> */
         if (c < 0x80) { out[o++] = (char)c; p++; continue; }
-        if (c == 0xE2 && p[1] == 0x80) {                    /* UTF-8 general punctuation */
-            unsigned char d = p[2];
-            const char *r = (d==0x98||d==0x99||d==0x9B) ? "'" : (d==0x9C||d==0x9D) ? "\"" :
-                            (d==0x93||d==0x94) ? "-" : (d==0xA6) ? "..." : "?";
-            for (const char *q = r; *q && o < cap - 1; q++) out[o++] = *q; p += 3; continue;
+        uint32_t cp; int n;                                  /* decode: valid UTF-8, else CP1252 byte */
+        if ((c & 0xE0) == 0xC0 && p[1]) { cp = ((uint32_t)(c & 0x1F) << 6) | (p[1] & 0x3F); n = 2; }
+        else if ((c & 0xF0) == 0xE0 && p[1] && p[2]) { cp = ((uint32_t)(c & 0x0F) << 12) | ((p[1] & 0x3F) << 6) | (p[2] & 0x3F); n = 3; }
+        else if ((c & 0xF8) == 0xF0 && p[1] && p[2] && p[3]) { cp = ((uint32_t)(c & 0x07) << 18) | ((p[1] & 0x3F) << 12) | ((p[2] & 0x3F) << 6) | (p[3] & 0x3F); n = 4; }
+        else { cp = cp1252(c); n = 1; }
+        if      (cp == 0x2018 || cp == 0x2019 || cp == 0x201B) out[o++] = '\'';
+        else if (cp == 0x201C || cp == 0x201D)                 out[o++] = '"';
+        else if (cp == 0x2013 || cp == 0x2014)                 out[o++] = '-';
+        else if (cp == 0x00A0)                                 out[o++] = ' ';   /* nbsp */
+        else if (cp == 0x2026) { if (o < cap - 3) { out[o++]='.'; out[o++]='.'; out[o++]='.'; } }
+        else if (sub_glyph(cp)) {                              /* renderable -> emit as UTF-8 */
+            if (cp < 0x80) out[o++] = (char)cp;
+            else if (cp < 0x800) { out[o++] = (char)(0xC0 | (cp >> 6)); out[o++] = (char)(0x80 | (cp & 0x3F)); }
+            else { out[o++] = (char)(0xE0 | (cp >> 12)); out[o++] = (char)(0x80 | ((cp >> 6) & 0x3F)); out[o++] = (char)(0x80 | (cp & 0x3F)); }
         }
-        if (c == 0xE2 && p[1] == 0x99 && (p[2] == 0xAA || p[2] == 0xAB)) { out[o++] = 0x0E; p += 3; continue; }  /* music note */
-        if (c == 0xC3 && p[1] >= 0x80 && p[1] <= 0xBF) {     /* UTF-8 Latin-1 supplement */
-            char a = latin1_ascii(0xC0 + (p[1] - 0x80)); out[o++] = a ? a : '?'; p += 2; continue;
-        }
-        if (c == 0xC2 && p[1] >= 0x80 && p[1] <= 0xBF) { out[o++] = ' '; p += 2; continue; }
-        if ((c & 0xE0) == 0xC0 && p[1]) { out[o++] = '?'; p += 2; continue; }         /* other 2-byte */
-        if ((c & 0xF0) == 0xE0 && p[1] && p[2]) { out[o++] = '?'; p += 3; continue; } /* other 3-byte */
-        if (c == 0x91 || c == 0x92) out[o++] = '\'';         /* Windows-1252 singles */
-        else if (c == 0x93 || c == 0x94) out[o++] = '"';
-        else if (c == 0x96 || c == 0x97) out[o++] = '-';
-        else if (c == 0x85) { if (o < cap - 3) { out[o++]='.'; out[o++]='.'; out[o++]='.'; } }
-        else { char a = latin1_ascii(c); out[o++] = a ? a : '?'; }
-        p++;
+        else out[o++] = '?';                                  /* no glyph for this codepoint */
+        p += n;
     }
     out[o] = 0;
 }
@@ -323,15 +337,14 @@ static void subs_autoload(const char *moviepath) {
 static void sub_fbpx(u16 *fb, int x, int y, u16 c) {
     if ((unsigned)x < SCR_W && (unsigned)y < SCR_H) fb[x * SCR_H + (SCR_H - 1 - y)] = c;
 }
-static const char sub_note_glyph[8] = { 0x08, 0x08, 0x08, 0x08, 0x08, 0x0E, 0x0F, 0x06 };  /* a music note (for ♪) */
-static void sub_fbtext(u16 *fb, int x, int y, int sc, u16 c, const char *s) {
-    for (; *s; s++) {
-        unsigned ch = (unsigned char)*s;
-        const char *g = (ch == 0x0E) ? sub_note_glyph : font8x8_basic[ch > 127 ? '?' : ch];
+static void sub_fbtext(u16 *fb, int x, int y, int sc, u16 col, const char *s) {
+    while (*s) {
+        uint32_t cp = u8_next(&s);                          /* one UTF-8 codepoint per glyph */
+        const char *g = sub_glyph(cp); if (!g) g = font8x8_basic['?'];
         for (int row = 0; row < 8; row++) { char bits = g[row];
-            for (int col = 0; col < 8; col++) if (bits & (1 << col))
+            for (int c = 0; c < 8; c++) if (bits & (1 << c))
                 for (int a = 0; a < sc; a++) for (int b = 0; b < sc; b++)
-                    sub_fbpx(fb, x + col * sc + a, y + row * sc + b, c);
+                    sub_fbpx(fb, x + c * sc + a, y + row * sc + b, col);
         }
         x += 8 * sc;
     }
@@ -339,27 +352,31 @@ static void sub_fbtext(u16 *fb, int x, int y, int sc, u16 c, const char *s) {
 static void sub_fbfill(u16 *fb, u16 c) { int n = SCR_W * SCR_H; for (int i = 0; i < n; i++) fb[i] = c; }
 
 #define SUB_MAXLN 4
-#define SUB_LNW  56                         /* line buffer (small size fits ~48 chars) */
+#define SUB_LNW  160                        /* line buffer in BYTES (UTF-8: up to 3 per glyph) */
 
 /* Wrap a cue into display lines: keep the SRT's own line breaks (dialogue dashes),
  * and word-wrap only within each of those lines. Returns line count. */
 static int sub_wrap(const char *t, char lines[SUB_MAXLN][SUB_LNW], int maxch) {
-    if (maxch > SUB_LNW - 1) maxch = SUB_LNW - 1;
+    if (maxch > (SUB_LNW - 1) / 3) maxch = (SUB_LNW - 1) / 3;   /* codepoints; guard the byte buffer */
     if (maxch < 1) maxch = 1;
     int nl = 0;
     for (const char *seg = t; *seg && nl < SUB_MAXLN; ) {
         const char *segend = seg; while (*segend && *segend != '\n') segend++;   /* one source line */
-        char cur[SUB_LNW]; int cl = 0;
+        char cur[SUB_LNW]; int cb = 0, cw = 0;   /* current line: byte length, codepoint width */
         for (const char *p = seg; p < segend && nl < SUB_MAXLN; ) {
             while (p < segend && (*p == ' ' || *p == '\t' || *p == '\r')) p++;
             if (p >= segend) break;
-            const char *w = p; while (p < segend && *p != ' ' && *p != '\t' && *p != '\r') p++;
-            int wl = (int)(p - w); if (wl > maxch) wl = maxch;
-            if (cl == 0) { memcpy(cur, w, wl); cl = wl; }
-            else if (cl + 1 + wl <= maxch) { cur[cl++] = ' '; memcpy(cur + cl, w, wl); cl += wl; }
-            else { cur[cl] = 0; snprintf(lines[nl++], SUB_LNW, "%s", cur); cl = wl; memcpy(cur, w, wl); }
+            const char *w = p; int ww = 0;       /* word: byte range [w,p), ww codepoints */
+            while (p < segend && *p != ' ' && *p != '\t' && *p != '\r') { const char *q = p; u8_next(&q); p = q; ww++; }
+            if (ww > maxch) {                    /* word longer than a line -> truncate at a codepoint edge */
+                const char *q = w; for (int k = 0; k < maxch; k++) u8_next(&q); p = q; ww = maxch;
+            }
+            int wb = (int)(p - w);
+            if (cw == 0) { memcpy(cur, w, wb); cb = wb; cw = ww; }
+            else if (cw + 1 + ww <= maxch) { cur[cb++] = ' '; memcpy(cur + cb, w, wb); cb += wb; cw += 1 + ww; }
+            else { cur[cb] = 0; snprintf(lines[nl++], SUB_LNW, "%s", cur); memcpy(cur, w, wb); cb = wb; cw = ww; }
         }
-        if (cl > 0 && nl < SUB_MAXLN) { cur[cl] = 0; snprintf(lines[nl++], SUB_LNW, "%s", cur); }
+        if (cb > 0 && nl < SUB_MAXLN) { cur[cb] = 0; snprintf(lines[nl++], SUB_LNW, "%s", cur); }
         seg = (*segend == '\n') ? segend + 1 : segend;
     }
     return nl;
@@ -369,7 +386,7 @@ static void sub_draw_lines(u16 *fb, int cx, int y0, char lines[SUB_MAXLN][SUB_LN
     int lh = 8 * sc + 4;
     for (int i = 0; i < nl; i++) {
         const char *s = lines[i];
-        int x = cx - (int)strlen(s) * 8 * sc / 2, y = y0 + i * lh;
+        int x = cx - u8_cplen(s) * 8 * sc / 2, y = y0 + i * lh;   /* center by glyph count, not bytes */
         sub_fbtext(fb, x - 1, y, sc, 0, s); sub_fbtext(fb, x + 1, y, sc, 0, s);
         sub_fbtext(fb, x, y - 1, sc, 0, s); sub_fbtext(fb, x, y + 1, sc, 0, s);
         sub_fbtext(fb, x, y, sc, 0xFFFF, s);
@@ -1072,6 +1089,40 @@ gdone:
     return result;
 }
 
+/* ---- APT (HOME button / sleep) handling during playback ----
+ * Pressing HOME hands the screens + GPU to the HOME-menu applet. Without a hook the player keeps
+ * its custom GPU state (RGB565 + 3D + double-buffer) and active audio, which deadlocks the
+ * transition -> the console hangs. The hook pauses audio + lights the bottom screen on the way
+ * out, and re-applies our screen config + resumes audio on the way back. */
+static aptHookCookie g_apt_cookie;
+static volatile int  g_apt_is3d = 0, g_apt_have_audio = 0, g_apt_playing = 1, g_apt_redraw = 0;
+static int g_apt_w = 0, g_apt_h = 0, g_apt_y2r = 0;
+
+static void mp_apt_hook(APT_HookType hook, void *param) {
+    (void)param;
+    switch (hook) {
+        case APTHOOK_ONSUSPEND:
+        case APTHOOK_ONSLEEP:
+            /* Hand back EVERY video-only hardware resource before the HOME/sleep applet takes the
+             * GPU. Menus don't hold Y2R or gsp::Lcd; keeping them open across the transition
+             * hard-locks the GSP (needs a power-off). Release them here, re-acquire on restore. */
+            if (g_apt_have_audio) ndspChnSetPaused(0, true);                 /* silence while suspended */
+            if (g_screen_off) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; }
+            if (g_lcd_ok) gspLcdExit();                                      /* release gsp::Lcd */
+            if (g_apt_y2r) { y2r_video_drain(); y2r_video_exit(); }          /* release Y2R */
+            gfxSet3D(false);                                                 /* the HOME menu is 2D */
+            break;
+        case APTHOOK_ONRESTORE:
+        case APTHOOK_ONWAKEUP:
+            if (g_apt_y2r) y2r_video_init(g_apt_w, g_apt_h);                 /* re-acquire Y2R */
+            if (g_lcd_ok) gspLcdInit();                                      /* re-acquire gsp::Lcd */
+            if (g_apt_have_audio && g_apt_playing) ndspChnSetPaused(0, false);   /* resume only if we were playing */
+            g_apt_redraw = 1;   /* the loop re-applies our screen format AFTER libctru's gfx hook restores */
+            break;
+        default: break;
+    }
+}
+
 MoflexResult moflex_play(const char *path) {
     /* One path for BOTH consoles now: the classic audio-paced player. It plays 2D fluidly everywhere and
      * 3D perfectly on New 3DS; on Old 3DS 3D just can't keep up (decode is 2x the frames) and degrades --
@@ -1185,7 +1236,19 @@ MoflexResult moflex_play(const char *path) {
     g_lcd_ok = R_SUCCEEDED(gspLcdInit());   /* per-screen backlight control for the bottom-screen-off button */
     g_screen_off = 0;
 
+    /* handle HOME/sleep cleanly (release Y2R + gsp::Lcd, pause audio, restore GPU state) */
+    g_apt_is3d = is3d; g_apt_have_audio = have_audio; g_apt_playing = playing; g_apt_redraw = 0;
+    g_apt_w = W; g_apt_h = H; g_apt_y2r = use_y2r;
+    aptHook(&g_apt_cookie, mp_apt_hook, NULL);
+
     while (aptMainLoop()) {
+        g_apt_playing = playing;                       /* keep the hook's resume decision in sync */
+        if (g_apt_redraw) {                            /* returned from HOME: re-apply our screen config + repaint */
+            g_apt_redraw = 0; dirty = 1;
+            gfxSetScreenFormat(GFX_TOP, GSP_RGB565_OES);
+            gfxSetDoubleBuffering(GFX_TOP, true);
+            gfxSet3D(is3d);
+        }
         hidScanInput();
         u32 kd = hidKeysDown(), kh = hidKeysHeld();
         touchPosition tp; hidTouchRead(&tp);
@@ -1354,6 +1417,7 @@ MoflexResult moflex_play(const char *path) {
     if (!aptMainLoop() && result == MOFLEX_QUIT_BACK) result = MOFLEX_QUIT_EXIT;
 
 done:
+    aptUnhook(&g_apt_cookie);
     if (g_screen_off) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; }   /* never leave it dark */
     if (g_lcd_ok) { gspLcdExit(); g_lcd_ok = 0; }
     g_old3d_warn = 0;
