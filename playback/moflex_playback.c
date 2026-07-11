@@ -29,6 +29,8 @@ extern size_t mobi_ctx_size(void);
 /* ---- software volume (persisted) ---- */
 static float g_vol = 1.0f;
 static int   g_old3d_warn = 0;   /* Old 3DS + 3D content: show the "unsupported / perf issues" notice */
+static int   g_lcd_ok = 0;       /* gsp::Lcd available -> bottom-screen-off feature usable */
+static int   g_screen_off = 0;   /* bottom backlight is currently off (movie keeps playing on top) */
 static void vol_load(void) {
     FILE *f = fopen("sdmc:/moflex_player/volume.txt", "rb");
     if (f) { float v; if (fscanf(f, "%f", &v) == 1 && v >= 0.25f && v <= 4.0f) g_vol = v; fclose(f); }
@@ -185,6 +187,11 @@ static void bw_exit(void) {
 #define CC_Y 104
 #define CC_W 48
 #define CC_H 28
+/* DIM (bottom-screen-off) button -- below CC */
+#define DIM_X 244
+#define DIM_Y 138
+#define DIM_W 48
+#define DIM_H 28
 
 static void fmt_time(int64_t us, char *o, int cap) {
     if (us < 0) us = 0;
@@ -434,6 +441,13 @@ static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing)
     ui_button(EXB_X, BTN_Y, EXB_W, BTN_H, "EXIT", 0, UI_RED);
     /* subtitles: CC toggle/options (glows when on) */
     ui_button(CC_X, CC_Y, CC_W, CC_H, "CC", g_sub_on, g_sub_on ? UI_NEON : UI_DIM);
+    /* bottom-screen-off: a crescent-moon button (video keeps playing on top) */
+    if (g_lcd_ok) {
+        ui_button(DIM_X, DIM_Y, DIM_W, DIM_H, "", 0, UI_NEONP);
+        int mx = DIM_X + DIM_W / 2, my = DIM_Y + DIM_H / 2, mr = 8;
+        ui_fill_round(mx - mr, my - mr, 2 * mr, 2 * mr, mr, UI_NEONC);                 /* full disc */
+        ui_fill_round(mx - mr + 6, my - mr - 2, 2 * mr, 2 * mr, mr, UI_RGB(18, 21, 33)); /* carve -> crescent */
+    }
     ui_present();
 }
 
@@ -1089,7 +1103,7 @@ MoflexResult moflex_play(const char *path) {
     /* The video is shown as its frame is READ, while audio sits buffered ahead of what's heard -> the
      * picture leads the sound by ~the audio-queue depth. Shallower queue = tighter lip-sync. 2D races
      * ahead (light decode) so it needs the shallowest; 3D a bit deeper for slack against decode dips. */
-    int nwb = is3d ? 8 : 4;
+    int nwb = is3d ? 12 : 4;   /* deeper 3D audio queue absorbs heavy-frame decode stalls (higher-bitrate files) */
 
     AVCodecContext ctx;
     memset(&ctx, 0, sizeof(ctx));
@@ -1168,10 +1182,18 @@ MoflexResult moflex_play(const char *path) {
         seek_to_us = rpos; want_seek = 1; last_save = rpos;
     }
 
+    g_lcd_ok = R_SUCCEEDED(gspLcdInit());   /* per-screen backlight control for the bottom-screen-off button */
+    g_screen_off = 0;
+
     while (aptMainLoop()) {
         hidScanInput();
         u32 kd = hidKeysDown(), kh = hidKeysHeld();
         touchPosition tp; hidTouchRead(&tp);
+
+        if (g_screen_off) {   /* bottom screen is dark: the first input just wakes it (no action) */
+            if (kd) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; dirty = 1; }
+            goto after_input;
+        }
 
         /* ---- controls (direct, nothing to select): A play/pause,
                Left/Right (hold) rewind/FF, Up/Down volume, B back ---- */
@@ -1208,7 +1230,9 @@ MoflexResult moflex_play(const char *path) {
                 if (nv < 0.25f) nv = 0.25f; if (nv > 4.0f) nv = 4.0f;
                 g_vol = nv; vol_dirty = 1; dirty = 1;   /* save deferred; dragging the slider must not write to SD each tick */
             } else if (kd & KEY_TOUCH) {
-                if (px >= CC_X && px < CC_X + CC_W && py >= CC_Y && py < CC_Y + CC_H) {   /* CC: subtitle options */
+                if (g_lcd_ok && px >= DIM_X && px < DIM_X + DIM_W && py >= DIM_Y && py < DIM_Y + DIM_H) {
+                    GSPLCD_PowerOffBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 1;   /* dark until any button press */
+                } else if (px >= CC_X && px < CC_X + CC_W && py >= CC_Y && py < CC_Y + CC_H) {   /* CC: subtitle options */
                     if (have_audio) ndspChnSetPaused(0, true);
                     sub_menu(path, is3d);
                     if (have_audio) ndspChnSetPaused(0, !playing);
@@ -1226,6 +1250,7 @@ MoflexResult moflex_play(const char *path) {
                 }
             }
         }
+    after_input: ;
 
         /* ---- apply a requested seek (resume playback, flush stale audio) ---- */
         if (want_seek) {
@@ -1320,8 +1345,8 @@ MoflexResult moflex_play(const char *path) {
             gspWaitForVBlank();
         }
 
-        /* ---- panel redraw (throttled to spare CPU on old 3DS) ---- */
-        if (dirty || ++since_panel > 20) {
+        /* ---- panel redraw (throttled; skipped while the bottom screen is dark) ---- */
+        if (!g_screen_off && (dirty || ++since_panel > 20)) {
             panel_draw(title, cur_us, dur_us, playing);
             since_panel = 0; dirty = 0;
         }
@@ -1329,6 +1354,8 @@ MoflexResult moflex_play(const char *path) {
     if (!aptMainLoop() && result == MOFLEX_QUIT_BACK) result = MOFLEX_QUIT_EXIT;
 
 done:
+    if (g_screen_off) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; }   /* never leave it dark */
+    if (g_lcd_ok) { gspLcdExit(); g_lcd_ok = 0; }
     g_old3d_warn = 0;
     if (vol_dirty) { vol_save(); vol_dirty = 0; }   /* persist any volume change made during playback */
     /* remember where we stopped (clear it if we watched to the end) */
