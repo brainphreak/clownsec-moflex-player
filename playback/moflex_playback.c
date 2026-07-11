@@ -517,8 +517,8 @@ static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing)
 }
 
 /* ---- subtitle options (modal, bottom screen; top keeps showing the frozen frame) ---- */
-static int sub_modal(const char *title, const char *const *items, int n) {
-    int sel = 0;
+static int sub_modal(const char *title, const char *const *items, int n, int start) {
+    int sel = (start >= 0 && start < n) ? start : 0;
     int top = 40, step = (218 - top) / (n > 0 ? n : 1);   /* adaptive: fit n items above the footer */
     if (step > 30) step = 30;
     int bh = step - 4; if (bh > 26) bh = 26; if (bh < 15) bh = 15;
@@ -581,7 +581,7 @@ static void sub_load_menu(const char *moviepath) {
     nf = sub_srt_scan("sdmc:/moflex_player/moviedata/", names, paths, nf, 5);
     if (nf == 0) { sub_msg("No .srt files found in the\nmovie folder or moviedata."); return; }
     const char *items[5]; for (int i = 0; i < nf; i++) items[i] = names[i];
-    int c = sub_modal("LOAD SRT", items, nf);
+    int c = sub_modal("LOAD SRT", items, nf, 0);
     if (c < 0) return;
     if (subs_load(paths[c])) { g_sub_on = 1; sub_msg("Subtitles loaded."); }
     else sub_msg("Could not read that file.");
@@ -659,6 +659,7 @@ static void sub_offset_menu(void) {
     }
 }
 static void sub_menu(const char *moviepath, int is3d) {
+    int msel = 0;                       /* keep the cursor on the item you just changed */
     for (;;) {
         char i0[28], i1[28], i2[28], i3[28], i4[28], i5[28];
         snprintf(i0, sizeof i0, "Subtitles: %s", g_sub_on ? "ON" : "OFF");
@@ -676,8 +677,9 @@ static void sub_menu(const char *moviepath, int is3d) {
         items[n] = i5; act[n++] = 6;                         /* text encoding (for non-UTF-8 SRTs) */
         if (is3d) { snprintf(i4, sizeof i4, "Depth (3D): %+d", g_sub_depth); items[n] = i4; act[n++] = 4; }
         items[n] = "Load SRT file..."; act[n++] = 5;
-        int c = sub_modal("SUBTITLES", items, n);
+        int c = sub_modal("SUBTITLES", items, n, msel);
         if (c < 0) return;                                   /* B closes the menu */
+        msel = c;                                            /* stay on this row after the action */
         int a = act[c];
         if (a == 0) { if (g_nsubs > 0) g_sub_on = !g_sub_on; else sub_msg("No subtitles loaded.\nUse 'Load SRT file'."); }
         else if (a == 1) g_sub_top = !g_sub_top;
