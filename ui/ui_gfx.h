@@ -65,6 +65,8 @@ void ui_px(int x, int y, u16 c);
 void ui_fill(int x, int y, int w, int h, u16 c);
 void ui_text(int x, int y, int scale, u16 c, const char *s);
 int  ui_text_w(int scale, const char *s);
+int  ui_u8_len(const char *s);              /* number of UTF-8 codepoints (for layout/centering) */
+int  ui_u8_bytes(const char *s, int ncp);   /* byte length of the first ncp codepoints (safe truncation) */
 void ui_text_center(int cx, int y, int scale, u16 c, const char *s);
 /* draw text but only the pixels within [clipL, clipR) horizontally (for marquee/scrolling titles) */
 void ui_text_clipped(int x, int y, int scale, u16 c, const char *s, int clipL, int clipR);
