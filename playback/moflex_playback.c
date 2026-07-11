@@ -241,7 +241,7 @@ static const char sub_note_glyph[8] = { 0x08, 0x08, 0x08, 0x08, 0x08, 0x0E, 0x0F
 /* 8x8 bitmap for a Unicode codepoint; NULL if we have no glyph (e.g. CJK). */
 static const char *sub_glyph(uint32_t cp) {
     if (cp == 0x266A || cp == 0x266B) return sub_note_glyph;             /* ♪ ♫ */
-    if (cp < 0x80)                    return font8x8_basic[cp];          /* ASCII: keep the familiar font */
+    if (cp >= 0x20 && cp < 0x7F)      return (const char *)font512[cp];  /* ASCII (512_8 CP437 identity) -> one uniform font */
     int lo = 0, hi = FONT512_MAP_N - 1;                                 /* foreign scripts: binary-search 512_8 */
     while (lo <= hi) {
         int mid = (lo + hi) >> 1; unsigned c = font512_map[mid].cp;
@@ -388,7 +388,7 @@ static void sub_fbpx(u16 *fb, int x, int y, u16 c) {
 static void sub_fbtext(u16 *fb, int x, int y, int sc, u16 col, const char *s) {
     while (*s) {
         uint32_t cp = u8_next(&s);                          /* one UTF-8 codepoint per glyph */
-        const char *g = sub_glyph(cp); if (!g) g = font8x8_basic['?'];
+        const char *g = sub_glyph(cp); if (!g) g = (const char *)font512[0x3F];   /* no glyph -> '?' */
         for (int row = 0; row < 8; row++) { char bits = g[row];
             for (int c = 0; c < 8; c++) if (bits & (1 << c))
                 for (int a = 0; a < sc; a++) for (int b = 0; b < sc; b++)
@@ -719,7 +719,7 @@ static void prime_after_seek(MfxDemux *m, AVCodecContext *ctx, AVFrame *out, int
         AVPacket ap; ap.data = pkt.data; ap.size = pkt.size; int got = 0;
         int ok = (mobi_decode(ctx, out, &got, &ap) >= 0 && got);
         if (!is3d) {                                        /* 2D: first decodable frame is the landing */
-            if (ok) { blit_eye(out, GFX_LEFT, W, H); gfxFlushBuffers(); gfxSwapBuffers(); (*vidx)++; return; }
+            if (ok) { blit_eye(out, GFX_LEFT, W, H); sub_overlay(0, *cur_us); gfxFlushBuffers(); gfxSwapBuffers(); (*vidx)++; return; }
             (*vidx)++; continue;
         }
         if ((*vidx & 1) == 0) {                             /* left eye */
@@ -728,6 +728,7 @@ static void prime_after_seek(MfxDemux *m, AVCodecContext *ctx, AVFrame *out, int
         } else {                                            /* right eye: present a matched pair */
             if (ok && *left_ok && *vidx == *left_vidx + 1) {
                 blit_eye(out, GFX_RIGHT, W, H);
+                sub_overlay(1, *cur_us);                    /* subtitle on the landing frame */
                 gfxFlushBuffers(); gfxSwapBuffers();
                 (*vidx)++;
                 return;                                     /* landing frame shown */
@@ -1337,6 +1338,7 @@ MoflexResult moflex_play(const char *path) {
             sub_menu(path, is3d);
             if (have_audio) ndspChnSetPaused(0, !playing);
             dirty = 1;
+            if (!playing) { want_seek = 1; seek_to_us = cur_us; }   /* re-render the frozen frame with the new subtitle */
         }
 
         /* ---- touch (always active) ---- */
@@ -1356,6 +1358,7 @@ MoflexResult moflex_play(const char *path) {
                     sub_menu(path, is3d);
                     if (have_audio) ndspChnSetPaused(0, !playing);
                     dirty = 1;
+                    if (!playing) { want_seek = 1; seek_to_us = cur_us; }   /* re-render the frozen frame with the new subtitle */
                 } else if (py >= PLAY_CY - 20 && py <= PLAY_CY + 20) {
                     if (px >= PLAY_CX - 20 && px <= PLAY_CX + 20) { playing = !playing; if (have_audio) ndspChnSetPaused(0, !playing); dirty = 1;
                           if (!playing) { resume_save_us(path, cur_us); last_save = cur_us;
