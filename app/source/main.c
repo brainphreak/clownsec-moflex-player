@@ -163,14 +163,14 @@ static void lib_getinfo_menu(int *idx, int ni, int csel); /* library Get Info: t
 static void ui_text_fit(int cx, int y, int scale, u16 c, const char *s, int maxw) {
     if (ui_text_w(scale, s) <= maxw) { ui_text_center(cx, y, scale, c, s); return; }
     int maxch = maxw / (8 * scale) - 2; if (maxch < 1) maxch = 1;
-    char buf[160]; snprintf(buf, sizeof buf, "%.*s..", maxch, s);
+    char buf[160]; snprintf(buf, sizeof buf, "%.*s..", ui_u8_bytes(s, maxch), s);   /* cut on a codepoint */
     ui_text_center(cx, y, scale, c, buf);
 }
 /* left-aligned truncate-to-fit (x is the LEFT edge, unlike ui_text_fit which centers on cx) */
 static void ui_text_left_fit(int x, int y, int scale, u16 c, const char *s, int maxw) {
     if (ui_text_w(scale, s) <= maxw) { ui_text(x, y, scale, c, s); return; }
     int maxch = maxw / (8 * scale) - 2; if (maxch < 1) maxch = 1;
-    char buf[160]; snprintf(buf, sizeof buf, "%.*s..", maxch, s);
+    char buf[160]; snprintf(buf, sizeof buf, "%.*s..", ui_u8_bytes(s, maxch), s);   /* cut on a codepoint */
     ui_text(x, y, scale, c, buf);
 }
 /* center a string, shrinking the scale (maxscale..1) until it fits -- keeps the whole thing readable */
@@ -552,14 +552,18 @@ static int pick_folder(char *out, size_t cap) {
 
 /* greedy word-wrap helper for the top-screen info panel */
 static void ui_text_wrap(int x, int *y, int scale, u16 col, const char *s, int maxcw, int maxlines) {
-    char buf[96];
+    char buf[160];   /* holds up to maxcw codepoints (UTF-8: several bytes each) */
     int lines = 0;
     while (*s && lines < maxlines) {
         while (*s == ' ') s++;
         if (!*s) break;
-        int take = 0, lastsp = -1;
-        while (s[take] && take < maxcw) { if (s[take] == ' ') lastsp = take; take++; }
-        int cut = (s[take] && lastsp > 0) ? lastsp : take;   /* break at last space if the line is full */
+        const char *p = s; int cp = 0, lastsp = -1;      /* lastsp = byte offset of the last space */
+        while (*p && cp < maxcw) {
+            if (*p == ' ') lastsp = (int)(p - s);
+            p += ui_u8_bytes(p, 1);                       /* advance one whole codepoint */
+            cp++;
+        }
+        int cut = (*p && lastsp > 0) ? lastsp : (int)(p - s);   /* break at the last space if the line is full */
         int n = cut < (int)sizeof(buf) - 1 ? cut : (int)sizeof(buf) - 1;
         memcpy(buf, s, n); buf[n] = 0;
         ui_text(x, *y, scale, col, buf);

@@ -1,9 +1,43 @@
 #include "ui_gfx.h"
 #include "font8x8_basic.h"
+#include "font8x8_ext.h"   /* Latin-1 + Greek + Turkish glyphs (foreign chars in UI text, e.g. "Pokemon") */
+#include "font512.h"       /* fallback for Cyrillic/Hebrew/punctuation */
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
 #include <sys/stat.h>
+
+/* decode one UTF-8 codepoint and advance; 8x8 glyph for any codepoint (falls back to '?') */
+static u32 ui_u8_next(const char **ps) {
+    const unsigned char *s = (const unsigned char *)*ps; u32 cp; int n;
+    if (s[0] < 0x80) { cp = s[0]; n = 1; }
+    else if ((s[0] & 0xE0) == 0xC0 && s[1]) { cp = ((u32)(s[0] & 0x1F) << 6) | (s[1] & 0x3F); n = 2; }
+    else if ((s[0] & 0xF0) == 0xE0 && s[1] && s[2]) { cp = ((u32)(s[0] & 0x0F) << 12) | ((s[1] & 0x3F) << 6) | (s[2] & 0x3F); n = 3; }
+    else if ((s[0] & 0xF8) == 0xF0 && s[1] && s[2] && s[3]) { cp = ((u32)(s[0] & 0x07) << 18) | ((s[1] & 0x3F) << 12) | ((s[2] & 0x3F) << 6) | (s[3] & 0x3F); n = 4; }
+    else { cp = '?'; n = 1; }
+    *ps += n; return cp;
+}
+static const char *ui_glyph(u32 cp) {
+    if (cp < 0x80)                   return font8x8_basic[cp];
+    if (cp >= 0xA0 && cp <= 0xFF)    return font8x8_ext_latin[cp - 0xA0];
+    if (cp >= 0x390 && cp <= 0x3C9)  return font8x8_greek[cp - 0x390];
+    switch (cp) {                                                        /* Turkish Ext-A */
+        case 0x011E: return font8x8_turk[0]; case 0x011F: return font8x8_turk[1];
+        case 0x0130: return font8x8_turk[2]; case 0x0131: return font8x8_turk[3];
+        case 0x015E: return font8x8_turk[4]; case 0x015F: return font8x8_turk[5];
+    }
+    int lo = 0, hi = FONT512_MAP_N - 1;                                 /* Cyrillic/quotes/dashes/etc */
+    while (lo <= hi) { int m = (lo + hi) >> 1; unsigned c = font512_map[m].cp;
+        if (c == cp) return (const char *)font512[font512_map[m].idx];
+        if (c < cp) lo = m + 1; else hi = m - 1; }
+    return font8x8_basic['?'];
+}
+int ui_u8_len(const char *s) { int n = 0; while (*s) { ui_u8_next(&s); n++; } return n; }   /* codepoints */
+int ui_u8_bytes(const char *s, int ncp) {   /* byte length of the first ncp codepoints (safe truncation) */
+    const char *p = s; int n = 0;
+    while (*p && n < ncp) { ui_u8_next(&p); n++; }
+    return (int)(p - s);
+}
 
 /* ======================= runtime theme ======================= */
 UiTheme g_theme;   /* the live palette (all UI_* / TH_* macros read this) */
@@ -176,10 +210,8 @@ void ui_fill(int x, int y, int w, int h, u16 c) {
 }
 
 void ui_text(int x, int y, int scale, u16 c, const char *s) {
-    for (; *s; s++) {
-        unsigned ch = (unsigned char)*s;
-        if (ch > 127) ch = '?';
-        const char *g = font8x8_basic[ch];
+    while (*s) {
+        const char *g = ui_glyph(ui_u8_next(&s));
         for (int row = 0; row < 8; row++) {
             char bits = g[row];
             for (int col = 0; col < 8; col++)
@@ -190,19 +222,17 @@ void ui_text(int x, int y, int scale, u16 c, const char *s) {
     }
 }
 
-int ui_text_w(int scale, const char *s) { return (int)strlen(s) * 8 * scale; }
+int ui_text_w(int scale, const char *s) { return ui_u8_len(s) * 8 * scale; }   /* by glyph, not byte */
 
 void ui_text_center(int cx, int y, int scale, u16 c, const char *s) {
     ui_text(cx - ui_text_w(scale, s) / 2, y, scale, c, s);
 }
 
 void ui_text_clipped(int x, int y, int scale, u16 c, const char *s, int clipL, int clipR) {
-    for (; *s; s++) {
+    while (*s) {
         if (x >= clipR) break;
-        unsigned ch = (unsigned char)*s;
-        if (ch > 127) ch = '?';
+        const char *g = ui_glyph(ui_u8_next(&s));
         if (x + 8 * scale > clipL) {                 /* glyph at least partly inside the clip */
-            const char *g = font8x8_basic[ch];
             for (int row = 0; row < 8; row++) {
                 char bits = g[row];
                 for (int col = 0; col < 8; col++)
