@@ -1096,22 +1096,28 @@ gdone:
  * out, and re-applies our screen config + resumes audio on the way back. */
 static aptHookCookie g_apt_cookie;
 static volatile int  g_apt_is3d = 0, g_apt_have_audio = 0, g_apt_playing = 1, g_apt_redraw = 0;
+static int g_apt_w = 0, g_apt_h = 0, g_apt_y2r = 0;
 
 static void mp_apt_hook(APT_HookType hook, void *param) {
     (void)param;
     switch (hook) {
         case APTHOOK_ONSUSPEND:
         case APTHOOK_ONSLEEP:
+            /* Hand back EVERY video-only hardware resource before the HOME/sleep applet takes the
+             * GPU. Menus don't hold Y2R or gsp::Lcd; keeping them open across the transition
+             * hard-locks the GSP (needs a power-off). Release them here, re-acquire on restore. */
             if (g_apt_have_audio) ndspChnSetPaused(0, true);                 /* silence while suspended */
-            if (g_screen_off) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; }  /* HOME menu needs the bottom screen */
+            if (g_screen_off) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; }
+            if (g_lcd_ok) gspLcdExit();                                      /* release gsp::Lcd */
+            if (g_apt_y2r) { y2r_video_drain(); y2r_video_exit(); }          /* release Y2R */
+            gfxSet3D(false);                                                 /* the HOME menu is 2D */
             break;
         case APTHOOK_ONRESTORE:
         case APTHOOK_ONWAKEUP:
-            gfxSetScreenFormat(GFX_TOP, GSP_RGB565_OES);   /* the applet reset our config -> restore it */
-            gfxSetDoubleBuffering(GFX_TOP, true);
-            gfxSet3D(g_apt_is3d);
+            if (g_apt_y2r) y2r_video_init(g_apt_w, g_apt_h);                 /* re-acquire Y2R */
+            if (g_lcd_ok) gspLcdInit();                                      /* re-acquire gsp::Lcd */
             if (g_apt_have_audio && g_apt_playing) ndspChnSetPaused(0, false);   /* resume only if we were playing */
-            g_apt_redraw = 1;
+            g_apt_redraw = 1;   /* the loop re-applies our screen format AFTER libctru's gfx hook restores */
             break;
         default: break;
     }
@@ -1230,13 +1236,19 @@ MoflexResult moflex_play(const char *path) {
     g_lcd_ok = R_SUCCEEDED(gspLcdInit());   /* per-screen backlight control for the bottom-screen-off button */
     g_screen_off = 0;
 
-    /* handle HOME/sleep cleanly (pause audio + restore GPU state across the applet transition) */
+    /* handle HOME/sleep cleanly (release Y2R + gsp::Lcd, pause audio, restore GPU state) */
     g_apt_is3d = is3d; g_apt_have_audio = have_audio; g_apt_playing = playing; g_apt_redraw = 0;
+    g_apt_w = W; g_apt_h = H; g_apt_y2r = use_y2r;
     aptHook(&g_apt_cookie, mp_apt_hook, NULL);
 
     while (aptMainLoop()) {
         g_apt_playing = playing;                       /* keep the hook's resume decision in sync */
-        if (g_apt_redraw) { g_apt_redraw = 0; dirty = 1; }   /* returned from HOME -> repaint the panel */
+        if (g_apt_redraw) {                            /* returned from HOME: re-apply our screen config + repaint */
+            g_apt_redraw = 0; dirty = 1;
+            gfxSetScreenFormat(GFX_TOP, GSP_RGB565_OES);
+            gfxSetDoubleBuffering(GFX_TOP, true);
+            gfxSet3D(is3d);
+        }
         hidScanInput();
         u32 kd = hidKeysDown(), kh = hidKeysHeld();
         touchPosition tp; hidTouchRead(&tp);
