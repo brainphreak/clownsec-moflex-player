@@ -2198,7 +2198,7 @@ static void themes_screen(void) {
                 ui_fill_round(sx + 20, sy + sh / 2 - 2, 5, 5, 2, a3);
                 ui_text(58, ry + 6, 1, i == sel ? UI_WHITE : UI_INK, theme_name(i));
             }
-            ui_text_center(UI_W / 2, 224, 1, UI_DIM, "up/down preview   A/B apply   X edit Custom");
+            ui_text_center(UI_W / 2, 224, 1, UI_DIM, "up/dn preview   A/B apply   X custom");
             ui_present(); redraw = 0;
         }
         gspWaitForVBlank();
