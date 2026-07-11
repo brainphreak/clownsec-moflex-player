@@ -80,6 +80,13 @@ If the timer won't advance past `0:00` in Citra, give the emulator the 3DS **DSP
   Open Video, and a **Get Info** action fetches them from the catalogs for anything missing.
 - **Hidden system folders** — the browser hides `3DS`, `DCIM`, `Nintendo 3DS`, etc. by default
   (press **Y** to reveal them), so you only see your movies and folders.
+- **Themes** — recolor the whole UI. Pick from built-in themes (Clownsec, Matrix, Nintendo,
+  Light, Amber, Ice) or build your own with the **Custom** color editor (R/G/B sliders for each
+  of the accents, text, and background). Open it from the swatch chip on the home screen or press
+  **Y**; your choice is saved and applied everywhere. See [Themes](#themes).
+- **Turn off the bottom screen** during playback — tap the **moon** button on the player to power
+  off the bottom backlight while the movie keeps playing up top (saves battery / kills the glow in
+  the dark). Any button press wakes it back up.
 - **3D branding** on the top screen while idle.
 
 ## Screenshots
@@ -91,6 +98,18 @@ If the timer won't advance past `0:00` in Citra, give the emulator the 3DS **DSP
 </tr>
 <tr>
 <td align="center" colspan="2"><img src="screenshots/13-player-subtitles.png" width="300"><br><sub>Subtitles — a `.srt` overlaid on the video (2D or 3D), with the CC options menu below</sub></td>
+</tr>
+<tr>
+<td align="center"><img src="screenshots/14-player-themes.png" width="340"><br><sub>Themes — live-preview picker (Clownsec, Matrix, Nintendo, Light, Amber, Ice, Custom)</sub></td>
+<td align="center"><img src="screenshots/20-player-screen-off.png" width="340"><br><sub>Tap the moon to turn off the bottom screen — the movie keeps playing on top</sub></td>
+</tr>
+<tr>
+<td align="center"><img src="screenshots/15-player-theme-matrix.png" width="340"><br><sub>Matrix theme</sub></td>
+<td align="center"><img src="screenshots/16-player-theme-nintendo.png" width="340"><br><sub>Nintendo theme</sub></td>
+</tr>
+<tr>
+<td align="center"><img src="screenshots/17-player-theme-amber.png" width="340"><br><sub>Amber theme — every screen (home, browser, player) recolors</sub></td>
+<td align="center"><img src="screenshots/18-player-theme-custom.png" width="340"><br><sub>Custom editor — R/G/B sliders per palette item, with a live preview</sub></td>
 </tr>
 <tr>
 <td align="center"><img src="screenshots/07-player-download-from-catalog.png" width="340"><br><sub>Catalog browser — poster + details on top, download from the list</sub></td>
@@ -288,6 +307,50 @@ During playback, tap **CC** on the bottom screen (or press **SELECT**) to open s
   sidecar isn't named to match)
 
 Position, size, and depth are remembered across movies; the delay resets per movie.
+
+## Themes
+
+The entire interface — home, browser, library, catalog, and the player controls — can be
+recolored. Open the theme picker from the little **color-swatch chip** at the top-left of the home
+screen, or press **Y**.
+
+<p align="center">
+<img src="screenshots/14-player-themes.png" width="300">
+&nbsp;&nbsp;
+<img src="screenshots/17-player-theme-amber.png" width="300">
+</p>
+
+In the picker, move up/down (or tap a row) to **preview a theme live** — the whole UI recolors
+instantly — then press **A** or **B** to apply. Your choice is saved to the SD card and restored on
+next launch. Built-in themes:
+
+| Theme | Look |
+|-------|------|
+| **Clownsec** | the default neon — green / purple / cyan on black |
+| **Matrix** | green monochrome on near-black |
+| **Nintendo** | grey background, blue accent, red |
+| **Light** | dark text on a near-white background |
+| **Amber** | retro amber / orange terminal |
+| **Ice** | cyan / white on deep blue |
+
+### Custom colors
+
+Select **Custom** and press **X** to open the color editor:
+
+<p align="center">
+<img src="screenshots/18-player-theme-custom.png" width="300">
+&nbsp;&nbsp;
+<img src="screenshots/19-player-theme-custom-bg.png" width="300">
+</p>
+
+- **L / R** — cycle the palette item: *Accent 1/2/3, Danger, Bright text, Text, Muted, Background*
+- **D-pad** — pick and adjust the **R / G / B** channel (or tap a slider to set it directly)
+- **Y** — reset to defaults · **B** — save and exit
+
+The editor's own chrome stays a fixed, readable dark scheme no matter what you pick, and a live
+**preview** panel shows the themed result. Panel, row, and border shades are derived from your base
+colors, so even light backgrounds stay coherent. Custom colors are saved to
+`sdmc:/moflex_player/custom.cfg`.
 
 ## Credits & license
 
