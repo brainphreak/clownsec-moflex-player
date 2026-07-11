@@ -221,7 +221,8 @@ static void fmt_time(int64_t us, char *o, int cap) {
 
 /* ---------- subtitles: external .srt (sidecar next to the movie, or in moviedata/) ---------- */
 extern char font8x8_basic[128][8];   /* defined once in ui_gfx.c */
-#include "font512.h"                 /* Latin/Greek/Cyrillic/Hebrew glyphs for foreign subtitles */
+#include "font8x8_ext.h"             /* IBM-VGA-style Latin-1 + Greek + Turkish (matches font8x8_basic) */
+#include "font512.h"                 /* fallback for Cyrillic/Hebrew/other foreign scripts */
 #include "subcp.h"                   /* 8-bit codepage -> Unicode maps (Turkish/Cyrillic/Greek/...) */
 
 /* decode one UTF-8 codepoint from *ps and advance past it */
@@ -241,8 +242,15 @@ static const char sub_note_glyph[8] = { 0x08, 0x08, 0x08, 0x08, 0x08, 0x0E, 0x0F
 /* 8x8 bitmap for a Unicode codepoint; NULL if we have no glyph (e.g. CJK). */
 static const char *sub_glyph(uint32_t cp) {
     if (cp == 0x266A || cp == 0x266B) return sub_note_glyph;             /* ♪ ♫ */
-    if (cp >= 0x20 && cp < 0x7F)      return (const char *)font512[cp];  /* ASCII (512_8 CP437 identity) -> one uniform font */
-    int lo = 0, hi = FONT512_MAP_N - 1;                                 /* foreign scripts: binary-search 512_8 */
+    if (cp < 0x80)                    return font8x8_basic[cp];          /* ASCII (IBM VGA) */
+    if (cp >= 0xA0 && cp <= 0xFF)     return font8x8_ext_latin[cp - 0xA0]; /* Latin-1 (matching style) */
+    if (cp >= 0x390 && cp <= 0x3C9)   return font8x8_greek[cp - 0x390];  /* Greek (matching style) */
+    switch (cp) {                                                        /* Turkish Ext-A (composed to match) */
+        case 0x011E: return font8x8_turk[0]; case 0x011F: return font8x8_turk[1];   /* Ğ ğ */
+        case 0x0130: return font8x8_turk[2]; case 0x0131: return font8x8_turk[3];   /* İ ı */
+        case 0x015E: return font8x8_turk[4]; case 0x015F: return font8x8_turk[5];   /* Ş ş */
+    }
+    int lo = 0, hi = FONT512_MAP_N - 1;                                 /* Cyrillic/Hebrew/other: 512_8 fallback */
     while (lo <= hi) {
         int mid = (lo + hi) >> 1; unsigned c = font512_map[mid].cp;
         if (c == cp) return (const char *)font512[font512_map[mid].idx];
@@ -388,7 +396,7 @@ static void sub_fbpx(u16 *fb, int x, int y, u16 c) {
 static void sub_fbtext(u16 *fb, int x, int y, int sc, u16 col, const char *s) {
     while (*s) {
         uint32_t cp = u8_next(&s);                          /* one UTF-8 codepoint per glyph */
-        const char *g = sub_glyph(cp); if (!g) g = (const char *)font512[0x3F];   /* no glyph -> '?' */
+        const char *g = sub_glyph(cp); if (!g) g = font8x8_basic['?'];   /* no glyph -> '?' */
         for (int row = 0; row < 8; row++) { char bits = g[row];
             for (int c = 0; c < 8; c++) if (bits & (1 << c))
                 for (int a = 0; a < sc; a++) for (int b = 0; b < sc; b++)
