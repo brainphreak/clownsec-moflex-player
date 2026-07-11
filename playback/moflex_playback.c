@@ -1103,7 +1103,7 @@ MoflexResult moflex_play(const char *path) {
     /* The video is shown as its frame is READ, while audio sits buffered ahead of what's heard -> the
      * picture leads the sound by ~the audio-queue depth. Shallower queue = tighter lip-sync. 2D races
      * ahead (light decode) so it needs the shallowest; 3D a bit deeper for slack against decode dips. */
-    int nwb = is3d ? 12 : 4;   /* deeper 3D audio queue absorbs heavy-frame decode stalls (higher-bitrate files) */
+    int nwb = is3d ? 8 : 4;   /* tuned for lip-sync (deeper queue = picture leads sound more) */
 
     AVCodecContext ctx;
     memset(&ctx, 0, sizeof(ctx));
