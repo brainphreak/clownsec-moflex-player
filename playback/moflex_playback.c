@@ -203,7 +203,7 @@ static void fmt_time(int64_t us, char *o, int cap) {
 
 /* ---------- subtitles: external .srt (sidecar next to the movie, or in moviedata/) ---------- */
 extern char font8x8_basic[128][8];   /* defined once in ui_gfx.c */
-#include "font8x8_ext.h"             /* Latin-1 Supplement + Greek glyphs (foreign languages) */
+#include "font512.h"                 /* Latin/Greek/Cyrillic/Hebrew glyphs for foreign subtitles */
 
 /* decode one UTF-8 codepoint from *ps and advance past it */
 static uint32_t u8_next(const char **ps) {
@@ -219,13 +219,17 @@ static int u8_cplen(const char *s) { int n = 0; while (*s) { u8_next(&s); n++; }
 
 static const char sub_note_glyph[8] = { 0x08, 0x08, 0x08, 0x08, 0x08, 0x0E, 0x0F, 0x06 };  /* ♪ */
 
-/* 8x8 bitmap for a Unicode codepoint, across our font tables; NULL if we can't render it. */
+/* 8x8 bitmap for a Unicode codepoint; NULL if we have no glyph (e.g. CJK). */
 static const char *sub_glyph(uint32_t cp) {
     if (cp == 0x266A || cp == 0x266B) return sub_note_glyph;             /* ♪ ♫ */
-    if (cp < 0x80)                    return font8x8_basic[cp];          /* ASCII */
-    if (cp >= 0xA0 && cp <= 0xFF)     return font8x8_ext_latin[cp - 0xA0]; /* Latin-1 supplement */
-    if (cp >= 0x390 && cp <= 0x3C9)   return font8x8_greek[cp - 0x390];  /* Greek */
-    return NULL;                                                          /* Cyrillic/CJK/etc: unsupported */
+    if (cp < 0x80)                    return font8x8_basic[cp];          /* ASCII: keep the familiar font */
+    int lo = 0, hi = FONT512_MAP_N - 1;                                 /* foreign scripts: binary-search 512_8 */
+    while (lo <= hi) {
+        int mid = (lo + hi) >> 1; unsigned c = font512_map[mid].cp;
+        if (c == cp) return (const char *)font512[font512_map[mid].idx];
+        if (c < cp)  lo = mid + 1; else hi = mid - 1;
+    }
+    return NULL;                                                         /* CJK/etc: no glyph */
 }
 
 #define SUB_MAX 4000
