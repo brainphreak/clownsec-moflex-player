@@ -204,6 +204,7 @@ static void fmt_time(int64_t us, char *o, int cap) {
 /* ---------- subtitles: external .srt (sidecar next to the movie, or in moviedata/) ---------- */
 extern char font8x8_basic[128][8];   /* defined once in ui_gfx.c */
 #include "font512.h"                 /* Latin/Greek/Cyrillic/Hebrew glyphs for foreign subtitles */
+#include "subcp.h"                   /* 8-bit codepage -> Unicode maps (Turkish/Cyrillic/Greek/...) */
 
 /* decode one UTF-8 codepoint from *ps and advance past it */
 static uint32_t u8_next(const char **ps) {
@@ -242,6 +243,11 @@ static int  g_sub_top = 0;     /* 0 = bottom of the top screen, 1 = top */
 static int  g_sub_depth = 0;   /* 3D parallax: per-eye horizontal shift (-=out toward you, +=into screen) */
 static int  g_sub_size = 1;    /* font scale: 1 = small (sharpest), 2 = medium, 3 = large */
 static int64_t g_sub_off = 0;  /* timing offset in us (+ = show later, - = show earlier) */
+/* Encoding for 8-bit (non-UTF-8) SRTs -- UTF-8 is auto-detected; the various legacy codepages
+ * can't be told apart from the bytes, so the user picks. Index into sub_cp_hi[] (see subcp.h). */
+static int  g_sub_enc = 0;     /* 0=Western 1=Turkish 2=Cyrillic 3=Greek 4=Central-Euro */
+static int  g_sub_mode = -1;   /* resolved for the loaded file: -1 = UTF-8, else 0..4 codepage */
+static const char *g_sub_enc_name[5] = { "Western", "Turkish", "Cyrillic", "Greek", "Central Eur" };
 static char g_sub_file[512] = "";
 
 static int sub_parse_ts(const char *p, int64_t *us) {
@@ -272,11 +278,12 @@ static void sub_clean(const char *in, char *out, int cap) {
         unsigned char c = *p;
         if (c == '<') { p++; while (*p && *p != '>') p++; if (*p) p++; continue; }   /* <i>, <font ...> */
         if (c < 0x80) { out[o++] = (char)c; p++; continue; }
-        uint32_t cp; int n;                                  /* decode: valid UTF-8, else CP1252 byte */
-        if ((c & 0xE0) == 0xC0 && p[1]) { cp = ((uint32_t)(c & 0x1F) << 6) | (p[1] & 0x3F); n = 2; }
+        uint32_t cp; int n;
+        if (g_sub_mode >= 0) { cp = sub_cp_hi[g_sub_mode][c - 0x80]; n = 1; }   /* 8-bit codepage */
+        else if ((c & 0xE0) == 0xC0 && p[1]) { cp = ((uint32_t)(c & 0x1F) << 6) | (p[1] & 0x3F); n = 2; }   /* UTF-8 */
         else if ((c & 0xF0) == 0xE0 && p[1] && p[2]) { cp = ((uint32_t)(c & 0x0F) << 12) | ((p[1] & 0x3F) << 6) | (p[2] & 0x3F); n = 3; }
         else if ((c & 0xF8) == 0xF0 && p[1] && p[2] && p[3]) { cp = ((uint32_t)(c & 0x07) << 18) | ((p[1] & 0x3F) << 12) | ((p[2] & 0x3F) << 6) | (p[3] & 0x3F); n = 4; }
-        else { cp = cp1252(c); n = 1; }
+        else { cp = cp1252(c); n = 1; }   /* stray high byte in an otherwise-UTF-8 file */
         if      (cp == 0x2018 || cp == 0x2019 || cp == 0x201B) out[o++] = '\'';
         else if (cp == 0x201C || cp == 0x201D)                 out[o++] = '"';
         else if (cp == 0x2013 || cp == 0x2014)                 out[o++] = '-';
@@ -292,10 +299,28 @@ static void sub_clean(const char *in, char *out, int cap) {
     }
     out[o] = 0;
 }
+/* Is the whole file valid UTF-8? (unambiguous, so we can auto-detect it). Rewinds the file. */
+static int sub_is_utf8(FILE *f) {
+    rewind(f);
+    int c, cont = 0;
+    while ((c = fgetc(f)) != EOF) {
+        unsigned char b = (unsigned char)c;
+        if (cont) { if ((b & 0xC0) != 0x80) { rewind(f); return 0; } cont--; }
+        else if (b < 0x80) continue;
+        else if ((b & 0xE0) == 0xC0) cont = 1;
+        else if ((b & 0xF0) == 0xE0) cont = 2;
+        else if ((b & 0xF8) == 0xF0) cont = 3;
+        else { rewind(f); return 0; }
+    }
+    rewind(f);
+    return cont == 0;
+}
 static int subs_load(const char *path) {
     FILE *f = fopen(path, "rb"); if (!f) return 0;
     if (!g_subs) g_subs = (SubCue *)malloc(sizeof(SubCue) * SUB_MAX);
     if (!g_subs) { fclose(f); return 0; }
+    /* Auto-detect UTF-8; otherwise decode as the user-selected 8-bit codepage. */
+    g_sub_mode = sub_is_utf8(f) ? -1 : g_sub_enc;
     g_nsubs = 0;
     char line[512];
     while (g_nsubs < SUB_MAX && fgets(line, sizeof line, f)) {
@@ -613,18 +638,20 @@ static void sub_offset_menu(void) {
 }
 static void sub_menu(const char *moviepath, int is3d) {
     for (;;) {
-        char i0[28], i1[28], i2[28], i3[28], i4[28];
+        char i0[28], i1[28], i2[28], i3[28], i4[28], i5[28];
         snprintf(i0, sizeof i0, "Subtitles: %s", g_sub_on ? "ON" : "OFF");
         snprintf(i1, sizeof i1, "Position: %s", g_sub_top ? "TOP" : "BOTTOM");
         snprintf(i2, sizeof i2, "Size: %s", g_sub_size == 1 ? "Small" : g_sub_size == 2 ? "Medium" : "Large");
         int64_t da = g_sub_off < 0 ? -g_sub_off : g_sub_off;
         snprintf(i3, sizeof i3, "Delay: %c%d.%02d s", g_sub_off < 0 ? '-' : '+',
                  (int)(da / 1000000), (int)((da % 1000000) / 10000));
-        const char *items[6]; int act[6], n = 0;
+        snprintf(i5, sizeof i5, "Encoding: %s%s", g_sub_enc_name[g_sub_enc], g_sub_mode < 0 ? " (UTF-8)" : "");
+        const char *items[8]; int act[8], n = 0;
         items[n] = i0; act[n++] = 0;
         items[n] = i1; act[n++] = 1;
         items[n] = i2; act[n++] = 2;
         items[n] = i3; act[n++] = 3;
+        items[n] = i5; act[n++] = 6;                         /* text encoding (for non-UTF-8 SRTs) */
         if (is3d) { snprintf(i4, sizeof i4, "Depth (3D): %+d", g_sub_depth); items[n] = i4; act[n++] = 4; }
         items[n] = "Load SRT file..."; act[n++] = 5;
         int c = sub_modal("SUBTITLES", items, n);
@@ -636,6 +663,8 @@ static void sub_menu(const char *moviepath, int is3d) {
         else if (a == 3) sub_offset_menu();
         else if (a == 4) sub_depth_menu(is3d);
         else if (a == 5) sub_load_menu(moviepath);
+        else if (a == 6) { g_sub_enc = (g_sub_enc + 1) % 5;   /* re-decode the loaded SRT with the new codepage */
+                           if (g_sub_file[0]) subs_load(g_sub_file); }
     }
 }
 
