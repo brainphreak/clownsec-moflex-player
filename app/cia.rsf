@@ -78,6 +78,7 @@ AccessControlInfo:
    - hid:USER
    - http:C
    - ldr:ro
+   - mcu::HWC
    - ndm:u
    - nim:s
    - ptm:sysm
