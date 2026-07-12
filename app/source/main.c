@@ -1795,10 +1795,24 @@ static void manage_menu(void) {
     if (nentries == 0) return;
     char full[PATHLEN + NAMELEN];
     snprintf(full, sizeof(full), "%s%s", cwd, entries[sel].name);
-    const char *items[] = { "DELETE", "MOVE (cut)", "CANCEL" };
-    int c = ui_menu("MANAGE", entries[sel].name, items, 3);
-    if (c == 0) { if (confirm("Delete this item?")) { remove(full); scan(); } }
-    else if (c == 1) {
+    const char *items[] = { "RENAME", "DELETE", "MOVE (cut)", "CANCEL" };
+    int c = ui_menu("MANAGE", entries[sel].name, items, 4);
+    if (c == 0) {                                   /* RENAME (edit the filename in place) */
+        char newname[NAMELEN];
+        snprintf(newname, sizeof(newname), "%s", entries[sel].name);
+        SwkbdState s; swkbdInit(&s, SWKBD_TYPE_NORMAL, 2, -1);
+        swkbdSetHintText(&s, "New name");
+        swkbdSetInitialText(&s, newname);
+        if (swkbdInputText(&s, newname, sizeof(newname)) == SWKBD_BUTTON_RIGHT
+            && newname[0] && !strchr(newname, '/') && strcmp(newname, entries[sel].name) != 0) {
+            char dest[PATHLEN + NAMELEN];
+            snprintf(dest, sizeof(dest), "%s%s", cwd, newname);
+            if (rename(full, dest) != 0) msg_screen("RENAME", "Could not rename\n(name already in use?).");
+            scan();
+        }
+    }
+    else if (c == 1) { if (confirm("Delete this item?")) { remove(full); scan(); } }
+    else if (c == 2) {
         snprintf(move_src, sizeof(move_src), "%s", full);
         snprintf(move_name, sizeof(move_name), "%s", entries[sel].name);
         move_pending = 1;
