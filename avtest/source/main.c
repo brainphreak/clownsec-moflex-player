@@ -176,6 +176,7 @@ int main(void) {
     int done = 0, has_pending = 0;
     MfxPacket pending;
     u64 fps_t0 = osGetTime(); int shown = 0; double fps = 0;
+    u64 dec_ticks = 0; int dec_frames = 0;   /* rolling: raw decode capability (pairs/sec) */
 
     while (aptMainLoop()) {
         hidScanInput();
@@ -190,7 +191,9 @@ int main(void) {
                 if ((wr - rd) < NBUF - 1) {
                     int eye = vidx & 1; AVFrame *dst = eye ? fR : fL; int got = 0, fill = wr % NBUF;
                     AVPacket ap; ap.data = pending.data; ap.size = pending.size;
+                    u64 _dt = svcGetSystemTick();
                     int ok = (mobi_decode(&ctx, dst, &got, &ap) >= 0 && got);
+                    dec_ticks += svcGetSystemTick() - _dt; dec_frames++;
                     if (eye == 0) {
                         if (ok) { left_ok = 1; lv = vidx;
                             if (prev >= 0) { y2r_wait(&texR[prev]); ready[prev] = 1; prev = -1; }
@@ -228,9 +231,12 @@ int main(void) {
         u64 now = osGetTime();
         if (now - fps_t0 >= 250) {
             fps = shown * 1000.0 / (now - fps_t0); shown = 0; fps_t0 = now;
+            int dfps = (dec_ticks > 0) ? (int)((double)SYSCLOCK_ARM11 * dec_frames / (double)dec_ticks / 2.0) : 0;
+            dec_ticks = 0; dec_frames = 0;   /* d = raw decode pairs/sec (>=24 => render/bank-bound; <24 => decode wall) */
             int64_t apos = g_apos;
             int e = (apos >= 0) ? (int)((int64_t)rd * pair_dur - apos) / 1000 : 0;
-            printf("\x1b[5;0Hfps%5.1f  q%2d  e%5dms  apos%lldms   \n",
+            printf("\x1b[4;0Hd%3d (>=24 ok)\x1b[5;0Hfps%5.1f  q%2d  e%5dms  apos%lldms   \n",
+                   dfps,
                    fps, wr - rd, e, (long long)(apos / 1000));
         }
     }
