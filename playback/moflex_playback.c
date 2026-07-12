@@ -31,6 +31,21 @@ static float g_vol = 1.0f;
 static int   g_old3d_warn = 0;   /* Old 3DS + 3D content: show the "unsupported / perf issues" notice */
 static int   g_lcd_ok = 0;       /* gsp::Lcd available -> bottom-screen-off feature usable */
 static int   g_screen_off = 0;   /* bottom backlight is currently off (movie keeps playing on top) */
+
+/* ---- battery indicator (player panel) ---- */
+static int   g_mcu_ok = 0;       /* mcu::HWC available -> exact 0-100% */
+static int   g_batt_pct = -1;    /* cached level (-1 = unknown) */
+static int   g_batt_chg = 0;     /* charging / plugged in */
+static u64   g_batt_next = 0;    /* next refresh time (osGetTime ms) */
+static void batt_refresh(void) {
+    u64 now = osGetTime();
+    if (g_batt_pct >= 0 && now < g_batt_next) return;   /* throttle: read every few seconds */
+    g_batt_next = now + 4000;
+    u8 v = 0;
+    if (g_mcu_ok && R_SUCCEEDED(MCUHWC_GetBatteryLevel(&v))) g_batt_pct = v > 100 ? 100 : v;
+    else { u8 lvl = 0; if (R_SUCCEEDED(PTMU_GetBatteryLevel(&lvl))) g_batt_pct = lvl * 20; }   /* 0-5 -> % */
+    u8 c = 0; if (R_SUCCEEDED(PTMU_GetBatteryChargeState(&c))) g_batt_chg = c;
+}
 static void vol_load(void) {
     FILE *f = fopen("sdmc:/moflex_player/volume.txt", "rb");
     if (f) { float v; if (fscanf(f, "%f", &v) == 1 && v >= 0.25f && v <= 4.0f) g_vol = v; fclose(f); }
@@ -478,6 +493,20 @@ static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing)
     fmt_time(dur, td, sizeof(td));
     snprintf(line, sizeof(line), "%s / %s", tc, td);
     ui_text(10, 26, 1, UI_NEONC, line);
+
+    /* battery: small icon + % at the far right of the time row (cyan while charging) */
+    batt_refresh();
+    if (g_batt_pct >= 0) {
+        char bs[8]; snprintf(bs, sizeof bs, "%d%%", g_batt_pct);
+        u16 bcol = g_batt_chg ? UI_NEONC : (g_batt_pct <= 15 ? UI_RED : g_batt_pct <= 30 ? UI_RGB(255,180,60) : UI_NEON);
+        int tw = ui_text_w(1, bs), bw = 16, bh = 10;
+        int tx = (VOL_X - 14) - tw, bx = tx - 22, by = 24;
+        ui_frame_round(bx, by, bw, bh, 2, bcol, 1);            /* body */
+        ui_fill(bx + bw, by + 3, 2, bh - 6, bcol);            /* terminal nub */
+        int fw = (bw - 4) * g_batt_pct / 100; if (fw < 1 && g_batt_pct > 0) fw = 1;
+        ui_fill_round(bx + 2, by + 2, fw, bh - 4, 1, bcol);   /* charge fill */
+        ui_text(tx, 26, 1, bcol, bs);
+    }
     if (g_old3d_warn)   /* Old 3DS can't keep up with 3D's doubled frame rate */
         ui_text(10, 42, 1, UI_RED, "3D Has Performance Issues on Old3DS");
 
@@ -1302,6 +1331,9 @@ MoflexResult moflex_play(const char *path) {
 
     g_lcd_ok = R_SUCCEEDED(gspLcdInit());   /* per-screen backlight control for the bottom-screen-off button */
     g_screen_off = 0;
+    ptmuInit();                                          /* charging state + coarse level */
+    g_mcu_ok = R_SUCCEEDED(mcuHwcInit());                /* exact 0-100% (needs mcu::HWC in the CIA RSF) */
+    g_batt_pct = -1; g_batt_next = 0;
 
     /* handle HOME/sleep cleanly (release Y2R + gsp::Lcd, pause audio, restore GPU state) */
     g_apt_is3d = is3d; g_apt_have_audio = have_audio; g_apt_playing = playing; g_apt_redraw = 0;
@@ -1489,6 +1521,8 @@ done:
     aptUnhook(&g_apt_cookie);
     if (g_screen_off) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; }   /* never leave it dark */
     if (g_lcd_ok) { gspLcdExit(); g_lcd_ok = 0; }
+    if (g_mcu_ok) { mcuHwcExit(); g_mcu_ok = 0; }
+    ptmuExit();
     g_old3d_warn = 0;
     if (vol_dirty) { vol_save(); vol_dirty = 0; }   /* persist any volume change made during playback */
     /* remember where we stopped (clear it if we watched to the end) */
