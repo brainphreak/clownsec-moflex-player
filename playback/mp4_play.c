@@ -45,15 +45,16 @@ MoflexResult mp4_play(const char *path) {
 
     printf("\x1b[2J\x1b[HMP4 (test): %dx%d, %d frames\nB = back\n", m.width, m.height, m.v_count);
 
-    /* pace to the video frame rate (osGetTime is wall-clock ms, independent of the CPU speedup) */
+    /* Pace by counting display refreshes so 24fps content gets a steady 3:2 pulldown (each frame
+     * held 2 or 3 vblanks in an even pattern) -- a ms timer quantizes unevenly and judders. */
     double dur_s = mp4_duration_s(&m);
     double fps   = (dur_s > 0 && m.v_count > 1) ? (m.v_count - 1) / dur_s : 30.0;
     if (fps < 1.0 || fps > 120.0) fps = 30.0;
-    double frame_ms = 1000.0 / fps;
+    double vpf = 59.83 / fps;                 /* display vblanks per video frame (3DS refresh ~59.83 Hz) */
+    if (vpf < 1.0) vpf = 1.0;
+    double acc = 0.0;
 
     MoflexResult result = MOFLEX_QUIT_BACK;
-    double next_ms = (double)osGetTime() + frame_ms;
-
     for (int vi = 0; vi < m.v_count && aptMainLoop(); vi++) {
         hidScanInput();
         if (hidKeysDown() & KEY_B) { result = MOFLEX_QUIT_BACK; break; }
@@ -62,8 +63,10 @@ MoflexResult mp4_play(const char *path) {
         int n = mp4_read_sample(&m, s, buf);
         int got = (n == (int)s->size && mp4_mvd_decode(buf, n, GFX_LEFT));   /* decode into the back buffer */
 
-        next_ms += frame_ms;                                     /* then present at the exact frame time */
-        while ((double)osGetTime() < next_ms) gspWaitForVBlank();
+        acc += vpf;                                              /* hold the current frame a steady 2/3 vblanks */
+        int nv = (int)(acc + 1e-6); if (nv < 1) nv = 1;
+        acc -= nv;
+        for (int i = 0; i < nv; i++) gspWaitForVBlank();
         if (got) { gfxFlushBuffers(); gfxSwapBuffers(); }
     }
 
