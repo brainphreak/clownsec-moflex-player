@@ -41,11 +41,13 @@ int mp4_mvd_init(int w, int h, const uint8_t *avcc, int avcc_len, int nal_len_si
     g_out   = (u16 *)linearAlloc((size_t)w * h * sizeof(u16));
     if (!g_inbuf || !g_out) { mp4_mvd_exit(); return 0; }
 
-    if (R_FAILED(mvdstdInit(MVDMODE_VIDEOPROCESSING, MVD_INPUT_H264, MVD_OUTPUT_RGB565,
+    /* BGR565 matches the RGB565_OES framebuffer's byte order (MVD's "RGB565" comes out R/B-swapped) */
+    if (R_FAILED(mvdstdInit(MVDMODE_VIDEOPROCESSING, MVD_INPUT_H264, MVD_OUTPUT_BGR565,
                             MVD_DEFAULT_WORKBUF_SIZE, NULL))) { mp4_mvd_exit(); return 0; }
 
-    /* decode w x h, output RGB565 into g_out (no scaling); we transpose g_out -> framebuffer */
+    /* decode w x h, output into g_out (no scaling); we transpose g_out -> framebuffer */
     mvdstdGenerateDefaultConfig(&g_config, (u32)w, (u32)h, (u32)w, (u32)h, NULL, (u32 *)g_out, (u32 *)g_out);
+    g_config.output_type = MVD_OUTPUT_BGR565;
 
     /* prime SPS/PPS from the avcC box */
     if (avcc && avcc_len > 6) {
