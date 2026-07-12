@@ -985,6 +985,7 @@ static MoflexResult moflex_play_gpu(const char *path) {
     /* decode-ahead ring: wr = pairs decoded-in (monotonic), rd = pairs presented; slot = idx % NTB.
      * last_rp = slot whose R-eye Y2R is still in flight (waited before the next L start). */
     int wr = 0, rd = 0, last_rp = -1, shown_landing = 0, last_shown = -1;
+    int priming = 0;   /* fill the ring BEFORE audio starts, so audio-0 lines up with video pair-0 */
     int64_t ring_ts[NTB], ring_bts[NTB]; int ring_ready[NTB] = { 0 };   /* synthetic + raw block ts */
     int64_t cur_show_ts = 0, cur_show_bts = 0, next_vts = 0, v_anchor = 0; int have_anchor = 0;
     int64_t cal_aud0 = -1; int cal_frames = 0;                    /* calibrate pair_dur from the AUDIO clock */
@@ -1003,7 +1004,7 @@ static MoflexResult moflex_play_gpu(const char *path) {
      * from the video decode on core 0. This is the stutter fix (what the official player does). */
     Thread awt = NULL;
     if (have_audio) {
-        g_aw_stop = 0; g_aw_paused = 0;
+        g_aw_stop = 0; g_aw_paused = 1; priming = 1;        /* hold audio until the video ring is primed */
         g_aud_play_us = -1;                                 /* "audio not started yet" -> video won't race */
         g_aw_seek = want_seek; g_aw_seek_us = seek_to_us;   /* worker seeks to the resume pos too */
         APT_SetAppCpuTimeLimit(30);                          /* light audio worker on the syscore */
@@ -1059,7 +1060,8 @@ static MoflexResult moflex_play_gpu(const char *path) {
             for (int i = 0; i < NTB; i++) ring_ready[i] = 0;
             have_anchor = 0; cal_aud0 = -1; cal_frames = 0; qmin = 99; ce_have = 0;   /* re-anchor; reset diag */
             if (have_audio) { g_aud_play_us = -1;   /* audio clock offline until worker re-locks at new pos */
-                              g_aw_seek_us = seek_to_us; g_aw_seek = 1; g_aw_paused = 0; }
+                              g_aw_seek_us = seek_to_us; g_aw_seek = 1;
+                              g_aw_paused = 1; priming = 1; }   /* re-prime the ring before audio resumes */
             t0_wall = 0; g_vid_us = seek_to_us;   /* reset the pace clock so it re-locks at the new position */
             want_seek = 0; dirty = 1;
         }
@@ -1130,6 +1132,10 @@ static MoflexResult moflex_play_gpu(const char *path) {
             }
         }
 
+        /* once the ring is primed, release audio: its content-0 now lines up with the first video pair
+         * we're about to present (instead of audio racing ~ring-fill-time ahead at startup/seek). */
+        if (priming && (wr - rd) >= NTB - 3) { priming = 0; if (have_audio) g_aw_paused = 0; }
+
         /* ---- clock = elapsed audio time since AUDIO started; video uses elapsed time since VIDEO started.
          * Comparing RELATIVE times cancels any offset between the two demuxes' timelines (they disagreed by
          * seconds, which froze the video at startup). No audio -> real-time wall clock. ---- */
@@ -1158,17 +1164,22 @@ static MoflexResult moflex_play_gpu(const char *path) {
 
         if (dirty && last_shown >= 0) {
             int64_t ptime = cur_show_bts;
-            char tc[16], ts[64];
-            fmt_time(ptime, tc, sizeof tc);
-            /* DIAG HUD: e = video-audio error ms (pinned per-frame, so it should stay ~CONSTANT now, not
-             * grow); q = ring depth now/worst; sp = ring content span ms (coarse-ts check); o = lead (L/R). */
-            int aerr = (have_audio && g_aud_play_us >= 0 && g_aud_start >= 0)
-                       ? (int)(((cur_show_bts - v_anchor) - (g_aud_play_us - g_aud_start)) / 1000) : 0;
-            int span = (wr > rd) ? (int)((ring_bts[(wr - 1) % NTB] - ring_bts[rd % NTB]) / 1000) : 0;
-            snprintf(ts, sizeof ts, "%s e%d q%d/%d sp%d o%d",
-                     tc, aerr, wr - rd, qmin == 99 ? 0 : qmin, span, g_vlead_ms);
-            if (strcmp(ts, last_ts)) { strncpy(last_ts, ts, sizeof last_ts - 1);
-                C2D_TextBufClear(tmbuf); C2D_TextParse(&ttime, tmbuf, ts); C2D_TextOptimize(&ttime); }
+            /* Rebuild + re-parse the HUD/time text at most ~4x/sec (it used to churn EVERY video frame
+             * because 'e' changes -- C2D_TextParse/Optimize per frame is pure CPU stolen from decode). */
+            static u64 hud_next = 0;
+            u64 hnow = osGetTime();
+            if (hnow >= hud_next) {
+                hud_next = hnow + 250;
+                char tc[16], ts[64];
+                fmt_time(ptime, tc, sizeof tc);
+                int aerr = (have_audio && g_aud_play_us >= 0 && g_aud_start >= 0)
+                           ? (int)(((cur_show_bts - v_anchor) - (g_aud_play_us - g_aud_start)) / 1000) : 0;
+                int span = (wr > rd) ? (int)((ring_bts[(wr - 1) % NTB] - ring_bts[rd % NTB]) / 1000) : 0;
+                snprintf(ts, sizeof ts, "%s e%d q%d/%d sp%d o%d",
+                         tc, aerr, wr - rd, qmin == 99 ? 0 : qmin, span, g_vlead_ms);
+                if (strcmp(ts, last_ts)) { strncpy(last_ts, ts, sizeof last_ts - 1);
+                    C2D_TextBufClear(tmbuf); C2D_TextParse(&ttime, tmbuf, ts); C2D_TextOptimize(&ttime); }
+            }
             C3D_FrameBegin(0);
             C2D_TargetClear(topL, black); C2D_SceneBegin(topL); C2D_DrawImageAt(imgL[last_shown], 0, 0, 0, NULL, 1, 1);
             C2D_TargetClear(topR, black); C2D_SceneBegin(topR); C2D_DrawImageAt(is3d ? imgR[last_shown] : imgL[last_shown], 0, 0, 0, NULL, 1, 1);
