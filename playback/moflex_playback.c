@@ -1549,3 +1549,9 @@ done:
     fclose(f);
     return result;
 }
+
+/* ---- shared subtitle API for the MP4 player (wrap the statics above) ---- */
+void moflex_subs_autoload(const char *moviepath)      { subs_autoload(moviepath); }
+void moflex_sub_menu(const char *moviepath, int is3d) { sub_menu(moviepath, is3d); }
+void moflex_sub_overlay(int is3d, long long us)       { sub_overlay(is3d, (int64_t)us); }
+int  moflex_subs_on(void)                             { return g_sub_on; }

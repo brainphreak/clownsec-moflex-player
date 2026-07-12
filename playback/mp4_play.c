@@ -34,6 +34,14 @@
 #define OPB_W 96
 #define EXB_X 216
 #define EXB_W 96
+#define CC_X 244
+#define CC_Y 104
+#define CC_W 48
+#define CC_H 28
+#define DIM_X 244
+#define DIM_Y 138
+#define DIM_W 48
+#define DIM_H 28
 
 #define NWB          16
 #define AAC_MAXSAMP  2048
@@ -53,6 +61,15 @@ static int64_t     g_a_base_us;      /* media time at g_a_played==0 (moves on se
 /* ---- player state ---- */
 static float       g_pvol = 1.0f;
 static int         g_playing = 1;
+static int         g_lcd_ok = 0, g_screen_off = 0;   /* bottom-screen-off (gsp::Lcd) */
+
+/* wall clock, used as the master when a file has no audio (audio files use the DSP position) */
+static int64_t     g_clk_base_us;
+static u64         g_clk_t0;
+static int         g_clk_running;
+static void clk_set(int64_t us, int running) { g_clk_base_us = us; g_clk_t0 = osGetTime(); g_clk_running = running; }
+static void clk_pause(void)  { if (g_clk_running) { g_clk_base_us += (int64_t)(osGetTime() - g_clk_t0) * 1000; g_clk_running = 0; } }
+static void clk_resume(void) { if (!g_clk_running) { g_clk_t0 = osGetTime(); g_clk_running = 1; } }
 
 /* ---- battery (local; New-3DS panel) ---- */
 static int  g_batt = -1, g_batt_chg = 0, g_mcu_ok = 0;
@@ -84,10 +101,13 @@ static int64_t a_time_us(Mp4 *m, int i) {
     return (int64_t)(m->asamples[i].dts * 1000000LL / (int64_t)m->a_timescale);
 }
 
-/* audible position in the media (us) */
-static int64_t audio_now_us(void) {
-    if (!g_have_audio || !g_a_started) return g_a_base_us;
-    return g_a_base_us + (int64_t)(g_a_played * 1000000LL / (long long)g_aac.rate);
+/* current media position (us). Audio is the master when present; otherwise a wall clock. */
+static int64_t media_now_us(void) {
+    if (g_have_audio) {
+        if (!g_a_started) return g_a_base_us;
+        return g_a_base_us + (int64_t)(g_a_played * 1000000LL / (long long)g_aac.rate);
+    }
+    return g_clk_base_us + (g_clk_running ? (int64_t)(osGetTime() - g_clk_t0) * 1000 : 0);
 }
 
 /* refill free/done wavebufs from the next AAC access units, applying volume */
@@ -165,6 +185,17 @@ static void draw_panel(const char *title, int64_t cur, int64_t dur) {
     ui_button(BKB_X, BTN_Y, BKB_W, BTN_H, "BACK", 0, UI_NEONP);
     ui_button(OPB_X, BTN_Y, OPB_W, BTN_H, "OPEN", 0, UI_NEON);
     ui_button(EXB_X, BTN_Y, EXB_W, BTN_H, "EXIT", 0, UI_RED);
+
+    /* subtitles: CC toggle/options (glows when on) */
+    int cc = moflex_subs_on();
+    ui_button(CC_X, CC_Y, CC_W, CC_H, "CC", cc, cc ? UI_NEON : UI_DIM);
+    /* bottom-screen-off: crescent-moon button (video keeps playing on top) */
+    if (g_lcd_ok) {
+        ui_button(DIM_X, DIM_Y, DIM_W, DIM_H, "", 0, UI_NEONP);
+        int mx = DIM_X + DIM_W / 2, my = DIM_Y + DIM_H / 2, mr = 8;
+        ui_fill_round(mx - mr, my - mr, 2 * mr, 2 * mr, mr, UI_NEONC);
+        ui_fill_round(mx - mr + 6, my - mr - 2, 2 * mr, 2 * mr, mr, UI_BG2);
+    }
     ui_present();
 }
 
@@ -184,7 +215,7 @@ static void do_seek(Mp4 *m, uint8_t *vbuf, uint8_t *atmp, int sbs, int64_t dur_u
         int nn = mp4_read_sample(m, &m->vsamples[j], vbuf);
         got = (nn == (int)m->vsamples[j].size && mp4_mvd_decode(vbuf, nn));
     }
-    if (got) { mp4_mvd_present(sbs); gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank(); }
+    if (got) { mp4_mvd_present(sbs); moflex_sub_overlay(sbs, target_us); gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank(); }
     *vi = tvi + 1;
 
     if (g_have_audio) {
@@ -197,6 +228,7 @@ static void do_seek(Mp4 *m, uint8_t *vbuf, uint8_t *atmp, int sbs, int64_t dur_u
     } else {
         g_a_base_us = target_us;
     }
+    clk_set(target_us, g_playing);
 }
 
 /* quick full-screen message (bottom, ui) with B/A to dismiss */
@@ -265,6 +297,7 @@ MoflexResult mp4_play(const char *path) {
     }
 
     g_mcu_ok = R_SUCCEEDED(mcuHwcInit());
+    g_lcd_ok = R_SUCCEEDED(gspLcdInit()); g_screen_off = 0;   /* bottom-screen-off button */
     g_pvol = moflex_vol_get();
     g_playing = 1;
 
@@ -273,6 +306,8 @@ MoflexResult mp4_play(const char *path) {
     { const char *b = strrchr(path, '/'); b = b ? b + 1 : path;
       snprintf(title, sizeof title, "%s", b);
       size_t L = strlen(title); if (L > 4 && !strcasecmp(title + L - 4, ".mp4")) title[L - 4] = 0; }
+
+    moflex_subs_autoload(path);   /* load a matching .srt (sidecar or moviedata/) if one exists */
 
     double dur_s = mp4_duration_s(&m);
     int64_t dur_us = (int64_t)(dur_s * 1e6);
@@ -287,6 +322,8 @@ MoflexResult mp4_play(const char *path) {
     if (g_have_audio) pump_audio(&m, atmp);
     if (resume_us > 3000000 && (dur_us <= 0 || resume_us < dur_us - 5000000))
         do_seek(&m, buf, atmp, sbs, dur_us, resume_us, &vi);
+    else
+        clk_set(0, 1);   /* no-audio wall clock starts now */
 
     MoflexResult result = MOFLEX_QUIT_BACK;
     int quit = 0, was_paused = 0, vol_dirty = 0, hrep = 0;
@@ -299,6 +336,12 @@ MoflexResult mp4_play(const char *path) {
         hidScanInput();
         u32 kd = hidKeysDown(), kh = hidKeysHeld();
         touchPosition tp; hidTouchRead(&tp);
+
+        /* bottom screen off: any input wakes it (and is swallowed so it doesn't hit a control) */
+        if (g_screen_off) {
+            if (kd || (kh & KEY_TOUCH)) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; }
+            kd = 0; kh &= ~KEY_TOUCH; last_sig = -1;
+        }
 
         if (kd & KEY_B) { result = MOFLEX_QUIT_BACK; break; }
         if (kd & KEY_A) { g_playing = !g_playing; }
@@ -329,6 +372,17 @@ MoflexResult mp4_play(const char *path) {
             if (dx * dx + dy * dy <= 26 * 26) g_playing = !g_playing;
             else if (y >= PLAY_CY - 16 && y <= PLAY_CY + 16 && x >= RW_CX - 20 && x <= RW_CX + 20) { seek_req = 1; seek_to = cur_us - SEEK_STEP_US; }
             else if (y >= PLAY_CY - 16 && y <= PLAY_CY + 16 && x >= FF_CX - 20 && x <= FF_CX + 20) { seek_req = 1; seek_to = cur_us + SEEK_STEP_US; }
+            else if (x >= CC_X && x <= CC_X + CC_W && y >= CC_Y && y <= CC_Y + CC_H) {   /* subtitles menu */
+                if (g_have_audio) ndspChnSetPaused(0, true);
+                clk_pause();
+                moflex_sub_menu(path, sbs);
+                if (g_have_audio && g_playing) ndspChnSetPaused(0, false);
+                clk_resume();
+                last_sig = -1;
+            }
+            else if (g_lcd_ok && x >= DIM_X && x <= DIM_X + DIM_W && y >= DIM_Y && y <= DIM_Y + DIM_H) {   /* bottom screen off */
+                GSPLCD_PowerOffBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 1;
+            }
             else if (y >= BTN_Y && y <= BTN_Y + BTN_H) {
                 if (x >= BKB_X && x <= BKB_X + BKB_W) { result = MOFLEX_QUIT_BACK; break; }
                 if (x >= OPB_X && x <= OPB_X + OPB_W) { result = MOFLEX_QUIT_OPEN; break; }
@@ -343,6 +397,7 @@ MoflexResult mp4_play(const char *path) {
         if (!g_playing) {
             if (!was_paused) {
                 if (g_have_audio) ndspChnSetPaused(0, true);
+                clk_pause();
                 if (vol_dirty) { moflex_vol_set(g_pvol); vol_dirty = 0; }
                 if (cur_us > 3000000 && (dur_us <= 0 || cur_us < dur_us - 5000000)) moflex_resume_save(path, cur_us);
                 was_paused = 1;
@@ -352,7 +407,7 @@ MoflexResult mp4_play(const char *path) {
             gspWaitForVBlank();
             continue;
         }
-        if (was_paused) { if (g_have_audio) ndspChnSetPaused(0, false); was_paused = 0; }
+        if (was_paused) { if (g_have_audio) ndspChnSetPaused(0, false); clk_resume(); was_paused = 0; }
 
         /* ---- EOF ---- */
         if (vi >= m.v_count) { moflex_resume_clear(path); result = MOFLEX_EOF; break; }
@@ -367,7 +422,7 @@ MoflexResult mp4_play(const char *path) {
         /* ---- wait until this frame is due (audio-master), staying responsive ---- */
         for (;;) {
             pump_audio(&m, atmp);
-            int64_t now = audio_now_us();
+            int64_t now = media_now_us();
             int sig = (int)(cur_us / 250000) ^ (g_playing << 20) ^ ((int)(g_pvol * 4) << 22) ^ (g_batt << 24);
             if (sig != last_sig) { draw_panel(title, scrub ? scrub_us : cur_us, dur_us); last_sig = sig; }
             if (now >= cur_us) break;
@@ -383,7 +438,7 @@ MoflexResult mp4_play(const char *path) {
         if (quit) break;
         if (!g_playing) continue;   /* got paused mid-wait -> re-handle */
 
-        if (got) { mp4_mvd_present(sbs); gfxFlushBuffers(); gfxSwapBuffers(); }
+        if (got) { mp4_mvd_present(sbs); moflex_sub_overlay(sbs, cur_us); gfxFlushBuffers(); gfxSwapBuffers(); }
         gspWaitForVBlank();
         vi++;
     }
@@ -400,6 +455,8 @@ MoflexResult mp4_play(const char *path) {
         for (int i = 0; i < NWB; i++) if (g_abuf[i]) { linearFree(g_abuf[i]); g_abuf[i] = NULL; }
         mp4_aac_close(&g_aac);
     }
+    if (g_screen_off) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; }
+    if (g_lcd_ok) { gspLcdExit(); g_lcd_ok = 0; }
     if (g_mcu_ok) { mcuHwcExit(); g_mcu_ok = 0; }
     free(atmp);
     mp4_mvd_exit();

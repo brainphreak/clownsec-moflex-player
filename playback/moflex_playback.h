@@ -32,4 +32,10 @@ void  moflex_resume_clear(const char *path);
 float moflex_vol_get(void);          /* persisted playback volume (0.25..4.0) */
 void  moflex_vol_set(float v);       /* clamp to 0.25..4.0 and persist */
 
+/* Shared subtitle system, so the MP4 player reuses the same SRT loading/menu/overlay. */
+void moflex_subs_autoload(const char *moviepath);   /* load a sidecar/moviedata .srt if present */
+void moflex_sub_menu(const char *moviepath, int is3d);  /* the CC options menu (bottom screen) */
+void moflex_sub_overlay(int is3d, long long us);    /* draw the active cue onto the top framebuffer */
+int  moflex_subs_on(void);                          /* subtitles currently enabled? (for the CC button) */
+
 #endif
