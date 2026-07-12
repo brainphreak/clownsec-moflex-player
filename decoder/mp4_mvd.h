@@ -12,8 +12,14 @@
 int  mp4_mvd_init(int w, int h, const uint8_t *avcc, int avcc_len, int nal_len_size);
 void mp4_mvd_exit(void);
 
-/* Decode one MP4 video sample (AVCC: length-prefixed NAL units) and render the resulting frame
- * to the given top-screen eye. Returns 1 if a frame was rendered, 0 otherwise. */
-int  mp4_mvd_decode(const uint8_t *sample, int size, gfx3dSide_t side);
+/* Decode one MP4 video sample (AVCC: length-prefixed NAL units) into the internal frame buffer.
+ * Returns 1 if a frame was produced, 0 otherwise. Call mp4_mvd_present() to blit it. */
+int  mp4_mvd_decode(const uint8_t *sample, int size);
+
+/* Blit the last decoded frame to the top screen. If sbs is non-zero the frame is treated as
+ * side-by-side stereo: left half -> GFX_LEFT, right half -> GFX_RIGHT (use with gfxSet3D(true)).
+ * Otherwise the whole frame goes to GFX_LEFT. Each eye is aspect-fit (nearest-scaled + centered,
+ * letterboxed) into the 400x240 top screen. */
+void mp4_mvd_present(int sbs);
 
 #endif

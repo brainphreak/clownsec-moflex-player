@@ -72,19 +72,42 @@ void mp4_mvd_exit(void) {
     g_ready = 0;
 }
 
-/* rotate-transpose the decoded frame into the column-major top framebuffer, centered */
-static void blit_rot(gfx3dSide_t side) {
+/* Blit one eye -- source columns [sx, sx+sw) of the decoded frame -- into a top-screen
+ * framebuffer, aspect-fit (nearest-scaled, centered, letter/pillar-boxed) into 400x240 and
+ * rotate-transposed into the column-major framebuffer. */
+static void blit_eye(gfx3dSide_t side, int sx, int sw) {
     u16 *fb = (u16 *)gfxGetFramebuffer(GFX_TOP, side, NULL, NULL);
-    int cw = g_w < TOP_W ? g_w : TOP_W, ch = g_h < TOP_H ? g_h : TOP_H;
-    int xoff = (TOP_W - cw) / 2, yoff = (TOP_H - ch) / 2;
-    for (int x = 0; x < cw; x++) {
-        u16 *col = fb + (x + xoff) * TOP_H;
-        const u16 *s = g_out + x;
-        for (int y = 0; y < ch; y++) col[TOP_H - 1 - (y + yoff)] = s[y * g_w];
+    int sh = g_h, dw, dh;
+    /* fit sw x sh into TOP_W x TOP_H preserving aspect */
+    if (sw * TOP_H <= sh * TOP_W) { dh = TOP_H; dw = sw ? sw * TOP_H / sh : TOP_W; }  /* height-limited */
+    else                          { dw = TOP_W; dh = sh ? sh * TOP_W / sw : TOP_H; }  /* width-limited  */
+    if (dw < 1) dw = 1; if (dw > TOP_W) dw = TOP_W;
+    if (dh < 1) dh = 1; if (dh > TOP_H) dh = TOP_H;
+    int dxoff = (TOP_W - dw) / 2, dyoff = (TOP_H - dh) / 2;
+
+    /* precompute the source row for each destination row (avoids a divide per pixel) */
+    static int srcrow[TOP_H];
+    for (int dy = 0; dy < dh; dy++) srcrow[dy] = (dy * sh / dh) * g_w;
+
+    for (int dx = 0; dx < TOP_W; dx++) {
+        u16 *col = fb + dx * TOP_H;
+        if (dx < dxoff || dx >= dxoff + dw) {            /* pillarbox column */
+            for (int dy = 0; dy < TOP_H; dy++) col[dy] = 0;
+            continue;
+        }
+        int srcx = sx + (dx - dxoff) * sw / dw;
+        for (int dy = 0; dy < dyoff; dy++)               col[TOP_H - 1 - dy] = 0;                    /* top bar */
+        for (int dy = 0; dy < dh; dy++)                  col[TOP_H - 1 - (dy + dyoff)] = g_out[srcrow[dy] + srcx];
+        for (int dy = dyoff + dh; dy < TOP_H; dy++)      col[TOP_H - 1 - dy] = 0;                    /* bottom bar */
     }
 }
 
-int mp4_mvd_decode(const uint8_t *sample, int size, gfx3dSide_t side) {
+void mp4_mvd_present(int sbs) {
+    if (sbs) { int hw = g_w / 2; blit_eye(GFX_LEFT, 0, hw); blit_eye(GFX_RIGHT, hw, hw); }
+    else     { blit_eye(GFX_LEFT, 0, g_w); }
+}
+
+int mp4_mvd_decode(const uint8_t *sample, int size) {
     if (!g_ready) return 0;
 
     /* build one Annex-B packet from all of this frame's length-prefixed NALs */
@@ -114,6 +137,5 @@ int mp4_mvd_decode(const uint8_t *sample, int size, gfx3dSide_t side) {
     GSPGPU_InvalidateDataCache(g_out, (u32)g_w * g_h * sizeof(u16));
     if (!corners_changed()) return 0;   /* MVD didn't actually write a frame yet */
 
-    blit_rot(side);
     return 1;
 }

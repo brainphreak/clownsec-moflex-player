@@ -27,9 +27,13 @@ MoflexResult mp4_play(const char *path) {
     Mp4 m;
     if (!mp4_open(&m, path)) { mp4_msg("Could not open the MP4\n(no H.264 video track found)."); return MOFLEX_QUIT_BACK; }
 
-    /* top screen: MVD outputs RGB565 straight to the framebuffer (it handles the rotation) */
+    /* width >= two eyes wide -> side-by-side stereo 3D (each eye 400-wide); else flat 2D */
+    int sbs = (m.width >= 800);
+
+    /* top screen: RGB565, double-buffered so both eyes land in the back buffer before one atomic
+     * swap (no left-before-right tearing on 3D); 3D on only for SBS content */
     gfxSetScreenFormat(GFX_TOP, GSP_RGB565_OES);
-    gfxSet3D(false);
+    gfxSet3D(sbs);
     gfxSetDoubleBuffering(GFX_TOP, true);
 
     if (!mp4_mvd_init(m.width, m.height, m.avcc, m.avcc_len, m.nal_length_size)) {
@@ -68,7 +72,7 @@ MoflexResult mp4_play(const char *path) {
 
         Mp4Sample *s = &m.vsamples[vi];
         int n = mp4_read_sample(&m, s, buf);
-        int got = (n == (int)s->size && mp4_mvd_decode(buf, n, GFX_LEFT));   /* decode into the back buffer */
+        int got = (n == (int)s->size && mp4_mvd_decode(buf, n));   /* decode into the internal buffer */
 
         /* hold the previous frame until its slot is up (decode above ran during this hold) */
         while (vb < (u64)hold_until && aptMainLoop()) {
@@ -78,7 +82,7 @@ MoflexResult mp4_play(const char *path) {
         }
         if (quit) break;
 
-        if (got) { gfxFlushBuffers(); gfxSwapBuffers(); }
+        if (got) { mp4_mvd_present(sbs); gfxFlushBuffers(); gfxSwapBuffers(); }  /* blit eye(s) -> back buffer */
         /* the swap flips at the next vblank; this wait lands it (and makes this frame visible)
          * before the next iteration blits into the new back buffer -- prevents two-frame tearing */
         gspWaitForVBlank(); vb++;
