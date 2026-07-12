@@ -760,8 +760,13 @@ static int distinct_categories(const CatEntry *cat, int nc, char out[][32], int 
     }
     return n;
 }
+static int genre_has_any(const char *genres) {   /* does this entry list at least one genre? */
+    for (const char *g = genres; *g; g++) if (*g != ' ' && *g != ',') return 1;
+    return 0;
+}
 static int genre_match(const char *genres, const char *want) {
     if (!want || !want[0]) return 1;
+    if (!strcasecmp(want, "Uncategorized")) return !genre_has_any(genres);   /* no-genre bucket */
     for (const char *g = genres; *g; ) {
         while (*g == ' ' || *g == ',') g++;
         char tok[32]; int t = 0; while (*g && *g != ',' && t < 31) tok[t++] = *g++;
@@ -771,9 +776,10 @@ static int genre_match(const char *genres, const char *want) {
     return 0;
 }
 static int distinct_genres(const CatEntry *cat, int nc, const char *category, char out[][32], int max) {
-    int n = 0;
+    int n = 0, any_none = 0;
     for (int i = 0; i < nc && n < max; i++) {
         if (category[0] && strcasecmp(cat[i].category, category)) continue;
+        if (!genre_has_any(cat[i].genres)) { any_none = 1; continue; }   /* -> Uncategorized bucket */
         for (const char *g = cat[i].genres; *g && n < max; ) {
             while (*g == ' ' || *g == ',') g++;
             if (!*g) break;
@@ -782,6 +788,11 @@ static int distinct_genres(const CatEntry *cat, int nc, const char *category, ch
             if (t) { int f = 0; for (int j = 0; j < n; j++) if (!strcasecmp(out[j], tok)) { f = 1; break; }
                 if (!f && n < max) snprintf(out[n++], 32, "%s", tok); }
         }
+    }
+    /* add an "Uncategorized" genre so movies with no genre are still reachable by genre browse */
+    if (any_none && n < max) {
+        int f = 0; for (int j = 0; j < n; j++) if (!strcasecmp(out[j], "Uncategorized")) { f = 1; break; }
+        if (!f) snprintf(out[n++], 32, "%s", "Uncategorized");
     }
     return n;
 }
