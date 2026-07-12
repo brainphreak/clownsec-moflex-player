@@ -24,8 +24,8 @@ extern int    mobi_opt;
 #define TEXH 256
 #define VW   400
 #define VH   240
-#define NBUF 24                 /* decode-ahead ring (pairs) -- deeper = more cushion for hard scenes */
-#define AWB  96                 /* audio wavebufs -- banks audio ahead so hard scenes don't underrun */
+#define NBUF 40                 /* decode-ahead ring (pairs) -- deeper = more cushion for hard scenes */
+#define AWB  128                /* audio wavebufs -- banks audio ahead so hard scenes don't underrun */
 #define ABUF (16 * 1024)        /* max samples/ch per audio packet */
 
 /* ---- SINGLE-DEMUX audio: TWO demuxers reading the same file thrash the SD (each seeks to a
@@ -218,11 +218,12 @@ int main(void) {
 
         audio_poll();   /* advance the audio clock from real DSP playback (not just when feeding) */
 
-        /* ---- present the next pair when the audio clock reaches it (g_apos = -1 until audio starts,
-         *      so video naturally waits for audio; then it's audio-paced) ---- */
-        if ((wr - rd) > 0 && ready[rd % NBUF]) {
-            int64_t vtime = (int64_t)rd * pair_dur;      /* this pair's elapsed video time */
-            if (g_apos >= vtime) { draw_present(rd % NBUF); rd++; shown++; }
+        /* ---- present, audio-master. Drop stale pairs (video slaved to the audio clock): if the NEXT
+         *      pair is already due too, this one is stale -> skip it without drawing so video re-locks
+         *      to audio instead of fast-forwarding. Audio stays smooth+in-sync; video sheds frames. ---- */
+        while ((wr - rd) > 1 && ready[rd % NBUF] && (int64_t)(rd + 1) * pair_dur <= g_apos) rd++;
+        if ((wr - rd) > 0 && ready[rd % NBUF] && g_apos >= (int64_t)rd * pair_dur) {
+            draw_present(rd % NBUF); rd++; shown++;
         } else if ((wr - rd) == 0 && done) {
             break;   /* ring drained + EOF */
         }
