@@ -471,6 +471,39 @@ static void idct(int *arr, int size)
     arr[7] = tmp[0] - x0;
 }
 
+/* Sparse IDCT: same result as idct() when arr[nlive..size-1] are all zero, but it skips the
+ * provably-zero terms. Bit-exact (the skipped terms multiply zeros); the arithmetic/casts mirror
+ * idct()/inverse4() exactly so overflow behaviour matches. Used by the column pass, where every
+ * transposed row shares the coefficient rows' sparsity (nlive = highest live row + 1). */
+static void idct_sparse(int *arr, int size, int nlive)
+{
+    if (nlive <= 1) {                       /* DC only -> every output equals arr[0] */
+        int v = arr[0];
+        for (int i = 1; i < size; i++) arr[i] = v;
+        return;
+    }
+    if (size == 4) { inverse4((unsigned *)arr); return; }   /* 4-pt is already cheap */
+    if (nlive <= 4) {                       /* arr[4..7] == 0 */
+        int e, f, g, h;
+        unsigned x3, x2, x1, x0;
+        int tmp[4];
+        tmp[0] = arr[0]; tmp[1] = arr[2]; tmp[2] = arr[4]; tmp[3] = arr[6];   /* arr[4],arr[6]=0 */
+        inverse4((unsigned *)tmp);
+        e = (unsigned)0 + arr[1] - arr[3] - (arr[3] >> 1);   /* arr7=0 */
+        f = (unsigned)0 - arr[1];                            /* arr7=arr5=0 */
+        g = (unsigned)0 - arr[3];                            /* arr5=arr7=0 */
+        h = (unsigned)0 + arr[3] + arr[1] + (arr[1] >> 1);   /* arr5=0 */
+        x3 = (unsigned)g + (h >> 2);
+        x2 = (unsigned)e + (f >> 2);
+        x1 = (e >> 2) - (unsigned)f;
+        x0 = (unsigned)h - (g >> 2);
+        arr[0] = tmp[0] + x0; arr[1] = tmp[1] + x1; arr[2] = tmp[2] + x2; arr[3] = tmp[3] + x3;
+        arr[4] = tmp[3] - x3; arr[5] = tmp[2] - x2; arr[6] = tmp[1] - x1; arr[7] = tmp[0] - x0;
+        return;
+    }
+    idct(arr, size);                        /* 5..8 live -> full */
+}
+
 static void read_run_encoding(AVCodecContext *avctx,
                               int *last, int *run, int *level)
 {
@@ -631,6 +664,13 @@ static int add_coefficients_impl(AVCodecContext *avctx, AVFrame *frame,
             idct(&mat[y * size], size);
     }
 
+    /* column pass: after the transpose, every column-IDCT input has the coefficient rows' sparsity
+     * (nonzero only where a row was live), so nlive = highest live row + 1 -> a sparse IDCT. */
+    int nlive_col = size;
+    if (mobi_opt & 0x800) {
+        nlive_col = 1;
+        for (int r = size - 1; r >= 1; r--) if (rowmask & (1u << r)) { nlive_col = r + 1; break; }
+    }
     for (int y = 0; y < size; y++) {
         for (int x = y + 1; x < size; x++) {
             int a = mat[x * size + y];
@@ -640,7 +680,8 @@ static int add_coefficients_impl(AVCodecContext *avctx, AVFrame *frame,
             mat[x * size + y] = b;
         }
 
-        idct(&mat[y * size], size);
+        if (mobi_opt & 0x800) idct_sparse(&mat[y * size], size, nlive_col);
+        else                  idct(&mat[y * size], size);
         if (mobi_opt & 32)                    /* clamp-LUT: fused residual-add + saturate, no branch */
             for (int x = 0; x < size; x++)
                 dst[x] = g_clamp[CLAMP_OFF + dst[x] + (mat[y * size + x] >> 6)];

@@ -81,11 +81,11 @@ int main(void) {
 
     static const struct { const char *name; int opt; } C[6] = {
         { "0 base        ", 0 },
-        { "1 entropy C   ", 0x200 },              /* inlined lazy-refill entropy loop */
-        { "2 entropy ASM ", 0x400 },              /* hand ARM asm entropy -- must checksum == base */
-        { "3 asm+best    ", 0x40E },
-        { "4 pf+sk+dc    ", 0x0E },
-        { "5 ASM-mc+best ", 0x10E },
+        { "1 entropy     ", 0x200 },              /* lazy-refill entropy loop */
+        { "2 sparse IDCT ", 0x800 },              /* sparse column-pass IDCT -- must checksum == base */
+        { "3 ent+sparse  ", 0xA00 },
+        { "4 ALL ent+sp+b", 0xA0E },
+        { "5 best pf+sk+dc", 0x0E },
     };
     int NC = sizeof(C) / sizeof(C[0]);
     Res res[16];
