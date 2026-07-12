@@ -6,3 +6,4 @@
 void mc_havg_a(uint8_t *d, const uint8_t *s, int w, int h, int ds, int ss) { (void)d;(void)s;(void)w;(void)h;(void)ds;(void)ss; }
 void mc_vavg_a(uint8_t *d, const uint8_t *s, int w, int h, int ds, int ss) { (void)d;(void)s;(void)w;(void)h;(void)ds;(void)ss; }
 void mc_diag_a(uint8_t *d, const uint8_t *s, int w, int h, int ds, int ss) { (void)d;(void)s;(void)w;(void)h;(void)ds;(void)ss; }
+/* mobi_entropy_asm (0x400) host reference lives in entropy_c_ref.c */

@@ -30,6 +30,7 @@
 #include "get_bits.h"
 #include "golomb.h"
 #include "mathops.h"
+#include "mobi_entropy.h"   /* ARM asm coefficient-entropy loop (mobi_opt 0x400) */
 
 /* --- lightweight phase profiler: accumulate ARM11 ticks per decode phase.
  * OFF by default (zero overhead in the shipped app); define MOBI_PROFILE to measure. --- */
@@ -496,7 +497,20 @@ static int add_coefficients_impl(AVCodecContext *avctx, AVFrame *frame,
     if ((mobi_opt & 32) && !g_clamp_ready) clamp_init();
     uint64_t _te = PROF_NOW();
 
-    if (mobi_opt & 0x200) {
+    if (mobi_opt & 0x400) {
+        /* --- ARM assembly entropy loop (mobi_entropy_asm.s): same work as 0x200, hand-scheduled with
+         * the reader + coefficient state pinned in registers. Verified on-device via the gputest
+         * checksum against 0x200. --- */
+        MobiEntropyCtx c;
+        c.buffer = gb->buffer; c.index = gb->index;
+        c.size_in_bits = gb->size_in_bits; c.size_in_bits_plus8 = gb->size_in_bits_plus8;
+        c.rltab = rl_vlc[s->dct_tab_idx]; c.rres = run_residue[s->dct_tab_idx];
+        c.qtab = qtab; c.ztab = ztab; c.mat = mat; c.size = size;
+        c.rowmask = 1; c.ac = 0;
+        int rc = mobi_entropy_asm(&c);
+        gb->index = c.index; rowmask = c.rowmask; ac = c.ac;
+        if (rc) return AVERROR_INVALIDDATA;
+    } else if (mobi_opt & 0x200) {
         /* --- opt entropy loop (mobi_opt 0x200): hold the bit-reader cache/index in locals across the
          * whole coefficient run and inline get_vlc2 (rl_vlc is a FLAT 12-bit table, max_depth 1 -> one
          * lookup) + get_bits, refilling the 32-bit cache LAZILY -- only at points where more than

@@ -22,12 +22,14 @@ cc -c $CFLAGS $INC "$FSUP/mathtables.c"    -o "$OUT/mathtables.o"
 cc -c $CFLAGS $INC "$FSUP/reverse.c"       -o "$OUT/reverse.o"
 
 # host-only link stubs for the ARM-asm motion-comp routines (mc_asm.s is devkitARM-only)
-cc -c $CFLAGS $INC "$HERE/mc_stub.c"       -o "$OUT/mc_stub.o"
+cc -c $CFLAGS $INC "$HERE/mc_stub.c"        -o "$OUT/mc_stub.o"
+# host C reference for mobi_entropy_asm (0x400) -- verifies the wiring; .s is device-only
+cc -c $CFLAGS $INC "$HERE/entropy_c_ref.c"  -o "$OUT/entropy_c_ref.o"
 
 # video test
 cc -c $CFLAGS $INC "$HERE/test_decode.c"   -o "$OUT/test_decode.o"
 cc -O2 "$OUT"/mobiclip.o "$OUT"/mobicompat.o "$OUT"/vlc.o "$OUT"/golomb.o \
-       "$OUT"/mathtables.o "$OUT"/reverse.o "$OUT"/moflex_demux.o "$OUT"/mc_stub.o "$OUT"/test_decode.o \
+       "$OUT"/mathtables.o "$OUT"/reverse.o "$OUT"/moflex_demux.o "$OUT"/mc_stub.o "$OUT"/entropy_c_ref.o "$OUT"/test_decode.o \
        -o "$HERE/test_decode"
 
 # audio test

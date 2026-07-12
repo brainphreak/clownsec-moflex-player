@@ -43,9 +43,9 @@ extern int    mobi_opt;
 static const struct { const char *name; int opt; } CFG[] = {
     { "C  base            ", 0 },
     { "C  best pf+sk+dc   ", 0x0E },
-    { "C  ENTROPY opt     ", 0x200 },        /* inlined bit-reader + get_vlc2 (host bit-exact) */
-    { "C  entropy + best  ", 0x20E },
-    { "ASM mc + best      ", 0x10E },
+    { "C  entropy         ", 0x200 },         /* inlined lazy-refill bit reader (host bit-exact)  */
+    { "ASM entropy        ", 0x400 },         /* hand ARM asm of the entropy loop                */
+    { "ASM entropy + best ", 0x40E },
 };
 #define NCFG ((int)(sizeof(CFG)/sizeof(CFG[0])))
 
@@ -134,26 +134,43 @@ static double bench_cfg(int opt) {
     return pairs * 1000.0 / dt;
 }
 
-static int find_moflex(char *out, size_t cap) {
+static char g_paths[2][300]; static int g_npaths = 0, g_cur = 0;
+static FILE *g_f = NULL;
+static char g_name[64];
+
+/* collect the first two .moflex in sdmc:/ root (2 samples per transfer) */
+static int find_moflex_list(void) {
     DIR *d = opendir("sdmc:/"); if (!d) return 0;
-    struct dirent *e;
-    while ((e = readdir(d))) { size_t l = strlen(e->d_name);
-        if (l > 7 && !strcasecmp(e->d_name + l - 7, ".moflex")) { snprintf(out, cap, "sdmc:/%s", e->d_name); closedir(d); return 1; } }
-    closedir(d); return 0;
+    struct dirent *e; g_npaths = 0;
+    while ((e = readdir(d)) && g_npaths < 2) { size_t l = strlen(e->d_name);
+        if (l > 7 && !strcasecmp(e->d_name + l - 7, ".moflex"))
+            snprintf(g_paths[g_npaths++], 300, "sdmc:/%s", e->d_name); }
+    closedir(d); return g_npaths;
 }
 
-static char g_name[64];
+/* switch the open demuxer to file idx (both moflex are 400x240, so ctx is reused + flushed) */
+static int switch_file(int idx) {
+    if (idx >= g_npaths) return 0;
+    if (g_f) { mfx_close(&m); fclose(g_f); g_f = NULL; }
+    g_f = fopen(g_paths[idx], "rb");
+    if (!g_f || mfx_open(&m, g_f) != 0) { if (g_f) { fclose(g_f); g_f = NULL; } return 0; }
+    g_cur = idx;
+    const char *bn = strrchr(g_paths[idx], '/'); snprintf(g_name, sizeof g_name, "%s", bn ? bn + 1 : g_paths[idx]);
+    mobi_flush(&ctx); restart();
+    return 1;
+}
+
 static void print_live(int cfg, double fps) {
     printf("\x1b[H\x1b[2J");
     printf("MoFlex ASM test  (standalone)\n");
-    printf("%.40s\n\n", g_name);
+    printf("file %d/%d: %.32s\n\n", g_cur + 1, g_npaths, g_name);
     printf("config: %s\n", CFG[cfg].name);
     printf("opt   : 0x%X\n\n", CFG[cfg].opt);
     printf("LIVE fps: %5.1f  (stereo pairs/sec)\n\n", fps);
     printf("LEFT/RIGHT = change config\n");
-    printf("Y          = run benchmark table\n");
-    printf("START      = exit\n\n");
-    printf("(video loops on the top screen)\n");
+    printf("X          = switch file (2 samples)\n");
+    printf("Y          = benchmark table (this file)\n");
+    printf("START      = exit\n");
 }
 
 int main(void) {
@@ -170,10 +187,10 @@ int main(void) {
     }
     y2r_setup();
 
-    char path[300];
-    if (!find_moflex(path, sizeof path)) { printf("Put a .moflex in sdmc:/ root.\n"); goto wait; }
-    FILE *f = fopen(path, "rb");
-    if (!f || mfx_open(&m, f) != 0) { printf("open failed: %s\n", path); goto wait; }
+    if (!find_moflex_list()) { printf("Put a .moflex in sdmc:/ root.\n"); goto wait; }
+    /* open the first file to size the decoder context (all moflex are 400x240) */
+    g_f = fopen(g_paths[0], "rb");
+    if (!g_f || mfx_open(&m, g_f) != 0) { printf("open failed: %s\n", g_paths[0]); goto wait; }
     int vi = -1;
     for (int i = 0; i < m.nb_streams; i++) if (m.streams[i].media_type == MFX_TYPE_VIDEO && vi < 0) vi = i;
     if (vi < 0) { printf("no video stream.\n"); goto wait; }
@@ -181,7 +198,8 @@ int main(void) {
     ctx.width = m.streams[vi].width; ctx.height = m.streams[vi].height;
     ctx.priv_data = calloc(1, mobi_ctx_size()); mobi_init(&ctx);
     fL = av_frame_alloc(); fR = av_frame_alloc();
-    snprintf(g_name, sizeof g_name, "%s", strrchr(path, '/') + 1);
+    g_cur = 0;
+    { const char *bn = strrchr(g_paths[0], '/'); snprintf(g_name, sizeof g_name, "%s", bn ? bn + 1 : g_paths[0]); }
 
     int cfg = 0; mobi_opt = CFG[cfg].opt;
     restart();
@@ -195,6 +213,11 @@ int main(void) {
         if (kd & (KEY_RIGHT | KEY_LEFT)) {
             cfg = (kd & KEY_RIGHT) ? (cfg + 1) % NCFG : (cfg + NCFG - 1) % NCFG;
             mobi_opt = CFG[cfg].opt; restart();
+            fps_t0 = osGetTime(); fps_pairs = 0; live = 0; print_live(cfg, live);
+        }
+        if ((kd & KEY_X) && g_npaths > 1) {   /* switch to the other sample file */
+            switch_file((g_cur + 1) % g_npaths);
+            mobi_opt = CFG[cfg].opt;
             fps_t0 = osGetTime(); fps_pairs = 0; live = 0; print_live(cfg, live);
         }
         if (kd & KEY_Y) {   /* precise benchmark of all configs */
