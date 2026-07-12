@@ -1,8 +1,11 @@
-/* MVD (New-3DS hardware H.264) wrapper -- see mp4_mvd.h. Feed raw NAL units to
- * mvdstdProcessVideoFrame (SPS/PPS -> PARAMSET, a completed slice -> a frame), render into a
- * linear RGB565 buffer, then TRANSPOSE that into the 3DS top framebuffer (which is stored rotated/
- * column-major) using the same mapping the moflex/Y2R path uses. Rendering straight to the
- * framebuffer came out sideways + sheared because MVD writes linearly and the fb is rotated. */
+/* MVD (New-3DS hardware H.264) wrapper -- see mp4_mvd.h.
+ * Flow modeled on Core-2-Extreme/Video_player_for_3DS (proven in production):
+ *   - feed NAL units in ANNEX-B form (00 00 01 prefix), all of a frame's NALs concatenated into
+ *     ONE mvdstdProcessVideoFrame call (SPS/PPS from avcC are primed the same way at init),
+ *   - the FIRST frame is fed twice (MVD needs it),
+ *   - detect that a frame was actually produced by writing 0x11 sentinels to the output buffer's
+ *     corners and checking whether MVD overwrote them (return status alone is unreliable),
+ *   - render into a linear BGR565 buffer, then rotate-transpose it into the (column-major) top fb. */
 #include "mp4_mvd.h"
 #include <string.h>
 #include <stdlib.h>
@@ -11,69 +14,68 @@
 #define TOP_W 400
 #define TOP_H 240
 
-static int            g_ready = 0;
+static int            g_ready = 0, g_first = 1;
 static MVDSTD_Config  g_config;
-static uint8_t       *g_inbuf = NULL;    /* NAL unit being fed */
-static size_t         g_inbuf_cap = 0;
-static u16           *g_out = NULL;       /* MVD writes the decoded frame here (linear RGB565) */
-static int            g_w = 0, g_h = 0;
-static int            g_nal_len = 4;
-static int            g_frame_ready = 0;
+static uint8_t       *g_pkt = NULL;       /* Annex-B packet for a frame */
+static size_t         g_pkt_cap = 0;
+static u16           *g_out = NULL;        /* MVD writes the decoded frame here (linear BGR565) */
+static int            g_w = 0, g_h = 0, g_nal_len = 4;
 
-static Result feed_nal(const uint8_t *nal, int len) {
-    if (len <= 0 || (size_t)len > g_inbuf_cap) return -1;
-    memcpy(g_inbuf, nal, len);
-    GSPGPU_FlushDataCache(g_inbuf, len);
-    MVDSTD_ProcessNALUnitOut out;
-    Result r = mvdstdProcessVideoFrame(g_inbuf, len, 0, &out);
-    if (MVD_CHECKNALUPROC_SUCCESS(r) && r != MVD_STATUS_PARAMSET && r != MVD_STATUS_INCOMPLETEPROCESSING)
-        g_frame_ready = 1;
-    return r;
+static void set_corners(void) {
+    uint8_t *d = (uint8_t *)g_out; int w = g_w, h = g_h;
+    d[0] = 0x11; d[w*2 - 1] = 0x11; d[(w*h*2) - (w*2)] = 0x11; d[w*h*2 - 1] = 0x11;
+}
+static int corners_changed(void) {
+    const uint8_t *d = (const uint8_t *)g_out; int w = g_w, h = g_h;
+    return d[0] != 0x11 || d[w*2 - 1] != 0x11 || d[(w*h*2) - (w*2)] != 0x11 || d[w*h*2 - 1] != 0x11;
+}
+
+/* feed one Annex-B unit (00 00 01 + data) as its own ProcessVideoFrame -- used to prime SPS/PPS */
+static void feed_annexb(const uint8_t *nal, int len) {
+    if (len <= 0 || (size_t)(len + 3) > g_pkt_cap) return;
+    g_pkt[0] = 0; g_pkt[1] = 0; g_pkt[2] = 1;
+    memcpy(g_pkt + 3, nal, len);
+    GSPGPU_FlushDataCache(g_pkt, len + 3);
+    mvdstdProcessVideoFrame(g_pkt, len + 3, 0, NULL);
 }
 
 int mp4_mvd_init(int w, int h, const uint8_t *avcc, int avcc_len, int nal_len_size) {
-    g_frame_ready = 0;
+    g_first = 1;
     g_nal_len = (nal_len_size == 1 || nal_len_size == 2 || nal_len_size == 4) ? nal_len_size : 4;
     g_w = w; g_h = h;
 
-    g_inbuf_cap = 1024 * 1024;
-    g_inbuf = (uint8_t *)linearAlloc(g_inbuf_cap);
-    g_out   = (u16 *)linearAlloc((size_t)w * h * sizeof(u16));
-    if (!g_inbuf || !g_out) { mp4_mvd_exit(); return 0; }
+    g_pkt_cap = 2 * 1024 * 1024;
+    g_pkt = (uint8_t *)linearAlloc(g_pkt_cap);
+    g_out = (u16 *)linearAlloc((size_t)w * h * sizeof(u16));
+    if (!g_pkt || !g_out) { mp4_mvd_exit(); return 0; }
 
-    /* BGR565 matches the RGB565_OES framebuffer's byte order (MVD's "RGB565" comes out R/B-swapped) */
     if (R_FAILED(mvdstdInit(MVDMODE_VIDEOPROCESSING, MVD_INPUT_H264, MVD_OUTPUT_BGR565,
                             MVD_DEFAULT_WORKBUF_SIZE, NULL))) { mp4_mvd_exit(); return 0; }
-
-    /* decode w x h, output into g_out (no scaling); we transpose g_out -> framebuffer */
-    mvdstdGenerateDefaultConfig(&g_config, (u32)w, (u32)h, (u32)w, (u32)h, NULL, (u32 *)g_out, (u32 *)g_out);
+    mvdstdGenerateDefaultConfig(&g_config, (u32)w, (u32)h, (u32)w, (u32)h, NULL, NULL, NULL);
     g_config.output_type = MVD_OUTPUT_BGR565;
 
-    /* prime SPS/PPS from the avcC box */
+    /* prime SPS/PPS from avcC as Annex-B units */
     if (avcc && avcc_len > 6) {
         int p = 5, nsps = avcc[p++] & 0x1F;
-        for (int i = 0; i < nsps && p + 2 <= avcc_len; i++) { int l = (avcc[p]<<8)|avcc[p+1]; p+=2; if (p+l>avcc_len) break; feed_nal(avcc+p,l); p+=l; }
+        for (int i = 0; i < nsps && p + 2 <= avcc_len; i++) { int l = (avcc[p]<<8)|avcc[p+1]; p+=2; if (p+l>avcc_len) break; feed_annexb(avcc+p, l); p+=l; }
         if (p < avcc_len) { int npps = avcc[p++];
-            for (int i = 0; i < npps && p + 2 <= avcc_len; i++) { int l = (avcc[p]<<8)|avcc[p+1]; p+=2; if (p+l>avcc_len) break; feed_nal(avcc+p,l); p+=l; } }
+            for (int i = 0; i < npps && p + 2 <= avcc_len; i++) { int l = (avcc[p]<<8)|avcc[p+1]; p+=2; if (p+l>avcc_len) break; feed_annexb(avcc+p, l); p+=l; } }
     }
-    g_frame_ready = 0;
     g_ready = 1;
     return 1;
 }
 
 void mp4_mvd_exit(void) {
     if (g_ready) mvdstdExit();
-    if (g_inbuf) { linearFree(g_inbuf); g_inbuf = NULL; }
-    if (g_out)   { linearFree(g_out);   g_out = NULL; }
+    if (g_pkt) { linearFree(g_pkt); g_pkt = NULL; }
+    if (g_out) { linearFree(g_out); g_out = NULL; }
     g_ready = 0;
 }
 
-/* rotate-transpose the decoded frame into the (column-major) top framebuffer, centered */
+/* rotate-transpose the decoded frame into the column-major top framebuffer, centered */
 static void blit_rot(gfx3dSide_t side) {
     u16 *fb = (u16 *)gfxGetFramebuffer(GFX_TOP, side, NULL, NULL);
-    GSPGPU_InvalidateDataCache(g_out, (u32)g_w * g_h * sizeof(u16));
-    int cw = g_w < TOP_W ? g_w : TOP_W;
-    int ch = g_h < TOP_H ? g_h : TOP_H;
+    int cw = g_w < TOP_W ? g_w : TOP_W, ch = g_h < TOP_H ? g_h : TOP_H;
     int xoff = (TOP_W - cw) / 2, yoff = (TOP_H - ch) / 2;
     for (int x = 0; x < cw; x++) {
         u16 *col = fb + (x + xoff) * TOP_H;
@@ -84,20 +86,34 @@ static void blit_rot(gfx3dSide_t side) {
 
 int mp4_mvd_decode(const uint8_t *sample, int size, gfx3dSide_t side) {
     if (!g_ready) return 0;
-    g_frame_ready = 0;
 
-    int i = 0;                               /* an MP4 sample is one or more length-prefixed NALs */
-    while (i + g_nal_len <= size) {
+    /* build one Annex-B packet from all of this frame's length-prefixed NALs */
+    int off = 0, sp = 0;
+    while (sp + g_nal_len <= size) {
         uint32_t nlen = 0;
-        for (int b = 0; b < g_nal_len; b++) nlen = (nlen << 8) | sample[i + b];
-        i += g_nal_len;
-        if (nlen == 0 || i + (int)nlen > size) break;
-        feed_nal(sample + i, (int)nlen);
-        i += (int)nlen;
+        for (int b = 0; b < g_nal_len; b++) nlen = (nlen << 8) | sample[sp + b];
+        sp += g_nal_len;
+        if (nlen == 0 || sp + (int)nlen > size) break;
+        if ((size_t)(off + 3 + nlen) > g_pkt_cap) break;
+        g_pkt[off] = 0; g_pkt[off+1] = 0; g_pkt[off+2] = 1; off += 3;
+        memcpy(g_pkt + off, sample + sp, nlen); off += (int)nlen; sp += (int)nlen;
     }
-    if (!g_frame_ready) return 0;
+    if (off == 0) return 0;
 
-    if (mvdstdRenderVideoFrame(&g_config, true) != MVD_STATUS_OK) return 0;
+    g_config.physaddr_outdata0 = osConvertVirtToPhys(g_out);
+    set_corners();
+    GSPGPU_FlushDataCache(g_out, (u32)g_w * g_h * sizeof(u16));
+    GSPGPU_FlushDataCache(g_pkt, off);
+
+    Result r = mvdstdProcessVideoFrame(g_pkt, off, 0, NULL);
+    if (g_first) { mvdstdProcessVideoFrame(g_pkt, off, 0, NULL); g_first = 0; }   /* MVD needs the first frame twice */
+    if (!MVD_CHECKNALUPROC_SUCCESS(r)) return 0;
+
+    /* render the decoded frame into g_out (the config points there) */
+    mvdstdRenderVideoFrame(&g_config, true);
+    GSPGPU_InvalidateDataCache(g_out, (u32)g_w * g_h * sizeof(u16));
+    if (!corners_changed()) return 0;   /* MVD didn't actually write a frame yet */
+
     blit_rot(side);
     return 1;
 }
