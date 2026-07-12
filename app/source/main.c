@@ -13,6 +13,7 @@
 #include <time.h>
 
 #include "moflex_playback.h"
+#include "mp4_play.h"
 #include "httpd.h"
 #include "downloader.h"
 #include "catalog.h"
@@ -62,8 +63,9 @@ static char move_name[NAMELEN];
 
 static int is_moflex(const char *n) {
     size_t L = strlen(n);
-    /* playable = a plain .moflex OR a .cia with an embedded moflex (played in place) */
+    /* playable = a plain .moflex, an .mp4 (New-3DS H.264), OR a .cia with an embedded moflex */
     return (L > 7 && strcasecmp(n + L - 7, ".moflex") == 0)
+        || (L > 4 && strcasecmp(n + L - 4, ".mp4") == 0)
         || (L > 4 && strcasecmp(n + L - 4, ".cia") == 0);
 }
 static int cmp_entry(const void *a, const void *b) {
@@ -1866,6 +1868,17 @@ static int pick_moflex(const CiaMoflex *list, int n) {
 }
 
 static MoflexResult play_movie(const char *path) {
+    { size_t L = strlen(path);                       /* .mp4 -> New-3DS hardware H.264 path */
+      if (L > 4 && !strcasecmp(path + L - 4, ".mp4")) {
+        cia_clear_selection();
+        snprintf(g_now_playing_path, sizeof g_now_playing_path, "%s", path);
+        const char *base = strrchr(path, '/'); base = base ? base + 1 : path;
+        snprintf(g_now_playing, sizeof g_now_playing, "%s", base);
+        size_t nl = strlen(g_now_playing); if (nl > 4) g_now_playing[nl - 4] = 0;   /* hide .mp4 */
+        MoflexResult r = mp4_play(path);
+        consoleInit(GFX_BOTTOM, NULL); gfxSetDoubleBuffering(GFX_BOTTOM, false); branding_show();
+        return r;
+      } }
     cia_clear_selection();
     const char *title_src = path; char titlebuf[NAMELEN];
     if (cia_is_cia(path)) {
