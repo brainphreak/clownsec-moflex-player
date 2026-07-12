@@ -45,14 +45,18 @@ MoflexResult mp4_play(const char *path) {
 
     printf("\x1b[2J\x1b[HMP4 (test): %dx%d, %d frames\nB = back\n", m.width, m.height, m.v_count);
 
-    /* Pace by counting display refreshes so 24fps content gets a steady 3:2 pulldown (each frame
-     * held 2 or 3 vblanks in an even pattern) -- a ms timer quantizes unevenly and judders. */
+    /* Pace against an ABSOLUTE elapsed-time clock (the model our proven moflex player uses):
+     * stamp t0 at the first frame, and present frame vi only once (now - t0) reaches vi/fps.
+     * Decode time varies per frame (SD read + MVD), so adding a fixed vblank wait AFTER decode
+     * makes each frame's on-screen moment drift with that jitter -- which looks like the video
+     * running "ahead then behind." Anchoring to absolute time absorbs the jitter: a slow-decoding
+     * frame waits less, a fast one waits more, and the cadence stays locked. Presenting only at
+     * vblank boundaries also gives 24fps content its 3:2 pulldown for free. */
     double dur_s = mp4_duration_s(&m);
     double fps   = (dur_s > 0 && m.v_count > 1) ? (m.v_count - 1) / dur_s : 30.0;
     if (fps < 1.0 || fps > 120.0) fps = 30.0;
-    double vpf = 59.83 / fps;                 /* display vblanks per video frame (3DS refresh ~59.83 Hz) */
-    if (vpf < 1.0) vpf = 1.0;
-    double acc = 0.0;
+    double frame_ms = 1000.0 / fps;
+    u64 t0 = 0;
 
     MoflexResult result = MOFLEX_QUIT_BACK;
     for (int vi = 0; vi < m.v_count && aptMainLoop(); vi++) {
@@ -63,10 +67,16 @@ MoflexResult mp4_play(const char *path) {
         int n = mp4_read_sample(&m, s, buf);
         int got = (n == (int)s->size && mp4_mvd_decode(buf, n, GFX_LEFT));   /* decode into the back buffer */
 
-        acc += vpf;                                              /* hold the current frame a steady 2/3 vblanks */
-        int nv = (int)(acc + 1e-6); if (nv < 1) nv = 1;
-        acc -= nv;
-        for (int i = 0; i < nv; i++) gspWaitForVBlank();
+        if (t0 == 0) t0 = osGetTime();                          /* start the clock at the first frame */
+        double target = vi * frame_ms;                          /* when this frame is due (ms since t0) */
+        int quit = 0;
+        while (aptMainLoop()) {                                 /* hold until due, aligning to vblank */
+            if ((double)(osGetTime() - t0) >= target) break;
+            gspWaitForVBlank();
+            hidScanInput();
+            if (hidKeysDown() & KEY_B) { result = MOFLEX_QUIT_BACK; quit = 1; break; }
+        }
+        if (quit) break;
         if (got) { gfxFlushBuffers(); gfxSwapBuffers(); }
     }
 
