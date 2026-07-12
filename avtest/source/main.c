@@ -24,9 +24,8 @@ extern int    mobi_opt;
 #define TEXH 256
 #define VW   400
 #define VH   240
-#define NBUF 12                 /* decode-ahead ring (pairs) */
-#define AWB  64                 /* audio wavebufs -- must exceed the priming span's audio (paused) */
-#define PRIME 6                 /* prime this many pairs before releasing audio */
+#define NBUF 24                 /* decode-ahead ring (pairs) -- deeper = more cushion for hard scenes */
+#define AWB  96                 /* audio wavebufs -- banks audio ahead so hard scenes don't underrun */
 #define ABUF (16 * 1024)        /* max samples/ch per audio packet */
 
 /* ---- SINGLE-DEMUX audio: TWO demuxers reading the same file thrash the SD (each seeks to a
