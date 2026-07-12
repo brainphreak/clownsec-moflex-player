@@ -729,13 +729,15 @@ static void fix_download_ext(char *dest, size_t cap) {
     size_t L = strlen(dest);
     if ((L > 7 && !strcasecmp(dest + L - 7, ".moflex")) ||
         (L > 4 && !strcasecmp(dest + L - 4, ".cia"))    ||
+        (L > 4 && !strcasecmp(dest + L - 4, ".mp4"))    ||
         (L > 4 && !strcasecmp(dest + L - 4, ".zip"))) return;   /* already typed */
     FILE *f = fopen(dest, "rb"); if (!f) return;
-    unsigned char b[4] = {0}; size_t r = fread(b, 1, 4, f); fclose(f);
+    unsigned char b[12] = {0}; size_t r = fread(b, 1, sizeof b, f); fclose(f);
     if (r < 4) return;
     const char *ext = ".moflex";
     if (b[0] == 0x20 && b[1] == 0x20 && b[2] == 0 && b[3] == 0) ext = ".cia";
     else if (b[0] == 'P' && b[1] == 'K' && b[2] == 3 && b[3] == 4) ext = ".zip";
+    else if (r >= 8 && b[4] == 'f' && b[5] == 't' && b[6] == 'y' && b[7] == 'p') ext = ".mp4";  /* ISO-BMFF */
     char nd[PATHLEN + NAMELEN]; snprintf(nd, sizeof nd, "%s%s", dest, ext);
     if (rename(dest, nd) == 0) snprintf(dest, cap, "%s", nd);
 }
@@ -1945,6 +1947,7 @@ static void strip_ext(char *d) {
     if (L > 7 && !strcasecmp(d + L - 7, ".moflex")) d[L - 7] = 0;
     else if (L > 4 && !strcasecmp(d + L - 4, ".zip")) d[L - 4] = 0;
     else if (L > 4 && !strcasecmp(d + L - 4, ".cia")) d[L - 4] = 0;
+    else if (L > 4 && !strcasecmp(d + L - 4, ".mp4")) d[L - 4] = 0;
 }
 static void browser_draw_gfx(int mode) {
     int manage = (mode == MODE_MANAGE);

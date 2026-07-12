@@ -106,6 +106,12 @@ static void subenc_save(const char *movie, int enc) {
 }
 long long moflex_resume_get(const char *path) { return (long long)resume_load(path); }
 
+/* shared stores for the MP4 player (same files/keys, so position + volume stay consistent) */
+void  moflex_resume_save(const char *path, long long us) { resume_save_us(path, (int64_t)us); }
+void  moflex_resume_clear(const char *path)              { resume_clear(path); }
+float moflex_vol_get(void)  { vol_load(); return g_vol; }
+void  moflex_vol_set(float v) { if (v < 0.25f) v = 0.25f; if (v > 4.0f) v = 4.0f; g_vol = v; vol_save(); }
+
 /* ---- YUV->RGB565 LUTs ---- */
 static int yl[256], rv[256], gu[256], gv[256], bu[256];
 static u8  clamp8[1024];

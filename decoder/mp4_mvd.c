@@ -20,6 +20,8 @@ static uint8_t       *g_pkt = NULL;       /* Annex-B packet for a frame */
 static size_t         g_pkt_cap = 0;
 static u16           *g_out = NULL;        /* MVD writes the decoded frame here (linear BGR565) */
 static int            g_w = 0, g_h = 0, g_nal_len = 4;
+static uint8_t        g_avcc[512];         /* saved SPS/PPS, for re-priming after a seek */
+static int            g_avcc_len = 0;
 
 static void set_corners(void) {
     uint8_t *d = (uint8_t *)g_out; int w = g_w, h = g_h;
@@ -39,10 +41,22 @@ static void feed_annexb(const uint8_t *nal, int len) {
     mvdstdProcessVideoFrame(g_pkt, len + 3, 0, NULL);
 }
 
+/* feed the saved SPS/PPS (from avcC) into MVD as Annex-B units */
+static void prime_sps_pps(void) {
+    const uint8_t *avcc = g_avcc; int avcc_len = g_avcc_len;
+    if (avcc_len <= 6) return;
+    int p = 5, nsps = avcc[p++] & 0x1F;
+    for (int i = 0; i < nsps && p + 2 <= avcc_len; i++) { int l = (avcc[p]<<8)|avcc[p+1]; p+=2; if (p+l>avcc_len) break; feed_annexb(avcc+p, l); p+=l; }
+    if (p < avcc_len) { int npps = avcc[p++];
+        for (int i = 0; i < npps && p + 2 <= avcc_len; i++) { int l = (avcc[p]<<8)|avcc[p+1]; p+=2; if (p+l>avcc_len) break; feed_annexb(avcc+p, l); p+=l; } }
+}
+
 int mp4_mvd_init(int w, int h, const uint8_t *avcc, int avcc_len, int nal_len_size) {
     g_first = 1;
     g_nal_len = (nal_len_size == 1 || nal_len_size == 2 || nal_len_size == 4) ? nal_len_size : 4;
     g_w = w; g_h = h;
+    g_avcc_len = (avcc && avcc_len > 0 && avcc_len <= (int)sizeof g_avcc) ? avcc_len : 0;
+    if (g_avcc_len) memcpy(g_avcc, avcc, g_avcc_len);
 
     g_pkt_cap = 2 * 1024 * 1024;
     g_pkt = (uint8_t *)linearAlloc(g_pkt_cap);
@@ -54,15 +68,17 @@ int mp4_mvd_init(int w, int h, const uint8_t *avcc, int avcc_len, int nal_len_si
     mvdstdGenerateDefaultConfig(&g_config, (u32)w, (u32)h, (u32)w, (u32)h, NULL, NULL, NULL);
     g_config.output_type = MVD_OUTPUT_BGR565;
 
-    /* prime SPS/PPS from avcC as Annex-B units */
-    if (avcc && avcc_len > 6) {
-        int p = 5, nsps = avcc[p++] & 0x1F;
-        for (int i = 0; i < nsps && p + 2 <= avcc_len; i++) { int l = (avcc[p]<<8)|avcc[p+1]; p+=2; if (p+l>avcc_len) break; feed_annexb(avcc+p, l); p+=l; }
-        if (p < avcc_len) { int npps = avcc[p++];
-            for (int i = 0; i < npps && p + 2 <= avcc_len; i++) { int l = (avcc[p]<<8)|avcc[p+1]; p+=2; if (p+l>avcc_len) break; feed_annexb(avcc+p, l); p+=l; } }
-    }
+    prime_sps_pps();
     g_ready = 1;
     return 1;
+}
+
+/* after a seek: re-prime SPS/PPS and arm the "first frame twice" so MVD resyncs cleanly on the
+ * next IDR/keyframe fed to it. */
+void mp4_mvd_reset(void) {
+    if (!g_ready) return;
+    prime_sps_pps();
+    g_first = 1;
 }
 
 void mp4_mvd_exit(void) {

@@ -26,4 +26,10 @@ MoflexResult moflex_play(const char *path);
 /* Saved resume position (microseconds) for a movie, or 0 if none. */
 long long moflex_resume_get(const char *path);
 
+/* Shared resume + volume stores, so the MP4 player keeps position/volume consistent with moflex. */
+void  moflex_resume_save(const char *path, long long us);
+void  moflex_resume_clear(const char *path);
+float moflex_vol_get(void);          /* persisted playback volume (0.25..4.0) */
+void  moflex_vol_set(float v);       /* clamp to 0.25..4.0 and persist */
+
 #endif

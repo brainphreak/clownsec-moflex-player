@@ -16,6 +16,10 @@ void mp4_mvd_exit(void);
  * Returns 1 if a frame was produced, 0 otherwise. Call mp4_mvd_present() to blit it. */
 int  mp4_mvd_decode(const uint8_t *sample, int size);
 
+/* Re-prime the decoder after a seek so it resyncs on the next keyframe. Decode the keyframe and
+ * any following frames up to the seek target (discarding output) before presenting again. */
+void mp4_mvd_reset(void);
+
 /* Blit the last decoded frame to the top screen. If sbs is non-zero the frame is treated as
  * side-by-side stereo: left half -> GFX_LEFT, right half -> GFX_RIGHT (use with gfxSet3D(true)).
  * Otherwise the whole frame goes to GFX_LEFT. Each eye is aspect-fit (nearest-scaled + centered,
