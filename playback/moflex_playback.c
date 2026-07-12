@@ -499,14 +499,15 @@ static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing)
     if (g_batt_pct >= 0) {
         char bs[8]; snprintf(bs, sizeof bs, "%d%%", g_batt_pct);
         u16 bcol = g_batt_chg ? UI_NEONC : (g_batt_pct <= 15 ? UI_RED : g_batt_pct <= 30 ? UI_RGB(255,180,60) : UI_NEON);
-        /* fixed layout: icon never moves; "100%" (4 chars) ends 10px from the right edge, mirroring
-           the time at x=10. Shorter values keep the same left-aligned start, so only the digits change. */
-        int bw = 16, bh = 10, bx = 256, by = 24, tx = 278;
-        ui_frame_round(bx, by, bw, bh, 2, bcol, 1);            /* body */
-        ui_fill(bx + bw, by + 3, 2, bh - 6, bcol);            /* terminal nub */
-        int fw = (bw - 4) * g_batt_pct / 100; if (fw < 1 && g_batt_pct > 0) fw = 1;
-        ui_fill_round(bx + 2, by + 2, fw, bh - 4, 1, bcol);   /* charge fill */
+        /* icon pinned to the right edge (nub ends 10px from the edge, mirroring the time at x=10);
+           the number sits just left of it and grows leftward, so the battery never moves. */
+        int bw = 16, bh = 10, bx = 292, by = 24;
+        int tx = (bx - 4) - ui_text_w(1, bs);                 /* number right-aligned against the icon */
         ui_text(tx, 26, 1, bcol, bs);
+        ui_frame_round(bx, by, bw, bh, 2, bcol, 1);           /* body */
+        ui_fill(bx + bw, by + 3, 2, bh - 6, bcol);           /* terminal nub */
+        int fw = (bw - 4) * g_batt_pct / 100; if (fw < 1 && g_batt_pct > 0) fw = 1;
+        ui_fill_round(bx + 2, by + 2, fw, bh - 4, 1, bcol);  /* charge fill */
     }
     if (g_old3d_warn)   /* Old 3DS can't keep up with 3D's doubled frame rate */
         ui_text(10, 42, 1, UI_RED, "3D Has Performance Issues on Old3DS");
