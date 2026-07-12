@@ -45,21 +45,24 @@ MoflexResult mp4_play(const char *path) {
 
     printf("\x1b[2J\x1b[HMP4 (test): %dx%d, %d frames\nB = back\n", m.width, m.height, m.v_count);
 
-    /* Pace against an ABSOLUTE elapsed-time clock (the model our proven moflex player uses):
-     * stamp t0 at the first frame, and present frame vi only once (now - t0) reaches vi/fps.
-     * Decode time varies per frame (SD read + MVD), so adding a fixed vblank wait AFTER decode
-     * makes each frame's on-screen moment drift with that jitter -- which looks like the video
-     * running "ahead then behind." Anchoring to absolute time absorbs the jitter: a slow-decoding
-     * frame waits less, a fast one waits more, and the cadence stays locked. Presenting only at
-     * vblank boundaries also gives 24fps content its 3:2 pulldown for free. */
+    /* Pace with the VBLANK as the clock, not wall-clock ms. The panel scans out only at vblank
+     * (~59.83 Hz), so a frame can only ever change on a vblank boundary. Timing against osGetTime()
+     * (1 ms integer, and drifting vs the vblanks) makes each frame round to an uneven number of
+     * refreshes -- 24fps came out as holds of 3,3,2,3... instead of a clean 3,2,3,2, which reads as
+     * juddery "not fluid" motion. Instead we count vblanks and hold each frame until its target
+     * vblank round((vi+1) * refreshes_per_frame): that yields an exact, even 3:2 pulldown AND
+     * absorbs decode jitter (a slow decode just eats into the hold instead of shifting the frame). */
     double dur_s = mp4_duration_s(&m);
     double fps   = (dur_s > 0 && m.v_count > 1) ? (m.v_count - 1) / dur_s : 30.0;
     if (fps < 1.0 || fps > 120.0) fps = 30.0;
-    double frame_ms = 1000.0 / fps;
-    u64 t0 = 0;
+    double vpf = 59.83 / fps;                 /* display refreshes per video frame */
+    if (vpf < 1.0) vpf = 1.0;
+    u64  vb = 0;                              /* vblanks elapsed since playback started */
+    long hold_until = 0;                      /* keep the shown frame until this vblank count */
 
     MoflexResult result = MOFLEX_QUIT_BACK;
-    for (int vi = 0; vi < m.v_count && aptMainLoop(); vi++) {
+    int quit = 0;
+    for (int vi = 0; vi < m.v_count && aptMainLoop() && !quit; vi++) {
         hidScanInput();
         if (hidKeysDown() & KEY_B) { result = MOFLEX_QUIT_BACK; break; }
 
@@ -67,23 +70,19 @@ MoflexResult mp4_play(const char *path) {
         int n = mp4_read_sample(&m, s, buf);
         int got = (n == (int)s->size && mp4_mvd_decode(buf, n, GFX_LEFT));   /* decode into the back buffer */
 
-        if (t0 == 0) t0 = osGetTime();                          /* start the clock at the first frame */
-        double target = vi * frame_ms;                          /* when this frame is due (ms since t0) */
-        int quit = 0;
-        while (aptMainLoop()) {                                 /* hold until due, aligning to vblank */
-            if ((double)(osGetTime() - t0) >= target) break;
-            gspWaitForVBlank();
+        /* hold the previous frame until its slot is up (decode above ran during this hold) */
+        while (vb < (u64)hold_until && aptMainLoop()) {
+            gspWaitForVBlank(); vb++;
             hidScanInput();
             if (hidKeysDown() & KEY_B) { result = MOFLEX_QUIT_BACK; quit = 1; break; }
         }
         if (quit) break;
-        if (got) {
-            gfxFlushBuffers(); gfxSwapBuffers();
-            /* gfxSwapBuffers only flips at the next vblank; wait for it before the next iteration
-             * blits into the new back buffer, otherwise we'd write the next frame into the buffer
-             * still being scanned out (two frames visible at once / tearing). */
-            gspWaitForVBlank();
-        }
+
+        if (got) { gfxFlushBuffers(); gfxSwapBuffers(); }
+        /* the swap flips at the next vblank; this wait lands it (and makes this frame visible)
+         * before the next iteration blits into the new back buffer -- prevents two-frame tearing */
+        gspWaitForVBlank(); vb++;
+        hold_until = (long)((vi + 1) * vpf + 0.5);   /* even 3:2 cadence: 2,3,2,3 refreshes */
     }
 
     mp4_mvd_exit();
