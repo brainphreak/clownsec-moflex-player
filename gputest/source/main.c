@@ -22,13 +22,23 @@ static MfxDemux m;
 static AVCodecContext ctx;
 static int gW, gH;
 
-static int find_moflex(char *out, size_t cap) {
+static int find_moflex_list(char paths[][300], int max) {
     DIR *d = opendir("sdmc:/"); if (!d) return 0;
-    struct dirent *e;
-    while ((e = readdir(d))) { size_t l = strlen(e->d_name);
-        if (l > 7 && !strcasecmp(e->d_name + l - 7, ".moflex")) { snprintf(out, cap, "sdmc:/%s", e->d_name); closedir(d); return 1; } }
-    closedir(d); return 0;
+    struct dirent *e; int n = 0;
+    while ((e = readdir(d)) && n < max) { size_t l = strlen(e->d_name);
+        if (l > 7 && !strcasecmp(e->d_name + l - 7, ".moflex")) snprintf(paths[n++], 300, "sdmc:/%s", e->d_name); }
+    closedir(d); return n;
 }
+
+static const struct { const char *name; int opt; } C[6] = {
+    { "0 base        ", 0 },
+    { "1 entropy     ", 0x200 },              /* lazy-refill entropy loop */
+    { "2 col sparse  ", 0x800 },              /* sparse column IDCT  -- must checksum == base */
+    { "3 row+col sprs", 0x1800 },             /* sparse row + column IDCT */
+    { "4 ALL 0x1A0E  ", 0x1A0E },             /* entropy | row+col sparse | pf+sk+dc */
+    { "5 best 0x0E   ", 0x0E },
+};
+#define NC ((int)(sizeof(C)/sizeof(C[0])))
 
 typedef struct { double tot; uint32_t csum; } Res;
 
@@ -61,43 +71,40 @@ static Res run_cfg(AVFrame *fr, int opt) {
     return r;
 }
 
+/* run the config matrix for one file and print its ms/frame + checksum table */
+static void profile_file(const char *path, AVFrame *fr) {
+    FILE *f = fopen(path, "rb");
+    if (!f || mfx_open(&m, f) != 0) { printf("open failed: %.28s\n", path); if (f) fclose(f); return; }
+    int vi = -1;
+    for (int i = 0; i < m.nb_streams; i++) if (m.streams[i].media_type == MFX_TYPE_VIDEO && vi < 0) vi = i;
+    if (vi < 0) { printf("no video\n"); mfx_close(&m); fclose(f); return; }
+    gW = m.streams[vi].width; gH = m.streams[vi].height;
+    memset(&ctx, 0, sizeof ctx);
+    ctx.width = gW; ctx.height = gH; ctx.priv_data = calloc(1, mobi_ctx_size()); mobi_init(&ctx);
+    const char *bn = strrchr(path, '/'); bn = bn ? bn + 1 : path;
+
+    Res res[NC];
+    for (int i = 0; i < NC; i++) res[i] = run_cfg(fr, C[i].opt);
+    printf("\n%.26s\n", bn);
+    for (int i = 0; i < NC; i++)
+        printf("%s %6.2f %s\n", C[i].name, res[i].tot,
+               i == 0 ? "base" : (res[i].csum == res[0].csum ? "YES" : "DIFF"));
+
+    free(ctx.priv_data); mfx_close(&m); fclose(f);
+}
+
 int main(void) {
     osSetSpeedupEnable(true);
     gfxInitDefault();
     consoleInit(GFX_TOP, NULL);
-    printf("MobiClip port A/B (clamp-LUT)\n\n");
+    printf("MobiClip A/B  (ms/f, lower=faster)\n");
 
-    char path[300];
-    if (!find_moflex(path, sizeof path)) { printf("Put a .moflex in sdmc:/ root.\n"); goto wait; }
-    FILE *f = fopen(path, "rb");
-    if (!f || mfx_open(&m, f) != 0) { printf("open failed.\n"); goto wait; }
-    int vi = -1;
-    for (int i = 0; i < m.nb_streams; i++) if (m.streams[i].media_type == MFX_TYPE_VIDEO && vi < 0) vi = i;
-    gW = m.streams[vi].width; gH = m.streams[vi].height;
-    memset(&ctx, 0, sizeof ctx);
-    ctx.width = gW; ctx.height = gH; ctx.priv_data = calloc(1, mobi_ctx_size()); mobi_init(&ctx);
+    char paths[2][300];
+    int np = find_moflex_list(paths, 2);
+    if (!np) { printf("Put a .moflex in sdmc:/ root.\n"); goto wait; }
     AVFrame *fr = av_frame_alloc();
-    printf("%.30s  %dx%d\n%d frames x configs...\n\n", strrchr(path, '/') + 1, gW, gH, SEG_FRAMES);
-
-    static const struct { const char *name; int opt; } C[6] = {
-        { "0 base        ", 0 },
-        { "1 entropy     ", 0x200 },              /* lazy-refill entropy loop */
-        { "2 sparse IDCT ", 0x800 },              /* sparse column-pass IDCT -- must checksum == base */
-        { "3 ent+sparse  ", 0xA00 },
-        { "4 ALL ent+sp+b", 0xA0E },
-        { "5 best pf+sk+dc", 0x0E },
-    };
-    int NC = sizeof(C) / sizeof(C[0]);
-    Res res[16];
-    for (int i = 0; i < NC; i++) { printf("  %s...\n", C[i].name); res[i] = run_cfg(fr, C[i].opt); }
-
-    printf("\x1b[2J\x1b[Hcfg          ms/frame  ok\n");
-    for (int i = 0; i < NC; i++)
-        printf("%s  %6.2f    %s\n", C[i].name, res[i].tot,
-               i == 0 ? "base" : (res[i].csum == res[0].csum ? "YES" : "DIFF"));
-    printf("\nall motion-comp attempts, one run.\n");
-    printf("ok=YES = bit-identical. lower=faster.\n");
-    printf("\nSTART to exit.\n");
+    for (int i = 0; i < np; i++) profile_file(paths[i], fr);   /* both sample files */
+    printf("\nYES = bit-identical to base.\nSTART to exit.\n");
 
 wait:
     while (aptMainLoop()) { hidScanInput(); if (hidKeysDown() & KEY_START) break; gspWaitForVBlank(); }

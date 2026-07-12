@@ -44,8 +44,8 @@ static const struct { const char *name; int opt; } CFG[] = {
     { "C  base            ", 0 },
     { "C  best pf+sk+dc   ", 0x0E },
     { "C  entropy         ", 0x200 },         /* inlined lazy-refill bit reader                   */
-    { "C  sparse IDCT     ", 0x800 },         /* sparse column-pass IDCT                          */
-    { "C  ALL (ent+sp+best", 0xA0E },         /* entropy | sparse | pf+sk+dc                      */
+    { "C  sparse r+c IDCT ", 0x1800 },        /* sparse row + column pass IDCT                    */
+    { "C  ALL 0x1A0E      ", 0x1A0E },         /* entropy | row+col sparse | pf+sk+dc              */
 };
 #define NCFG ((int)(sizeof(CFG)/sizeof(CFG[0])))
 

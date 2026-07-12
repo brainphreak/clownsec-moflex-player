@@ -42,6 +42,9 @@
 #endif
 /* 0=intra prediction, 1=intra residual (entropy+IDCT), 2=pframe residual, 3=motion comp */
 uint64_t mobi_prof[8];
+/* decode statistics (MOBI_PROFILE only): [0]=residual blocks [1]=DC-only blocks
+ * [2]=sum of (highest live coeff row) [3]=sum of AC-coeff counts.  Reveals the sparse-IDCT ceiling. */
+uint64_t mobi_stat[8];
 
 /* runtime optimization switch so one binary can A/B decode paths:
  *   bit 0 = SWAR motion comp   bit 1 = IDCT zero-row skip
@@ -526,6 +529,7 @@ static int add_coefficients_impl(AVCodecContext *avctx, AVFrame *frame,
     const int *qtab = s->qtab[size == 8];
     uint8_t *dst = frame->data[plane] + by * frame->linesize[plane] + bx;
     unsigned rowmask = 1;   /* row 0 is always live (mat[0] += 32 below) */
+    unsigned colmask = 1;   /* col 0 always live; for the row-pass sparse IDCT (mobi_opt 0x1000) */
     int ac = 0;             /* number of AC (non-DC) coefficients */
     if ((mobi_opt & 32) && !g_clamp_ready) clamp_init();
     uint64_t _te = PROF_NOW();
@@ -542,6 +546,7 @@ static int add_coefficients_impl(AVCodecContext *avctx, AVFrame *frame,
         c.rowmask = 1; c.ac = 0;
         int rc = mobi_entropy_asm(&c);
         gb->index = c.index; rowmask = c.rowmask; ac = c.ac;
+        colmask = (size == 8) ? 0xFFu : 0x0Fu;   /* asm path doesn't track colmask -> row-sparse = full (safe) */
         if (rc) return AVERROR_INVALIDDATA;
     } else if (mobi_opt & 0x200) {
         /* --- opt entropy loop (mobi_opt 0x200): hold the bit-reader cache/index in locals across the
@@ -595,6 +600,7 @@ static int add_coefficients_impl(AVCodecContext *avctx, AVFrame *frame,
             qval = qtab[pos];
             mat[ztab[pos]] = qval * (unsigned)level;
             rowmask |= 1u << (ztab[pos] / size);
+            colmask |= 1u << (ztab[pos] % size);
             if (ztab[pos]) ac++;
 
             if (last) break;
@@ -634,6 +640,7 @@ static int add_coefficients_impl(AVCodecContext *avctx, AVFrame *frame,
         qval = qtab[pos];
         mat[ztab[pos]] = qval *(unsigned)level;
         rowmask |= 1u << (ztab[pos] / size);
+        colmask |= 1u << (ztab[pos] % size);
         if (ztab[pos]) ac++;                  /* count AC (non-DC) coefficients */
 
         if (last)
@@ -642,6 +649,11 @@ static int add_coefficients_impl(AVCodecContext *avctx, AVFrame *frame,
 
     mobi_prof[5] += PROF_NOW() - _te;         /* bucket 5 = coefficient entropy decode */
     uint64_t _tt = PROF_NOW();
+
+#ifdef MOBI_PROFILE
+    { int mr = 0; for (int r = size - 1; r >= 1; r--) if (rowmask & (1u << r)) { mr = r; break; }
+      mobi_stat[0]++; if (ac == 0) mobi_stat[1]++; mobi_stat[2] += mr; mobi_stat[3] += ac; }
+#endif
 
     mat[0] += 32;
     if ((mobi_opt & 4) && ac == 0) {          /* DC-only block -> uniform delta, skip all IDCTs */
@@ -655,13 +667,19 @@ static int add_coefficients_impl(AVCodecContext *avctx, AVFrame *frame,
         mobi_prof[4] += PROF_NOW() - _tt;
         return 0;
     }
+    /* row pass: sparse variant (0x1000) skips zero coeff columns -- nlive = highest live column + 1 */
+    int nlive_row = size;
+    if (mobi_opt & 0x1000) {
+        nlive_row = 1;
+        for (int cc = size - 1; cc >= 1; cc--) if (colmask & (1u << cc)) { nlive_row = cc + 1; break; }
+    }
     if (mobi_opt & 2) {                       /* skip the row IDCT for all-zero rows */
         for (int y = 0; y < size; y++)
             if (rowmask & (1u << y))
-                idct(&mat[y * size], size);
+                (mobi_opt & 0x1000) ? idct_sparse(&mat[y * size], size, nlive_row) : idct(&mat[y * size], size);
     } else {
         for (int y = 0; y < size; y++)
-            idct(&mat[y * size], size);
+            (mobi_opt & 0x1000) ? idct_sparse(&mat[y * size], size, nlive_row) : idct(&mat[y * size], size);
     }
 
     /* column pass: after the transpose, every column-IDCT input has the coefficient rows' sparsity
