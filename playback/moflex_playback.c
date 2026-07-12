@@ -499,8 +499,9 @@ static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing)
     if (g_batt_pct >= 0) {
         char bs[8]; snprintf(bs, sizeof bs, "%d%%", g_batt_pct);
         u16 bcol = g_batt_chg ? UI_NEONC : (g_batt_pct <= 15 ? UI_RED : g_batt_pct <= 30 ? UI_RGB(255,180,60) : UI_NEON);
-        int tw = ui_text_w(1, bs), bw = 16, bh = 10;
-        int tx = (VOL_X - 14) - tw, bx = tx - 22, by = 24;
+        /* fixed layout: icon never moves; "100%" (4 chars) ends 10px from the right edge, mirroring
+           the time at x=10. Shorter values keep the same left-aligned start, so only the digits change. */
+        int bw = 16, bh = 10, bx = 256, by = 24, tx = 278;
         ui_frame_round(bx, by, bw, bh, 2, bcol, 1);            /* body */
         ui_fill(bx + bw, by + 3, 2, bh - 6, bcol);            /* terminal nub */
         int fw = (bw - 4) * g_batt_pct / 100; if (fw < 1 && g_batt_pct > 0) fw = 1;
