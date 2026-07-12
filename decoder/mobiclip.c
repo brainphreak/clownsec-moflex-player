@@ -497,42 +497,45 @@ static int add_coefficients_impl(AVCodecContext *avctx, AVFrame *frame,
     uint64_t _te = PROF_NOW();
 
     if (mobi_opt & 0x200) {
-        /* --- opt entropy loop (mobi_opt 0x200): hold the bit-reader cache/index in locals across
-         * the whole coefficient run and inline get_vlc2 + get_bits, instead of an OPEN/UPDATE/CLOSE
-         * + gb->index reload per read. Same macro semantics -> bit-exact. This is the structure the
-         * ARM assembly (0x400) mirrors. rl_vlc is a flat 12-bit table (max_depth 1): one lookup. --- */
+        /* --- opt entropy loop (mobi_opt 0x200): hold the bit-reader cache/index in locals across the
+         * whole coefficient run and inline get_vlc2 (rl_vlc is a FLAT 12-bit table, max_depth 1 -> one
+         * lookup) + get_bits, refilling the 32-bit cache LAZILY -- only at points where more than
+         * MIN_CACHE_BITS(25) could be consumed since the last refill, not before every read. The reads
+         * happen in the same order over the same bits, so this is BIT-EXACT vs stock (verified on host).
+         * This is the structure the ARM assembly (0x400) mirrors (cache + bit-budget in registers). --- */
         const VLCElem *rltab = rl_vlc[s->dct_tab_idx];
         const uint8_t *rres = run_residue[s->dct_tab_idx];
         OPEN_READER(re, gb);
-        /* read one run/level VLC (flat 12-bit) into n/last/run/level */
-        #define RRE_VLC()  do { UPDATE_CACHE(re, gb); \
-            unsigned _ix = SHOW_UBITS(re, gb, MOBI_RL_VLC_BITS); \
+        /* reads with NO refill (caller guarantees <=25 bits consumed since the last UPDATE_CACHE) */
+        #define RRE_VLC()  do { unsigned _ix = SHOW_UBITS(re, gb, MOBI_RL_VLC_BITS); \
             n = rltab[_ix].sym; SKIP_BITS(re, gb, rltab[_ix].len); \
             last = (n >> 11) == 1; run = (n >> 5) & 0x3F; level = n & 0x1F; } while (0)
-        /* read u bits (unsigned) into dst */
-        #define RRE_U(dst, u) do { UPDATE_CACHE(re, gb); dst = SHOW_UBITS(re, gb, (u)); SKIP_BITS(re, gb, (u)); } while (0)
-        /* read s bits (signed) into dst */
-        #define RRE_S(dst, u) do { UPDATE_CACHE(re, gb); dst = SHOW_SBITS(re, gb, (u)); SKIP_BITS(re, gb, (u)); } while (0)
+        #define RRE_U(dst, u) do { dst = SHOW_UBITS(re, gb, (u)); SKIP_BITS(re, gb, (u)); } while (0)
+        #define RRE_S(dst, u) do { dst = SHOW_SBITS(re, gb, (u)); SKIP_BITS(re, gb, (u)); } while (0)
 
         for (int pos = 0; BITS_LEFT(re, gb) > 0; pos++) {
             int qval, last, run, level, n, b;
 
-            RRE_VLC();
+            UPDATE_CACHE(re, gb);                     /* >=25 valid bits */
+            RRE_VLC();                                /* VLC <=12 -> >=13 left */
             if (level) {
-                RRE_U(b, 1); if (b) level = -level;
+                RRE_U(b, 1); if (b) level = -level;   /* common path: <=13 bits, ONE refill/coeff */
             } else {
-                RRE_U(b, 1);
+                RRE_U(b, 1);                          /* <=13 bits used */
                 if (!b) {
+                    UPDATE_CACHE(re, gb);             /* refill before the 2nd VLC (would exceed 25) */
                     RRE_VLC();
                     level += rres[(last ? 64 : 0) + run];
                     RRE_U(b, 1); if (b) level = -level;
                 } else {
-                    RRE_U(b, 1);
+                    RRE_U(b, 1);                      /* <=14 bits used */
                     if (!b) {
+                        UPDATE_CACHE(re, gb);         /* refill before the 2nd VLC */
                         RRE_VLC();
                         run += rres[128 + (last ? 64 : 0) + level];
                         RRE_U(b, 1); if (b) level = -level;
                     } else {
+                        UPDATE_CACHE(re, gb);         /* refill before the 19-bit escape */
                         RRE_U(last, 1);
                         RRE_U(run, 6);
                         RRE_S(level, 12);
