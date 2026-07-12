@@ -25,7 +25,8 @@ extern int    mobi_opt;
 #define VW   400
 #define VH   240
 #define NBUF 12                 /* decode-ahead ring (pairs) */
-#define AWB  32                 /* audio wavebufs (deep enough to cover the video read-ahead) */
+#define AWB  64                 /* audio wavebufs -- must exceed the priming span's audio (paused) */
+#define PRIME 6                 /* prime this many pairs before releasing audio */
 #define ABUF (16 * 1024)        /* max samples/ch per audio packet */
 
 /* ---- SINGLE-DEMUX audio: TWO demuxers reading the same file thrash the SD (each seeks to a
@@ -204,21 +205,16 @@ int main(void) {
             }
         }
 
-        /* ---- unpause audio once the ring is primed (audio-0 == video pair-0) ---- */
-        if (!gated && (wr - rd) >= NBUF - 3) { gated = 1; if (g_a_ok) ndspChnSetPaused(0, false); }
+        /* ---- unpause audio once the ring is primed (audio-0 == video pair-0). During priming (rd=0)
+         *      we do NOT present, so the ring fills cleanly to PRIME before audio starts. ---- */
+        if (!gated && wr >= PRIME) { gated = 1; if (g_a_ok) ndspChnSetPaused(0, false); }
 
-        /* ---- present the next pair when the audio clock reaches it ---- */
-        if ((wr - rd) > 0 && ready[rd % NBUF]) {
+        /* ---- once audio is running, present the next pair when the audio clock reaches it ---- */
+        if (gated && (wr - rd) > 0 && ready[rd % NBUF]) {
             int64_t vtime = (int64_t)rd * pair_dur;      /* this pair's elapsed video time */
-            int64_t apos  = g_apos;
-            if (apos >= 0 ? (apos >= vtime) : (rd == 0)) {   /* audio due, or first frame pre-audio */
-                draw_present(rd % NBUF);
-                rd++; shown++;
-            }
+            if (g_apos >= vtime) { draw_present(rd % NBUF); rd++; shown++; }
         } else if ((wr - rd) == 0 && done) {
             break;   /* ring drained + EOF */
-        } else {
-            gspWaitForVBlank();   /* nothing to do -> don't spin */
         }
 
         /* ---- tiny readout (~4x/sec): e = A/V error ms, q = ring depth, fps ---- */
