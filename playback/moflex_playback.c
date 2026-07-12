@@ -936,7 +936,7 @@ static MoflexResult moflex_play_gpu(const char *path) {
     AVCodecContext ctx; memset(&ctx, 0, sizeof ctx);
     ctx.width = W; ctx.height = H; ctx.priv_data = calloc(1, mobi_ctx_size());
     if (!ctx.priv_data || mobi_init(&ctx) != 0) { free(ctx.priv_data); mfx_close(&m); fclose(f); return MOFLEX_ERROR; }
-    mobi_opt = 14;
+    mobi_opt = 0x1A0E;
     AVFrame *fL = av_frame_alloc(), *fR = av_frame_alloc();
 
     const char *bn = strrchr(path, '/'); bn = bn ? bn + 1 : path;
@@ -1238,7 +1238,7 @@ MoflexResult moflex_play(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) { printf("\x1b[2J\x1b[Hfopen failed\npress A\n"); mp_wait_key(); return MOFLEX_ERROR; }
 
-    mobi_opt = 14;   /* prefetch + idct-skip + DC-only: bit-exact, ~6-8% faster decode (esp. Old 3DS) */
+    mobi_opt = 0x1A0E; /* entropy+sparse+prefetch + idct-skip + DC-only: bit-exact, ~6-8% faster decode (esp. Old 3DS) */
 
     MfxDemux m;
     if (mfx_open_auto(&m, f, path) != 0) { printf("\x1b[2J\x1b[Hmfx_open failed\npress A\n"); mp_wait_key(); fclose(f); return MOFLEX_ERROR; }
@@ -1254,7 +1254,14 @@ MoflexResult moflex_play(const char *path) {
     int chn   = ai >= 0 ? m.streams[ai].channels    : 2;
     int is3d  = mfx_detect_stereo(&m);   /* frame-interleaved 3D vs flat 2D (auto from frame-rate ratio) */
     { bool isnew = false; APT_CheckNew3DS(&isnew);
-      g_old3d_warn = (!isnew && is3d); }   /* Old 3DS can't decode the doubled 3D frames in real time */
+      if (!isnew && is3d) {
+          /* Old-3DS 3D: use the decode-ahead ring + core-1 audio-worker GPU pipeline. Viable now that
+           * the 0x1A0E decoder outruns display (~28 vs 24 pairs/sec) -- the ring cushions hard scenes,
+           * keeping audio in sync. moflex_play_gpu re-opens the file, so close ours first. */
+          mfx_close(&m); fclose(f);
+          return moflex_play_gpu(path);
+      }
+      g_old3d_warn = 0; }
     /* The video is shown as its frame is READ, while audio sits buffered ahead of what's heard -> the
      * picture leads the sound by ~the audio-queue depth. Shallower queue = tighter lip-sync. 2D races
      * ahead (light decode) so it needs the shallowest; 3D a bit deeper for slack against decode dips. */
