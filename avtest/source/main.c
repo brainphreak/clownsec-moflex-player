@@ -17,6 +17,7 @@
 
 extern int    mobi_init(AVCodecContext *);
 extern int    mobi_decode(AVCodecContext *, AVFrame *, int *, AVPacket *);
+extern void   mobi_flush(AVCodecContext *);
 extern size_t mobi_ctx_size(void);
 extern int    mobi_opt;
 
@@ -77,24 +78,6 @@ static void audio_close(void) {
     ndspChnWaveBufClear(0); ndspChnReset(0);
     for (int i = 0; i < AWB; i++) if (g_aab[i]) linearFree(g_aab[i]);
     g_a_ok = 0;
-}
-
-/* ---- compressed-video BACKLOG (decouples audio from the slow video decode). Read-ahead feeds audio
- * to the DSP (cheap) and STASHES video packets here; the slow mobiclip decode drains this FIFO at its
- * own pace. Audio thus advances at real-time even while decode falls behind on heavy action. ---- */
-#define VQN 384
-static uint8_t *g_vq[VQN]; static int g_vqsz[VQN];
-static int g_vqh = 0, g_vqt = 0, g_vqn = 0;
-static int vq_push(const uint8_t *d, int n) {
-    if (g_vqn >= VQN) return 0;
-    uint8_t *p = (uint8_t *)malloc(n); if (!p) return 0;
-    memcpy(p, d, n); g_vq[g_vqt] = p; g_vqsz[g_vqt] = n; g_vqt = (g_vqt + 1) % VQN; g_vqn++;
-    return 1;
-}
-static uint8_t *vq_pop(int *n) {
-    if (g_vqn <= 0) return NULL;
-    uint8_t *p = g_vq[g_vqh]; *n = g_vqsz[g_vqh]; g_vqh = (g_vqh + 1) % VQN; g_vqn--;
-    return p;
 }
 
 /* ---- video render (Y2R -> GPU texture -> citro2d), from asmtest ---- */
@@ -191,7 +174,7 @@ int main(void) {
     /* decode-ahead ring state + one pending packet (held when its target buffer is full) */
     int wr = 0, rd = 0, vidx = 0, left_ok = 0, lv = -2, prev = -1, ready[NBUF];
     memset(ready, 0, sizeof ready);
-    int done = 0, has_pending = 0;
+    int done = 0, has_pending = 0, skipping = 0, dropped = 0;
     MfxPacket pending;
     u64 fps_t0 = osGetTime(); int shown = 0; double fps = 0;
     u64 dec_ticks = 0; int dec_frames = 0;   /* rolling: raw decode capability (pairs/sec) */
@@ -200,39 +183,51 @@ int main(void) {
         hidScanInput();
         if (hidKeysDown() & (KEY_B | KEY_START)) break;
 
-        /* ---- PHASE 1: top up AUDIO to the brim first (cheap: file read + ADPCM), stashing video into
-         *      the backlog. One demuxer -> no SD thrash. Stops when the DSP buffer is full (audio banked)
-         *      or the backlog is full. This runs BEFORE the slow decode, so audio advances at real-time
-         *      independent of how far behind video decode is. ---- */
-        while (!done && g_vqn < VQN) {
-            if (!has_pending) { if (mfx_next_packet(&m, &pending) != 1) { done = 1; break; } has_pending = 1; }
+        /* ---- ONE demuxer: read a packet (held as pending until its buffer has room), dispatch
+         *      video -> ring, audio -> ndsp. No second demux -> no SD seek-thrash. ---- */
+        if (!has_pending && !done) { if (mfx_next_packet(&m, &pending) != 1) done = 1; else has_pending = 1; }
+        if (has_pending) {
             int mt = m.streams[pending.stream_index].media_type;
-            if (mt == MFX_TYPE_AUDIO) {
-                if (!audio_feed_pkt(&pending)) break;   /* DSP buffer full -> audio is banked, stop */
-                has_pending = 0;
-            } else if (mt == MFX_TYPE_VIDEO) {
-                if (!vq_push(pending.data, pending.size)) break;   /* backlog full -> stop */
-                has_pending = 0;
-            } else has_pending = 0;   /* data / other -> skip */
-        }
-
-        /* ---- PHASE 2: decode ONE pair from the backlog into the ring (bounded, so we loop back and
-         *      keep audio topped up). Video lags into the backlog on heavy action; present drops the
-         *      stale frames to stay locked to the audio clock. ---- */
-        if (g_vqn >= 2 && (wr - rd) < NBUF - 1) {
-            int fill = wr % NBUF, n, got;
-            uint8_t *p; AVPacket ap;
-            u64 _dt = svcGetSystemTick();
-            p = vq_pop(&n); ap.data = p; ap.size = n; got = 0;
-            int okL = (mobi_decode(&ctx, fL, &got, &ap) >= 0 && got); free(p);
-            if (okL) y2r_start(fL, &texL[fill]);        /* overlap Y2R(L) with decode(R) */
-            p = vq_pop(&n); ap.data = p; ap.size = n; got = 0;
-            int okR = (mobi_decode(&ctx, fR, &got, &ap) >= 0 && got); free(p);
-            dec_ticks += svcGetSystemTick() - _dt; dec_frames += 2;
-            if (okL && okR) {
-                y2r_wait(&texL[fill]); y2r_start(fR, &texR[fill]); y2r_wait(&texR[fill]);
-                ready[fill] = 1; wr++;
-            } else if (okL) { y2r_wait(&texL[fill]); }  /* drain the Y2R we started, drop the pair */
+            if (mt == MFX_TYPE_VIDEO) {
+                int eye = vidx & 1;
+                int is_kf_left = pending.keyframe && eye == 0;
+                /* CATCH-UP: when this pair is well behind the audio clock, decode can't keep up (real
+                 * deficit on heavy action). Skip decoding the rest of this GOP and resume at the next
+                 * left-eye keyframe -- video jumps forward to stay locked to audio, and the freed time
+                 * keeps audio fed (smooth + in-sync). Only starts at a pair boundary so pairs stay whole. */
+                int behind = (g_apos >= 0) && ((int64_t)wr * pair_dur + 500000 < g_apos);
+                if (skipping) {
+                    if (is_kf_left) { skipping = 0; mobi_flush(&ctx); }   /* resync point -> decode it */
+                    else { vidx++; dropped++; has_pending = 0; }          /* drop until keyframe */
+                } else if (eye == 0 && behind && !pending.keyframe) {
+                    skipping = 1; vidx++; dropped++; has_pending = 0;      /* fell behind -> drop GOP tail */
+                }
+                if (has_pending && (wr - rd) < NBUF - 1) {
+                    AVFrame *dst = eye ? fR : fL; int got = 0, fill = wr % NBUF;
+                    AVPacket ap; ap.data = pending.data; ap.size = pending.size;
+                    u64 _dt = svcGetSystemTick();
+                    int ok = (mobi_decode(&ctx, dst, &got, &ap) >= 0 && got);
+                    dec_ticks += svcGetSystemTick() - _dt; dec_frames++;
+                    if (eye == 0) {
+                        if (ok) { left_ok = 1; lv = vidx;
+                            if (prev >= 0) { y2r_wait(&texR[prev]); ready[prev] = 1; prev = -1; }
+                            y2r_start(fL, &texL[fill]);
+                        } else left_ok = 0;
+                    } else {
+                        if (ok && left_ok && vidx == lv + 1) {
+                            y2r_wait(&texL[fill]); y2r_start(fR, &texR[fill]);
+                            ready[fill] = 0; prev = fill; wr++;
+                        }
+                        left_ok = 0;
+                    }
+                    vidx++;
+                    has_pending = 0;
+                }   /* else ring full -> hold this video packet, drain first */
+            } else if (mt == MFX_TYPE_AUDIO) {
+                if (audio_feed_pkt(&pending)) has_pending = 0;   /* else buffer full -> hold */
+            } else {
+                has_pending = 0;   /* data / other -> skip */
+            }
         }
 
         audio_poll();   /* advance the audio clock from real DSP playback (not just when feeding) */
@@ -255,8 +250,8 @@ int main(void) {
             dec_ticks = 0; dec_frames = 0;   /* d = raw decode pairs/sec (>=24 => render/bank-bound; <24 => decode wall) */
             int64_t apos = g_apos;
             int e = (apos >= 0) ? (int)((int64_t)rd * pair_dur - apos) / 1000 : 0;
-            printf("\x1b[4;0Hd%3d (>=24 ok)\x1b[5;0Hfps%5.1f  q%2d  e%5dms  apos%lldms   \n",
-                   dfps,
+            printf("\x1b[4;0Hd%3d (>=24 ok) drop%d\x1b[5;0Hfps%5.1f  q%2d  e%5dms  apos%lldms   \n",
+                   dfps, dropped,
                    fps, wr - rd, e, (long long)(apos / 1000));
         }
     }
