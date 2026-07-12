@@ -43,8 +43,9 @@ extern int    mobi_opt;
 static const struct { const char *name; int opt; } CFG[] = {
     { "C  base            ", 0 },
     { "C  best pf+sk+dc   ", 0x0E },
-    { "ASM mc             ", 0x100 },
-    { "ASM mc + pf+sk+dc  ", 0x10E },
+    { "C  ENTROPY opt     ", 0x200 },        /* inlined bit-reader + get_vlc2 (host bit-exact) */
+    { "C  entropy + best  ", 0x20E },
+    { "ASM mc + best      ", 0x10E },
 };
 #define NCFG ((int)(sizeof(CFG)/sizeof(CFG[0])))
 

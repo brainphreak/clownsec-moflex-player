@@ -7,10 +7,13 @@
 extern int    mobi_init(AVCodecContext *);
 extern int    mobi_decode(AVCodecContext *, AVFrame *, int *, AVPacket *);
 extern size_t mobi_ctx_size(void);
+extern int    mobi_opt;
 
 int main(int argc, char **argv) {
-    if (argc < 3) { fprintf(stderr, "usage: %s in.moflex out.yuv [nframes]\n", argv[0]); return 1; }
+    if (argc < 3) { fprintf(stderr, "usage: %s in.moflex out.yuv [nframes] [mobi_opt]\n", argv[0]); return 1; }
     int want = argc > 3 ? atoi(argv[3]) : 10;
+    if (argc > 4) mobi_opt = (int)strtol(argv[4], NULL, 0);
+    fprintf(stderr, "mobi_opt = 0x%X\n", mobi_opt);
 
     FILE *f = fopen(argv[1], "rb");
     if (!f) { perror("open"); return 1; }

@@ -21,10 +21,13 @@ cc -c $CFLAGS $INC "$FSUP/golomb.c"        -o "$OUT/golomb.o"
 cc -c $CFLAGS $INC "$FSUP/mathtables.c"    -o "$OUT/mathtables.o"
 cc -c $CFLAGS $INC "$FSUP/reverse.c"       -o "$OUT/reverse.o"
 
+# host-only link stubs for the ARM-asm motion-comp routines (mc_asm.s is devkitARM-only)
+cc -c $CFLAGS $INC "$HERE/mc_stub.c"       -o "$OUT/mc_stub.o"
+
 # video test
 cc -c $CFLAGS $INC "$HERE/test_decode.c"   -o "$OUT/test_decode.o"
 cc -O2 "$OUT"/mobiclip.o "$OUT"/mobicompat.o "$OUT"/vlc.o "$OUT"/golomb.o \
-       "$OUT"/mathtables.o "$OUT"/reverse.o "$OUT"/moflex_demux.o "$OUT"/test_decode.o \
+       "$OUT"/mathtables.o "$OUT"/reverse.o "$OUT"/moflex_demux.o "$OUT"/mc_stub.o "$OUT"/test_decode.o \
        -o "$HERE/test_decode"
 
 # audio test

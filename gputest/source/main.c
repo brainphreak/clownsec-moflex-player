@@ -81,11 +81,11 @@ int main(void) {
 
     static const struct { const char *name; int opt; } C[6] = {
         { "0 base        ", 0 },
-        { "1 ASM-mc      ", 0x100 },              /* hand-written assembly motion comp */
-        { "2 ASM+pf+sk+dc", 0x100 | 8 | 2 | 4 },  /* asm mc + the decode wins */
-        { "3 pf+sk+dc    ", 0x0E },               /* current best (no asm) for comparison */
-        { "4 dir-mc(C)   ", 0x80 },               /* the C aligned-read attempt (was a wash) */
-        { "5 uhadd-mc(C) ", 16 },                 /* the C UHADD8 attempt (was a wash) */
+        { "1 pf+sk+dc    ", 0x0E },               /* current best (no asm) */
+        { "2 entropy     ", 0x200 },              /* NEW: inlined bit-reader entropy loop */
+        { "3 entropy+best", 0x20E },
+        { "4 ASM-mc      ", 0x100 },              /* hand-written assembly motion comp */
+        { "5 ASM-mc+best ", 0x10E },
     };
     int NC = sizeof(C) / sizeof(C[0]);
     Res res[16];

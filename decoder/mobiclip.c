@@ -62,9 +62,14 @@ static inline void     st4(uint8_t *p, uint32_t v) { memcpy(p, &v, 4); }
  * truncated (a>>1)+(b>>1): they differ by 1 only when both bytes are odd, and the UHADD8
  * result is >=1 there, so a plain subtract can't underflow -> bit-identical. */
 static inline uint32_t u8avg(uint32_t a, uint32_t b) {
+#if defined(__arm__)
     uint32_t r;
     __asm__("uhadd8 %0, %1, %2" : "=r"(r) : "r"(a), "r"(b));
     return r - ((a & b) & 0x01010101u);
+#else
+    /* portable per-byte (a>>1)+(b>>1) for the host verify build; bit-identical to the UHADD8 path */
+    return ((a >> 1) & 0x7f7f7f7fu) + ((b >> 1) & 0x7f7f7f7fu);
+#endif
 }
 
 /* hand-written ARM assembly half-pel motion comp (mc_asm.s); aligned src + width%4==0 only. */
@@ -491,6 +496,64 @@ static int add_coefficients_impl(AVCodecContext *avctx, AVFrame *frame,
     if ((mobi_opt & 32) && !g_clamp_ready) clamp_init();
     uint64_t _te = PROF_NOW();
 
+    if (mobi_opt & 0x200) {
+        /* --- opt entropy loop (mobi_opt 0x200): hold the bit-reader cache/index in locals across
+         * the whole coefficient run and inline get_vlc2 + get_bits, instead of an OPEN/UPDATE/CLOSE
+         * + gb->index reload per read. Same macro semantics -> bit-exact. This is the structure the
+         * ARM assembly (0x400) mirrors. rl_vlc is a flat 12-bit table (max_depth 1): one lookup. --- */
+        const VLCElem *rltab = rl_vlc[s->dct_tab_idx];
+        const uint8_t *rres = run_residue[s->dct_tab_idx];
+        OPEN_READER(re, gb);
+        /* read one run/level VLC (flat 12-bit) into n/last/run/level */
+        #define RRE_VLC()  do { UPDATE_CACHE(re, gb); \
+            unsigned _ix = SHOW_UBITS(re, gb, MOBI_RL_VLC_BITS); \
+            n = rltab[_ix].sym; SKIP_BITS(re, gb, rltab[_ix].len); \
+            last = (n >> 11) == 1; run = (n >> 5) & 0x3F; level = n & 0x1F; } while (0)
+        /* read u bits (unsigned) into dst */
+        #define RRE_U(dst, u) do { UPDATE_CACHE(re, gb); dst = SHOW_UBITS(re, gb, (u)); SKIP_BITS(re, gb, (u)); } while (0)
+        /* read s bits (signed) into dst */
+        #define RRE_S(dst, u) do { UPDATE_CACHE(re, gb); dst = SHOW_SBITS(re, gb, (u)); SKIP_BITS(re, gb, (u)); } while (0)
+
+        for (int pos = 0; BITS_LEFT(re, gb) > 0; pos++) {
+            int qval, last, run, level, n, b;
+
+            RRE_VLC();
+            if (level) {
+                RRE_U(b, 1); if (b) level = -level;
+            } else {
+                RRE_U(b, 1);
+                if (!b) {
+                    RRE_VLC();
+                    level += rres[(last ? 64 : 0) + run];
+                    RRE_U(b, 1); if (b) level = -level;
+                } else {
+                    RRE_U(b, 1);
+                    if (!b) {
+                        RRE_VLC();
+                        run += rres[128 + (last ? 64 : 0) + level];
+                        RRE_U(b, 1); if (b) level = -level;
+                    } else {
+                        RRE_U(last, 1);
+                        RRE_U(run, 6);
+                        RRE_S(level, 12);
+                    }
+                }
+            }
+
+            pos += run;
+            if (pos >= size * size) { CLOSE_READER(re, gb); return AVERROR_INVALIDDATA; }
+            qval = qtab[pos];
+            mat[ztab[pos]] = qval * (unsigned)level;
+            rowmask |= 1u << (ztab[pos] / size);
+            if (ztab[pos]) ac++;
+
+            if (last) break;
+        }
+        CLOSE_READER(re, gb);
+        #undef RRE_VLC
+        #undef RRE_U
+        #undef RRE_S
+    } else
     for (int pos = 0; get_bits_left(gb) > 0; pos++) {
         int qval, last, run, level;
 
