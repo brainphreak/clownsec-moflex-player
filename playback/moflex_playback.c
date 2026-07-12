@@ -986,6 +986,9 @@ static MoflexResult moflex_play_gpu(const char *path) {
      * last_rp = slot whose R-eye Y2R is still in flight (waited before the next L start). */
     int wr = 0, rd = 0, last_rp = -1, shown_landing = 0, last_shown = -1;
     int priming = 0;   /* fill the ring BEFORE audio starts, so audio-0 lines up with video pair-0 */
+    int64_t vskip = -1; /* after a seek, discard video pairs with ts < this (the seek target) so the
+                         * video anchors at the SAME content time the audio seeks to, not the earlier
+                         * keyframe it lands on -> no constant A/V offset after seek/resume */
     int64_t ring_ts[NTB], ring_bts[NTB]; int ring_ready[NTB] = { 0 };   /* synthetic + raw block ts */
     int64_t cur_show_ts = 0, cur_show_bts = 0, next_vts = 0, v_anchor = 0; int have_anchor = 0;
     int64_t cal_aud0 = -1; int cal_frames = 0;                    /* calibrate pair_dur from the AUDIO clock */
