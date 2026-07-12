@@ -202,19 +202,19 @@ static void bw_exit(void) {
 #define RW_CX 108
 #define FF_CX 212
 #define VOL_X 298
-#define VOL_Y 96
-#define VOL_H 108
+#define VOL_Y 88
+#define VOL_H 104
 #define BACK_X 6
 #define BACK_Y 220
 /* bottom action buttons: BACK (home) / OPEN (new file) / EXIT (quit app) */
 #define BTN_Y 208
 #define BTN_H 28
 #define BKB_X 8
-#define BKB_W 86
-#define OPB_X 98
-#define OPB_W 86
-#define EXB_X 188
-#define EXB_W 88
+#define BKB_W 96
+#define OPB_X 112
+#define OPB_W 96
+#define EXB_X 216
+#define EXB_W 96
 /* CC (subtitles) toggle button -- between the FF control and the volume slider */
 #define CC_X 244
 #define CC_Y 104
@@ -537,7 +537,7 @@ static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing)
     int vf = (int)(VOL_H * (g_vol / 4.0f));
     if (vf > 0) ui_fill_round(VOL_X, VOL_Y + VOL_H - vf, 12, vf, 6, UI_NEON);
     char vs[8]; snprintf(vs, sizeof(vs), "%d%%", (int)(g_vol * 100 + 0.5f));
-    ui_text(VOL_X - 16, VOL_Y + VOL_H + 4, 1, UI_INK, vs);
+    ui_text(VOL_X - 16, VOL_Y - 12, 1, UI_INK, vs);   /* label above the slider (frees the button row) */
 
     /* action buttons (touch): BACK / OPEN / EXIT */
     ui_button(BKB_X, BTN_Y, BKB_W, BTN_H, "BACK", 0, UI_NEONP);
