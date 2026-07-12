@@ -77,7 +77,13 @@ MoflexResult mp4_play(const char *path) {
             if (hidKeysDown() & KEY_B) { result = MOFLEX_QUIT_BACK; quit = 1; break; }
         }
         if (quit) break;
-        if (got) { gfxFlushBuffers(); gfxSwapBuffers(); }
+        if (got) {
+            gfxFlushBuffers(); gfxSwapBuffers();
+            /* gfxSwapBuffers only flips at the next vblank; wait for it before the next iteration
+             * blits into the new back buffer, otherwise we'd write the next frame into the buffer
+             * still being scanned out (two frames visible at once / tearing). */
+            gspWaitForVBlank();
+        }
     }
 
     mp4_mvd_exit();
