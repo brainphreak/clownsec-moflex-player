@@ -1175,8 +1175,12 @@ static MoflexResult moflex_play_gpu(const char *path) {
                 int aerr = (have_audio && g_aud_play_us >= 0 && g_aud_start >= 0)
                            ? (int)(((cur_show_bts - v_anchor) - (g_aud_play_us - g_aud_start)) / 1000) : 0;
                 int span = (wr > rd) ? (int)((ring_bts[(wr - 1) % NTB] - ring_bts[rd % NTB]) / 1000) : 0;
-                snprintf(ts, sizeof ts, "%s e%d q%d/%d sp%d o%d",
-                         tc, aerr, wr - rd, qmin == 99 ? 0 : qmin, span, g_vlead_ms);
+                /* d = raw decode capability in-player (stereo pairs/sec). If d>=24 the decoder keeps
+                 * up and any deficit is render/present; if d<24 the audio worker is starving decode. */
+                int dfps = (dec_ticks > 0) ? (int)((double)SYSCLOCK_ARM11 * dec_frames / (double)dec_ticks / 2.0) : 0;
+                dec_ticks = 0; dec_frames = 0;   /* rolling: 'd' reflects the last ~250ms of decode */
+                snprintf(ts, sizeof ts, "%s e%d q%d d%d o%d",
+                         tc, aerr, wr - rd, dfps, g_vlead_ms);
                 if (strcmp(ts, last_ts)) { strncpy(last_ts, ts, sizeof last_ts - 1);
                     C2D_TextBufClear(tmbuf); C2D_TextParse(&ttime, tmbuf, ts); C2D_TextOptimize(&ttime); }
             }
