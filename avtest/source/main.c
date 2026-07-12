@@ -28,55 +28,60 @@ extern int    mobi_opt;
 #define AWB  16                 /* audio wavebufs */
 #define ABUF (16 * 1024)        /* max samples/ch per audio packet */
 
-/* ---- audio worker (core 1): publishes elapsed audible time (us), starts at 0 when gated on ---- */
-static volatile int64_t g_apos = -1;     /* audible elapsed us since audio start, -1 = not started */
-static volatile int     g_astop = 0;
-static volatile int     g_agate = 0;      /* 0 = hold (video priming), 1 = feed audio */
-static char             g_path[300];
+/* ---- INLINE audio (same core as decode): a core-1 worker thread halves the memory-bound decoder
+ * (shared memory bus). ADPCM decode is cheap, so feeding it inline costs far less than that
+ * contention. Separate audio demux (audio_only), fed from the main loop; g_apos = elapsed audible us. */
+static char       g_path[300];
+static int64_t    g_apos = -1;            /* elapsed audible us, -1 = not started */
+static MfxDemux   g_am;   static FILE *g_af = NULL;
+static ndspWaveBuf g_awb[AWB]; static int16_t *g_aab[AWB];
+static int        g_awi = 0, g_arate = 44100, g_achn = 2, g_a_ok = 0;
+static long long  g_aplayed = 0; static int g_aslot[AWB];
 
-static void audio_worker(void *arg) {
-    (void)arg;
-    FILE *f = fopen(g_path, "rb");
-    if (!f) return;
-    MfxDemux am;
-    if (mfx_open(&am, f) != 0) { fclose(f); return; }
-    am.audio_only = 1;
+static int audio_open(void) {
+    g_af = fopen(g_path, "rb");
+    if (!g_af || mfx_open(&g_am, g_af) != 0) { if (g_af) fclose(g_af); g_af = NULL; return 0; }
+    g_am.audio_only = 1;
     int ai = -1;
-    for (int i = 0; i < am.nb_streams; i++) if (am.streams[i].media_type == MFX_TYPE_AUDIO && ai < 0) ai = i;
-    if (ai < 0) { mfx_close(&am); fclose(f); return; }
-    int arate = am.streams[ai].sample_rate, chn = am.streams[ai].channels;
-
+    for (int i = 0; i < g_am.nb_streams; i++) if (g_am.streams[i].media_type == MFX_TYPE_AUDIO && ai < 0) ai = i;
+    if (ai < 0) { mfx_close(&g_am); fclose(g_af); g_af = NULL; return 0; }
+    g_arate = g_am.streams[ai].sample_rate; g_achn = g_am.streams[ai].channels;
     ndspChnReset(0);
     ndspChnSetInterp(0, NDSP_INTERP_POLYPHASE);
-    ndspChnSetRate(0, (float)arate);
-    ndspChnSetFormat(0, chn == 2 ? NDSP_FORMAT_STEREO_PCM16 : NDSP_FORMAT_MONO_PCM16);
+    ndspChnSetRate(0, (float)g_arate);
+    ndspChnSetFormat(0, g_achn == 2 ? NDSP_FORMAT_STEREO_PCM16 : NDSP_FORMAT_MONO_PCM16);
     float mix[12]; memset(mix, 0, sizeof mix); mix[0] = mix[1] = 1.0f; ndspChnSetMix(0, mix);
+    memset(g_awb, 0, sizeof g_awb); memset(g_aslot, 0, sizeof g_aslot);
+    for (int i = 0; i < AWB; i++) { g_aab[i] = (int16_t *)linearAlloc(ABUF * g_achn * 2); g_awb[i].status = NDSP_WBUF_DONE; }
+    g_a_ok = 1;
+    return 1;
+}
 
-    ndspWaveBuf wb[AWB]; int16_t *ab[AWB]; memset(wb, 0, sizeof wb);
-    for (int i = 0; i < AWB; i++) { ab[i] = (int16_t *)linearAlloc(ABUF * chn * 2); wb[i].data_vaddr = ab[i]; wb[i].status = NDSP_WBUF_DONE; }
-
-    while (!g_astop && !g_agate) svcSleepThread(2000000);   /* hold until the video ring is primed */
-
-    int wi = 0; long long played = 0; int slot_ns[AWB]; memset(slot_ns, 0, sizeof slot_ns);
-    MfxPacket pkt;
-    while (!g_astop) {
-        if (mfx_next_packet(&am, &pkt) != 1) break;         /* EOF */
-        if (am.streams[pkt.stream_index].media_type != MFX_TYPE_AUDIO) continue;
-        ndspWaveBuf *w = &wb[wi];
-        while (w->status != NDSP_WBUF_FREE && w->status != NDSP_WBUF_DONE) { if (g_astop) break; svcSleepThread(2000000); }
-        if (g_astop) break;
-        int fr = adpcm_moflex_decode(pkt.data, pkt.size, chn, ab[wi]);
-        if (fr > 0 && fr <= ABUF) {
-            played += slot_ns[wi]; slot_ns[wi] = fr;         /* the slot we're reusing has finished */
-            g_apos = (int64_t)(played * 1000000LL / arate);  /* elapsed audible time */
-            DSP_FlushDataCache(ab[wi], fr * chn * 2);
-            memset(w, 0, sizeof *w); w->data_vaddr = ab[wi]; w->nsamples = fr;
-            ndspChnWaveBufAdd(0, w); wi = (wi + 1) % AWB;
-        }
+/* top up ndsp: fill every free wavebuf from the audio stream (non-blocking). Called each main-loop
+ * iteration so the DSP never starves; g_apos tracks the audible position. */
+static void audio_feed(void) {
+    if (!g_a_ok) return;
+    for (int guard = 0; guard < AWB; guard++) {
+        ndspWaveBuf *w = &g_awb[g_awi];
+        if (w->status != NDSP_WBUF_FREE && w->status != NDSP_WBUF_DONE) return;   /* all queued */
+        MfxPacket pkt;
+        if (mfx_next_packet(&g_am, &pkt) != 1) return;   /* EOF */
+        if (g_am.streams[pkt.stream_index].media_type != MFX_TYPE_AUDIO) continue;
+        int fr = adpcm_moflex_decode(pkt.data, pkt.size, g_achn, g_aab[g_awi]);
+        if (fr <= 0 || fr > ABUF) continue;
+        g_aplayed += g_aslot[g_awi]; g_aslot[g_awi] = fr;
+        g_apos = (int64_t)(g_aplayed * 1000000LL / g_arate);
+        DSP_FlushDataCache(g_aab[g_awi], fr * g_achn * 2);
+        memset(w, 0, sizeof *w); w->data_vaddr = g_aab[g_awi]; w->nsamples = fr;
+        ndspChnWaveBufAdd(0, w); g_awi = (g_awi + 1) % AWB;
     }
+}
+static void audio_close(void) {
+    if (!g_a_ok) return;
     ndspChnWaveBufClear(0); ndspChnReset(0);
-    for (int i = 0; i < AWB; i++) if (ab[i]) linearFree(ab[i]);
-    mfx_close(&am); fclose(f);
+    for (int i = 0; i < AWB; i++) if (g_aab[i]) linearFree(g_aab[i]);
+    mfx_close(&g_am); if (g_af) fclose(g_af);
+    g_a_ok = 0;
 }
 
 /* ---- video render (Y2R -> GPU texture -> citro2d), from asmtest ---- */
@@ -163,11 +168,9 @@ int main(void) {
         if (pd >= 16000 && pd <= 100000) pair_dur = pd;
     }
 
-    /* start the audio worker (held at the gate until the video ring is primed) */
-    g_astop = 0; g_agate = 0; g_apos = -1;
-    s32 prio = 0x30; svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
-    APT_SetAppCpuTimeLimit(30);
-    Thread awt = threadCreate(audio_worker, NULL, 16 * 1024, prio - 1, 1, false);
+    /* open audio -- fed INLINE from the main loop (no core-1 thread -> no decode contention) */
+    g_apos = -1;
+    audio_open();
 
     /* decode-ahead ring state */
     int wr = 0, rd = 0, vidx = 0, left_ok = 0, lv = -2, cur = 0, prev = -1, ready[NBUF];
@@ -203,8 +206,9 @@ int main(void) {
             }
         }
 
-        /* ---- release audio once the ring is primed (so audio-0 == video pair-0) ---- */
-        if (!gated && (wr - rd) >= NBUF - 3) { gated = 1; g_agate = 1; }
+        /* ---- start feeding audio once the ring is primed (so audio-0 == video pair-0) ---- */
+        if (!gated && (wr - rd) >= NBUF - 3) gated = 1;
+        if (gated) audio_feed();   /* keep the DSP topped up, inline on this core */
 
         /* ---- present the next pair when the audio clock reaches it ---- */
         if ((wr - rd) > 0 && ready[rd % NBUF]) {
@@ -231,8 +235,7 @@ int main(void) {
         }
     }
 
-    g_astop = 1;
-    if (awt) { threadJoin(awt, 2000000000LL); threadFree(awt); }
+    audio_close();
 
 wait:
     while (aptMainLoop()) { hidScanInput(); if (hidKeysDown() & (KEY_B | KEY_START)) break; gspWaitForVBlank(); }
