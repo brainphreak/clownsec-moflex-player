@@ -37,7 +37,7 @@ static char        g_path[300];
 static int64_t     g_apos = -1;           /* elapsed audible us, -1 = not started */
 static ndspWaveBuf g_awb[AWB]; static int16_t *g_aab[AWB];
 static int         g_awi = 0, g_arate = 44100, g_achn = 2, g_a_ok = 0;
-static long long   g_aplayed = 0; static int g_aslot[AWB];
+static long long   g_aplayed = 0; static int g_acnt[AWB];   /* g_acnt[i]=1: buffer i's samples counted */
 
 static void audio_setup(int arate, int chn) {
     g_arate = arate; g_achn = chn;
@@ -46,22 +46,31 @@ static void audio_setup(int arate, int chn) {
     ndspChnSetRate(0, (float)arate);
     ndspChnSetFormat(0, chn == 2 ? NDSP_FORMAT_STEREO_PCM16 : NDSP_FORMAT_MONO_PCM16);
     float mix[12]; memset(mix, 0, sizeof mix); mix[0] = mix[1] = 1.0f; ndspChnSetMix(0, mix);
-    memset(g_awb, 0, sizeof g_awb); memset(g_aslot, 0, sizeof g_aslot);
+    memset(g_awb, 0, sizeof g_awb); memset(g_acnt, 0, sizeof g_acnt);
     for (int i = 0; i < AWB; i++) { g_aab[i] = (int16_t *)linearAlloc(ABUF * chn * 2); g_awb[i].status = NDSP_WBUF_DONE; }
     g_a_ok = 1;
+}
+/* advance g_apos from ACTUAL DSP playback (count finished wavebufs) -- called every loop iteration, so
+ * the audio clock keeps moving even when we're not feeding (holding a video packet on a full ring). */
+static void audio_poll(void) {
+    if (!g_a_ok) return;
+    for (int i = 0; i < AWB; i++)
+        if (g_awb[i].status == NDSP_WBUF_DONE && !g_acnt[i] && g_awb[i].nsamples > 0) { g_aplayed += g_awb[i].nsamples; g_acnt[i] = 1; }
+    if (g_apos >= 0) g_apos = (int64_t)(g_aplayed * 1000000LL / g_arate);
 }
 /* buffer one audio packet. 1 = consumed, 0 = no free wavebuf (hold the packet and retry next iter). */
 static int audio_feed_pkt(MfxPacket *pkt) {
     if (!g_a_ok) return 1;
     ndspWaveBuf *w = &g_awb[g_awi];
     if (w->status != NDSP_WBUF_FREE && w->status != NDSP_WBUF_DONE) return 0;   /* full -> hold */
+    if (w->status == NDSP_WBUF_DONE && !g_acnt[g_awi] && w->nsamples > 0) { g_aplayed += w->nsamples; g_acnt[g_awi] = 1; }
     int fr = adpcm_moflex_decode(pkt->data, pkt->size, g_achn, g_aab[g_awi]);
     if (fr <= 0 || fr > ABUF) return 1;                                         /* bad -> drop */
-    g_aplayed += g_aslot[g_awi]; g_aslot[g_awi] = fr;
-    g_apos = (int64_t)(g_aplayed * 1000000LL / g_arate);
     DSP_FlushDataCache(g_aab[g_awi], fr * g_achn * 2);
     memset(w, 0, sizeof *w); w->data_vaddr = g_aab[g_awi]; w->nsamples = fr;
-    ndspChnWaveBufAdd(0, w); g_awi = (g_awi + 1) % AWB;
+    ndspChnWaveBufAdd(0, w); g_acnt[g_awi] = 0;   /* freshly queued: not yet played */
+    if (g_apos < 0) g_apos = 0;                    /* audio has started */
+    g_awi = (g_awi + 1) % AWB;
     return 1;
 }
 static void audio_close(void) {
@@ -155,17 +164,17 @@ int main(void) {
         if (pd >= 16000 && pd <= 100000) pair_dur = pd;
     }
 
-    /* audio: SINGLE demuxer (the video one) -> feed its interleaved audio packets to ndsp. Start the
-     * channel PAUSED and buffer audio while the ring primes, then unpause so audio-0 == video pair-0. */
+    /* audio: SINGLE demuxer (the video one) -> feed its interleaved audio packets to ndsp, playing
+     * immediately (no pause/priming -> can't deadlock; buffers always free as they play). */
     g_apos = -1;
     { int ai = -1;
       for (int i = 0; i < m.nb_streams; i++) if (m.streams[i].media_type == MFX_TYPE_AUDIO && ai < 0) ai = i;
-      if (ai >= 0) { audio_setup(m.streams[ai].sample_rate, m.streams[ai].channels); ndspChnSetPaused(0, true); } }
+      if (ai >= 0) audio_setup(m.streams[ai].sample_rate, m.streams[ai].channels); }
 
     /* decode-ahead ring state + one pending packet (held when its target buffer is full) */
     int wr = 0, rd = 0, vidx = 0, left_ok = 0, lv = -2, prev = -1, ready[NBUF];
     memset(ready, 0, sizeof ready);
-    int done = 0, gated = 0, has_pending = 0;
+    int done = 0, has_pending = 0;
     MfxPacket pending;
     u64 fps_t0 = osGetTime(); int shown = 0; double fps = 0;
 
@@ -205,12 +214,11 @@ int main(void) {
             }
         }
 
-        /* ---- unpause audio once the ring is primed (audio-0 == video pair-0). During priming (rd=0)
-         *      we do NOT present, so the ring fills cleanly to PRIME before audio starts. ---- */
-        if (!gated && wr >= PRIME) { gated = 1; if (g_a_ok) ndspChnSetPaused(0, false); }
+        audio_poll();   /* advance the audio clock from real DSP playback (not just when feeding) */
 
-        /* ---- once audio is running, present the next pair when the audio clock reaches it ---- */
-        if (gated && (wr - rd) > 0 && ready[rd % NBUF]) {
+        /* ---- present the next pair when the audio clock reaches it (g_apos = -1 until audio starts,
+         *      so video naturally waits for audio; then it's audio-paced) ---- */
+        if ((wr - rd) > 0 && ready[rd % NBUF]) {
             int64_t vtime = (int64_t)rd * pair_dur;      /* this pair's elapsed video time */
             if (g_apos >= vtime) { draw_present(rd % NBUF); rd++; shown++; }
         } else if ((wr - rd) == 0 && done) {
