@@ -60,8 +60,10 @@ MoflexResult mp4_play(const char *path) {
 
         Mp4Sample *s = &m.vsamples[vi];
         int n = mp4_read_sample(&m, s, buf);
-        if (n == (int)s->size && mp4_mvd_decode(buf, n, GFX_LEFT))
+        if (n == (int)s->size && mp4_mvd_decode(buf, n, GFX_LEFT)) {
+            gfxFlushBuffers();
             gfxSwapBuffers();
+        }
 
         while ((double)osGetTime() < next_ms) gspWaitForVBlank();
         next_ms += frame_ms;
