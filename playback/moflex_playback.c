@@ -1073,7 +1073,8 @@ static MoflexResult moflex_play_gpu(const char *path) {
             if (mfx_next_packet(&m, &pkt) != 1) { playing = 0; if (have_audio) g_aw_paused = 1; dirty = 1; }
             else {
                 cur_us = m.ts; if (cur_us < 0) cur_us = 0; if (dur_us > 0 && cur_us > dur_us) cur_us = dur_us;
-                if (cur_us - last_save > 15000000 || cur_us < last_save) { resume_save_us(path, cur_us); last_save = cur_us; }
+                /* NO periodic resume write here: an in-loop SD write stalls the serialized FS and hitches
+                 * decode every ~15s. Resume is saved on pause/exit only (like the classic path). */
                 int mt = m.streams[pkt.stream_index].media_type;
                 if (mt == MFX_TYPE_VIDEO && !is3d) {            /* 2D: one full frame per ring slot */
                     int got = 0, fill = wr % NTB;
@@ -1145,7 +1146,8 @@ static MoflexResult moflex_play_gpu(const char *path) {
         int show_slot = -1;
         if (playing && (wr - rd) > 0 && ring_ready[rd % NTB]) {
             int slot = rd % NTB;
-            int64_t vrel = ring_bts[slot] - v_anchor;   /* this frame's elapsed video time */
+            int64_t vrel = ring_ts[slot] - v_anchor;   /* SMOOTH synthetic per-pair time (not the coarse
+                                                        * raw block ts) -> steady audio-slaved cadence */
             if (arel < 0) { if (!shown_landing) show_slot = slot; }   /* audio not started: show landing frame */
             else if (arel + (int64_t)g_vlead_ms * 1000 >= vrel) show_slot = slot;
             if (show_slot >= 0) { rd++; shown_landing = 1; last_shown = show_slot; cur_show_bts = ring_bts[slot];
