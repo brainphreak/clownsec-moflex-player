@@ -67,6 +67,23 @@ Can't fix the freeze → make it RARE by carrying a bigger CLEAN cushion so fewe
 2. If freezes acceptably rare → **port the whole engine into `moflex_play_gpu`** (drop its core-1 worker AND per-frame UI panel; add single-demux + Phase-1 audio + YUV-ring + flush-skip).
 3. Longer shot for the freeze itself: only a faster decoder eliminates it (official-player parity). Not currently achievable.
 
+## OFFICIAL PLAYER REVERSE-ENGINEERING RESOURCES (the key to the freeze)
+The freeze only truly goes away with a decoder fast enough to never skip — which the OFFICIAL 3DS moflex
+player achieves on the same files/hardware. To learn how, study these (already on disk):
+- **`~/Downloads/all_decompiled_source.c`** (5.5 MB) — Ghidra decompile of the official player. Function names
+  are `FUN_<hexaddr>` (e.g. `FUN_00100024`); no symbols. Search for the mobiclip decode hot loop (IDCT /
+  motion-comp / entropy) and compare its structure to our `decoder/mobiclip.c` to find what makes it faster
+  (e.g. fixed-point tricks, table layouts, ARM-friendly inner loops, or skipping work we don't).
+- **`~/Downloads/code.bin`** (856 KB) — the official player's 3DS ExeFS `.code` (the actual ARM binary the
+  decompile came from). Load in Ghidra/IDA as ARM (3DS ARM11) for disassembly cross-ref. (`code (1).bin`,
+  `code (2).bin` are same-size copies/versions.)
+- **`~/Downloads/MobiclipDecoder/`** — Windows/.NET reference: `LibMobiclip.dll`, `MobiclipDecoder.exe`,
+  `MobiConverter.exe`, `NAudio.dll`. A readable managed Mobiclip decoder — good for confirming format/
+  algorithm details, NOT for ARM speed.
+- **`~/Downloads/CDG_Production_Mobiclip_Conversion_20150205/`** — Mobiclip production/conversion tooling.
+- Our decoder came from FFmpeg's mobiclip (see `decoder/mobiclip.c`, `ffmpeg_support/`). The official one is
+  Mobiclip's own hand-tuned ARM — that's the suspected speed gap (our assembly attempts lost to GCC).
+
 ## Key files
 - `avtest/source/main.c` — the test engine (all the above).
 - `decoder/mobiclip.c` — decoder; `mobi_flush` (1753), `mobi_seed_refs` (after it, unused), decode ref/null path (1360-1363), frame-type bit (1668).
