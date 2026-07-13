@@ -26,7 +26,9 @@ extern int    mobi_opt;
 #define TEXH 256
 #define VW   400
 #define VH   240
-#define NBUF 32                 /* decode-ahead ring (pairs) -- backlog is the main buffer now */
+#define NBUF 40                 /* decoded-ahead ring (pairs). This is the REAL action cushion: filled when
+                                 * decode outpaces present in calm scenes, drained during action. Each pair =
+                                 * 2 textures x 256KB, so it's RAM-capped (~AWB16k+NBUF32 already OOM'd). */
 #define AWB  256                /* audio wavebufs -- deep read-ahead so the next keyframe is buffered */
 #define ABUF (8 * 1024)         /* max samples/ch per audio packet (real packets ~2k; 8k = safe + small) */
 
@@ -241,7 +243,7 @@ int main(void) {
              * skip -- decode in order (show motion, slightly behind) until audio reaches it. */
             int apos_pair = (g_apos >= 0) ? (int)(g_apos / pair_dur) : -1;
             while (g_kfpc > 0 && g_kfp[g_kfph] < (int)dpair) { g_kfph = (g_kfph + 1) % KFPN; g_kfpc--; }
-            while (g_kfpc >= 2 && apos_pair >= 0 && g_kfp[(g_kfph + 1) % KFPN] <= apos_pair) { g_kfph = (g_kfph + 1) % KFPN; g_kfpc--; }
+            /* target = NEAREST keyframe ahead (small catch-up -> short freeze), not the farthest. */
             int target  = (g_kfpc > 0) ? g_kfp[g_kfph] : -1;
             int canskip = (apos_pair >= 0) && (target > (int)dpair) && (target <= apos_pair);
             /* FLUSH-based resync (clean picture, brief freeze -- the trade you preferred). Skip-with-flush
@@ -252,7 +254,7 @@ int main(void) {
              * looser sync. */
             (void)just_resynced;
             int drift = (apos_pair >= 0) ? apos_pair - (int)dpair : 0;   /* pairs the video is behind audio */
-            const int DRIFT_MAX = 24;                                    /* ~1s: only then is a freeze worth it */
+            const int DRIFT_MAX = 6;                                     /* ~0.25s: resync early+often -> short freezes */
             if (!skipping && canskip && drift > DRIFT_MAX) skipping = 1;
             if (skipping && (int)dpair >= target) { skipping = 0; mobi_flush(&ctx); }   /* clean freeze, not artifacts */
             if (skipping) {
