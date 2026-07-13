@@ -85,11 +85,22 @@ static void audio_close(void) {
 #define VQN 512
 static uint8_t *g_vq[VQN]; static int g_vqsz[VQN]; static uint8_t g_vqkf[VQN];
 static int g_vqh = 0, g_vqt = 0, g_vqn = 0, g_vqkfn = 0;   /* g_vqkfn = keyframe packets buffered */
+/* buffered keyframe PAIR-positions (so we can skip to a keyframe at/before the audio clock, never past
+ * it -- skipping past causes a freeze while present waits for audio to reach the future keyframe). */
+#define KFPN 256
+static int g_kfp[KFPN]; static int g_kfph = 0, g_kfpt = 0, g_kfpc = 0;
+static int g_pushv = 0;   /* video packets pushed to the backlog (pair index = /2) */
+static void kfp_enq(int pos) {
+    if (g_kfpc >= KFPN) { g_kfph = (g_kfph + 1) % KFPN; g_kfpc--; }   /* drop oldest */
+    g_kfp[g_kfpt] = pos; g_kfpt = (g_kfpt + 1) % KFPN; g_kfpc++;
+}
 static int vq_push(const uint8_t *d, int n, int kf) {
     if (g_vqn >= VQN) return 0;
     uint8_t *p = (uint8_t *)malloc(n); if (!p) return 0;
     memcpy(p, d, n); g_vq[g_vqt] = p; g_vqsz[g_vqt] = n; g_vqkf[g_vqt] = kf;
     g_vqt = (g_vqt + 1) % VQN; g_vqn++; if (kf) g_vqkfn++;
+    if (kf && (g_pushv & 1) == 0) kfp_enq(g_pushv / 2);   /* keyframe on a left eye -> record its pair pos */
+    g_pushv++;
     return 1;
 }
 static uint8_t *vq_pop(int *n) {
@@ -223,18 +234,19 @@ int main(void) {
          *      can't drift; video jumps forward to stay locked to audio. rts[] carries each ringed
          *      pair's true content-time so present stays correct across the gaps left by drops. ---- */
         if (g_vqn >= 2 && (wr - rd) < NBUF - 1) {
-            int64_t ptime = dpair * pair_dur;
-            int behind   = (g_apos >= 0) && (ptime + 500000 < g_apos);
-            int head_kf  = g_vqkf[g_vqh];
-            int kf_ahead = g_vqkfn > (head_kf ? 1 : 0);   /* a keyframe is buffered strictly ahead */
-            /* Skip toward a keyframe ONLY if one is already buffered -- otherwise dropping just empties
-             * the backlog and freezes waiting for it. Enter/continue skip only while kf_ahead; the moment
-             * no keyframe is buffered, decode the head pair instead (show motion, never a still freeze). */
-            if (!skipping && behind && !head_kf && kf_ahead) skipping = 1;
-            if (skipping && head_kf) { skipping = 0; mobi_flush(&ctx); }   /* reached it -> decode keyframe */
-            else if (skipping && !kf_ahead) skipping = 0;                  /* lost it -> fall back to decode */
+            /* CATCH-UP: skip forward to the LATEST buffered keyframe that is at/before the audio clock,
+             * so video re-locks without OVERSHOOTING (a keyframe past the audio clock would freeze the
+             * picture until audio caught up to it). If the next keyframe is still in the future, don't
+             * skip -- decode in order (show motion, slightly behind) until audio reaches it. */
+            int apos_pair = (g_apos >= 0) ? (int)(g_apos / pair_dur) : -1;
+            while (g_kfpc > 0 && g_kfp[g_kfph] < (int)dpair) { g_kfph = (g_kfph + 1) % KFPN; g_kfpc--; }
+            while (g_kfpc >= 2 && apos_pair >= 0 && g_kfp[(g_kfph + 1) % KFPN] <= apos_pair) { g_kfph = (g_kfph + 1) % KFPN; g_kfpc--; }
+            int target  = (g_kfpc > 0) ? g_kfp[g_kfph] : -1;
+            int canskip = (apos_pair >= 0) && (target > (int)dpair) && (target <= apos_pair);
+            if (!skipping && canskip && target >= (int)dpair + 2) skipping = 1;
+            if (skipping && (int)dpair >= target) { skipping = 0; mobi_flush(&ctx); }   /* reached keyframe -> decode */
             if (skipping) {
-                int n; free(vq_pop(&n)); if (g_vqn > 0) free(vq_pop(&n));   /* race to the buffered keyframe */
+                int n; free(vq_pop(&n)); if (g_vqn > 0) free(vq_pop(&n));   /* drop toward the target keyframe */
                 dpair++; dropped++;
             } else {
                 int fill = wr % NBUF, n, got; uint8_t *p; AVPacket ap;
@@ -247,7 +259,7 @@ int main(void) {
                 dec_ticks += svcGetSystemTick() - _dt; dec_frames += 2;
                 if (okL && okR) {
                     y2r_wait(&texL[fill]); y2r_start(fR, &texR[fill]); y2r_wait(&texR[fill]);
-                    rts[fill] = ptime; ready[fill] = 1; wr++;
+                    rts[fill] = dpair * pair_dur; ready[fill] = 1; wr++;   /* this pair's content-time */
                 } else if (okL) { y2r_wait(&texL[fill]); }
                 dpair++;
             }
