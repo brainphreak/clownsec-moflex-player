@@ -1779,5 +1779,19 @@ int  mobi_init(AVCodecContext *avctx)  { return mobiclip_init(avctx); }
 int  mobi_decode(AVCodecContext *avctx, AVFrame *frame, int *got, AVPacket *pkt)
                                        { return mobiclip_decode(avctx, frame, got, pkt); }
 void mobi_flush(AVCodecContext *avctx) { mobiclip_flush(avctx); }
+/* After a skip+resync, point every reference slot at the just-decoded keyframe. Post-skip P-frames then
+ * reference valid recent keyframe content (not stale frames -> no ghosting; not null -> no decode error/
+ * freeze). ff_reget_buffer is copy-on-write, so slots reused for later frames won't corrupt the keyframe. */
+void mobi_seed_refs(AVCodecContext *avctx)
+{
+    MobiClipContext *s = avctx->priv_data;
+    int cur = (s->current_pic + 5) % 6;   /* current_pic advanced past the just-decoded frame */
+    if (!s->pic[cur] || !s->pic[cur]->data[0]) return;
+    for (int i = 0; i < 6; i++) {
+        if (i == cur) continue;
+        av_frame_unref(s->pic[i]);
+        av_frame_ref(s->pic[i], s->pic[cur]);
+    }
+}
 int  mobi_close(AVCodecContext *avctx) { return mobiclip_close(avctx); }
 size_t mobi_ctx_size(void) { return sizeof(MobiClipContext); }
