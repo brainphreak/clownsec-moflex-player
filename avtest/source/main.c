@@ -243,7 +243,11 @@ int main(void) {
             while (g_kfpc >= 2 && apos_pair >= 0 && g_kfp[(g_kfph + 1) % KFPN] <= apos_pair) { g_kfph = (g_kfph + 1) % KFPN; g_kfpc--; }
             int target  = (g_kfpc > 0) ? g_kfp[g_kfph] : -1;
             int canskip = (apos_pair >= 0) && (target > (int)dpair) && (target <= apos_pair);
-            if (!skipping && canskip && target >= (int)dpair + 2) skipping = 1;
+            (void)canskip; (void)target;
+            /* SKIP DISABLED (diagnostic): decode strictly in order so the reference chain is always
+             * intact -> decode always produces a frame -> present always has the latest to show ->
+             * the picture can never freeze. Video just runs behind on heavy action (drift), no hangs. */
+            if (0 && !skipping && canskip && target >= (int)dpair + 2) skipping = 1;
             if (skipping && (int)dpair >= target) { skipping = 0; mobi_flush(&ctx); }   /* reached keyframe -> decode */
             if (skipping) {
                 int n; free(vq_pop(&n)); if (g_vqn > 0) free(vq_pop(&n));   /* drop toward the target keyframe */
