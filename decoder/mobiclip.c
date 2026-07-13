@@ -1779,5 +1779,26 @@ int  mobi_init(AVCodecContext *avctx)  { return mobiclip_init(avctx); }
 int  mobi_decode(AVCodecContext *avctx, AVFrame *frame, int *got, AVPacket *pkt)
                                        { return mobiclip_decode(avctx, frame, got, pkt); }
 void mobi_flush(AVCodecContext *avctx) { mobiclip_flush(avctx); }
+/* After a skip+resync, DEEP-COPY the just-decoded keyframe into every other reference slot (each keeps its
+ * OWN buffer via ff_reget_buffer -- NOT av_frame_ref, which is a shallow pointer-share here and makes the
+ * decoder decode into the shared buffer -> corruption/UAF crash). Post-skip P-frames then reference valid
+ * recent keyframe content instead of stale frames -> no ghosting; non-null -> no freeze. */
+void mobi_seed_refs(AVCodecContext *avctx)
+{
+    MobiClipContext *s = avctx->priv_data;
+    int cur = (s->current_pic + 5) % 6;               /* current_pic already advanced past the decode */
+    AVFrame *src = s->pic[cur];
+    if (!src || !src->data[0]) return;
+    int w = avctx->width, h = avctx->height, cw = w / 2, ch = h / 2;
+    for (int i = 0; i < 6; i++) {
+        if (i == cur) continue;
+        AVFrame *d = s->pic[i];
+        if (ff_reget_buffer(avctx, d, 0) < 0) continue;   /* d gets its own correctly-sized buffer */
+        memcpy(d->data[0], src->data[0], (size_t)w  * h);
+        memcpy(d->data[1], src->data[1], (size_t)cw * ch);
+        memcpy(d->data[2], src->data[2], (size_t)cw * ch);
+        d->pict_type = src->pict_type; d->flags = src->flags;
+    }
+}
 int  mobi_close(AVCodecContext *avctx) { return mobiclip_close(avctx); }
 size_t mobi_ctx_size(void) { return sizeof(MobiClipContext); }

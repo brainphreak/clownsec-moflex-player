@@ -18,6 +18,7 @@
 extern int    mobi_init(AVCodecContext *);
 extern int    mobi_decode(AVCodecContext *, AVFrame *, int *, AVPacket *);
 extern void   mobi_flush(AVCodecContext *);
+extern void   mobi_seed_refs(AVCodecContext *);
 extern size_t mobi_ctx_size(void);
 extern int    mobi_opt;
 
@@ -205,7 +206,7 @@ int main(void) {
     /* decode-ahead ring state + one pending packet (held when its target buffer is full) */
     int wr = 0, rd = 0, ready[NBUF]; int64_t rts[NBUF], vpts = 0;   /* rts = each ring slot's content-time */
     memset(ready, 0, sizeof ready);
-    int done = 0, has_pending = 0, skipping = 0, dropped = 0, gated = 0;
+    int done = 0, has_pending = 0, skipping = 0, dropped = 0, gated = 0, just_resynced = 0;
     int64_t dpair = 0;   /* decoder content position in pairs (advances on decode AND drop) */
     const int PRIME = 12;   /* pre-roll this many pairs before starting audio (kept small: pre-roll must
                              * finish before the paused audio bank fills and Phase 1 stops reading) */
@@ -244,11 +245,10 @@ int main(void) {
             int target  = (g_kfpc > 0) ? g_kfp[g_kfph] : -1;
             int canskip = (apos_pair >= 0) && (target > (int)dpair) && (target <= apos_pair);
             if (!skipping && canskip && target >= (int)dpair + 2) skipping = 1;
-            /* reached the keyframe -> stop skipping and decode it. NO mobi_flush: flush nulls the whole
-             * reference pool, and the P-frames right after the keyframe that reference a flushed slot hit
-             * the null-data path -> decode ERROR -> no frame -> the ring empties -> multi-second FREEZE.
-             * Leaving the pool populated makes those references merely STALE -> a brief glitch, not a hang. */
-            if (skipping && (int)dpair >= target) skipping = 0;
+            /* reached the keyframe -> stop skipping; decode it, then DEEP-COPY it into the ref pool
+             * (mobi_seed_refs, below) so post-skip P-frames reference valid keyframe content: no ghosting
+             * (not stale) and no freeze (not null). NO mobi_flush -- that nulls the pool -> decode error. */
+            if (skipping && (int)dpair >= target) { skipping = 0; just_resynced = 1; }
             if (skipping) {
                 int n; free(vq_pop(&n)); if (g_vqn > 0) free(vq_pop(&n));   /* drop toward the target keyframe */
                 dpair++; dropped++;
@@ -257,6 +257,7 @@ int main(void) {
                 u64 _dt = svcGetSystemTick();
                 p = vq_pop(&n); ap.data = p; ap.size = n; got = 0;
                 int okL = (mobi_decode(&ctx, fL, &got, &ap) >= 0 && got); free(p);
+                if (okL && just_resynced) { mobi_seed_refs(&ctx); just_resynced = 0; }   /* refs -> keyframe */
                 if (okL) y2r_start(fL, &texL[fill]);                        /* overlap Y2R(L) w/ decode(R) */
                 p = vq_pop(&n); ap.data = p; ap.size = n; got = 0;
                 int okR = (mobi_decode(&ctx, fR, &got, &ap) >= 0 && got); free(p);
