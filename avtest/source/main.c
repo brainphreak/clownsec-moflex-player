@@ -25,8 +25,8 @@ extern int    mobi_opt;
 #define TEXH 256
 #define VW   400
 #define VH   240
-#define NBUF 40                 /* decode-ahead ring (pairs) -- deeper = more cushion for hard scenes */
-#define AWB  128                /* audio wavebufs -- banks audio ahead so hard scenes don't underrun */
+#define NBUF 32                 /* decode-ahead ring (pairs) -- backlog is the main buffer now */
+#define AWB  256                /* audio wavebufs -- deep read-ahead so the next keyframe is buffered */
 #define ABUF (16 * 1024)        /* max samples/ch per audio packet */
 
 /* ---- SINGLE-DEMUX audio: TWO demuxers reading the same file thrash the SD (each seeks to a
@@ -82,19 +82,21 @@ static void audio_close(void) {
 
 /* ---- compressed-video BACKLOG (+ keyframe flag). Phase 1 stashes video here while feeding audio
  * ahead; Phase 2 drains it, dropping whole GOPs to the next keyframe when it falls behind. ---- */
-#define VQN 256
+#define VQN 512
 static uint8_t *g_vq[VQN]; static int g_vqsz[VQN]; static uint8_t g_vqkf[VQN];
-static int g_vqh = 0, g_vqt = 0, g_vqn = 0;
+static int g_vqh = 0, g_vqt = 0, g_vqn = 0, g_vqkfn = 0;   /* g_vqkfn = keyframe packets buffered */
 static int vq_push(const uint8_t *d, int n, int kf) {
     if (g_vqn >= VQN) return 0;
     uint8_t *p = (uint8_t *)malloc(n); if (!p) return 0;
     memcpy(p, d, n); g_vq[g_vqt] = p; g_vqsz[g_vqt] = n; g_vqkf[g_vqt] = kf;
-    g_vqt = (g_vqt + 1) % VQN; g_vqn++;
+    g_vqt = (g_vqt + 1) % VQN; g_vqn++; if (kf) g_vqkfn++;
     return 1;
 }
 static uint8_t *vq_pop(int *n) {
     if (g_vqn <= 0) return NULL;
-    uint8_t *p = g_vq[g_vqh]; *n = g_vqsz[g_vqh]; g_vqh = (g_vqh + 1) % VQN; g_vqn--;
+    uint8_t *p = g_vq[g_vqh]; *n = g_vqsz[g_vqh];
+    if (g_vqkf[g_vqh]) g_vqkfn--;
+    g_vqh = (g_vqh + 1) % VQN; g_vqn--;
     return p;
 }
 
@@ -222,12 +224,17 @@ int main(void) {
          *      pair's true content-time so present stays correct across the gaps left by drops. ---- */
         if (g_vqn >= 2 && (wr - rd) < NBUF - 1) {
             int64_t ptime = dpair * pair_dur;
-            int behind  = (g_apos >= 0) && (ptime + 500000 < g_apos);
-            int head_kf = g_vqkf[g_vqh];
-            if (!skipping && behind && !head_kf) skipping = 1;
-            if (skipping && head_kf) { skipping = 0; mobi_flush(&ctx); }
+            int behind   = (g_apos >= 0) && (ptime + 500000 < g_apos);
+            int head_kf  = g_vqkf[g_vqh];
+            int kf_ahead = g_vqkfn > (head_kf ? 1 : 0);   /* a keyframe is buffered strictly ahead */
+            /* Skip toward a keyframe ONLY if one is already buffered -- otherwise dropping just empties
+             * the backlog and freezes waiting for it. Enter/continue skip only while kf_ahead; the moment
+             * no keyframe is buffered, decode the head pair instead (show motion, never a still freeze). */
+            if (!skipping && behind && !head_kf && kf_ahead) skipping = 1;
+            if (skipping && head_kf) { skipping = 0; mobi_flush(&ctx); }   /* reached it -> decode keyframe */
+            else if (skipping && !kf_ahead) skipping = 0;                  /* lost it -> fall back to decode */
             if (skipping) {
-                int n; free(vq_pop(&n)); if (g_vqn > 0) free(vq_pop(&n));   /* drop a whole pair */
+                int n; free(vq_pop(&n)); if (g_vqn > 0) free(vq_pop(&n));   /* race to the buffered keyframe */
                 dpair++; dropped++;
             } else {
                 int fill = wr % NBUF, n, got; uint8_t *p; AVPacket ap;
@@ -268,8 +275,8 @@ int main(void) {
             dec_ticks = 0; dec_frames = 0;   /* d = raw decode pairs/sec (>=24 => render/bank-bound; <24 => decode wall) */
             int64_t apos = g_apos;
             int e = (apos >= 0) ? (int)(vpts - apos) / 1000 : 0;   /* last-presented content-time vs audio */
-            printf("\x1b[4;0Hd%3d (>=24 ok) drop%d\x1b[5;0Hfps%5.1f  q%2d  e%5dms  apos%lldms   \n",
-                   dfps, dropped,
+            printf("\x1b[4;0Hd%3d drop%d bk%d kf%d   \x1b[5;0Hfps%5.1f  q%2d  e%5dms  apos%lldms   \n",
+                   dfps, dropped, g_vqn, g_vqkfn,
                    fps, wr - rd, e, (long long)(apos / 1000));
         }
     }
