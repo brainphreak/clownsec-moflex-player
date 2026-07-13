@@ -3,8 +3,16 @@
 ## Goal
 Play 3D (frame-interleaved L/R) `.moflex` video **smoothly on Old 3DS** with **smooth, in-sync, non-stuttering audio** — matching the official player. The engine is being proven in an isolated test harness (`avtest/`) with NO player UI, then will be ported into the real player's Old-3DS-3D path (`playback/moflex_playback.c` → `moflex_play_gpu`).
 
+## BEST BUILD = `ba25f3f` (reverted to it; in ~/Downloads)
+> **YUV-ring (`f85ee41`) was WORSE and is reverted.** Storing decoded frames as YUV and doing Y2R at
+> display added per-frame overhead (memcpy ~288KB/pair at decode + 2 Y2R+waits per present instead of
+> overlapped-at-decode) that ate the scarce throughput → LONGER pauses appearing where it was smooth.
+> The deeper cushion didn't pay for the lost headroom. **Do not revisit the YUV-ring** unless the
+> memcpy/Y2R cost is first proven negligible. Best build stays the texture ring (NBUF=40, Y2R overlapped
+> at decode).
+
 ## TEST BUILD RIGHT NOW
-`~/Downloads/moflex_avtest.3dsx` (commit `f85ee41`, the **YUV-ring**). Put a `.moflex` in `sdmc:/` root; it plays the first one. B/START = exit. Bottom screen HUD:
+`~/Downloads/moflex_avtest.3dsx` (commit `ba25f3f`, texture ring). Put a `.moflex` in `sdmc:/` root; it plays the first one. B/START = exit. Bottom screen HUD:
 - `d` = raw decode rate (pairs/sec; **≥24 = keeping up**, dips to ~15 on heavy action = the deficit)
 - `drop` = frames dropped by catch-up skip
 - `bk` = compressed backlog depth, `kf` = keyframes buffered

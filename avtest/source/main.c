@@ -26,9 +26,9 @@ extern int    mobi_opt;
 #define TEXH 256
 #define VW   400
 #define VH   240
-#define NBUF 80                 /* decoded-ahead ring (pairs) = the REAL action cushion. Now YUV in normal
-                                 * heap (144KB/eye) not textures in the linear heap, so it can be much deeper
-                                 * (~3.3s here). Filled when decode outpaces present in calm scenes. */
+#define NBUF 40                 /* decoded-ahead ring (pairs). This is the REAL action cushion: filled when
+                                 * decode outpaces present in calm scenes, drained during action. Each pair =
+                                 * 2 textures x 256KB, so it's RAM-capped (~AWB16k+NBUF32 already OOM'd). */
 #define AWB  256                /* audio wavebufs -- deep read-ahead so the next keyframe is buffered */
 #define ABUF (8 * 1024)         /* max samples/ch per audio packet (real packets ~2k; 8k = safe + small) */
 
@@ -114,13 +114,9 @@ static uint8_t *vq_pop(int *n) {
     return p;
 }
 
-/* ---- video render. The decoded-ahead ring now holds raw YUV in NORMAL heap (144KB/eye) instead of
- * textures in the cramped linear heap (256KB/eye) -> a much deeper cushion. Y2R->texture happens only at
- * DISPLAY time into a tiny ping-pong texture pool. ---- */
-#define YUVSZ (VW * VH + 2 * (VW / 2) * (VH / 2))   /* 144000 bytes per eye */
-static uint8_t *yL[NBUF], *yR[NBUF];                /* decoded-YUV ring (regular RAM) */
-static C3D_Tex dtexL[2], dtexR[2];                  /* display texture pool (ping-pong) */
-static C2D_Image dimgL[2], dimgR[2];
+/* ---- video render (Y2R -> GPU texture -> citro2d), from asmtest ---- */
+static C3D_Tex texL[NBUF], texR[NBUF];
+static C2D_Image imgL[NBUF], imgR[NBUF];
 static Tex3DS_SubTexture sub = { VW, VH, 0.0f, 1.0f, (float)VW / TEXW, 1.0f - (float)VH / TEXH };
 static Handle y2r_ev;
 static C3D_RenderTarget *topL, *topR;
@@ -139,28 +135,22 @@ static void y2r_setup(void) {
     Y2RU_SetTransferEndInterrupt(true);
     Y2RU_GetTransferEndEvent(&y2r_ev);
 }
-/* copy a decoded AVFrame's YUV planes into a ring buffer (planes are contiguous: linesize == width) */
-static void copy_yuv(AVFrame *f, uint8_t *dst) {
+static void y2r_start(AVFrame *o, C3D_Tex *tex) {
     int cw = VW / 2, ch = VH / 2;
-    memcpy(dst,                     f->data[0], VW * VH);
-    memcpy(dst + VW * VH,           f->data[1], cw * ch);
-    memcpy(dst + VW * VH + cw * ch, f->data[2], cw * ch);
-}
-/* Y2R a ring YUV buffer into a display texture (start + wait; done at present, ~24/sec) */
-static void y2r_yuv(uint8_t *yuv, C3D_Tex *tex) {
-    int cw = VW / 2, ch = VH / 2;
-    GSPGPU_FlushDataCache(yuv, YUVSZ);
-    Y2RU_SetSendingY(yuv,                     VW * VH, VW, 0);
-    Y2RU_SetSendingU(yuv + VW * VH,           cw * ch, cw, 0);
-    Y2RU_SetSendingV(yuv + VW * VH + cw * ch, cw * ch, cw, 0);
+    GSPGPU_FlushDataCache(o->data[0], VW * VH);
+    GSPGPU_FlushDataCache(o->data[1], cw * ch);
+    GSPGPU_FlushDataCache(o->data[2], cw * ch);
+    Y2RU_SetSendingY(o->data[0], VW * VH, VW, 0);
+    Y2RU_SetSendingU(o->data[1], cw * ch, cw, 0);
+    Y2RU_SetSendingV(o->data[2], cw * ch, cw, 0);
     Y2RU_SetReceiving(tex->data, VW * VH * 2, VW * 2 * 8, (TEXW - VW) * 2 * 8);
     svcClearEvent(y2r_ev); Y2RU_StartConversion();
-    svcWaitSynchronization(y2r_ev, 300000000LL); C3D_TexFlush(tex);
 }
-static void draw_present(int db) {
+static void y2r_wait(C3D_Tex *tex) { svcWaitSynchronization(y2r_ev, 300000000LL); C3D_TexFlush(tex); }
+static void draw_present(int b) {
     C3D_FrameBegin(0);
-    C2D_SceneBegin(topL); C2D_DrawImageAt(dimgL[db], 0, 0, 0, NULL, 1, 1);
-    C2D_SceneBegin(topR); C2D_DrawImageAt(dimgR[db], 0, 0, 0, NULL, 1, 1);
+    C2D_SceneBegin(topL); C2D_DrawImageAt(imgL[b], 0, 0, 0, NULL, 1, 1);
+    C2D_SceneBegin(topR); C2D_DrawImageAt(imgR[b], 0, 0, 0, NULL, 1, 1);
     C3D_FrameEnd(0);
 }
 
@@ -180,14 +170,10 @@ int main(void) {
     consoleInit(GFX_BOTTOM, NULL);
     topL = C2D_CreateScreenTarget(GFX_TOP, GFX_LEFT);
     topR = C2D_CreateScreenTarget(GFX_TOP, GFX_RIGHT);
-    for (int i = 0; i < 2; i++) {   /* tiny display texture pool (linear heap); ring itself is YUV in RAM */
-        C3D_TexInit(&dtexL[i], TEXW, TEXH, GPU_RGB565); C3D_TexSetFilter(&dtexL[i], GPU_LINEAR, GPU_LINEAR);
-        C3D_TexInit(&dtexR[i], TEXW, TEXH, GPU_RGB565); C3D_TexSetFilter(&dtexR[i], GPU_LINEAR, GPU_LINEAR);
-        dimgL[i] = (C2D_Image){ &dtexL[i], &sub }; dimgR[i] = (C2D_Image){ &dtexR[i], &sub };
-    }
     for (int i = 0; i < NBUF; i++) {
-        yL[i] = (uint8_t *)malloc(YUVSZ); yR[i] = (uint8_t *)malloc(YUVSZ);
-        if (!yL[i] || !yR[i]) { printf("OOM: reduce NBUF\n"); goto wait; }
+        C3D_TexInit(&texL[i], TEXW, TEXH, GPU_RGB565); C3D_TexSetFilter(&texL[i], GPU_LINEAR, GPU_LINEAR);
+        C3D_TexInit(&texR[i], TEXW, TEXH, GPU_RGB565); C3D_TexSetFilter(&texR[i], GPU_LINEAR, GPU_LINEAR);
+        imgL[i] = (C2D_Image){ &texL[i], &sub }; imgR[i] = (C2D_Image){ &texR[i], &sub };
     }
     y2r_setup();
     mobi_opt = 0x1A0E;
@@ -220,7 +206,7 @@ int main(void) {
       if (ai >= 0) audio_setup(m.streams[ai].sample_rate, m.streams[ai].channels); }
 
     /* decode-ahead ring state + one pending packet (held when its target buffer is full) */
-    int wr = 0, rd = 0, db = 0, ready[NBUF]; int64_t rts[NBUF], vpts = 0;   /* rts = ring slot content-time; db = display ping-pong */
+    int wr = 0, rd = 0, ready[NBUF]; int64_t rts[NBUF], vpts = 0;   /* rts = each ring slot's content-time */
     memset(ready, 0, sizeof ready);
     int done = 0, has_pending = 0, skipping = 0, dropped = 0, gated = 0, just_resynced = 0;
     int64_t dpair = 0;   /* decoder content position in pairs (advances on decode AND drop) */
@@ -279,13 +265,14 @@ int main(void) {
                 u64 _dt = svcGetSystemTick();
                 p = vq_pop(&n); ap.data = p; ap.size = n; got = 0;
                 int okL = (mobi_decode(&ctx, fL, &got, &ap) >= 0 && got); free(p);
+                if (okL) y2r_start(fL, &texL[fill]);                        /* overlap Y2R(L) w/ decode(R) */
                 p = vq_pop(&n); ap.data = p; ap.size = n; got = 0;
                 int okR = (mobi_decode(&ctx, fR, &got, &ap) >= 0 && got); free(p);
                 dec_ticks += svcGetSystemTick() - _dt; dec_frames += 2;
-                if (okL && okR) {   /* stash decoded YUV in the ring (Y2R deferred to display time) */
-                    copy_yuv(fL, yL[fill]); copy_yuv(fR, yR[fill]);
+                if (okL && okR) {
+                    y2r_wait(&texL[fill]); y2r_start(fR, &texR[fill]); y2r_wait(&texR[fill]);
                     rts[fill] = dpair * pair_dur; ready[fill] = 1; wr++;   /* this pair's content-time */
-                }
+                } else if (okL) { y2r_wait(&texL[fill]); }
                 dpair++;
             }
         }
@@ -297,11 +284,9 @@ int main(void) {
 
         /* ---- present, audio-master. Drop stale ringed pairs by their true content-time (rts) so video
          *      stays locked to the audio clock. g_apos = -1 until the pre-roll unpauses -> video waits. */
-        while ((wr - rd) > 1 && ready[rd % NBUF] && rts[(rd + 1) % NBUF] <= g_apos) rd++;   /* drop stale (cheap: no Y2R) */
+        while ((wr - rd) > 1 && ready[rd % NBUF] && rts[(rd + 1) % NBUF] <= g_apos) rd++;
         if ((wr - rd) > 0 && ready[rd % NBUF] && g_apos >= rts[rd % NBUF]) {
-            int s = rd % NBUF;
-            y2r_yuv(yL[s], &dtexL[db]); y2r_yuv(yR[s], &dtexR[db]);   /* YUV -> texture only for the shown pair */
-            vpts = rts[s]; draw_present(db); db ^= 1; rd++; shown++;
+            vpts = rts[rd % NBUF]; draw_present(rd % NBUF); rd++; shown++;
         } else if ((wr - rd) == 0 && g_vqn < 2 && done) {
             break;   /* ring + backlog drained + EOF */
         }
