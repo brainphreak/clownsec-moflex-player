@@ -27,7 +27,7 @@ extern int    mobi_opt;
 #define VH   240
 #define NBUF 32                 /* decode-ahead ring (pairs) -- backlog is the main buffer now */
 #define AWB  256                /* audio wavebufs -- deep read-ahead so the next keyframe is buffered */
-#define ABUF (16 * 1024)        /* max samples/ch per audio packet */
+#define ABUF (8 * 1024)         /* max samples/ch per audio packet (real packets ~2k; 8k = safe + small) */
 
 /* ---- SINGLE-DEMUX audio: TWO demuxers reading the same file thrash the SD (each seeks to a
  * different position). So there is ONE demuxer (the video one); its interleaved audio packets are
