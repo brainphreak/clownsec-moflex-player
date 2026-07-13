@@ -244,11 +244,17 @@ int main(void) {
             while (g_kfpc >= 2 && apos_pair >= 0 && g_kfp[(g_kfph + 1) % KFPN] <= apos_pair) { g_kfph = (g_kfph + 1) % KFPN; g_kfpc--; }
             int target  = (g_kfpc > 0) ? g_kfp[g_kfph] : -1;
             int canskip = (apos_pair >= 0) && (target > (int)dpair) && (target <= apos_pair);
-            if (!skipping && canskip && target >= (int)dpair + 2) skipping = 1;
-            /* reached the keyframe -> stop skipping; decode it, then DEEP-COPY it into the ref pool
-             * (mobi_seed_refs, below) so post-skip P-frames reference valid keyframe content: no ghosting
-             * (not stale) and no freeze (not null). NO mobi_flush -- that nulls the pool -> decode error. */
-            if (skipping && (int)dpair >= target) { skipping = 0; just_resynced = 1; }
+            /* FLUSH-based resync (clean picture, brief freeze -- the trade you preferred). Skip-with-flush
+             * gives a CLEAN frozen frame (not corruption): flush nulls the pool so post-resync P-frames
+             * error until a natural keyframe refills it -> the picture holds a clean frame, then recovers.
+             * To make freezes RARER, only resync when we've actually drifted past DRIFT_MAX; between
+             * resyncs the picture just plays clean, a little behind. Higher DRIFT_MAX = fewer freezes but
+             * looser sync. */
+            (void)just_resynced;
+            int drift = (apos_pair >= 0) ? apos_pair - (int)dpair : 0;   /* pairs the video is behind audio */
+            const int DRIFT_MAX = 24;                                    /* ~1s: only then is a freeze worth it */
+            if (!skipping && canskip && drift > DRIFT_MAX) skipping = 1;
+            if (skipping && (int)dpair >= target) { skipping = 0; mobi_flush(&ctx); }   /* clean freeze, not artifacts */
             if (skipping) {
                 int n; free(vq_pop(&n)); if (g_vqn > 0) free(vq_pop(&n));   /* drop toward the target keyframe */
                 dpair++; dropped++;
@@ -257,7 +263,6 @@ int main(void) {
                 u64 _dt = svcGetSystemTick();
                 p = vq_pop(&n); ap.data = p; ap.size = n; got = 0;
                 int okL = (mobi_decode(&ctx, fL, &got, &ap) >= 0 && got); free(p);
-                if (okL && just_resynced) { mobi_seed_refs(&ctx); just_resynced = 0; }   /* refs -> keyframe */
                 if (okL) y2r_start(fL, &texL[fill]);                        /* overlap Y2R(L) w/ decode(R) */
                 p = vq_pop(&n); ap.data = p; ap.size = n; got = 0;
                 int okR = (mobi_decode(&ctx, fR, &got, &ap) >= 0 && got); free(p);
