@@ -128,37 +128,43 @@ static void init_luts(void) {
     for (int i = 0; i < 1024; i++) { int v = i - 256; clamp8[i] = (u8)(v < 0 ? 0 : (v > 255 ? 255 : v)); }
     luts_ready = 1;
 }
-static inline u16 yuv2rgb565(int Y, int U, int V) {
+/* 24-BIT OUTPUT. The top screen used to be RGB565, which gives BLUE ONLY 5 BITS -- 32 levels --
+ * so any smooth gradient could only ever land in ~32 hard steps. That is the banding users see
+ * against the official player, and no colour-space fix can remove it: it is quantisation, not
+ * mapping. (The full-range fix in v1.1 removed the 1.164x stretch that was AMPLIFYING it.)
+ * The 3DS top screen takes GSP_BGR8_OES: 3 bytes per pixel, stored B,G,R -- the same byte order
+ * Y2R's OUTPUT_RGB_24 produces, so the hardware path needs no swizzle. 8 bits per channel = 256
+ * blue levels instead of 32. Costs 50% more framebuffer bandwidth on the blit. */
+static inline void yuv2bgr8(int Y, int U, int V, u8 *px) {
     int y = yl[Y];
-    int r = clamp8[((y + rv[V]) >> 8) + 256];
-    int g = clamp8[((y + gu[U] + gv[V]) >> 8) + 256];
-    int b = clamp8[((y + bu[U]) >> 8) + 256];
-    return (u16)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
+    px[0] = clamp8[((y + bu[U]) >> 8) + 256];               /* B */
+    px[1] = clamp8[((y + gu[U] + gv[V]) >> 8) + 256];       /* G */
+    px[2] = clamp8[((y + rv[V]) >> 8) + 256];               /* R */
 }
 /* Convert+rotate one eye into a specific framebuffer (used by the blit worker). */
-static void blit_to(AVFrame *out, u16 *fb, int W, int H) {
+static void blit_to(AVFrame *out, u8 *fb, int W, int H) {
     if (y2r_video_blit_fb(out, fb, W, H)) return;   /* hardware color conversion */
-    /* software fallback (per-pixel YUV->RGB565 + rotate) */
+    /* software fallback (per-pixel YUV->BGR8 + rotate) */
     const uint8_t *Yp = out->data[0], *Up = out->data[1], *Vp = out->data[2];
     int ys = out->linesize[0], cs = out->linesize[1];
     int w = W < SCR_W ? W : SCR_W, h = H < SCR_H ? H : SCR_H;
     for (int x = 0; x < w; x++) {
-        u16 *col = fb + x * SCR_H;
+        u8 *col = fb + (size_t)x * SCR_H * 3;
         int cx = x >> 1;
         for (int k = 0; k < h; k++) {
             int y = h - 1 - k;
-            col[k] = yuv2rgb565(Yp[y * ys + x], Up[(y >> 1) * cs + cx], Vp[(y >> 1) * cs + cx]);
+            yuv2bgr8(Yp[y * ys + x], Up[(y >> 1) * cs + cx], Vp[(y >> 1) * cs + cx], col + k * 3);
         }
     }
 }
 
 static void blit_eye(AVFrame *out, gfx3dSide_t side, int W, int H) {
-    blit_to(out, (u16 *)gfxGetFramebuffer(GFX_TOP, side, NULL, NULL), W, H);
+    blit_to(out, (u8 *)gfxGetFramebuffer(GFX_TOP, side, NULL, NULL), W, H);
 }
 
 /* ---- blit worker: runs the Y2R+transpose for both eyes on the 2nd CPU core so it
  * overlaps the (slow) MobiClip decode on the main core -> ~doubles Old-3DS throughput. */
-typedef struct { AVFrame *l, *r; u16 *fbl, *fbr; int w, h; } BlitJob;
+typedef struct { AVFrame *l, *r; u8 *fbl, *fbr; int w, h; } BlitJob;
 static volatile int bw_run = 0;
 static LightEvent   bw_start, bw_done;
 static BlitJob      bw_job;
@@ -412,11 +418,22 @@ static void subs_autoload(const char *moviepath) {
     if (subs_load(cand)) { g_sub_on = 1; return; }
 }
 
-/* draw the active cue straight onto the (rotated) TOP framebuffer, both eyes in 3D */
-static void sub_fbpx(u16 *fb, int x, int y, u16 c) {
-    if ((unsigned)x < SCR_W && (unsigned)y < SCR_H) fb[x * SCR_H + (SCR_H - 1 - y)] = c;
+/* draw the active cue straight onto the (rotated) TOP framebuffer, both eyes in 3D.
+ * The top screen is now 24-bit BGR8, so subtitle colours (RGB565 constants shared with the UI)
+ * are expanded to 8 bits per channel and packed B | G<<8 | R<<16 to match sub_fbpx. */
+static inline u32 rgb565_bgr8(u16 c) {
+    u32 r = (u32)(((c >> 11) & 0x1F) * 255 / 31);
+    u32 g = (u32)(((c >> 5)  & 0x3F) * 255 / 63);
+    u32 b = (u32)(( c        & 0x1F) * 255 / 31);
+    return b | (g << 8) | (r << 16);
 }
-static void sub_fbtext(u16 *fb, int x, int y, int sc, u16 col, const char *s) {
+static void sub_fbpx(u8 *fb, int x, int y, u32 c) {
+    if ((unsigned)x < SCR_W && (unsigned)y < SCR_H) {
+        u8 *p = fb + ((size_t)x * SCR_H + (SCR_H - 1 - y)) * 3;
+        p[0] = (u8)(c & 0xFF); p[1] = (u8)((c >> 8) & 0xFF); p[2] = (u8)((c >> 16) & 0xFF);  /* B,G,R */
+    }
+}
+static void sub_fbtext(u8 *fb, int x, int y, int sc, u32 col, const char *s) {
     while (*s) {
         uint32_t cp = u8_next(&s);                          /* one UTF-8 codepoint per glyph */
         const char *g = sub_glyph(cp); if (!g) g = font8x8_basic['?'];   /* no glyph -> '?' */
@@ -428,7 +445,7 @@ static void sub_fbtext(u16 *fb, int x, int y, int sc, u16 col, const char *s) {
         x += 8 * sc;
     }
 }
-static void sub_fbfill(u16 *fb, u16 c) { int n = SCR_W * SCR_H; for (int i = 0; i < n; i++) fb[i] = c; }
+static void sub_fbfill(u8 *fb, u32 c) { int n = SCR_W * SCR_H; for (int i = 0; i < n; i++) sub_fbpx(fb, i / SCR_H, SCR_H - 1 - (i % SCR_H), c); }
 
 #define SUB_MAXLN 4
 #define SUB_LNW  160                        /* line buffer in BYTES (UTF-8: up to 3 per glyph) */
@@ -461,14 +478,14 @@ static int sub_wrap(const char *t, char lines[SUB_MAXLN][SUB_LNW], int maxch) {
     return nl;
 }
 /* draw the wrapped lines centered at cx (white text + a thin black outline, no box) */
-static void sub_draw_lines(u16 *fb, int cx, int y0, char lines[SUB_MAXLN][SUB_LNW], int nl, int sc) {
+static void sub_draw_lines(u8 *fb, int cx, int y0, char lines[SUB_MAXLN][SUB_LNW], int nl, int sc) {
     int lh = 8 * sc + 4;
     for (int i = 0; i < nl; i++) {
         const char *s = lines[i];
         int x = cx - u8_cplen(s) * 8 * sc / 2, y = y0 + i * lh;   /* center by glyph count, not bytes */
         sub_fbtext(fb, x - 1, y, sc, 0, s); sub_fbtext(fb, x + 1, y, sc, 0, s);
         sub_fbtext(fb, x, y - 1, sc, 0, s); sub_fbtext(fb, x, y + 1, sc, 0, s);
-        sub_fbtext(fb, x, y, sc, 0xFFFF, s);
+        sub_fbtext(fb, x, y, sc, 0x00FFFFFF, s);          /* white, B|G|R all 0xFF */
     }
 }
 static void sub_overlay(int is3d, int64_t us) {
@@ -481,7 +498,7 @@ static void sub_overlay(int is3d, int64_t us) {
     int total = nl * (8 * sc + 4);
     int y0 = g_sub_top ? 12 : (SCR_H - 12 - total);
     for (int eye = 0; eye < (is3d ? 2 : 1); eye++) {
-        u16 *fb = (u16 *)gfxGetFramebuffer(GFX_TOP, eye ? GFX_RIGHT : GFX_LEFT, NULL, NULL);
+        u8 *fb = (u8 *)gfxGetFramebuffer(GFX_TOP, eye ? GFX_RIGHT : GFX_LEFT, NULL, NULL);
         int dx = is3d ? ((eye == 0) ? -g_sub_depth : g_sub_depth) : 0;   /* parallax between eyes */
         sub_draw_lines(fb, SCR_W / 2 + dx, y0, lines, nl, sc);
     }
@@ -655,8 +672,8 @@ static void sub_depth_menu(int is3d) {
         }
         /* top: neutral background + the sample caption at the current depth (both eyes) */
         for (int eye = 0; eye < (is3d ? 2 : 1); eye++) {
-            u16 *fb = (u16 *)gfxGetFramebuffer(GFX_TOP, eye ? GFX_RIGHT : GFX_LEFT, NULL, NULL);
-            sub_fbfill(fb, UI_BG2);
+            u8 *fb = (u8 *)gfxGetFramebuffer(GFX_TOP, eye ? GFX_RIGHT : GFX_LEFT, NULL, NULL);
+            sub_fbfill(fb, rgb565_bgr8(UI_BG2));
             int dx = is3d ? ((eye == 0) ? -g_sub_depth : g_sub_depth) : 0;
             sub_draw_lines(fb, SCR_W / 2 + dx, SCR_H - 48, lines, nl, sc);
         }
@@ -1187,8 +1204,8 @@ gdone:
     gspWaitForVBlank(); gspWaitForVBlank();
     C2D_Fini(); C3D_Fini(); y2rExit();
     /* restore the software-UI framebuffer format for the home/browser screens */
-    gfxSetScreenFormat(GFX_TOP, GSP_RGB565_OES);
-    gfxSetScreenFormat(GFX_BOTTOM, GSP_RGB565_OES);
+    gfxSetScreenFormat(GFX_TOP, GSP_BGR8_OES);      /* 24-bit: RGB565 gave blue only 5 bits -> banding */
+    gfxSetScreenFormat(GFX_BOTTOM, GSP_RGB565_OES);   /* UI panel stays 16-bit */
     gfxSet3D(false);
     av_frame_free(&fL); av_frame_free(&fR);
     mobi_close(&ctx); free(ctx.priv_data); mfx_close(&m); fclose(f);
@@ -1273,7 +1290,7 @@ MoflexResult moflex_play(const char *path) {
     AVFrame *setR[2] = { av_frame_alloc(), av_frame_alloc() };
     int cur_set = 0, pair_in_flight = 0;
 
-    gfxSetScreenFormat(GFX_TOP, GSP_RGB565_OES);
+    gfxSetScreenFormat(GFX_TOP, GSP_BGR8_OES);   /* 24-bit video (RGB565 banded the gradients) */
     gfxSetDoubleBuffering(GFX_TOP, true);   /* MUST be on: both eyes go to the back
         buffer and appear together only on gfxSwapBuffers. Single-buffered here would
         make the left eye update before the right (branding_show() turns this off). */
@@ -1354,7 +1371,7 @@ MoflexResult moflex_play(const char *path) {
         g_apt_playing = playing;                       /* keep the hook's resume decision in sync */
         if (g_apt_redraw) {                            /* returned from HOME: re-apply our screen config + repaint */
             g_apt_redraw = 0; dirty = 1;
-            gfxSetScreenFormat(GFX_TOP, GSP_RGB565_OES);
+            gfxSetScreenFormat(GFX_TOP, GSP_BGR8_OES);   /* keep 24-bit after returning from HOME */
             gfxSetDoubleBuffering(GFX_TOP, true);
             gfxSet3D(is3d);
         }
