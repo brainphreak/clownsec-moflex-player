@@ -179,6 +179,10 @@ SystemControlInfo:
     ir: 0x0004013000003302L
     mcu: 0x0004013000001f02L
     mic: 0x0004013000002002L
+    # MVD = the New-3DS hardware H.264 decoder used by the MP4 path. mvd:STD was already in the
+    # service ACL but the SYSMODULE was never declared here -- every other module (dsp/gsp/csnd...)
+    # is. New-3DS-only module, hence the 20 in the title id.
+    mvd: 0x0004013020004102L
     ndm: 0x0004013000002b02L
     news: 0x0004013000003502L
     nim: 0x0004013000002c02L

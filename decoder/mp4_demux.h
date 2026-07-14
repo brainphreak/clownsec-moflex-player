@@ -8,6 +8,19 @@
 #include <stdio.h>
 #include <stdint.h>
 
+/* MVD (the New-3DS hardware video decoder) does H.264 ONLY. Anything else -- HEVC/H.265 (hvc1/hev1),
+ * AV1, VP9, MPEG-4 part 2 -- must be rejected with a message, NOT fed to the hardware. */
+#define MP4_FOURCC(a,b,c,d) (((uint32_t)(a)<<24)|((uint32_t)(b)<<16)|((uint32_t)(c)<<8)|(uint32_t)(d))
+#define MP4_FOURCC_AVC1     MP4_FOURCC('a','v','c','1')
+/* NATIVE frame sizes. The top screen is 400x240; a side-by-side 3D frame is 800x240 = 400x240 per
+ * eye. blit_eye() *can* downscale a larger frame, but doing so wastes MVD decode time and looks
+ * worse than simply encoding at native size -- so anything bigger is refused with a message telling
+ * the user what to encode. (SBS is detected as width >= 800.) */
+#define MP4_MAX_W_2D 400
+#define MP4_MAX_H_2D 240
+#define MP4_MAX_W_3D 800
+#define MP4_MAX_H_3D 240
+
 typedef struct {
     int64_t offset;    /* absolute file offset of the sample */
     uint32_t size;     /* sample size in bytes */
@@ -21,6 +34,7 @@ typedef struct {
     /* ---- video (H.264 / avc1) ---- */
     int      has_video;
     int      width, height;         /* coded dimensions */
+    uint32_t vfourcc;               /* video codec fourcc; only 'avc1' (H.264) is decodable */
     uint32_t v_timescale;           /* ticks per second for v-samples' dts */
     uint8_t  avcc[512];             /* raw avcC payload (holds SPS/PPS) */
     int      avcc_len;

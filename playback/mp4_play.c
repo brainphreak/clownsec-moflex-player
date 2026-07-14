@@ -260,6 +260,42 @@ MoflexResult mp4_play(const char *path) {
     gfxSetScreenFormat(GFX_BOTTOM, GSP_RGB565_OES);
     gfxSetDoubleBuffering(GFX_BOTTOM, false);
 
+    /* VALIDATE BEFORE TOUCHING THE HARDWARE. There was no check at all here: an HEVC (hvc1/hev1) file
+     * matched nothing in the stsd parser, so width/height/avcc_len all stayed 0 and went straight into
+     * mvdstdInit() -- a zero-size linearAlloc and a 0x0 frame handed to the video hardware. That is the
+     * crash. Same for an oversized file: MVD has real limits and we allocate w*h*2 up front. */
+    if (!m.has_video || m.vfourcc != MP4_FOURCC_AVC1) {
+        char msg[96];
+        uint32_t fc = m.vfourcc;
+        if (!m.has_video)
+            snprintf(msg, sizeof msg, "No video track in this MP4.");
+        else
+            snprintf(msg, sizeof msg,
+                     "Video is '%c%c%c%c', not H.264.\nRe-encode with x264 (H.264/AVC).",
+                     (char)(fc >> 24), (char)(fc >> 16), (char)(fc >> 8), (char)fc);
+        mp4_msg(msg);
+        mp4_close(&m); return MOFLEX_QUIT_BACK;
+    }
+    if (m.width <= 0 || m.height <= 0 || m.avcc_len <= 0) {
+        mp4_msg("MP4 video track is missing its H.264 config (avcC).");
+        mp4_close(&m); return MOFLEX_QUIT_BACK;
+    }
+    /* Refuse anything above the NATIVE size for its mode. The player could downscale (blit_eye
+     * aspect-fits any source into 400x240), but that burns MVD decode time and looks worse than a
+     * native encode -- so tell the user what to encode instead of quietly degrading. */
+    {
+        int maxw = sbs ? MP4_MAX_W_3D : MP4_MAX_W_2D;
+        int maxh = sbs ? MP4_MAX_H_3D : MP4_MAX_H_2D;
+        if (m.width > maxw || m.height > maxh) {
+            char msg[128];
+            snprintf(msg, sizeof msg,
+                     "Video is %dx%d - too large.\nEncode 400x240 (2D)\nor 800x240 (3D side-by-side).",
+                     m.width, m.height);
+            mp4_msg(msg);
+            mp4_close(&m); return MOFLEX_QUIT_BACK;
+        }
+    }
+
     if (!mp4_mvd_init(m.width, m.height, m.avcc, m.avcc_len, m.nal_length_size)) {
         mp4_msg("MVD init failed (unsupported H.264 profile/level).");
         mp4_close(&m); return MOFLEX_QUIT_BACK;

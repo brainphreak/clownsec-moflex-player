@@ -19,6 +19,7 @@ typedef struct {
     int width, height;
     uint32_t timescale;
     uint8_t avcc[512]; int avcc_len; int nal_len_size;
+    uint32_t vfourcc;               /* video sample-entry fourcc (0 = none) */
     uint8_t asc[64]; int asc_len; int a_rate, a_channels;
     uint32_t *stts_n, *stts_d; int stts_cnt;
     uint32_t *stsc_first, *stsc_spc; int stsc_cnt;
@@ -65,8 +66,18 @@ static void parse_stsd_mem(const uint8_t *b, int64_t body, int64_t bend, Trak *t
     for (uint32_t i = 0; i < nent && pos + 8 <= bend; i++) {
         uint32_t esz = mu32(b + pos), fmt = mu32(b + pos + 4);
         int64_t eend = pos + (esz ? esz : 8); if (eend > bend) eend = bend;
+        /* Record the video codec fourcc even for formats we CANNOT decode, so the player can say
+         * WHY instead of feeding a 0x0 frame with no SPS/PPS straight into the MVD hardware.
+         * MVD does H.264 only: an HEVC file (hvc1/hev1) used to match nothing here, leaving
+         * width=height=avcc_len=0, which then went into mvdstdInit() and crashed. */
+        if (fmt == BOX('h','v','c','1') || fmt == BOX('h','e','v','1') ||
+            fmt == BOX('a','v','0','1') || fmt == BOX('m','p','4','v') ||
+            fmt == BOX('v','p','0','9') || fmt == BOX('V','P','9','0')) {
+            t->is_video = 1; t->vfourcc = fmt;              /* known video, unsupported codec */
+            if (pos + 8 + 28 <= bend) { t->width = mu16(b + pos + 8 + 24); t->height = mu16(b + pos + 8 + 26); }
+        }
         if (fmt == BOX('a','v','c','1') || fmt == BOX('a','v','c','C')) {
-            t->is_video = 1;
+            t->is_video = 1; t->vfourcc = BOX('a','v','c','1');
             if (pos + 8 + 28 <= bend) { t->width = mu16(b + pos + 8 + 24); t->height = mu16(b + pos + 8 + 26); }
             int64_t cp = pos + 8 + 78;                       /* scan avc1's child boxes for 'avcC' */
             while (cp + 8 <= eend) {
@@ -166,6 +177,7 @@ static void trak_free_tables(Trak *t) {
 static void finalize_trak(Mp4 *m, Trak *t) {
     if (t->is_video && !m->has_video) {
         m->has_video = 1; m->width = t->width; m->height = t->height; m->v_timescale = t->timescale ? t->timescale : 1;
+        m->vfourcc = t->vfourcc;
         memcpy(m->avcc, t->avcc, sizeof m->avcc); m->avcc_len = t->avcc_len; m->nal_length_size = t->nal_len_size ? t->nal_len_size : 4;
         m->vsamples = assemble(t, &m->v_count);
     } else if (t->is_audio && !m->has_audio) {
