@@ -30,7 +30,10 @@ bool y2r_video_init(int w, int h) {
     p.block_alignment      = BLOCK_LINE;                 /* linear, row-major */
     p.input_line_width     = (s16)w;
     p.input_lines          = (s16)h;
-    p.standard_coefficient = COEFFICIENT_ITU_R_BT_601_SCALING;  /* TV range, like the SW blit */
+    /* FULL range, matching the software LUT. The _SCALING variants expand 16..235 -> 0..255; this
+     * content is full-range (luma 0..245, 38% of pixels below 16), so that stretch crushed the
+     * shadows, blew the highlights, and amplified the RGB565 gradient banding. */
+    p.standard_coefficient = COEFFICIENT_ITU_R_BT_601;
     p.alpha                = 0xFF;
     if (R_FAILED(Y2RU_SetConversionParams(&p))) { linearFree(g_out); g_out = NULL; y2rExit(); return false; }
 
