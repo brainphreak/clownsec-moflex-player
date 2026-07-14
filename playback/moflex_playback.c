@@ -113,17 +113,19 @@ static int luts_ready = 0;
 static void init_luts(void) {
     if (luts_ready) return;
     for (int i = 0; i < 256; i++) {
-        /* FULL-RANGE BT.601 (JFIF). This was the TV-range expansion -- 298*(Y-16), i.e. assume luma
-         * lives in 16..235 and stretch it to 0..255 (x1.164). But the content is FULL-RANGE: measured
-         * over decoded frames, luma spans 0..245 and 38% of ALL pixels sit below 16. The expansion was
-         * therefore crushing more than a third of every frame to pure black, blowing the highlights,
-         * and stretching the rest by 1.164x -- which also AMPLIFIES each RGB565 quantisation step and
-         * makes gradient banding worse. That is the reported "worse gradients / lines in the colour"
-         * versus the official player.
-         *   R = Y + 1.402(V-128)   G = Y - 0.344(U-128) - 0.714(V-128)   B = Y + 1.772(U-128)  */
-        yl[i] = 256 * i + 128;
-        rv[i] = 359 * (i - 128); gu[i] = -88 * (i - 128);
-        gv[i] = -183 * (i - 128); bu[i] = 454 * (i - 128);
+        /* TV-RANGE BT.601 (16..235 -> 0..255). The content IS TV-range -- verified by histogramming the
+ * decoded luma with the PADDING BARS EXCLUDED:
+ *     Cash Machine   content 1..246   below 16: 0.10%   above 235: 0.79%
+ *     Freaks & Geeks content 13..232  below 16: 0.00%   above 235: 0.00%
+ * A brief v1.1/v1.2 experiment converted it as FULL-range on the strength of "38% of pixels are
+ * below 16" -- but that 38% was 38.28% at EXACTLY Y=0: the pillarbox padding, which encoders write
+ * as pure black regardless of range. It says nothing about the picture. Treating TV-range video as
+ * full-range lifts the blacks and drops ~14% of the chroma gain, which is the washed-out, low-
+ * contrast look users reported. The real bug was only ever RGB565 banding (fixed separately by the
+ * 24-bit top screen). */
+        yl[i] = 298 * (i - 16) + 128;
+        rv[i] = 409 * (i - 128); gu[i] = -100 * (i - 128);
+        gv[i] = -208 * (i - 128); bu[i] = 516 * (i - 128);
     }
     for (int i = 0; i < 1024; i++) { int v = i - 256; clamp8[i] = (u8)(v < 0 ? 0 : (v > 255 ? 255 : v)); }
     luts_ready = 1;
@@ -821,7 +823,7 @@ static void g_y2r_init(int W, int H) {
     p.input_format = INPUT_YUV420_INDIV_8; p.output_format = OUTPUT_RGB_16_565;
     p.rotation = ROTATION_NONE; p.block_alignment = BLOCK_8_BY_8;
     p.input_line_width = (s16)W; p.input_lines = (s16)H;
-    p.standard_coefficient = COEFFICIENT_ITU_R_BT_601; p.alpha = 0xFF;   /* FULL range (content is 0..255) */
+    p.standard_coefficient = COEFFICIENT_ITU_R_BT_601_SCALING; p.alpha = 0xFF;   /* TV range (content is 16..235) */
     Y2RU_SetConversionParams(&p);
     Y2RU_SetTransferEndInterrupt(true);
     Y2RU_GetTransferEndEvent(&g_y2r_done);
