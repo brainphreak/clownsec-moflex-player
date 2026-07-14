@@ -17,6 +17,7 @@ extern int    mobi_decode(AVCodecContext *, AVFrame *, int *, AVPacket *);
 extern void   mobi_flush(AVCodecContext *);
 extern size_t mobi_ctx_size(void);
 extern int    mobi_opt;
+extern int    mobi_pfd;
 
 #define TEXW 512
 #define TEXH 256
@@ -127,14 +128,17 @@ int main(void) {
     AVFrame *fL = av_frame_alloc(), *fR = av_frame_alloc();
     printf("in-player fps per config\n%.30s\n%d pairs each...\n\n", strrchr(path, '/') + 1, SEG_PAIRS);
 
-    static const struct { const char *name; int opt; } C[6] = {
-        { "0 base        ", 0 },        { "1 ASM-mc      ", 0x100 },
-        { "2 ASM+pf+sk+dc", 0x10E },    { "3 pf+sk+dc    ", 0x0E },
-        { "4 prefetch    ", 8 },        { "5 uhadd-mc(C) ", 16 },
-    };
+    static const struct { const char *name; int opt; int pfd; } C[6] = {
+    { "0 pfd=1 (now) ", 0x5A0E, 1 },     /* today's behaviour: prefetch 1 row ahead */
+    { "1 pfd=2       ", 0x5A0E, 2 },
+    { "2 pfd=3       ", 0x5A0E, 3 },     /* ~3 fills in flight = what the HW allows */
+    { "3 pfd=4       ", 0x5A0E, 4 },
+    { "4 pfd=6       ", 0x5A0E, 6 },
+    { "5 prefetch OFF", 0x5A06, 1 },     /* bit 8 cleared -- the floor */
+};
     int NC = sizeof(C) / sizeof(C[0]);
     double fps[6];
-    for (int i = 0; i < NC; i++) { printf("  %s...\n", C[i].name); fps[i] = run_cfg(fL, fR, C[i].opt); }
+    for (int i = 0; i < NC; i++) { printf("  %s...\n", C[i].name); mobi_pfd = C[i].pfd; fps[i] = run_cfg(fL, fR, C[i].opt); }
 
     printf("\x1b[2J\x1b[Hin-player fps (higher=better)\n\n");
     for (int i = 0; i < NC; i++) printf("%s  %5.1f\n", C[i].name, fps[i]);

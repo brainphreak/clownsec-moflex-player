@@ -49,10 +49,39 @@ uint64_t mobi_stat[8];
 /* runtime optimization switch so one binary can A/B decode paths:
  *   bit 0 = SWAR motion comp   bit 1 = IDCT zero-row skip
  *   bit 2 = DC-only block       bit 3 = cache prefetch (PLD)   bit 4 = UHADD8 motion comp
+ *   bit 0x2000 = burst-prefetch whole ref block  bit 0x4000 = zero only mat[size*size]
  * DEFAULT 0 = stock decode (the shipped app relies on this; the gputest harness sets it per test).
  * Findings: 1 SWAR hurt, 2 idct-skip ~2%, 4 DC-only noise, 8 prefetch helps pure-decode ~5% but
- * REGRESSES in-player (fights Y2R for the memory bus), 16 UHADD8 bit-exact but 0 gain (memory-bound). */
+ * REGRESSES in-player (fights Y2R for the memory bus), 16 UHADD8 bit-exact but 0 gain (memory-bound).
+ *
+ * 0x2000 BURST PREFETCH: TRIED 2026-07-13, MEASURED ON OLD 3DS, **DOES NOT WORK -- DO NOT RETRY.**
+ * Theory was that bit 8's PLDs sit INSIDE the row loop one row ahead (~30 cycles of cover for a
+ * ~100+ cycle FCRAM miss), so hoisting every row's PLD to the top of the block would put several
+ * line fills in flight at once. Bit-exact, but on hardware it is SLOWER than the naive bit 8:
+ * Kung Fury ms/frame base 20.02 / PLD8 alone 19.52 / burst alone 19.79; best 0x1A0E 17.78 vs
+ * best+burst 0x3A06 18.10. Why: PLD on ARM11 is a DROPPABLE hint -- once the line-fill buffer
+ * (~3 entries) is full the remaining ~30 PLDs per block are discarded, yet still cost issue slots,
+ * and they are paid on every block including 4x4s whose row fits in ONE cache line. Motion-comp
+ * prefetch has a hard ceiling of ~2.5% and bit 8 already collects it. Kept only as a negative result. */
 int mobi_opt = 0;
+/* Prefetch distance is FIXED at 1 row. Kept as a global only so the harnesses still link; changing
+ * it does nothing now. MEASURED 2026-07-13 (distance sweep, Kung Fury ms/f): d=1 18.03, d=2 18.14,
+ * d=3 18.25, d=4 18.37, d=6 18.61, prefetch OFF 18.29. MONOTONICALLY WORSE with distance -- and d=6 is
+ * worse than no prefetch at all. Why: 65% of blocks are 4x4, so prefetching 3-6 rows ahead fetches
+ * memory OUTSIDE the block entirely = wasted bus traffic + cache pollution. Motion-comp prefetch is
+ * CLOSED: d=1 is optimal, worth ~1.4% over off, and that is the whole prize.
+ * (Also: making this a runtime variable at all cost ~2% -- a global load + multiply in the inner
+ * loop -- which is why the sites below are back to compile-time constants. Don't re-parameterize it.) */
+int mobi_pfd = 1;
+/* One counter per decoder failure path, so a freeze can be attributed to an EXACT line instead of
+ * guessed at. Indices are assigned in source order; see mobi_err_name() in mobi_entropy.h consumers.
+ * 0/1 qtab  2 asm-entropy  3 coef-pos  4 coef-pos(stock)  5 ?  6/7 intra  8 mv-bounds  9/10 null-ref
+ * 11 pkt-size  12 pframe-coef */
+int mobi_err[16];
+/* substitution tiers actually taken: [0]=forward-walk hit  [1]=any-frame-in-pool  [2]=POOL EMPTY
+ * (referenced the black frame we're building -- this is what makes the picture green). */
+int mobi_sub[3];
+static inline int mobi_fail(int id) { mobi_err[id]++; return AVERROR_INVALIDDATA; }
 #define PF(p) do { if (mobi_opt & 8) __builtin_prefetch((p), 0, 1); } while (0)
 
 /* SWAR (SIMD-within-a-register): process 4 packed bytes per 32-bit op. The >>1 + mask
@@ -376,7 +405,7 @@ static av_cold int mobiclip_init(AVCodecContext *avctx)
 
     if (avctx->width & 15 || avctx->height & 15) {
         av_log(avctx, AV_LOG_ERROR, "width/height not multiple of 16\n");
-        return AVERROR_INVALIDDATA;
+        return mobi_fail(0);
     }
 
     ff_bswapdsp_init(&s->bdsp);
@@ -405,7 +434,7 @@ static int setup_qtables(AVCodecContext *avctx, int64_t quantizer)
     int qx, qy;
 
     if (quantizer < 12 || quantizer > 161)
-        return AVERROR_INVALIDDATA;
+        return mobi_fail(1);
 
     s->quantizer = quantizer;
 
@@ -524,7 +553,15 @@ static int add_coefficients_impl(AVCodecContext *avctx, AVFrame *frame,
 {
     MobiClipContext *s = avctx->priv_data;
     GetBitContext *gb = &s->gb;
-    int mat[64] = { 0 };
+    /* mat[] only ever spans size*size (every access is mat[y*size+x], x,y < size), but the plain
+     * `= {0}` initializer zeroes all 64 ints -- 256 bytes -- even for a 4x4 block that needs 64.
+     * P-frames split 8x8 into four 4x4s (add_pframe_coefficients), so 4x4 is the COMMON block and
+     * three quarters of that zeroing is dead. It is also invisible to the profiler: _te = PROF_NOW()
+     * below starts the entropy bucket AFTER this line, so this cost lands in no bucket at all.
+     * Bit 0x4000 zeroes only the live square. Bit-exact by construction. */
+    int mat[64];
+    if (mobi_opt & 0x4000) memset(mat, 0, (size_t)size * size * sizeof(int));
+    else                   memset(mat, 0, sizeof(mat));
     const uint8_t *ztab = size == 8 ? ff_zigzag_direct : zigzag4x4_tab;
     const int *qtab = s->qtab[size == 8];
     uint8_t *dst = frame->data[plane] + by * frame->linesize[plane] + bx;
@@ -547,7 +584,7 @@ static int add_coefficients_impl(AVCodecContext *avctx, AVFrame *frame,
         int rc = mobi_entropy_asm(&c);
         gb->index = c.index; rowmask = c.rowmask; ac = c.ac;
         colmask = (size == 8) ? 0xFFu : 0x0Fu;   /* asm path doesn't track colmask -> row-sparse = full (safe) */
-        if (rc) return AVERROR_INVALIDDATA;
+        if (rc) return mobi_fail(2);
     } else if (mobi_opt & 0x200) {
         /* --- opt entropy loop (mobi_opt 0x200): hold the bit-reader cache/index in locals across the
          * whole coefficient run and inline get_vlc2 (rl_vlc is a FLAT 12-bit table, max_depth 1 -> one
@@ -596,7 +633,7 @@ static int add_coefficients_impl(AVCodecContext *avctx, AVFrame *frame,
             }
 
             pos += run;
-            if (pos >= size * size) { CLOSE_READER(re, gb); return AVERROR_INVALIDDATA; }
+            if (pos >= size * size) { CLOSE_READER(re, gb); return mobi_fail(3); }
             qval = qtab[pos];
             mat[ztab[pos]] = qval * (unsigned)level;
             rowmask |= 1u << (ztab[pos] / size);
@@ -636,7 +673,7 @@ static int add_coefficients_impl(AVCodecContext *avctx, AVFrame *frame,
 
         pos += run;
         if (pos >= size * size)
-            return AVERROR_INVALIDDATA;
+            return mobi_fail(4);
         qval = qtab[pos];
         mat[ztab[pos]] = qval *(unsigned)level;
         rowmask |= 1u << (ztab[pos] / size);
@@ -746,7 +783,7 @@ static int add_pframe_coefficients(AVCodecContext *avctx, AVFrame *frame,
         }
         return 0;
     } else {
-        return AVERROR_INVALIDDATA;
+        return mobi_fail(5);
     }
 }
 
@@ -1204,7 +1241,7 @@ static int process_block(AVCodecContext *avctx, AVFrame *frame,
 
     tmp = get_ue_golomb_31(gb);
     if ((unsigned)tmp > FF_ARRAY_ELEMS(block4x4_coefficients_tab))
-        return AVERROR_INVALIDDATA;
+        return mobi_fail(6);
 
     if (tmp == 0) {
         if (pmode < 0)
@@ -1239,7 +1276,7 @@ static int decode_macroblock(AVCodecContext *avctx, AVFrame *frame,
     int ret = 0;
 
     if (idx < 0 || idx >= FF_ARRAY_ELEMS(block8x8_coefficients_tab))
-        return AVERROR_INVALIDDATA;
+        return mobi_fail(7);
 
     flags = block8x8_coefficients_tab[idx];
 
@@ -1332,12 +1369,66 @@ static int predict_motion_impl(AVCodecContext *avctx,
         if (sidx < 0)
             sidx += 6;
 
+        /* MISSING-REFERENCE TOLERANCE (bit 0x8000) -- this is what turns a multi-second FREEZE into a
+         * few frames of soft artifacts.
+         *
+         * After a catch-up skip we mobi_flush(), which NULLs the 6-frame reference pool. The resync
+         * keyframe then decodes fine (intra needs no refs), but the P-frames after it still reference
+         * 2..5 frames BACK -- i.e. frames from before the skip, now NULL. A mobiclip "keyframe" is just
+         * the intra bit, NOT a clean IDR, so this is normal and expected.
+         *
+         * Stock behaviour is to fail the whole frame (AVERROR_INVALIDDATA below). That is a CASCADE:
+         * s->current_pic only advances on a SUCCESSFUL decode (see the end of mobiclip_decode), so a
+         * failed frame never fills its own pool slot -- which means the next P-frame finds the same slot
+         * missing and fails too. The pool can never refill, and every P-frame errors out until the next
+         * NATURAL keyframe, seconds away. That is the entire freeze.
+         *
+         * Instead, walk FORWARD (toward current_pic = more recent) to the nearest frame that actually
+         * has pixels and use that. The prediction is wrong only by a small TEMPORAL OFFSET (we use frame
+         * n-1 where the encoder meant n-2), and adjacent frames are nearly identical, so the error is
+         * mild -- unlike seeding every slot with the keyframe (tried before: propagating blur). Crucially
+         * the frame now DECODES, so current_pic advances, the slot fills, and each following frame has one
+         * more valid reference: the substitution count decays to zero within ~5 frames (~0.2s) and decode
+         * is bit-exact again. Never fires in normal playback (no flush => no missing refs), so ordinary
+         * decoding stays bit-identical -- verified on host. */
+        if ((mobi_opt & 0x8000) && !s->pic[sidx]->data[0]) {
+            int probe = sidx, found = -1;
+
+            /* 1st choice: nearest valid frame walking FORWARD toward current_pic (most recent wins,
+             * so the error is the smallest possible temporal offset). */
+            for (int k = 0; k < 5; k++) {
+                probe = (probe + 1) % 6;
+                if (probe == s->current_pic)      /* don't reference the frame we're building */
+                    break;
+                if (s->pic[probe]->data[0]) { found = probe; mobi_sub[0]++; break; }
+            }
+
+            /* 2nd choice: ANY valid frame still in the pool. (The forward walk alone was the bug: it
+             * gave up at current_pic and left sidx on the NULL slot, so err9 fired and the cascade ran
+             * exactly as before -- observed as fail=250 / err9=500 with only drop=4 skips.) */
+            if (found < 0)
+                for (int k = 0; k < 6; k++)
+                    if (k != s->current_pic && s->pic[k]->data[0]) { found = k; mobi_sub[1]++; break; }
+
+            /* Pool COMPLETELY empty -> DO NOT substitute. We used to fall back to the frame being built
+             * (freshly calloc'd, i.e. BLACK) so that the frame would always decode. That is what turned
+             * the picture GREEN: a black frame lands in the pool and every later P-frame references it,
+             * so the blackness propagates until the next natural keyframe. A clean failure is strictly
+             * better than a poisoned reference. Fall through to err9 and let this one frame drop.
+             *
+             * With the caller now only flushing when the next packet is genuinely intra, the pool always
+             * receives a clean keyframe first, so this case should not arise at all -- mobi_sub[2] counts
+             * it so we can see if it ever does. */
+            if (found < 0) { mobi_sub[2]++; }
+            else sidx = found;
+        }
+
         if (index > 0) {
             mv.x = mv.x + (unsigned)get_se_golomb(gb);
             mv.y = mv.y + (unsigned)get_se_golomb(gb);
         }
         if (mv.x >= INT_MAX || mv.y >= INT_MAX)
-            return AVERROR_INVALIDDATA;
+            return mobi_fail(8);
 
         motion[offsetm].x = mv.x;
         motion[offsetm].y = mv.y;
@@ -1361,7 +1452,7 @@ static int predict_motion_impl(AVCodecContext *avctx,
             av_assert0(s->pic[s->current_pic]);
             av_assert0(s->pic[s->current_pic]->data[i]);
             if (!s->pic[sidx]->data[i])
-                return AVERROR_INVALIDDATA;
+                return mobi_fail(9);
 
             method = (mv.x & 1) | ((mv.y & 1) << 1);
             src_linesize = s->pic[sidx]->linesize[i];
@@ -1372,10 +1463,26 @@ static int predict_motion_impl(AVCodecContext *avctx,
                 offsety + (mv.y >> 1) < 0 ||
                 offsetx + width  + (mv.x + 1 >> 1) > fwidth ||
                 offsety + height + (mv.y + 1 >> 1) > fheight)
-                return AVERROR_INVALIDDATA;
+                return mobi_fail(10);
 
             src = s->pic[sidx]->data[i] + offsetx + (mv.x >> 1) +
                            (offsety + (mv.y >> 1)) * src_linesize;
+
+            /* Burst-prefetch the whole reference block before touching it (bit 0x2000).
+             * The per-row PF() below only looks ONE row ahead, so a row's line fill has
+             * just that row's copy loop (~30 cycles) to hide behind while FCRAM needs
+             * ~100+ -- most of the miss stays exposed, which is why PLD only ever bought
+             * ~5%. ARM11's D-cache is non-blocking, so issuing every row's PLD back to
+             * back puts several line fills in flight at once and overlaps the latencies.
+             * height+1 rows and the +width line cover the extra row/column that half-pel
+             * interpolation reads. Prefetch is a pure hint: output stays bit-identical. */
+            if (mobi_opt & 0x2000) {
+                const uint8_t *p = src;
+                for (int y = 0; y <= height; y++, p += src_linesize) {
+                    __builtin_prefetch(p, 0, 1);
+                    __builtin_prefetch(p + width, 0, 1);
+                }
+            }
           if (mobi_opt & 0x100) {                      /* hand-written ARM assembly half-pel */
             int al = (((uintptr_t)src & 3) == 0) && ((width & 3) == 0);
             switch (method) {
@@ -1649,7 +1756,7 @@ static int mobiclip_decode(AVCodecContext *avctx, AVFrame *rframe,
     int ret;
 
     if (avctx->height/16 * (avctx->width/16) * 2 > 8LL*FFALIGN(pkt->size, 2))
-        return AVERROR_INVALIDDATA;
+        return mobi_fail(11);
 
     av_fast_padded_malloc(&s->bitstream, &s->bitstream_size,
                           pkt->size);
@@ -1717,7 +1824,7 @@ static int mobiclip_decode(AVCodecContext *avctx, AVFrame *rframe,
                         return ret;
                     idx2 = get_ue_golomb(gb);
                     if (idx2 >= FF_ARRAY_ELEMS(pframe_block8x8_coefficients_tab))
-                        return AVERROR_INVALIDDATA;
+                        return mobi_fail(12);
                     flags = pframe_block8x8_coefficients_tab[idx2];
 
                     for (int sy = y; sy < y + 16; sy += 8) {

@@ -14,6 +14,7 @@ extern int    mobi_decode(AVCodecContext *, AVFrame *, int *, AVPacket *);
 extern void   mobi_flush(AVCodecContext *);
 extern size_t mobi_ctx_size(void);
 extern int    mobi_opt;
+extern int    mobi_pfd;
 
 #define SEG_FRAC   0.35
 #define SEG_FRAMES 500
@@ -30,13 +31,13 @@ static int find_moflex_list(char paths[][300], int max) {
     closedir(d); return n;
 }
 
-static const struct { const char *name; int opt; } C[6] = {
-    { "0 base        ", 0 },
-    { "1 entropy     ", 0x200 },              /* lazy-refill entropy loop */
-    { "2 col sparse  ", 0x800 },              /* sparse column IDCT  -- must checksum == base */
-    { "3 row+col sprs", 0x1800 },             /* sparse row + column IDCT */
-    { "4 ALL 0x1A0E  ", 0x1A0E },             /* entropy | row+col sparse | pf+sk+dc */
-    { "5 best 0x0E   ", 0x0E },
+static const struct { const char *name; int opt; int pfd; } C[6] = {
+    { "0 pfd=1 (now) ", 0x5A0E, 1 },     /* today's behaviour: prefetch 1 row ahead */
+    { "1 pfd=2       ", 0x5A0E, 2 },
+    { "2 pfd=3       ", 0x5A0E, 3 },     /* ~3 fills in flight = what the HW allows */
+    { "3 pfd=4       ", 0x5A0E, 4 },
+    { "4 pfd=6       ", 0x5A0E, 6 },
+    { "5 prefetch OFF", 0x5A06, 1 },     /* bit 8 cleared -- the floor */
 };
 #define NC ((int)(sizeof(C)/sizeof(C[0])))
 
@@ -84,7 +85,7 @@ static void profile_file(const char *path, AVFrame *fr) {
     const char *bn = strrchr(path, '/'); bn = bn ? bn + 1 : path;
 
     Res res[NC];
-    for (int i = 0; i < NC; i++) res[i] = run_cfg(fr, C[i].opt);
+    for (int i = 0; i < NC; i++) { mobi_pfd = C[i].pfd; res[i] = run_cfg(fr, C[i].opt); }
     printf("\n%.26s\n", bn);
     for (int i = 0; i < NC; i++)
         printf("%s %6.2f %s\n", C[i].name, res[i].tot,
