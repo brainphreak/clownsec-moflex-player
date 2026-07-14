@@ -99,11 +99,8 @@ static int subenc_load(const char *movie) {             /* 0..4, or -1 if none s
     int e = -1; if (fscanf(f, "%d", &e) != 1) e = -1; fclose(f);
     return (e >= 0 && e < 5) ? e : -1;
 }
-static void subenc_save(const char *movie, int enc) {
-    mkdir("sdmc:/moflex_player", 0777); mkdir("sdmc:/moflex_player/resume", 0777);
-    char p[256]; subenc_path(movie, p, sizeof p);
-    FILE *f = fopen(p, "wb"); if (f) { fprintf(f, "%d\n", enc); fclose(f); }
-}
+/* (subenc_save is gone -- the encoding is now written with the rest of the settings by subcfg_save;
+ *  subenc_load stays as the read-side fallback for .enc files written by older builds.) */
 long long moflex_resume_get(const char *path) { return (long long)resume_load(path); }
 
 /* ---- YUV->RGB565 LUTs ---- */
@@ -406,10 +403,58 @@ static const char *subs_active(int64_t us) {
     for (int i = 0; i < g_nsubs; i++) if (u >= g_subs[i].s && u < g_subs[i].e) return g_subs[i].t;
     return NULL;
 }
+/* ---- per-movie subtitle settings ----------------------------------------------------------
+ * Everything the SUBTITLES menu exposes -- on/off, position, size, delay, 3D depth, encoding and
+ * the chosen track -- is stored per movie in .../resume/<key>.sub, so reopening a film restores
+ * exactly what the viewer set last time. (Previously only the encoding persisted, in <key>.enc;
+ * that file is still read as a fallback so existing choices survive the upgrade.) Written once
+ * when the menu closes -- never mid-playback, because an SD write stalls the FS service. */
+static void subcfg_path(const char *movie, char *out, size_t cap) {
+    resume_path(movie, out, cap);                                   /* .../<key>.pos */
+    size_t L = strlen(out);
+    if (L >= 4) snprintf(out + L - 4, cap - (L - 4), ".sub");       /* -> .../<key>.sub */
+}
+static void subcfg_save(const char *movie) {
+    mkdir("sdmc:/moflex_player", 0777); mkdir("sdmc:/moflex_player/resume", 0777);
+    char p[256]; subcfg_path(movie, p, sizeof p);
+    FILE *f = fopen(p, "wb"); if (!f) return;
+    fprintf(f, "1 %d %d %d %d %lld %d\n%s\n", g_sub_on, g_sub_top, g_sub_size, g_sub_depth,
+            (long long)g_sub_off, g_sub_enc, g_sub_file);
+    fclose(f);
+}
+static void subcfg_load(const char *movie) {
+    char p[256]; subcfg_path(movie, p, sizeof p);
+    FILE *f = fopen(p, "rb");
+    if (!f) { int e = subenc_load(movie); if (e >= 0) g_sub_enc = e; return; }   /* pre-.sub: encoding only */
+    int ver = 0, on = 0, top = 0, size = 1, depth = 0, enc = 0; long long off = 0;
+    if (fscanf(f, "%d %d %d %d %d %lld %d", &ver, &on, &top, &size, &depth, &off, &enc) == 7 && ver == 1) {
+        g_sub_on    = !!on;
+        g_sub_top   = !!top;
+        g_sub_size  = (size  >= 1 && size <= 3) ? size : 1;
+        g_sub_depth = depth < -16 ? -16 : (depth > 16 ? 16 : depth);
+        g_sub_off   = (int64_t)off;
+        g_sub_enc   = (enc >= 0 && enc < 5) ? enc : 0;
+        char line[512];
+        if (fgets(line, sizeof line, f)) {                  /* consume the tail of the numbers line */
+            if (fgets(line, sizeof line, f)) {              /* the track path is on its own line */
+                size_t L = strlen(line);
+                while (L && (line[L - 1] == '\n' || line[L - 1] == '\r')) line[--L] = 0;
+                if (L) snprintf(g_sub_file, sizeof g_sub_file, "%s", line);
+            }
+        }
+    }
+    fclose(f);
+}
+
 /* auto-load a matching track at playback start: "<movie>.srt" beside the file, else moviedata/ */
 static void subs_autoload(const char *moviepath) {
     g_nsubs = 0; g_sub_on = 0; g_sub_off = 0; g_sub_file[0] = 0;   /* offset is per-movie */
-    { int e = subenc_load(moviepath); if (e >= 0) g_sub_enc = e; }  /* this movie's saved encoding (else keep last-used) */
+    subcfg_load(moviepath);   /* this movie's saved settings (else keep last-used) */
+    if (g_sub_file[0]) {      /* the exact track they were watching with -- keeps their on/off choice */
+        char want[512]; snprintf(want, sizeof want, "%s", g_sub_file);   /* subs_load() rewrites g_sub_file */
+        if (subs_load(want)) return;
+        g_sub_file[0] = 0;    /* the saved track is gone -> fall through to the sidecar search */
+    }
     const char *b = strrchr(moviepath, '/'); b = b ? b + 1 : moviepath;
     char stem[256]; snprintf(stem, sizeof stem, "%s", b);
     char *dot = strrchr(stem, '.'); if (dot) *dot = 0;
@@ -744,7 +789,7 @@ static void sub_menu(const char *moviepath, int is3d) {
         if (is3d) { snprintf(i4, sizeof i4, "Depth (3D): %+d", g_sub_depth); items[n] = i4; act[n++] = 4; }
         items[n] = "Load SRT file..."; act[n++] = 5;
         int c = sub_modal("SUBTITLES", items, n, msel);
-        if (c < 0) return;                                   /* B closes the menu */
+        if (c < 0) { subcfg_save(moviepath); return; }        /* B closes the menu -> persist for this movie */
         msel = c;                                            /* stay on this row after the action */
         int a = act[c];
         if (a == 0) { if (g_nsubs > 0) g_sub_on = !g_sub_on; else sub_msg("No subtitles loaded.\nUse 'Load SRT file'."); }
@@ -754,8 +799,8 @@ static void sub_menu(const char *moviepath, int is3d) {
         else if (a == 4) sub_depth_menu(is3d);
         else if (a == 5) sub_load_menu(moviepath);
         else if (a == 6) { g_sub_enc = (g_sub_enc + 1) % 5;   /* re-decode the loaded SRT with the new codepage */
-                           subenc_save(moviepath, g_sub_enc);   /* remember this movie's encoding */
-                           if (g_sub_file[0]) subs_load(g_sub_file); }
+                           if (g_sub_file[0]) { char want[512]; snprintf(want, sizeof want, "%s", g_sub_file);
+                                                subs_load(want); } }   /* saved with the rest when the menu closes */
     }
 }
 
@@ -1345,6 +1390,12 @@ MoflexResult moflex_play(const char *path) {
        two eyes are always the same moment (never a mismatched pair). */
     int vidx = 0, left_ok = 0, left_vidx = -2;
     int playing = 1, dirty = 1, since_panel = 999, vol_dirty = 0;
+    /* Deferred checkpoint. An SD write goes through the FS service and takes hundreds of ms; doing it
+     * straight from the pause handler blocked the loop inside fclose(), so the pause -- and the next
+     * keypress, which hidScanInput() never got to sample -- appeared to hang. Arm it on pause instead
+     * and let the idle branch write it once the paused frame is already on screen. */
+    int save_pend = 0, save_delay = 0;
+    #define SAVE_DELAY_FRAMES 30   /* ~0.5s: a quick pause/unpause never touches the card at all */
     int64_t cur_us = 0, dur_us = m.duration_us;
     int64_t seek_to_us = 0; int want_seek = 0, shold = 0;
     MfxPacket pkt;
@@ -1390,8 +1441,7 @@ MoflexResult moflex_play(const char *path) {
                Left/Right (hold) rewind/FF, Up/Down volume, B back ---- */
         if (kd & KEY_B) { result = MOFLEX_QUIT_BACK; break; }
         if (kd & KEY_A) { playing = !playing; if (have_audio) ndspChnSetPaused(0, !playing); dirty = 1;
-                          if (!playing) { resume_save_us(path, cur_us); last_save = cur_us;
-                                          if (vol_dirty) { vol_save(); vol_dirty = 0; } } }   /* checkpoint + flush volume while stopped (SD write can't stall the read loop) */
+                          save_pend = !playing; save_delay = SAVE_DELAY_FRAMES; }   /* arm only; unpausing disarms it */
         if (kd & KEY_UP)   { int s = (int)(g_vol / 0.25f + 0.0001f); g_vol = (s + 1) * 0.25f; if (g_vol > 4.0f) g_vol = 4.0f; vol_dirty = 1; dirty = 1; }   /* snap up to the 25% grid, capped at 400% */
         if (kd & KEY_DOWN) { int s = (int)(g_vol / 0.25f + 0.9999f); g_vol = (s - 1) * 0.25f; if (g_vol < 0.25f) g_vol = 0.25f; vol_dirty = 1; dirty = 1; }
         {   /* Left/Right seek, hold to keep scrubbing (~30s steps) */
@@ -1432,8 +1482,7 @@ MoflexResult moflex_play(const char *path) {
                     if (!playing) { want_seek = 1; seek_to_us = cur_us; }   /* re-render the frozen frame with the new subtitle */
                 } else if (py >= PLAY_CY - 20 && py <= PLAY_CY + 20) {
                     if (px >= PLAY_CX - 20 && px <= PLAY_CX + 20) { playing = !playing; if (have_audio) ndspChnSetPaused(0, !playing); dirty = 1;
-                          if (!playing) { resume_save_us(path, cur_us); last_save = cur_us;
-                                          if (vol_dirty) { vol_save(); vol_dirty = 0; } } }   /* checkpoint + flush volume while stopped */
+                          save_pend = !playing; save_delay = SAVE_DELAY_FRAMES; }   /* arm only (same as KEY_A) */
                     else if (px >= RW_CX - 18 && px <= RW_CX + 18) { seek_to_us = cur_us - 30000000; want_seek = 1; }
                     else if (px >= FF_CX - 18 && px <= FF_CX + 18) { seek_to_us = cur_us + 30000000; want_seek = 1; }
                 } else if (py >= BTN_Y && py < BTN_Y + BTN_H) {   /* BACK / OPEN / EXIT */
@@ -1536,6 +1585,13 @@ MoflexResult moflex_play(const char *path) {
             }
         } else {
             gspWaitForVBlank();
+            /* paused + idle: the pause is on screen and the decoder is stopped, so the card can take
+             * as long as it likes here without anyone noticing. */
+            if (save_pend && --save_delay <= 0) {
+                if (cur_us != last_save) { resume_save_us(path, cur_us); last_save = cur_us; }
+                if (vol_dirty) { vol_save(); vol_dirty = 0; }
+                save_pend = 0;
+            }
         }
 
         /* ---- panel redraw (throttled; skipped while the bottom screen is dark) ---- */
