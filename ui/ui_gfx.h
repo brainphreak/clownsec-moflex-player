@@ -59,6 +59,10 @@ void theme_save(void);
 
 void ui_begin(gfxScreen_t screen);         /* draw to offscreen for GFX_TOP or GFX_BOTTOM */
 void ui_present(void);                     /* copy offscreen -> that screen's framebuffer */
+void ui_capture(int on);                   /* when on, ui_present() is a no-op: the caller reads ui_pixels()
+                                              itself (used to draw the UI as a citro2d texture instead of the
+                                              framebuffer, which deadlocks against citro2d owning the GPU) */
+const u16 *ui_pixels(void);                /* offscreen buffer; pixel (x,y) is at [x*UI_H + (UI_H-1-y)] */
 int  ui_width(void);                       /* current target width (320 or 400) */
 void ui_clear(u16 c);
 void ui_px(int x, int y, u16 c);

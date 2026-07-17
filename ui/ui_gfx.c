@@ -187,7 +187,12 @@ void ui_begin(gfxScreen_t screen) {
 }
 int ui_width(void) { return g_w; }
 
+static int g_capture = 0;
+void ui_capture(int on) { g_capture = on; }
+const u16 *ui_pixels(void) { return g_buf; }
+
 void ui_present(void) {
+    if (g_capture) return;   /* caller lifts g_buf into a citro2d texture instead (no fb copy) */
     u16 *fb = (u16 *)gfxGetFramebuffer(g_screen, GFX_LEFT, NULL, NULL);
     memcpy(fb, g_buf, (size_t)g_w * UI_H * sizeof(u16));
     gfxFlushBuffers();

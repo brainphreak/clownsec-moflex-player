@@ -1505,6 +1505,12 @@ static void r3_draw_sub(C2D_Text *t, int dx, u32 col, u32 outline) {
 static aptHookCookie g_ring_apt_cookie;
 static volatile int g_ring_apt_audio = 0, g_ring_apt_playing = 1, g_ring_apt_redraw = 0;
 static int g_ring_apt_w = 0, g_ring_apt_h = 0, g_ring_apt_bpp = 2;
+/* The decode thread does Y2R while holding its lock; the hook (main thread) must not y2rExit()
+ * mid-conversion. On suspend it sets g_ring_susp so the worker parks, then briefly takes the lock to
+ * drain any in-flight produce before releasing Y2R. On restore it clears the flag and wakes it. */
+static volatile int g_ring_susp = 0;
+static LightLock  *g_ring_lock  = NULL;   /* &s.lock  when threaded, else NULL (Y2R on main thread) */
+static LightEvent *g_ring_wake  = NULL;   /* &s.wake  when threaded */
 static void mp_ring_apt_hook(APT_HookType hook, void *param) {
     (void)param;
     switch (hook) {
@@ -1514,6 +1520,8 @@ static void mp_ring_apt_hook(APT_HookType hook, void *param) {
              * GPU. Menus don't hold Y2R or gsp::Lcd; keeping them open across the transition
              * hard-locks the GSP (needs a power-off). Release them here, re-acquire on restore. */
             if (g_ring_apt_audio) ndspChnSetPaused(0, true);
+            g_ring_susp = 1;                            /* stop the worker from starting a new Y2R... */
+            if (g_ring_lock) { LightLock_Lock(g_ring_lock); LightLock_Unlock(g_ring_lock); }  /* ...and drain any in flight */
             if (g_screen_off) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; }
             if (g_lcd_ok) gspLcdExit();                 /* release gsp::Lcd (else HOME hard-locks) */
             y2rExit();                                  /* release Y2R for the applet */
@@ -1524,6 +1532,8 @@ static void mp_ring_apt_hook(APT_HookType hook, void *param) {
             g_y2r_init(g_ring_apt_w, g_ring_apt_h, g_ring_apt_bpp);      /* re-acquire Y2R */
             if (g_lcd_ok) gspLcdInit();                                  /* re-acquire gsp::Lcd */
             if (g_ring_apt_audio && g_ring_apt_playing) ndspChnSetPaused(0, false);
+            g_ring_susp = 0;                            /* let the worker produce again */
+            if (g_ring_wake) LightEvent_Signal(g_ring_wake);
             g_ring_apt_redraw = 1;
             break;
         default: break;
@@ -1623,7 +1633,7 @@ static void r3_dec_thread(void *arg) {
     R3S *s = (R3S *)arg;
     while (s->run) {
         LightLock_Lock(&s->lock);
-        int wait = s->paused || (s->wr - s->rd >= s->NB - 1) || (s->done && r3_vqc == 0);
+        int wait = s->paused || g_ring_susp || (s->wr - s->rd >= s->NB - 1) || (s->done && r3_vqc == 0);
         if (!wait) r3_produce(s);
         LightLock_Unlock(&s->lock);
         if (wait) LightEvent_Wait(&s->wake);   /* nothing to do -> sleep until main pokes us */
@@ -1736,7 +1746,12 @@ static MoflexResult moflex_play_ring(const char *path) {
     }
     g_y2r_init(W, H, r3_bpp);
     if (have_audio) { r3_audio_setup(arate, chn); if (!r3_aok) have_audio = 0; }   /* alloc failed -> wall-clock */
-    (void)g_ring_apt_cookie; (void)mp_ring_apt_hook;   /* HOME handled by libctru default (like avtest) */
+    /* Register our suspend hook: the libctru default only saves the GPU, but we also hold Y2R,
+     * gsp::Lcd (moon), and an ndsp channel -- keeping those across a HOME/sleep transition hard-locks
+     * the GSP (needs a power-off). The hook hands them back on suspend and re-acquires on restore. */
+    g_ring_apt_w = W; g_ring_apt_h = H; g_ring_apt_bpp = r3_bpp;
+    g_ring_apt_audio = have_audio; g_ring_apt_playing = 1;
+    aptHook(&g_ring_apt_cookie, mp_ring_apt_hook, NULL);
 
     C2D_TextBuf sbuf = C2D_TextBufNew(256), tmbuf = C2D_TextBufNew(48);
     C2D_Text ttitle, thint, ttime;
@@ -1787,6 +1802,9 @@ static MoflexResult moflex_play_ring(const char *path) {
         dthr = threadCreate(r3_dec_thread, &s, 128 * 1024, dprio - 1, 2, false);   /* free core 2 on New-3DS */
         if (!dthr) threaded = 0;   /* couldn't create the thread -> fall back to inline decode */
     }
+    g_ring_susp = 0;
+    g_ring_lock = threaded ? &s.lock : NULL;   /* the suspend hook drains the worker through these */
+    g_ring_wake = threaded ? &s.wake : NULL;
     #define WORKER_LOCK()   do { if (threaded) LightLock_Lock(&s.lock); } while (0)   /* pause the worker for a seek */
     #define WORKER_UNLOCK() do { if (threaded) { LightLock_Unlock(&s.lock); LightEvent_Signal(&s.wake); } } while (0)
 
@@ -1805,6 +1823,7 @@ static MoflexResult moflex_play_ring(const char *path) {
         hidScanInput();
         u32 kd = hidKeysDown(), kh = hidKeysHeld();
         touchPosition tp; hidTouchRead(&tp);
+        g_ring_apt_playing = playing;   /* so the suspend hook resumes audio only if we were playing */
 
         /* bottom screen dark (moon): the top video keeps playing; the first input just wakes the
          * backlight and is consumed so it doesn't also trigger a control. */
@@ -2008,12 +2027,14 @@ static MoflexResult moflex_play_ring(const char *path) {
         }
     }
     if (!aptMainLoop() && result == MOFLEX_QUIT_BACK) result = MOFLEX_QUIT_EXIT;
+    aptUnhook(&g_ring_apt_cookie);
 
     /* stop + join the decode thread (New-3DS) before freeing anything it uses (demux, decoder, ring) */
     if (threaded) {
-        s.run = 0; s.paused = 0; LightEvent_Signal(&s.wake);
+        s.run = 0; s.paused = 0; g_ring_susp = 0; LightEvent_Signal(&s.wake);
         threadJoin(dthr, UINT64_MAX); threadFree(dthr);
     }
+    g_ring_lock = NULL; g_ring_wake = NULL;   /* s.lock/s.wake go out of scope after this */
 
     if (dur_us > 0 && cur_us >= dur_us - 10000000) resume_clear(path);
     else if (cur_us > 3000000) resume_save_us(path, cur_us);
