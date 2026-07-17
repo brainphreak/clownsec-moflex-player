@@ -962,9 +962,14 @@ static void g_panel(C3D_RenderTarget *bot, C2D_Text *ttitle, C2D_Text *ttime, C2
     if (playing) { C2D_DrawRectSolid(PLAY_CX - 9, PLAY_CY - 13, 0, 6, 26, wht); C2D_DrawRectSolid(PLAY_CX + 3, PLAY_CY - 13, 0, 6, 26, wht); }
     else C2D_DrawTriangle(PLAY_CX - 8, PLAY_CY - 13, wht, PLAY_CX - 8, PLAY_CY + 13, wht, PLAY_CX + 12, PLAY_CY, wht, 0);
 
-    /* volume */
+    /* volume: % label above the vertical slider */
+    static C2D_TextBuf vbuf; if (!vbuf) vbuf = C2D_TextBufNew(16);
+    { char vs[8]; snprintf(vs, sizeof vs, "%d%%", (int)(vol * 100 + 0.5f));
+      C2D_Text tv; C2D_TextBufClear(vbuf); C2D_TextParse(&tv, vbuf, vs); C2D_TextOptimize(&tv);
+      float tw = 0; C2D_TextGetDimensions(&tv, 0.45f, 0.45f, &tw, NULL);
+      C2D_DrawText(&tv, C2D_WithColor, VOL_X + 6 - tw / 2, VOL_Y - 18, 0, 0.45f, 0.45f, wht); }
     C2D_DrawRectSolid(VOL_X, VOL_Y, 0, 12, VOL_H, C2D_Color32(60, 60, 60, 255));
-    C2D_DrawRectSolid(VOL_X, VOL_Y + VOL_H * (1.0f - vol / 4.0f), 0, 12, VOL_H * (vol / 4.0f), wht);
+    C2D_DrawRectSolid(VOL_X, VOL_Y + VOL_H * (1.0f - vol / 4.0f), 0, 12, VOL_H * (vol / 4.0f), neon);
 
     /* CC toggle (glows when subs on) */
     gp_btn(CC_X, CC_Y, CC_W, CC_H, &tCC, g_sub_on ? neon : dim, 0);
@@ -1772,6 +1777,7 @@ static MoflexResult moflex_play_ring(const char *path) {
     const int PRIME = (NB >= 16) ? 8 : (NB > 2 ? NB / 2 : 1);   /* pre-roll depth, clamped to a small ring */
     int64_t cur_us = 0, dur_us = m.duration_us, seek_to_us = 0; int want_seek = 0, shold = 0;
     int scrubbing = 0; int64_t scrub_us = 0;   /* touch-drag on the bar: preview while held, seek on release */
+    int vol_drag = 0;                           /* touch-drag on the volume slider (applies live) */
     int64_t rpos = resume_load(path), last_save = 0;
     if (rpos > 3000000 && (dur_us <= 0 || rpos < dur_us - 10000000)) { seek_to_us = rpos; want_seek = 1; last_save = rpos; }
     int vol_dirty = 0, save_pend = 0, save_delay = 0;
@@ -1853,6 +1859,8 @@ static MoflexResult moflex_play_ring(const char *path) {
             int px = tp.px, py = tp.py;
             if (py >= BAR_Y - 8 && py <= BAR_Y + BAR_H + 8 && px >= BAR_X && px <= BAR_X + BAR_W) {
                 scrubbing = 1;   /* begin drag; the seek fires on release (tracked in the scrub block below) */
+            } else if (px >= VOL_X - 14 && px <= VOL_X + 26 && py >= VOL_Y - 8 && py <= VOL_Y + VOL_H + 8) {
+                vol_drag = 1;    /* begin volume drag; applies live (tracked in the vol block below) */
             } else if (py >= PLAY_CY - 20 && py <= PLAY_CY + 20 && px >= PLAY_CX - 20 && px <= PLAY_CX + 20) {
                 playing = !playing; if (have_audio) ndspChnSetPaused(0, !playing);
                 s.paused = !playing; if (playing) LightEvent_Signal(&s.wake); save_pend = !playing; save_delay = 30;
@@ -1881,6 +1889,18 @@ static MoflexResult moflex_play_ring(const char *path) {
             } else {   /* released -> seek to where they let go and resume playing there */
                 seek_to_us = scrub_us; want_seek = 1; scrubbing = 0;
             }
+        }
+
+        /* ---- touch-drag the vertical volume slider: top = 400%, bottom = 25%, snapped to 25% steps,
+         *      applied live (no release needed). ---- */
+        if (vol_drag) {
+            if (kh & KEY_TOUCH) {
+                float f = 1.0f - (float)(tp.py - VOL_Y) / VOL_H; if (f < 0) f = 0; if (f > 1) f = 1;
+                int st = (int)(f * 4.0f / 0.25f + 0.5f); float nv = st * 0.25f;
+                if (nv < 0.25f) nv = 0.25f; if (nv > 4.0f) nv = 4.0f;
+                if (nv != g_vol) { g_vol = nv; vol_dirty = 1; }
+                dirty = 1;
+            } else vol_drag = 0;
         }
 
         /* ---- seek: pause the worker (own demux+decoder), reset ring/demux/audio, PRIME the landing
