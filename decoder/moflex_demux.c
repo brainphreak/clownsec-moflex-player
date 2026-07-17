@@ -255,7 +255,7 @@ int mfx_seek_frac(MfxDemux *m, double frac) {
  * lands near the target regardless of the nonlinear byte<->time mapping. */
 int mfx_seek_time(MfxDemux *m, int64_t target_us) {
     if (m->duration_us <= 0 || m->file_size <= 0) return mfx_seek_frac(m, 0);
-    if (target_us < 0) target_us = 0;
+    if (target_us <= 0) return mfx_seek_frac(m, 0);   /* seek-to-start: no binary search needed */
     if (target_us > m->duration_us) target_us = m->duration_us;
 
     double lo = 0.0, hi = 0.999, best = 0.0;
@@ -289,7 +289,12 @@ int mfx_detect_stereo(MfxDemux *m) {
     int stereo = 1;
     if (t0 >= 0 && m->ts > t0 && vc > 4) {
         double dfps = (double)vc / ((double)(m->ts - t0) / 1e6);
-        stereo = (dfps / tbfps) > 1.5;      /* ~2x = 3D interleaved, ~1x = 2D */
+        /* Interleaved 3D shows up two ways depending on how the frame rate was declared:
+         *  - our transcodes declare the DISPLAY rate (24-30) -> actual packet rate is ~2x it.
+         *  - Nintendo's files declare the PACKET rate itself (~48-60 = L+R for 24-30fps) -> ratio ~1x,
+         *    but the declared rate is implausibly high for a real display rate on this hardware. */
+        stereo = (dfps / tbfps) > 1.5
+              || (tbfps >= 47.0 && dfps / tbfps > 0.75);   /* declared rate is actually the 2x packet rate */
     }
     /* rewind demux to the start for playback */
     io_seek(m, 0, SEEK_SET);
@@ -354,7 +359,7 @@ int mfx_next_packet(MfxDemux *m, MfxPacket *pkt) {
                 pkt->size = st->acc_size;
                 pkt->pos  = m->pos;
                 if (st->media_type == MFX_TYPE_VIDEO)
-                    pkt->keyframe = (st->acc[0] & 0x80) ? 1 : 0;
+                    pkt->keyframe = (st->acc[1] & 0x80) ? 1 : 0;
                 else
                     pkt->keyframe = 1;
                 st->acc_size = 0;       /* consumed; reuse buffer */
