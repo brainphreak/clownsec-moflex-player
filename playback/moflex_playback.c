@@ -1510,13 +1510,19 @@ static void mp_ring_apt_hook(APT_HookType hook, void *param) {
     switch (hook) {
         case APTHOOK_ONSUSPEND:
         case APTHOOK_ONSLEEP:
+            /* Hand back EVERY video-only hardware resource before the HOME/sleep applet takes the
+             * GPU. Menus don't hold Y2R or gsp::Lcd; keeping them open across the transition
+             * hard-locks the GSP (needs a power-off). Release them here, re-acquire on restore. */
             if (g_ring_apt_audio) ndspChnSetPaused(0, true);
+            if (g_screen_off) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; }
+            if (g_lcd_ok) gspLcdExit();                 /* release gsp::Lcd (else HOME hard-locks) */
             y2rExit();                                  /* release Y2R for the applet */
             gfxSet3D(false);
             break;
         case APTHOOK_ONRESTORE:
         case APTHOOK_ONWAKEUP:
             g_y2r_init(g_ring_apt_w, g_ring_apt_h, g_ring_apt_bpp);      /* re-acquire Y2R */
+            if (g_lcd_ok) gspLcdInit();                                  /* re-acquire gsp::Lcd */
             if (g_ring_apt_audio && g_ring_apt_playing) ndspChnSetPaused(0, false);
             g_ring_apt_redraw = 1;
             break;
@@ -1750,6 +1756,7 @@ static MoflexResult moflex_play_ring(const char *path) {
     int playing = 1, gated = 0, last_shown = -1, dirty = 1;
     const int PRIME = (NB >= 16) ? 8 : (NB > 2 ? NB / 2 : 1);   /* pre-roll depth, clamped to a small ring */
     int64_t cur_us = 0, dur_us = m.duration_us, seek_to_us = 0; int want_seek = 0, shold = 0;
+    int scrubbing = 0; int64_t scrub_us = 0;   /* touch-drag on the bar: preview while held, seek on release */
     int64_t rpos = resume_load(path), last_save = 0;
     if (rpos > 3000000 && (dur_us <= 0 || rpos < dur_us - 10000000)) { seek_to_us = rpos; want_seek = 1; last_save = rpos; }
     int vol_dirty = 0, save_pend = 0, save_delay = 0;
@@ -1826,7 +1833,7 @@ static MoflexResult moflex_play_ring(const char *path) {
         if (kd & KEY_TOUCH) {
             int px = tp.px, py = tp.py;
             if (py >= BAR_Y - 8 && py <= BAR_Y + BAR_H + 8 && px >= BAR_X && px <= BAR_X + BAR_W) {
-                seek_to_us = (int64_t)((double)(px - BAR_X) / BAR_W * (dur_us > 0 ? dur_us : 0)); want_seek = 1;
+                scrubbing = 1;   /* begin drag; the seek fires on release (tracked in the scrub block below) */
             } else if (py >= PLAY_CY - 20 && py <= PLAY_CY + 20 && px >= PLAY_CX - 20 && px <= PLAY_CX + 20) {
                 playing = !playing; if (have_audio) ndspChnSetPaused(0, !playing);
                 s.paused = !playing; if (playing) LightEvent_Signal(&s.wake); save_pend = !playing; save_delay = 30;
@@ -1842,6 +1849,18 @@ static MoflexResult moflex_play_ring(const char *path) {
                 if      (px >= BKB_X && px < BKB_X + BKB_W) { result = MOFLEX_QUIT_BACK; break; }
                 else if (px >= OPB_X && px < OPB_X + OPB_W) { result = MOFLEX_QUIT_OPEN; break; }
                 else if (px >= EXB_X && px < EXB_X + EXB_W) { result = MOFLEX_QUIT_EXIT; break; }
+            }
+        }
+
+        /* ---- touch-drag the progress bar: while the finger is down, track its X into scrub_us and
+         *      show it as a live preview (below); the actual seek fires once, on release. ---- */
+        if (scrubbing) {
+            if (kh & KEY_TOUCH) {
+                int px = tp.px; if (px < BAR_X) px = BAR_X; if (px > BAR_X + BAR_W) px = BAR_X + BAR_W;
+                scrub_us = (int64_t)((double)(px - BAR_X) / BAR_W * (dur_us > 0 ? dur_us : 0));
+                dirty = 1;
+            } else {   /* released -> seek to where they let go and resume playing there */
+                seek_to_us = scrub_us; want_seek = 1; scrubbing = 0;
             }
         }
 
@@ -1922,6 +1941,7 @@ static MoflexResult moflex_play_ring(const char *path) {
         /* ---- draw: video pair (or held frame) + subtitle overlay + bottom panel, one GPU frame ---- */
         int64_t disp_us = (show >= 0) ? bts[show] : (last_shown >= 0 ? last_bts : cur_us);
         if (want_seek && (kh & (KEY_LEFT | KEY_RIGHT))) { disp_us = seek_to_us < 0 ? 0 : seek_to_us; dirty = 1; }  /* preview the accumulating seek target */
+        if (scrubbing) { disp_us = scrub_us; dirty = 1; }   /* preview the dragged position while the finger is down */
         const char *cue = subs_active(disp_us);   /* NULL if subs off or no cue now */
         char tc[16], td[16], ts[64];
         fmt_time(disp_us, tc, sizeof tc);
