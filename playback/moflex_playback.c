@@ -990,6 +990,45 @@ static void g_panel(C3D_RenderTarget *bot, C2D_Text *ttitle, C2D_Text *ttime, C2
     C2D_DrawText(thint, C2D_WithColor, 8, 222, 0, 0.42f, 0.42f, gry);
 }
 
+/* ============ REUSE THE RELEASE PANEL/MENU: draw the app's software UI (panel_draw / sub_menu,
+ * the exact look everyone already knows) onto the bottom screen as a citro2d texture. The UI renders
+ * to an offscreen RGB565 buffer (ui_capture -> ui_pixels); we 8x8-tile that into a texture the same
+ * way Y2R feeds the video textures (BLOCK_8_BY_8), so it lands upright with the shared sub-mapping.
+ * This runs every frame the movie is playing, so subtitle size/depth/etc. preview live. ============ */
+static C3D_Tex g_uitex; static C2D_Image g_uiimg; static int g_uitex_ok = 0;
+static Tex3DS_SubTexture g_uisub;
+static inline u32 r3_tile_off(u32 x, u32 y) {   /* 3DS 8x8 Morton (z-order) offset in a GT_W-wide tex */
+    u32 m = (x & 1) | ((y & 1) << 1) | ((x & 2) << 1) | ((y & 2) << 2) | ((x & 4) << 2) | ((y & 4) << 3);
+    return ((y >> 3) * (GT_W >> 3) + (x >> 3)) * 64 + m;
+}
+static int ui_tex_init(void) {
+    if (g_uitex_ok) return 1;
+    if (!C3D_TexInit(&g_uitex, GT_W, GT_H, GPU_RGB565)) return 0;
+    C3D_TexSetFilter(&g_uitex, GPU_LINEAR, GPU_LINEAR);
+    g_uisub = (Tex3DS_SubTexture){ UI_W, UI_H, 0.0f, 1.0f, (float)UI_W / GT_W, 1.0f - (float)UI_H / GT_H };
+    g_uiimg = (C2D_Image){ &g_uitex, &g_uisub };
+    g_uitex_ok = 1; return 1;
+}
+static void ui_tex_free(void) { if (g_uitex_ok) { C3D_TexDelete(&g_uitex); g_uitex_ok = 0; } }
+
+/* Drop-in for g_panel(): render the release panel to the offscreen buffer, lift it into the texture,
+ * draw it on the bottom. Same layout constants as the touch handler, so the controls still line up. */
+static void g_panel_sw(C3D_RenderTarget *bot, const char *title, int64_t cur, int64_t dur, int playing) {
+    if (!ui_tex_init()) return;
+    ui_capture(1);
+    panel_draw(title, cur, dur, playing);       /* fills g_buf; ui_present() is a no-op under capture */
+    ui_capture(0);
+    const u16 *src = ui_pixels();                /* pixel (x,y) at [x*UI_H + (UI_H-1-y)] (rotated fb) */
+    u16 *dst = (u16 *)g_uitex.data;
+    for (int y = 0; y < UI_H; y++)
+        for (int x = 0; x < UI_W; x++)
+            dst[r3_tile_off(x, y)] = src[x * UI_H + (UI_H - 1 - y)];
+    C3D_TexFlush(&g_uitex);
+    C2D_TargetClear(bot, C2D_Color32(0, 0, 0, 255));
+    C2D_SceneBegin(bot);
+    C2D_DrawImageAt(g_uiimg, 0, 0, 0, NULL, 1, 1);
+}
+
 /* ---- audio worker: runs on core 1, owns ndsp, reads its OWN file handle so it feeds the DSP
  * at real time completely decoupled from the video decode on core 0 (this is what the official
  * player does -- one worker thread -- and why its audio never stutters). ---- */
@@ -1375,10 +1414,9 @@ gdone:
 static ndspWaveBuf r3_wb[R3_AWB]; static int16_t *r3_ab[R3_AWB];
 static int r3_awi, r3_nawb, r3_arate, r3_achn, r3_aok, r3_acnt[R3_AWB];
 static long long r3_aplayed; static int64_t r3_apos;   /* elapsed audible us, -1 = not started */
-static int64_t r3_audio_t0 = -1;   /* content ts of the first audio sample after (re)start -- A/V anchor */
 static u64 r3_last;   /* last poll tick, for the phase-locked clock */
 static void r3_audio_setup(int arate, int chn) {
-    r3_arate = arate; r3_achn = chn; r3_awi = 0; r3_aplayed = 0; r3_apos = -1; r3_last = 0; r3_audio_t0 = -1;
+    r3_arate = arate; r3_achn = chn; r3_awi = 0; r3_aplayed = 0; r3_apos = -1; r3_last = 0;
     ndspChnReset(0); ndspChnSetInterp(0, NDSP_INTERP_POLYPHASE); ndspChnSetRate(0, (float)arate);
     ndspChnSetFormat(0, chn == 2 ? NDSP_FORMAT_STEREO_PCM16 : NDSP_FORMAT_MONO_PCM16);
     float mix[12]; memset(mix, 0, sizeof mix); mix[0] = mix[1] = 1.0f; ndspChnSetMix(0, mix);
@@ -1436,7 +1474,7 @@ static void r3_audio_flush(void) {   /* on seek: drop everything queued, clock o
     if (!r3_aok) return;
     ndspChnWaveBufClear(0);
     for (int i = 0; i < r3_nawb; i++) { r3_wb[i].status = NDSP_WBUF_DONE; r3_acnt[i] = 1; }
-    r3_awi = 0; r3_aplayed = 0; r3_apos = -1; r3_last = 0; r3_audio_t0 = -1;   /* re-anchor on next feed */
+    r3_awi = 0; r3_aplayed = 0; r3_apos = -1; r3_last = 0;
     ndspChnSetPaused(0, true);
 }
 static void r3_audio_close(void) {
@@ -1575,10 +1613,7 @@ static void r3_produce(R3S *s) {
         if (!s->has_pending) { if (mfx_next_packet(s->m, &s->pending) != 1) { s->done = 1; break; } s->has_pending = 1; }
         int mt = s->m->streams[s->pending.stream_index].media_type;
         if (mt == MFX_TYPE_AUDIO && s->have_audio) {
-            if (r3_audio_feed(&s->pending)) {
-                if (r3_audio_t0 < 0) { int64_t at = s->m->ts; r3_audio_t0 = at < 0 ? 0 : at; }  /* first audio content ts */
-                s->has_pending = 0;
-            }
+            if (r3_audio_feed(&s->pending)) s->has_pending = 0;
             else { s->audio_pre_full = 1; break; }        /* bank full: hold packet, let main unpause audio */
         } else if (mt == MFX_TYPE_VIDEO) {
             int64_t vts = s->m->ts; if (vts < 0) vts = 0; if (s->dur_us > 0 && vts > s->dur_us) vts = s->dur_us;
@@ -1976,15 +2011,9 @@ static MoflexResult moflex_play_ring(const char *path) {
         const int64_t VS_HALF = 8356;
         int show = -1;
         if ((wr - rd) > 0 && ready[rd % NB]) {
-            /* A/V anchor: rts is 0-based from the video's landing frame, but the audio actually restarts
-             * at the first audio packet after the seek (content r3_audio_t0), which differs from the video
-             * landing (bts-rts) by up to one packet. Shift apos by that difference so the two share a true
-             * content origin -- otherwise seeks leave audio a little ahead/behind. */
-            int64_t ae = apos;
-            if (have_audio && r3_audio_t0 >= 0) ae += r3_audio_t0 - (bts[rd % NB] - rts[rd % NB]);
-            while ((wr - rd) > 1 && ready[(rd + 1) % NB] && rts[(rd + 1) % NB] <= ae + VS_HALF) { ready[rd % NB] = 0; rd++; }
+            while ((wr - rd) > 1 && ready[(rd + 1) % NB] && rts[(rd + 1) % NB] <= apos + VS_HALF) { ready[rd % NB] = 0; rd++; }
             if (apos < 0) { if (last_shown < 0) show = rd % NB; }             /* pre-roll: show the landing pair */
-            else if (ae + VS_HALF >= rts[rd % NB]) show = rd % NB;
+            else if (apos + VS_HALF >= rts[rd % NB]) show = rd % NB;
         }
 
         /* ---- draw: video pair (or held frame) + subtitle overlay + bottom panel, one GPU frame ---- */
