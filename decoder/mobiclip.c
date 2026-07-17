@@ -42,6 +42,11 @@
 /* 0=intra prediction, 1=intra residual (entropy+IDCT), 2=pframe residual, 3=motion comp */
 uint64_t mobi_prof[8];
 
+/* Ticks spent in recon_execute (the replay/reconstruct pass), summed across decoded frames.
+ * Diagnostic for the cross-frame pipeline: if reconstruct-alone < base fused decode, the pipeline
+ * (parse N+1 || reconstruct N) wins. Set by recon_execute on device; 0 on host. */
+uint64_t mobi_recon_ticks;
+
 /* runtime optimization switch so one binary can A/B decode paths:
  *   bit 0 = SWAR motion comp   bit 1 = IDCT zero-row skip
  *   bit 2 = DC-only block       bit 3 = cache prefetch (PLD)   bit 4 = UHADD8 motion comp
@@ -62,15 +67,66 @@ static inline void     st4(uint8_t *p, uint32_t v) { memcpy(p, &v, 4); }
  * truncated (a>>1)+(b>>1): they differ by 1 only when both bytes are odd, and the UHADD8
  * result is >=1 there, so a plain subtract can't underflow -> bit-identical. */
 static inline uint32_t u8avg(uint32_t a, uint32_t b) {
+#if defined(__arm__)
     uint32_t r;
     __asm__("uhadd8 %0, %1, %2" : "=r"(r) : "r"(a), "r"(b));
     return r - ((a & b) & 0x01010101u);
+#else
+    /* portable host build (bit-identical): truncated per-byte average (a>>1)+(b>>1) */
+    return ((a >> 1) & 0x7F7F7F7Fu) + ((b >> 1) & 0x7F7F7F7Fu);
+#endif
+}
+
+/* ---- ARMv6 media ops for the residual add+clamp (4 pixels/instruction, like the official decoder).
+ * Host builds get bit-identical scalar equivalents so pc_verify still checks the exact output. ---- */
+#if defined(__arm__)
+static inline uint32_t simd_uxtb16(uint32_t a)      { uint32_t r; __asm__("uxtb16 %0,%1"        :"=r"(r):"r"(a)); return r; }
+static inline uint32_t simd_uxtb16_ror8(uint32_t a) { uint32_t r; __asm__("uxtb16 %0,%1,ror #8" :"=r"(r):"r"(a)); return r; }
+static inline uint32_t simd_sadd16(uint32_t a, uint32_t b) { uint32_t r; __asm__("sadd16 %0,%1,%2":"=r"(r):"r"(a),"r"(b)); return r; }
+static inline uint32_t simd_usat16_8(uint32_t a)    { uint32_t r; __asm__("usat16 %0,#8,%1"     :"=r"(r):"r"(a)); return r; }
+#else
+static inline uint32_t simd_uxtb16(uint32_t a)      { return a & 0x00ff00ffu; }
+static inline uint32_t simd_uxtb16_ror8(uint32_t a) { return (a >> 8) & 0x00ff00ffu; }
+static inline uint32_t simd_sadd16(uint32_t a, uint32_t b) {
+    int lo = (int)(int16_t)(a & 0xffff) + (int)(int16_t)(b & 0xffff);
+    int hi = (int)(int16_t)(a >> 16)    + (int)(int16_t)(b >> 16);
+    return ((uint32_t)lo & 0xffff) | ((uint32_t)hi << 16);
+}
+static inline uint32_t simd_usat16_8(uint32_t a) {
+    int lo = (int16_t)(a & 0xffff), hi = (int16_t)(a >> 16);
+    lo = lo < 0 ? 0 : (lo > 255 ? 255 : lo);
+    hi = hi < 0 ? 0 : (hi > 255 ? 255 : hi);
+    return (uint32_t)lo | ((uint32_t)hi << 16);
+}
+#endif
+/* dst[0..3] = clip_u8(dst[0..3] + res[0..3]), 4 pixels at once. res are the (mat>>6) residuals.
+ * Bit-exact with clip_u8(dst + r) as long as each residual fits in a signed 16-bit lane (true for
+ * valid content: pc_verify catches any clip where it doesn't). */
+static inline uint32_t simd_add_clip4(uint32_t d, int r0, int r1, int r2, int r3) {
+    uint32_t re = ((uint32_t)r0 & 0xffff) | ((uint32_t)r2 << 16);   /* lanes 0,2 */
+    uint32_t rh = ((uint32_t)r1 & 0xffff) | ((uint32_t)r3 << 16);   /* lanes 1,3 */
+    uint32_t se = simd_usat16_8(simd_sadd16(simd_uxtb16(d),      re));
+    uint32_t sh = simd_usat16_8(simd_sadd16(simd_uxtb16_ror8(d), rh));
+    return (se & 0xff) | ((sh & 0xff) << 8) | (((se >> 16) & 0xff) << 16) | (((sh >> 16) & 0xff) << 24);
 }
 
 /* hand-written ARM assembly half-pel motion comp (mc_asm.s); aligned src + width%4==0 only. */
+#if defined(__arm__)
 extern void mc_havg_a(uint8_t *dst, const uint8_t *src, int w, int h, int ds, int ss);
 extern void mc_vavg_a(uint8_t *dst, const uint8_t *src, int w, int h, int ds, int ss);
 extern void mc_diag_a(uint8_t *dst, const uint8_t *src, int w, int h, int ds, int ss);
+#else
+/* host verification build has no ARM asm -- faithful scalar equivalents (bit-identical) so the
+ * opt 0x100 path still decodes correctly off-target. */
+static void mc_havg_a(uint8_t *dst, const uint8_t *src, int w, int h, int ds, int ss) {
+    for (int y = 0; y < h; y++) { for (int x = 0; x < w; x++) dst[x] = (uint8_t)((src[x] >> 1) + (src[x + 1] >> 1)); dst += ds; src += ss; } }
+static void mc_vavg_a(uint8_t *dst, const uint8_t *src, int w, int h, int ds, int ss) {
+    for (int y = 0; y < h; y++) { for (int x = 0; x < w; x++) dst[x] = (uint8_t)((src[x] >> 1) + (src[x + ss] >> 1)); dst += ds; src += ss; } }
+static void mc_diag_a(uint8_t *dst, const uint8_t *src, int w, int h, int ds, int ss) {
+    for (int y = 0; y < h; y++) { for (int x = 0; x < w; x++)
+        dst[x] = (uint8_t)((((src[x] >> 1) + (src[x + 1] >> 1)) >> 1) + (((src[x + ss] >> 1) + (src[x + 1 + ss] >> 1)) >> 1));
+        dst += ds; src += ss; } }
+#endif
 
 /* load the 4 bytes at p (any alignment) using only ALIGNED word loads + a barrel shift --
  * no unaligned access (its penalty is what killed the naive SWAR), no memcpy. */
@@ -315,6 +371,32 @@ typedef struct MotionXY {
     int x, y;
 } MotionXY;
 
+/* ---- deferred reconstruction (dual-core). The serial decode reads the bitstream and RECORDS the
+ * per-block PIXEL work as jobs (recon_mode = RECON_RECORD); a second pass REPLAYS the jobs in decode
+ * order (bit-exact single-thread) or splits them across two cores. The intricate bitstream parsing
+ * stays inline and unchanged -- only the final pixel-write becomes a recorded job. ---- */
+enum { RECON_INLINE = 0, RECON_RECORD = 1 };   /* recon_mode: 0 = original (parse+reconstruct fused) */
+enum { RJ_MC = 0, RJ_IDCT = 1, RJ_INTRA = 2 };
+typedef struct ReconJob {
+    uint8_t  type, plane, size, param;   /* param = MC method / intra pmode */
+    uint8_t  mb_start;                    /* 1 = first job of a macroblock (a safe parallel split point) */
+    uint8_t *dst; int dst_ls;
+    const uint8_t *src; int src_ls; int w, h;      /* MC */
+    int matoff, ac; unsigned rowmask;              /* IDCT: coeff-pool offset + sparsity */
+    int ax, ay, golomb;                            /* INTRA: position + mode-2 bitstream value */
+} ReconJob;
+
+/* One frame's worth of recorded reconstruction work. Double-buffered (rset[2]) so the cross-frame
+ * pipeline can REPLAY set A (frame N-1) on the worker core while the main core PARSES frame N into
+ * set B. Lists pre-partitioned by phase so replay never scans:
+ *   [0] = inter MC + its residual IDCT (interleaved, block-hot; split at mb_start)   [2] = intra (serial) */
+typedef struct ReconSet {
+    ReconJob *rjob[3]; int rjob_n[3], rjob_cap[3];
+    int      *rmat; int rmat_n, rmat_cap;   /* sparse coefficient pool */
+    AVFrame  *out;                           /* frame this set reconstructs into (pipeline output) */
+    int       valid;                         /* has pending replay work */
+} ReconSet;
+
 typedef struct MobiClipContext {
     AVFrame *pic[6];
 
@@ -334,6 +416,12 @@ typedef struct MobiClipContext {
     int     motion_size;
 
     BswapDSPContext bdsp;
+
+    int       recon_mode;                /* RECON_INLINE (default) or RECON_RECORD */
+    int       rec_intra;                 /* 1 while recording an intra macroblock */
+    int       rec_mark;                  /* 1 = next list-0 job begins a new macroblock (split point) */
+    ReconSet  rset[2];                   /* double-buffered job sets (pipeline ping-pong) */
+    int       parse_slot;                /* which set the current parse records into */
 } MobiClipContext;
 
 static const VLCElem *rl_vlc[2];
@@ -415,6 +503,10 @@ static int setup_qtables(AVCodecContext *avctx, int64_t quantizer)
     return 0;
 }
 
+/* Coefficient blocks are stored as int16 (packed 16-bit = SIMD-ready). Verified bit-exact: transform
+ * inputs peak ~14k and outputs ~13k, both well inside int16. The 8-point butterfly's `tmp`/`e..h`/`x`
+ * intermediates can transiently hit ~49k before cancelling, so those locals stay 32-bit `int`. */
+typedef int16_t dctcoef;
 static void inverse4(unsigned *rs)
 {
     unsigned a = rs[0] + rs[2];
@@ -428,14 +520,16 @@ static void inverse4(unsigned *rs)
     rs[3] = a - c;
 }
 
-static void idct(int *arr, int size)
+static void idct(dctcoef *arr, int size)
 {
     int e, f, g, h;
     unsigned x3, x2, x1, x0;
     int tmp[4];
 
     if (size == 4) {
-        inverse4(arr);
+        tmp[0] = arr[0]; tmp[1] = arr[1]; tmp[2] = arr[2]; tmp[3] = arr[3];
+        inverse4((unsigned *)tmp);
+        arr[0] = tmp[0]; arr[1] = tmp[1]; arr[2] = tmp[2]; arr[3] = tmp[3];
         return;
     }
 
@@ -444,7 +538,7 @@ static void idct(int *arr, int size)
     tmp[2] = arr[4];
     tmp[3] = arr[6];
 
-    inverse4(tmp);
+    inverse4((unsigned *)tmp);
 
     e = (unsigned)arr[7] + arr[1] - arr[3] - (arr[3] >> 1);
     f = (unsigned)arr[7] - arr[1] + arr[5] + (arr[5] >> 1);
@@ -465,16 +559,106 @@ static void idct(int *arr, int size)
     arr[7] = tmp[0] - x0;
 }
 
-static void read_run_encoding(AVCodecContext *avctx,
-                              int *last, int *run, int *level)
+static inline void read_run_encoding(GetBitContext *gb, int tab_idx,
+                                     int *last, int *run, int *level)
 {
-    MobiClipContext *s = avctx->priv_data;
-    GetBitContext *gb = &s->gb;
-    int n = get_vlc2(gb, rl_vlc[s->dct_tab_idx], MOBI_RL_VLC_BITS, 1);
+    int n = get_vlc2(gb, rl_vlc[tab_idx], MOBI_RL_VLC_BITS, 1);
 
     *last = (n >> 11) == 1;
     *run  = (n >> 5) & 0x3F;
     *level = n & 0x1F;
+}
+
+/* ---- deferred-reconstruction record helpers (record into the set currently being parsed) ---- */
+static ReconJob *rj_new(MobiClipContext *s, int k) {   /* k = phase list: 0 inter MC+IDCT, 2 intra */
+    ReconSet *rs = &s->rset[s->parse_slot];
+    if (rs->rjob_n[k] >= rs->rjob_cap[k]) {
+        int nc = rs->rjob_cap[k] ? rs->rjob_cap[k] * 2 : 4096;
+        ReconJob *nj = av_realloc(rs->rjob[k], (size_t)nc * sizeof(ReconJob));
+        if (!nj) return NULL;
+        rs->rjob[k] = nj; rs->rjob_cap[k] = nc;
+    }
+    ReconJob *j = &rs->rjob[k][rs->rjob_n[k]++];
+    memset(j, 0, sizeof *j);
+    if (k == 0 && s->rec_mark) { j->mb_start = 1; s->rec_mark = 0; }   /* mark this MB's first inter job */
+    return j;
+}
+/* append a coefficient block to the pool, return its offset (jobs store the OFFSET, so pool realloc
+ * is safe). -1 on OOM. */
+/* Store the block's coefficients SPARSELY: [count, idx0,val0, idx1,val1, ...]. A residual block
+ * averages ~4 non-zero coeffs, so this moves ~9 ints instead of a dense 64 -- far less memory
+ * traffic on the record->replay round-trip (the dominant dual-core overhead on Old-3DS). */
+static int rmat_put(MobiClipContext *s, const dctcoef *mat, int n) {
+    ReconSet *rs = &s->rset[s->parse_slot];
+    int need = 1 + 2 * n;                                 /* worst case: all non-zero */
+    if (rs->rmat_n + need > rs->rmat_cap) {
+        int nc = rs->rmat_cap ? rs->rmat_cap * 2 : 65536;
+        while (nc < rs->rmat_n + need) nc *= 2;
+        int *nm = av_realloc(rs->rmat, (size_t)nc * sizeof(int));
+        if (!nm) return -1;
+        rs->rmat = nm; rs->rmat_cap = nc;
+    }
+    int off = rs->rmat_n;
+    int *p = rs->rmat + off + 1;
+    int cnt = 0;
+    for (int i = 0; i < n; i++) if (mat[i]) { *p++ = i; *p++ = mat[i]; cnt++; }
+    rs->rmat[off] = cnt;
+    rs->rmat_n = off + 1 + 2 * cnt;
+    return off;
+}
+static void idct_writeback(dctcoef *mat, uint8_t *dst, int linesize, int size, int ac, unsigned rowmask);
+/* Rebuild a dense coefficient block from the set's sparse pool, then run the IDCT + write-back. */
+static inline void idct_job(ReconSet *rs, const ReconJob *j) {
+    dctcoef mat[64];
+    const int *p = rs->rmat + j->matoff;
+    int cnt = *p++;
+    memset(mat, 0, (size_t)(j->size * j->size) * sizeof(dctcoef));
+    for (int i = 0; i < cnt; i++) { int idx = *p++; mat[idx] = *p++; }
+    idct_writeback(mat, j->dst, j->dst_ls, j->size, j->ac, j->rowmask);
+}
+
+/* the RECONSTRUCT half of add_coefficients: IDCT the coefficient block (mat) and add it to dst,
+ * saturating. Extracted verbatim from add_coefficients_impl so inline + replay are bit-identical. */
+static void idct_writeback(dctcoef *mat, uint8_t *dst, int linesize, int size, int ac, unsigned rowmask)
+{
+    if ((mobi_opt & 4) && ac == 0) {          /* DC-only block -> uniform delta */
+        dctcoef t[8] = { 0 }; t[0] = mat[0]; idct(t, size);
+        dctcoef u[8] = { 0 }; u[0] = t[0];        idct(u, size);
+        int d = u[0] >> 6;
+        for (int y = 0; y < size; y++) {
+            for (int x = 0; x < size; x++) dst[x] = av_clip_uint8(dst[x] + d);
+            dst += linesize;
+        }
+        return;
+    }
+    if (mobi_opt & 2) {
+        for (int y = 0; y < size; y++)
+            if (rowmask & (1u << y))
+                idct(&mat[y * size], size);
+    } else {
+        for (int y = 0; y < size; y++)
+            idct(&mat[y * size], size);
+    }
+    for (int y = 0; y < size; y++) {
+        for (int x = y + 1; x < size; x++) {
+            int a = mat[x * size + y];
+            int b = mat[y * size + x];
+            mat[y * size + x] = a;
+            mat[x * size + y] = b;
+        }
+        idct(&mat[y * size], size);
+        dctcoef *mr = &mat[y * size];
+        if (mobi_opt & 0x40) {           /* SIMD residual add+clamp: 4 pixels/instruction (size is 4 or 8) */
+            for (int x = 0; x < size; x += 4)
+                st4(dst + x, simd_add_clip4(ld4(dst + x), mr[x] >> 6, mr[x + 1] >> 6, mr[x + 2] >> 6, mr[x + 3] >> 6));
+        } else if (mobi_opt & 32)
+            for (int x = 0; x < size; x++)
+                dst[x] = g_clamp[CLAMP_OFF + dst[x] + (mr[x] >> 6)];
+        else
+            for (int x = 0; x < size; x++)
+                dst[x] = av_clip_uint8(dst[x] + (mr[x] >> 6));
+        dst += linesize;
+    }
 }
 
 static int add_coefficients_impl(AVCodecContext *avctx, AVFrame *frame,
@@ -482,7 +666,7 @@ static int add_coefficients_impl(AVCodecContext *avctx, AVFrame *frame,
 {
     MobiClipContext *s = avctx->priv_data;
     GetBitContext *gb = &s->gb;
-    int mat[64] = { 0 };
+    dctcoef mat[64] = { 0 };
     const uint8_t *ztab = size == 8 ? ff_zigzag_direct : zigzag4x4_tab;
     const int *qtab = s->qtab[size == 8];
     uint8_t *dst = frame->data[plane] + by * frame->linesize[plane] + bx;
@@ -494,18 +678,18 @@ static int add_coefficients_impl(AVCodecContext *avctx, AVFrame *frame,
     for (int pos = 0; get_bits_left(gb) > 0; pos++) {
         int qval, last, run, level;
 
-        read_run_encoding(avctx, &last, &run, &level);
+        read_run_encoding(gb, s->dct_tab_idx, &last, &run, &level);
 
         if (level) {
             if (get_bits1(gb))
                 level = -level;
         } else if (!get_bits1(gb)) {
-            read_run_encoding(avctx, &last, &run, &level);
+            read_run_encoding(gb, s->dct_tab_idx, &last, &run, &level);
             level += run_residue[s->dct_tab_idx][(last ? 64 : 0) + run];
             if (get_bits1(gb))
                 level = -level;
         } else if (!get_bits1(gb)) {
-            read_run_encoding(avctx, &last, &run, &level);
+            read_run_encoding(gb, s->dct_tab_idx, &last, &run, &level);
             run += run_residue[s->dct_tab_idx][128 + (last ? 64 : 0) + level];
             if (get_bits1(gb))
                 level = -level;
@@ -519,9 +703,10 @@ static int add_coefficients_impl(AVCodecContext *avctx, AVFrame *frame,
         if (pos >= size * size)
             return AVERROR_INVALIDDATA;
         qval = qtab[pos];
-        mat[ztab[pos]] = qval *(unsigned)level;
-        rowmask |= 1u << (ztab[pos] / size);
-        if (ztab[pos]) ac++;                  /* count AC (non-DC) coefficients */
+        int zp = ztab[pos];
+        mat[zp] = qval * (unsigned)level;
+        rowmask |= 1u << (zp / size);
+        if (zp) ac++;                         /* count AC (non-DC) coefficients */
 
         if (last)
             break;
@@ -531,45 +716,16 @@ static int add_coefficients_impl(AVCodecContext *avctx, AVFrame *frame,
     uint64_t _tt = PROF_NOW();
 
     mat[0] += 32;
-    if ((mobi_opt & 4) && ac == 0) {          /* DC-only block -> uniform delta, skip all IDCTs */
-        int t[8] = { 0 }; t[0] = mat[0]; idct(t, size);
-        int u[8] = { 0 }; u[0] = t[0];        idct(u, size);
-        int d = u[0] >> 6;
-        for (int y = 0; y < size; y++) {
-            for (int x = 0; x < size; x++) dst[x] = av_clip_uint8(dst[x] + d);
-            dst += frame->linesize[plane];
-        }
+    if (s->recon_mode == RECON_RECORD) {      /* defer the IDCT + write-back to the reconstruct pass */
+        ReconJob *j = rj_new(s, s->rec_intra ? 2 : 0);   /* inter residual -> list 0, right after its MC (stays cache-hot) */
+        int off = rmat_put(s, mat, size * size);
+        if (!j || off < 0) return AVERROR(ENOMEM);
+        j->type = RJ_IDCT; j->dst = dst; j->dst_ls = frame->linesize[plane];
+        j->size = (uint8_t)size; j->ac = ac; j->rowmask = rowmask; j->matoff = off;
         mobi_prof[4] += PROF_NOW() - _tt;
         return 0;
     }
-    if (mobi_opt & 2) {                       /* skip the row IDCT for all-zero rows */
-        for (int y = 0; y < size; y++)
-            if (rowmask & (1u << y))
-                idct(&mat[y * size], size);
-    } else {
-        for (int y = 0; y < size; y++)
-            idct(&mat[y * size], size);
-    }
-
-    for (int y = 0; y < size; y++) {
-        for (int x = y + 1; x < size; x++) {
-            int a = mat[x * size + y];
-            int b = mat[y * size + x];
-
-            mat[y * size + x] = a;
-            mat[x * size + y] = b;
-        }
-
-        idct(&mat[y * size], size);
-        if (mobi_opt & 32)                    /* clamp-LUT: fused residual-add + saturate, no branch */
-            for (int x = 0; x < size; x++)
-                dst[x] = g_clamp[CLAMP_OFF + dst[x] + (mat[y * size + x] >> 6)];
-        else
-            for (int x = 0; x < size; x++)
-                dst[x] = av_clip_uint8(dst[x] + (mat[y * size + x] >> 6));
-        dst += frame->linesize[plane];
-    }
-
+    idct_writeback(mat, dst, frame->linesize[plane], size, ac, rowmask);
     mobi_prof[4] += PROF_NOW() - _tt;         /* bucket 4 = transform (IDCT + write-back) */
     return 0;
 }
@@ -616,25 +772,23 @@ static int adjust(int x, int size)
     return size == 16 ? (x + 1) >> 1 : x;
 }
 
-static uint8_t pget(BlockXY b)
+/* Intra prediction sample fetch. Refactored to take the block descriptor by CONST POINTER plus the
+ * (already-transformed) coordinates px,py in registers -- the old code passed the whole 36-byte
+ * BlockXY struct BY VALUE per pixel through a function pointer. Bit-identical; just leaner calls. */
+static uint8_t pget(const BlockXY *b, int px, int py)
 {
-    BlockXY ret = b;
-    int x, y;
+    int rx, ry;
 
-    if (b.x == -1 && b.y >= b.size) {
-        ret.x = -1, ret.y = b.size - 1;
-    } else if (b.x >= -1 && b.y >= -1) {
-        ret.x = b.x, ret.y = b.y;
-    } else if (b.x == -1 && b.y == -2) {
-        ret.x = 0, ret.y = -1;
-    } else if (b.x == -2 && b.y == -1) {
-        ret.x = -1, ret.y = 0;
-    }
+    if (px == -1 && py >= b->size)      { rx = -1; ry = b->size - 1; }
+    else if (px >= -1 && py >= -1)      { rx = px; ry = py; }
+    else if (px == -1 && py == -2)      { rx =  0; ry = -1; }
+    else if (px == -2 && py == -1)      { rx = -1; ry =  0; }
+    else                                { rx = px; ry = py; }   /* fall-through kept ret = b */
 
-    y = av_clip(ret.ay + ret.y, 0, ret.h - 1);
-    x = av_clip(ret.ax + ret.x, 0, ret.w - 1);
+    int y = av_clip(b->ay + ry, 0, b->h - 1);
+    int x = av_clip(b->ax + rx, 0, b->w - 1);
 
-    return ret.block[y * ret.linesize + x];
+    return b->block[y * b->linesize + x];
 }
 
 static uint8_t half(int a, int b)
@@ -647,232 +801,62 @@ static uint8_t half3(int a, int b, int c)
     return ((a + b + b + c) * 2 / 4 + 1) / 2;
 }
 
-static uint8_t pick_above(BlockXY bxy)
-{
-    bxy.y = bxy.y - 1;
+static uint8_t pick_above(const BlockXY *b, int x, int y) { return pget(b, x, y - 1); }
+static uint8_t pick_left (const BlockXY *b, int x, int y) { return pget(b, x - 1, y); }
 
-    return pget(bxy);
+static uint8_t half_horz(const BlockXY *b, int x, int y)
+{
+    return half3(pget(b, x - 1, y), pget(b, x, y), pget(b, x + 1, y));
 }
 
-static uint8_t pick_left(BlockXY bxy)
+static uint8_t half_vert(const BlockXY *b, int x, int y)
 {
-    bxy.x = bxy.x - 1;
-
-    return pget(bxy);
+    return half3(pget(b, x, y - 1), pget(b, x, y), pget(b, x, y + 1));
 }
 
-static uint8_t half_horz(BlockXY bxy)
+static uint8_t pick_4(const BlockXY *b, int x, int y)
 {
-    BlockXY a = bxy, b = bxy, c = bxy;
-
-    a.x -= 1;
-    c.x += 1;
-
-    return half3(pget(a), pget(b), pget(c));
+    if ((x % 2) == 0)
+        return half(pget(b, -1, y + x / 2), pget(b, -1, y + x / 2 + 1));
+    return half_vert(b, -1, y + x / 2 + 1);
 }
 
-static uint8_t half_vert(BlockXY bxy)
+static uint8_t pick_5(const BlockXY *b, int x, int y)
 {
-    BlockXY a = bxy, b = bxy, c = bxy;
-
-    a.y -= 1;
-    c.y += 1;
-
-    return half3(pget(a), pget(b), pget(c));
+    if (x == 0)      return half(pget(b, -1, y - 1), pget(b, -1, y));
+    else if (y == 0) return half_horz(b, x - 2, y - 1);
+    else if (x == 1) return half_vert(b, x - 2, y - 1);
+    else             return pget(b, x - 2, y - 1);
 }
 
-static uint8_t pick_4(BlockXY bxy)
+static uint8_t pick_6(const BlockXY *b, int x, int y)
 {
-    int val;
-
-    if ((bxy.x % 2) == 0) {
-        BlockXY ba, bb;
-        int a, b;
-
-        ba = bxy;
-        ba.x = -1;
-        ba.y = bxy.y + bxy.x / 2;
-        a = pget(ba);
-
-        bb = bxy;
-        bb.x = -1;
-        bb.y = bxy.y + bxy.x / 2 + 1;
-        b = pget(bb);
-
-        val = half(a, b);
-    } else {
-        BlockXY ba;
-
-        ba = bxy;
-        ba.x = -1;
-        ba.y = bxy.y + bxy.x / 2 + 1;
-        val = half_vert(ba);
-    }
-
-    return val;
+    if (y == 0)      return half(pget(b, x - 1, -1), pget(b, x, -1));
+    else if (x == 0) return half_vert(b, x - 1, y - 2);
+    else if (y == 1) return half_horz(b, x - 1, y - 2);
+    else             return pget(b, x - 1, y - 2);
 }
 
-static uint8_t pick_5(BlockXY bxy)
+static uint8_t pick_7(const BlockXY *b, int x, int y)
 {
-    int val;
-
-    if (bxy.x == 0) {
-        BlockXY a = bxy;
-        BlockXY b = bxy;
-
-        a.x = -1;
-        a.y -= 1;
-
-        b.x = -1;
-
-        val = half(pget(a), pget(b));
-    } else if (bxy.y == 0) {
-        BlockXY a = bxy;
-
-        a.x -= 2;
-        a.y -= 1;
-
-        val = half_horz(a);
-    } else if (bxy.x == 1) {
-        BlockXY a = bxy;
-
-        a.x -= 2;
-        a.y -= 1;
-
-        val = half_vert(a);
-    } else {
-        BlockXY a = bxy;
-
-        a.x -= 2;
-        a.y -= 1;
-
-        val = pget(a);
-    }
-
-    return val;
-}
-
-static uint8_t pick_6(BlockXY bxy)
-{
-    int val;
-
-    if (bxy.y == 0) {
-        BlockXY a = bxy;
-        BlockXY b = bxy;
-
-        a.x -= 1;
-        a.y = -1;
-
-        b.y = -1;
-
-        val = half(pget(a), pget(b));
-    } else if (bxy.x == 0) {
-        BlockXY a = bxy;
-
-        a.x -= 1;
-        a.y -= 2;
-
-        val = half_vert(a);
-    } else if (bxy.y == 1) {
-        BlockXY a = bxy;
-
-        a.x -= 1;
-        a.y -= 2;
-
-        val = half_horz(a);
-    } else {
-        BlockXY a = bxy;
-
-        a.x -= 1;
-        a.y -= 2;
-
-        val = pget(a);
-    }
-
-    return val;
-}
-
-static uint8_t pick_7(BlockXY bxy)
-{
-    int clr, acc1, acc2;
-    BlockXY a = bxy;
-
-    a.x -= 1;
-    a.y -= 1;
-    clr = pget(a);
-    if (bxy.x && bxy.y)
+    int clr = pget(b, x - 1, y - 1);
+    if (x && y)
         return clr;
 
-    if (bxy.x == 0) {
-        a.x = -1;
-        a.y = bxy.y;
-    } else {
-        a.x = bxy.x - 2;
-        a.y = -1;
-    }
-    acc1 = pget(a);
-
-    if (bxy.y == 0) {
-        a.x = bxy.x;
-        a.y = -1;
-    } else {
-        a.x = -1;
-        a.y = bxy.y - 2;
-    }
-    acc2 = pget(a);
+    int acc1 = (x == 0) ? pget(b, -1, y)  : pget(b, x - 2, -1);
+    int acc2 = (y == 0) ? pget(b, x, -1)  : pget(b, -1, y - 2);
 
     return half3(acc1, clr, acc2);
 }
 
-static uint8_t pick_8(BlockXY bxy)
+static uint8_t pick_8(const BlockXY *b, int x, int y)
 {
-    BlockXY ba = bxy;
-    BlockXY bb = bxy;
-    int val;
-
-    if (bxy.y == 0) {
-        int a, b;
-
-        ba.y = -1;
-        a = pget(ba);
-
-        bb.x += 1;
-        bb.y = -1;
-
-        b = pget(bb);
-
-        val = half(a, b);
-    } else if (bxy.y == 1) {
-        ba.x += 1;
-        ba.y -= 2;
-
-        val = half_horz(ba);
-    } else if (bxy.x < bxy.size - 1) {
-        ba.x += 1;
-        ba.y -= 2;
-
-        val = pget(ba);
-    } else if (bxy.y % 2 == 0) {
-        int a, b;
-
-        ba.x = bxy.y / 2 + bxy.size - 1;
-        ba.y = -1;
-        a = pget(ba);
-
-        bb.x = bxy.y / 2 + bxy.size;
-        bb.y = -1;
-
-        b = pget(bb);
-
-        val = half(a, b);
-    } else {
-        ba.x = bxy.y / 2 + bxy.size;
-        ba.y = -1;
-
-        val = half_horz(ba);
-    }
-
-    return val;
+    if (y == 0)                return half(pget(b, x, -1), pget(b, x + 1, -1));
+    else if (y == 1)           return half_horz(b, x + 1, y - 2);
+    else if (x < b->size - 1)  return pget(b, x + 1, y - 2);
+    else if (y % 2 == 0)       return half(pget(b, y / 2 + b->size - 1, -1),
+                                           pget(b, y / 2 + b->size, -1));
+    else                       return half_horz(b, y / 2 + b->size, -1);
 }
 
 static void block_fill_simple(uint8_t *block, int size, int linesize, int fill)
@@ -885,7 +869,7 @@ static void block_fill_simple(uint8_t *block, int size, int linesize, int fill)
 
 static void block_fill(uint8_t *block, int size, int linesize,
                        int w, int h, int ax, int ay,
-                       uint8_t (*pick)(BlockXY bxy))
+                       uint8_t (*pick)(const BlockXY *, int, int))
 {
     BlockXY bxy;
 
@@ -897,18 +881,9 @@ static void block_fill(uint8_t *block, int size, int linesize,
     bxy.ay = ay;
     bxy.ax = ax;
 
-    for (int y = 0; y < size; y++) {
-        bxy.y = y;
-        for (int x = 0; x < size; x++) {
-            uint8_t val;
-
-            bxy.x = x;
-
-            val = pick(bxy);
-
-            block[ax + x + (ay + y) * linesize] = val;
-        }
-    }
+    for (int y = 0; y < size; y++)
+        for (int x = 0; x < size; x++)
+            block[ax + x + (ay + y) * linesize] = pick(&bxy, x, y);
 }
 
 static int block_sum(const uint8_t *block, int w, int h, int linesize)
@@ -925,31 +900,28 @@ static int block_sum(const uint8_t *block, int w, int h, int linesize)
     return sum;
 }
 
-static int predict_intra(AVCodecContext *avctx, AVFrame *frame, int ax, int ay,
-                          int pmode, int add_coeffs, int size, int plane)
+/* the RECONSTRUCT half of intra prediction: the prediction fill (reads reconstructed neighbours,
+ * writes the block). The mode-2 bitstream value is passed in (read serially in predict_intra), so
+ * this is pure pixel work -> deferrable/parallelisable. Byte-identical to the inline switch. */
+static int intra_predict_fill(uint8_t *pdata, int linesize, int w, int h,
+                              int ax, int ay, int pmode, int size, int golomb)
 {
-    MobiClipContext *s = avctx->priv_data;
-    GetBitContext *gb = &s->gb;
-    int w = avctx->width >> !!plane, h = avctx->height >> !!plane;
-    int ret = 0;
-    uint64_t _pt = PROF_NOW();
-
-    switch (pmode) {
+        switch (pmode) {
     case 0:
-        block_fill(frame->data[plane], size, frame->linesize[plane], w, h, ax, ay, pick_above);
+        block_fill(pdata, size, linesize, w, h, ax, ay, pick_above);
         break;
     case 1:
-        block_fill(frame->data[plane], size, frame->linesize[plane], w, h, ax, ay, pick_left);
+        block_fill(pdata, size, linesize, w, h, ax, ay, pick_left);
         break;
     case 2:
         {
             int arr1[16];
             int arr2[16];
-            uint8_t *top = frame->data[plane] + FFMAX(ay - 1, 0) * frame->linesize[plane] + ax;
-            uint8_t *left = frame->data[plane] + ay * frame->linesize[plane] + FFMAX(ax - 1, 0);
-            int bottommost = frame->data[plane][(ay + size - 1) * frame->linesize[plane] + FFMAX(ax - 1, 0)];
-            int rightmost = frame->data[plane][FFMAX(ay - 1, 0) * frame->linesize[plane] + ax + size - 1];
-            int avg = (bottommost + rightmost + 1) / 2 + 2 * av_clip(get_se_golomb(gb), -(1<<16), 1<<16);
+            uint8_t *top = pdata + FFMAX(ay - 1, 0) * linesize + ax;
+            uint8_t *left = pdata + ay * linesize + FFMAX(ax - 1, 0);
+            int bottommost = pdata[(ay + size - 1) * linesize + FFMAX(ax - 1, 0)];
+            int rightmost = pdata[FFMAX(ay - 1, 0) * linesize + ax + size - 1];
+            int avg = (bottommost + rightmost + 1) / 2 + 2 * av_clip(golomb, -(1<<16), 1<<16);
             int r6 = adjust(avg - bottommost, size);
             int r9 = adjust(avg - rightmost, size);
             int shift = adjust(size, size) == 8 ? 3 : 2;
@@ -961,18 +933,18 @@ static int predict_intra(AVCodecContext *avctx, AVFrame *frame, int ax, int ay,
             }
 
             for (int y = 0; y < size; y++) {
-                int val = left[y * frame->linesize[plane]];
+                int val = left[y * linesize];
                 arr2[y] = adjust(((rightmost - val) * (1 << shift)) + r9 * (y + 1), size);
             }
 
-            block = frame->data[plane] + ay * frame->linesize[plane] + ax;
+            block = pdata + ay * linesize + ax;
             for (int y = 0; y < size; y++) {
                 for (int x = 0; x < size; x++) {
                     block[x] = (((top[x] + left[0] + ((arr1[x] * (y + 1) +
                                                        arr2[y] * (x + 1)) >> 2 * shift)) + 1) / 2) & 0xFF;
                 }
-                block += frame->linesize[plane];
-                left  += frame->linesize[plane];
+                block += linesize;
+                left  += linesize;
             }
         }
         break;
@@ -983,41 +955,62 @@ static int predict_intra(AVCodecContext *avctx, AVFrame *frame, int ax, int ay,
             if (ax == 0 && ay == 0) {
                 fill = 0x80;
             } else if (ax >= 1 && ay >= 1) {
-                int left = block_sum(frame->data[plane] + ay * frame->linesize[plane] + ax - 1,
-                                     1, size, frame->linesize[plane]);
-                int top  = block_sum(frame->data[plane] + (ay - 1) * frame->linesize[plane] + ax,
-                                     size, 1, frame->linesize[plane]);
+                int left = block_sum(pdata + ay * linesize + ax - 1,
+                                     1, size, linesize);
+                int top  = block_sum(pdata + (ay - 1) * linesize + ax,
+                                     size, 1, linesize);
 
                 fill = ((left + top) * 2 / (2 * size) + 1) / 2;
             } else if (ax >= 1) {
-                fill = (block_sum(frame->data[plane] + ay * frame->linesize[plane] + ax - 1,
-                                  1, size, frame->linesize[plane]) * 2 / size + 1) / 2;
+                fill = (block_sum(pdata + ay * linesize + ax - 1,
+                                  1, size, linesize) * 2 / size + 1) / 2;
             } else if (ay >= 1) {
-                fill = (block_sum(frame->data[plane] + (ay - 1) * frame->linesize[plane] + ax,
-                                  size, 1, frame->linesize[plane]) * 2 / size + 1) / 2;
+                fill = (block_sum(pdata + (ay - 1) * linesize + ax,
+                                  size, 1, linesize) * 2 / size + 1) / 2;
             } else {
                 return -1;
             }
 
-            block_fill_simple(frame->data[plane] + ay * frame->linesize[plane] + ax,
-                              size, frame->linesize[plane], fill);
+            block_fill_simple(pdata + ay * linesize + ax,
+                              size, linesize, fill);
         }
         break;
     case 4:
-        block_fill(frame->data[plane], size, frame->linesize[plane], w, h, ax, ay, pick_4);
+        block_fill(pdata, size, linesize, w, h, ax, ay, pick_4);
         break;
     case 5:
-        block_fill(frame->data[plane], size, frame->linesize[plane], w, h, ax, ay, pick_5);
+        block_fill(pdata, size, linesize, w, h, ax, ay, pick_5);
         break;
     case 6:
-        block_fill(frame->data[plane], size, frame->linesize[plane], w, h, ax, ay, pick_6);
+        block_fill(pdata, size, linesize, w, h, ax, ay, pick_6);
         break;
     case 7:
-        block_fill(frame->data[plane], size, frame->linesize[plane], w, h, ax, ay, pick_7);
+        block_fill(pdata, size, linesize, w, h, ax, ay, pick_7);
         break;
     case 8:
-        block_fill(frame->data[plane], size, frame->linesize[plane], w, h, ax, ay, pick_8);
+        block_fill(pdata, size, linesize, w, h, ax, ay, pick_8);
         break;
+    }
+    return 0;
+}
+
+static int predict_intra(AVCodecContext *avctx, AVFrame *frame, int ax, int ay,
+                          int pmode, int add_coeffs, int size, int plane)
+{
+    MobiClipContext *s = avctx->priv_data;
+    GetBitContext *gb = &s->gb;
+    int w = avctx->width >> !!plane, h = avctx->height >> !!plane;
+    int ret = 0;
+    uint64_t _pt = PROF_NOW();
+
+    int golomb = (pmode == 2) ? get_se_golomb(gb) : 0;   /* mode 2 reads one value (serial) */
+    if (s->recon_mode == RECON_RECORD) {
+        ReconJob *j = rj_new(s, 2); if (!j) return AVERROR(ENOMEM);
+        j->type = RJ_INTRA; j->dst = frame->data[plane]; j->dst_ls = frame->linesize[plane];
+        j->w = w; j->h = h; j->ax = ax; j->ay = ay; j->param = (uint8_t)pmode;
+        j->size = (uint8_t)size; j->golomb = golomb;
+    } else {
+        if (intra_predict_fill(frame->data[plane], frame->linesize[plane], w, h, ax, ay, pmode, size, golomb) < 0) return -1;
     }
 
     mobi_prof[0] += PROF_NOW() - _pt;
@@ -1096,6 +1089,7 @@ static int decode_macroblock(AVCodecContext *avctx, AVFrame *frame,
 {
     MobiClipContext *s = avctx->priv_data;
     GetBitContext *gb = &s->gb;
+    s->rec_intra = 1;   /* this whole macroblock is intra (neighbour-dependent) -> serial phase */
     int flags, pmode_uv, idx = get_ue_golomb(gb);
     int ret = 0;
 
@@ -1176,68 +1170,12 @@ static int get_index(int x)
     return x == 16 ? 0 : x == 8 ? 1 : x == 4 ? 2 : x == 2 ? 3 : 0;
 }
 
-static int predict_motion_impl(AVCodecContext *avctx,
-                          int width, int height, int index,
-                          int offsetm, int offsetx, int offsety)
+/* the RECONSTRUCT half of motion comp: the extracted per-block copy (all opt paths), so inline and
+ * replay are byte-identical. Pure pixel work: reads src (ref frame), writes dst. */
+static void mc_copy(uint8_t *dst, const uint8_t *src, int width, int height,
+                    int dst_linesize, int src_linesize, int method)
 {
-    MobiClipContext *s = avctx->priv_data;
-    MotionXY *motion = s->motion;
-    GetBitContext *gb = &s->gb;
-    int fheight = avctx->height;
-    int fwidth = avctx->width;
-
-    if (index <= 5) {
-        int sidx = -FFMAX(1, index) + s->current_pic;
-        MotionXY mv = s->motion[0];
-
-        if (sidx < 0)
-            sidx += 6;
-
-        if (index > 0) {
-            mv.x = mv.x + (unsigned)get_se_golomb(gb);
-            mv.y = mv.y + (unsigned)get_se_golomb(gb);
-        }
-        if (mv.x >= INT_MAX || mv.y >= INT_MAX)
-            return AVERROR_INVALIDDATA;
-
-        motion[offsetm].x = mv.x;
-        motion[offsetm].y = mv.y;
-
-        for (int i = 0; i < 3; i++) {
-            int method, src_linesize, dst_linesize;
-            uint8_t *src, *dst;
-
-            if (i == 1) {
-                offsetx = offsetx >> 1;
-                offsety = offsety >> 1;
-                mv.x = mv.x >> 1;
-                mv.y = mv.y >> 1;
-                width = width >> 1;
-                height = height >> 1;
-                fwidth = fwidth >> 1;
-                fheight = fheight >> 1;
-            }
-
-            av_assert0(s->pic[sidx]);
-            av_assert0(s->pic[s->current_pic]);
-            av_assert0(s->pic[s->current_pic]->data[i]);
-            if (!s->pic[sidx]->data[i])
-                return AVERROR_INVALIDDATA;
-
-            method = (mv.x & 1) | ((mv.y & 1) << 1);
-            src_linesize = s->pic[sidx]->linesize[i];
-            dst_linesize = s->pic[s->current_pic]->linesize[i];
-            dst = s->pic[s->current_pic]->data[i] + offsetx + offsety * dst_linesize;
-
-            if (offsetx + (mv.x >> 1) < 0 ||
-                offsety + (mv.y >> 1) < 0 ||
-                offsetx + width  + (mv.x + 1 >> 1) > fwidth ||
-                offsety + height + (mv.y + 1 >> 1) > fheight)
-                return AVERROR_INVALIDDATA;
-
-            src = s->pic[sidx]->data[i] + offsetx + (mv.x >> 1) +
-                           (offsety + (mv.y >> 1)) * src_linesize;
-          if (mobi_opt & 0x100) {                      /* hand-written ARM assembly half-pel */
+            if (mobi_opt & 0x100) {                      /* hand-written ARM assembly half-pel */
             int al = (((uintptr_t)src & 3) == 0) && ((width & 3) == 0);
             switch (method) {
             case 0:
@@ -1466,6 +1404,76 @@ static int predict_motion_impl(AVCodecContext *avctx,
                 break;
             }
           }
+}
+
+static int predict_motion_impl(AVCodecContext *avctx,
+                          int width, int height, int index,
+                          int offsetm, int offsetx, int offsety)
+{
+    MobiClipContext *s = avctx->priv_data;
+    MotionXY *motion = s->motion;
+    GetBitContext *gb = &s->gb;
+    int fheight = avctx->height;
+    int fwidth = avctx->width;
+
+    if (index <= 5) {
+        int sidx = -FFMAX(1, index) + s->current_pic;
+        MotionXY mv = s->motion[0];
+
+        if (sidx < 0)
+            sidx += 6;
+
+        if (index > 0) {
+            mv.x = mv.x + (unsigned)get_se_golomb(gb);
+            mv.y = mv.y + (unsigned)get_se_golomb(gb);
+        }
+        if (mv.x >= INT_MAX || mv.y >= INT_MAX)
+            return AVERROR_INVALIDDATA;
+
+        motion[offsetm].x = mv.x;
+        motion[offsetm].y = mv.y;
+
+        for (int i = 0; i < 3; i++) {
+            int method, src_linesize, dst_linesize;
+            uint8_t *src, *dst;
+
+            if (i == 1) {
+                offsetx = offsetx >> 1;
+                offsety = offsety >> 1;
+                mv.x = mv.x >> 1;
+                mv.y = mv.y >> 1;
+                width = width >> 1;
+                height = height >> 1;
+                fwidth = fwidth >> 1;
+                fheight = fheight >> 1;
+            }
+
+            av_assert0(s->pic[sidx]);
+            av_assert0(s->pic[s->current_pic]);
+            av_assert0(s->pic[s->current_pic]->data[i]);
+            if (!s->pic[sidx]->data[i])
+                return AVERROR_INVALIDDATA;
+
+            method = (mv.x & 1) | ((mv.y & 1) << 1);
+            src_linesize = s->pic[sidx]->linesize[i];
+            dst_linesize = s->pic[s->current_pic]->linesize[i];
+            dst = s->pic[s->current_pic]->data[i] + offsetx + offsety * dst_linesize;
+
+            if (offsetx + (mv.x >> 1) < 0 ||
+                offsety + (mv.y >> 1) < 0 ||
+                offsetx + width  + (mv.x + 1 >> 1) > fwidth ||
+                offsety + height + (mv.y + 1 >> 1) > fheight)
+                return AVERROR_INVALIDDATA;
+
+            src = s->pic[sidx]->data[i] + offsetx + (mv.x >> 1) +
+                           (offsety + (mv.y >> 1)) * src_linesize;
+          if (s->recon_mode == RECON_RECORD) {   /* defer the copy to the reconstruct pass */
+            ReconJob *j = rj_new(s, 0); if (!j) return AVERROR(ENOMEM);
+            j->type = RJ_MC; j->dst = dst; j->src = src; j->w = width; j->h = height;
+            j->dst_ls = dst_linesize; j->src_ls = src_linesize; j->param = (uint8_t)method;
+          } else {
+            mc_copy(dst, src, width, height, dst_linesize, src_linesize, method);
+          }
         }
     } else {
         int tidx;
@@ -1501,13 +1509,171 @@ static int predict_motion(AVCodecContext *avctx,
     return r;
 }
 
+#define MOBI_RECON2 0x10000000   /* two-pass deferred reconstruction (dual-core foundation) */
+
+/* Replay reconstruction jobs, PRE-PARTITIONED into phase lists during the parse so this pass never
+ * scans or filters:
+ *   list 0  inter: MC + its residual IDCT, interleaved in decode order -- each block reads the
+ *           REFERENCE frame / its own pixels, so blocks are independent. Kept together (MC then
+ *           IDCT per block) so the block stays cache-hot; split across two cores at block boundaries.
+ *   list 2  intra pred+res  -- reads reconstructed NEIGHBOURS -> serial, decode order (runs last)
+ * (list 1 is unused now that inter MC+IDCT share list 0.)
+ * Host: single-threaded (proves the reorder is bit-exact). Device: list 0 split across two cores at
+ * block boundaries, list 2 stays serial. */
+static void recon_phase(ReconSet *rs, int lo, int hi, int k) {   /* jobs [lo,hi) of list k */
+    ReconJob *a = rs->rjob[k];
+    for (int i = lo; i < hi; i++) {
+        ReconJob *j = &a[i];
+        if (j->type == RJ_MC) mc_copy(j->dst, j->src, j->w, j->h, j->dst_ls, j->src_ls, j->param);
+        else                  idct_job(rs, j);
+    }
+}
+static void recon_list2(ReconSet *rs) {   /* intra: reads reconstructed neighbours -> serial, decode order */
+    ReconJob *a = rs->rjob[2];
+    for (int i = 0; i < rs->rjob_n[2]; i++) {
+        ReconJob *j = &a[i];
+        if (j->type == RJ_INTRA) intra_predict_fill(j->dst, j->dst_ls, j->w, j->h, j->ax, j->ay, j->param, j->size, j->golomb);
+        else                     idct_job(rs, j);
+    }
+}
+/* Reconstruct a whole set single-threaded (host path, and the pipeline worker's job). */
+static void recon_set_serial(ReconSet *rs) {
+    recon_phase(rs, 0, rs->rjob_n[0], 0);             /* inter MC+IDCT */
+    recon_list2(rs);                                  /* intra */
+}
+
+#define MOBI_PAR      0x20000000   /* split list 0 across two CPU cores within a frame (device only) */
+#define MOBI_REVSPLIT 0x40000000   /* host-only: run the split-halves reversed to prove independence */
+#define MOBI_PIPE     0x08000000   /* cross-frame pipeline: reconstruct(N-1) on worker || parse(N) on main */
+#ifdef __3DS__
+#include <3ds.h>
+static Thread            g_rthr;
+static LightEvent        g_rgo, g_rdone;
+static ReconSet * volatile g_rset;
+static volatile int      g_rwhich, g_rlo, g_rhi, g_rrun, g_rfull;
+static void recon_worker(void *a) {
+    (void)a;
+    while (g_rrun) {
+        LightEvent_Wait(&g_rgo);
+        if (!g_rrun) break;
+        if (g_rfull) {
+            recon_set_serial(g_rset);                          /* pipeline: whole frame on this core */
+            /* This core wrote the whole frame; clean ITS cache to main RAM so the Y2R DMA (which the
+             * main core kicks) doesn't read stale rows -> otherwise a half-flushed frame shows as a
+             * left/right split after the GPU rotation. */
+            /* Use the RAW cache syscall, NOT GSPGPU_FlushDataCache: the latter goes through the shared
+             * GSP session, and calling it from this worker core while the main thread renders can wedge
+             * the GSP (persistent black screen until app restart). svcFlushProcessDataCache is a pure
+             * per-core syscall with no shared session. */
+            AVFrame *o = g_rset->out;
+            if (o && o->data[0]) {
+                svcFlushProcessDataCache(CUR_PROCESS_HANDLE, (u32)o->data[0], (u32)o->linesize[0] * (u32)o->height);
+                if (o->data[1]) svcFlushProcessDataCache(CUR_PROCESS_HANDLE, (u32)o->data[1], (u32)o->linesize[1] * (u32)((o->height + 1) / 2));
+                if (o->data[2]) svcFlushProcessDataCache(CUR_PROCESS_HANDLE, (u32)o->data[2], (u32)o->linesize[2] * (u32)((o->height + 1) / 2));
+            }
+        } else {
+            recon_phase(g_rset, g_rlo, g_rhi, g_rwhich);
+        }
+        LightEvent_Signal(&g_rdone);
+    }
+}
+static void recon_par_init(void) {
+    if (g_rthr) return;
+    g_rrun = 1;
+    LightEvent_Init(&g_rgo,   RESET_ONESHOT);
+    LightEvent_Init(&g_rdone, RESET_ONESHOT);
+    bool isnew = false; APT_CheckNew3DS(&isnew);
+    int core = isnew ? 2 : 1;                 /* New: free core 2; Old: syscore (needs the time limit) */
+    if (!isnew) APT_SetAppCpuTimeLimit(80);
+    s32 prio = 0x30; svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
+    g_rthr = threadCreate(recon_worker, NULL, 128 * 1024, prio - 1, core, false);
+}
+void mobi_recon_par_exit(void) {              /* call on app shutdown to join the worker */
+    if (!g_rthr) return;
+    g_rrun = 0; LightEvent_Signal(&g_rgo);
+    threadJoin(g_rthr, UINT64_MAX); threadFree(g_rthr); g_rthr = NULL;
+}
+/* run one phase across two cores: worker does the second half, main the first, then barrier. */
+static void recon_phase_par(ReconSet *rs, int which) {
+    int n = rs->rjob_n[which];
+    if (n < 16 || !g_rthr) { recon_phase(rs, 0, n, which); return; }
+    int mid = n / 2;
+    ReconJob *a = rs->rjob[which];
+    while (mid < n && !a[mid].mb_start) mid++;   /* split only at a macroblock boundary so each MB runs wholly on one core */
+    if (mid >= n) { recon_phase(rs, 0, n, which); return; }
+    g_rfull = 0; g_rset = rs; g_rwhich = which; g_rlo = mid; g_rhi = n;
+    LightEvent_Signal(&g_rgo);
+    recon_phase(rs, 0, mid, which);
+    LightEvent_Wait(&g_rdone);
+}
+/* pipeline: hand a whole set to the worker core (non-blocking); pair with recon_pipe_wait(). */
+static void recon_pipe_kick(ReconSet *rs) {
+    recon_par_init();
+    g_rfull = 1; g_rset = rs;
+    LightEvent_Signal(&g_rgo);
+}
+static void recon_pipe_wait(void) { LightEvent_Wait(&g_rdone); }
+#else
+/* Host: exercise the pipeline bookkeeping synchronously (no worker) to prove frame/slot logic is bit-exact. */
+static void recon_pipe_kick(ReconSet *rs) { recon_set_serial(rs); }
+static void recon_pipe_wait(void) { }
+#endif
+
+/* Immediate (non-pipelined) reconstruct of one set: serial, within-frame dual-core, or host revsplit. */
+static void recon_execute(MobiClipContext *s, ReconSet *rs) {
+#ifdef __3DS__
+    uint64_t _rt = svcGetSystemTick();
+    if (mobi_opt & MOBI_PAR) {
+        recon_par_init();
+        recon_phase_par(rs, 0);                       /* inter MC+IDCT, split across 2 cores at block boundaries */
+        recon_list2(rs);
+        mobi_recon_ticks += svcGetSystemTick() - _rt;
+        return;
+    }
+#endif
+    if (mobi_opt & MOBI_REVSPLIT) {                   /* host proxy for the parallel hazard: run the two
+                                                         split-halves in REVERSED order. Bit-exact <=> the
+                                                         mb_start split points are truly independent. */
+        int n = rs->rjob_n[0], mid = n / 2;
+        ReconJob *a0 = rs->rjob[0];
+        while (mid < n && !a0[mid].mb_start) mid++;
+        recon_phase(rs, mid, n, 0);
+        recon_phase(rs, 0, mid, 0);
+        recon_list2(rs);
+    } else {
+        recon_set_serial(rs);
+    }
+#ifdef __3DS__
+    mobi_recon_ticks += svcGetSystemTick() - _rt;
+#endif
+}
+
 static int mobiclip_decode(AVCodecContext *avctx, AVFrame *rframe,
                            int *got_frame, AVPacket *pkt)
 {
     MobiClipContext *s = avctx->priv_data;
     GetBitContext *gb = &s->gb;
-    AVFrame *frame = s->pic[s->current_pic];
     int ret;
+
+    s->recon_mode = (mobi_opt & MOBI_RECON2) ? RECON_RECORD : RECON_INLINE;
+    int pipe = (mobi_opt & MOBI_PIPE) && s->recon_mode == RECON_RECORD;
+
+    /* flush (empty packet): drain the one frame still pending in the pipeline */
+    if (!pkt->data || pkt->size == 0) {
+        *got_frame = 0;
+        for (int sl = 0; sl < 2; sl++) if (s->rset[sl].valid) {
+            recon_set_serial(&s->rset[sl]);
+            s->rset[sl].valid = 0;
+            if ((ret = av_frame_ref(rframe, s->rset[sl].out)) < 0) return ret;
+            *got_frame = 1; break;
+        }
+        return 0;
+    }
+
+    int slot = pipe ? s->parse_slot : 0;
+    ReconSet *rs = &s->rset[slot];
+    s->parse_slot = slot;                      /* rj_new / rmat_put record into rs */
+    AVFrame *frame = s->pic[s->current_pic];
 
     if (avctx->height/16 * (avctx->width/16) * 2 > 8LL*FFALIGN(pkt->size, 2))
         return AVERROR_INVALIDDATA;
@@ -1525,6 +1691,13 @@ static int mobiclip_decode(AVCodecContext *avctx, AVFrame *rframe,
     ret = init_get_bits8(gb, s->bitstream, FFALIGN(pkt->size, 2));
     if (ret < 0)
         return ret;
+
+    if (s->recon_mode == RECON_RECORD) {
+        rs->rjob_n[0] = rs->rjob_n[1] = rs->rjob_n[2] = 0; rs->rmat_n = 0; rs->out = frame;
+    }
+
+    ReconSet *pend = (pipe && s->rset[slot ^ 1].valid) ? &s->rset[slot ^ 1] : NULL;
+    if (pend) recon_pipe_kick(pend);           /* reconstruct N-1 on the worker, concurrently with parse below */
 
     if (get_bits1(gb)) {
         frame->pict_type = AV_PICTURE_TYPE_I;
@@ -1559,6 +1732,8 @@ static int mobiclip_decode(AVCodecContext *avctx, AVFrame *rframe,
         for (int y = 0; y < avctx->height; y += 16) {
             for (int x = 0; x < avctx->width; x += 16) {
                 int idx;
+                s->rec_intra = 0;   /* default: inter MB (decode_macroblock sets 1 for intra MBs) */
+                s->rec_mark  = 1;   /* this MB's first list-0 job is a safe parallel split boundary */
 
                 motion[0].x = mid_pred(motion[x / 16 + 1].x, motion[x / 16 + 2].x, motion[x / 16 + 3].x);
                 motion[0].y = mid_pred(motion[x / 16 + 1].y, motion[x / 16 + 2].y, motion[x / 16 + 3].y);
@@ -1599,14 +1774,27 @@ static int mobiclip_decode(AVCodecContext *avctx, AVFrame *rframe,
         }
     }
 
+    if (s->recon_mode == RECON_RECORD) {
+        if (pipe) {
+            if (pend) recon_pipe_wait();      /* N-1 reconstruct finished (overlapped the parse above) */
+            rs->valid = 1;                    /* this frame becomes next call's pending reconstruct */
+            s->parse_slot = slot ^ 1;
+        } else
+            recon_execute(s, rs);             /* immediate: replay reconstruction into frame */
+    }
+
     if (!s->moflex)
         avctx->colorspace = AVCOL_SPC_YCGCO;
 
     s->current_pic = (s->current_pic + 1) % 6;
-    ret = av_frame_ref(rframe, frame);
-    if (ret < 0)
-        return ret;
-    *got_frame = 1;
+
+    if (pipe) {
+        if (pend) { if ((ret = av_frame_ref(rframe, pend->out)) < 0) return ret; pend->valid = 0; *got_frame = 1; }
+        else *got_frame = 0;                  /* priming: first frame parsed, not yet reconstructed/output */
+    } else {
+        if ((ret = av_frame_ref(rframe, frame)) < 0) return ret;
+        *got_frame = 1;
+    }
 
     return 0;
 }
@@ -1617,6 +1805,9 @@ static void mobiclip_flush(AVCodecContext *avctx)
 
     for (int i = 0; i < 6; i++)
         av_frame_unref(s->pic[i]);
+    /* drop any pending pipeline frame so a seek doesn't reconstruct against a stale reference */
+    s->rset[0].valid = s->rset[1].valid = 0;
+    s->parse_slot = 0;
 }
 
 static av_cold int mobiclip_close(AVCodecContext *avctx)
@@ -1627,12 +1818,47 @@ static av_cold int mobiclip_close(AVCodecContext *avctx)
     s->bitstream_size = 0;
     av_freep(&s->motion);
     s->motion_size = 0;
+    for (int sl = 0; sl < 2; sl++) {
+        ReconSet *rs = &s->rset[sl];
+        for (int k = 0; k < 3; k++) { av_freep(&rs->rjob[k]); rs->rjob_cap[k] = rs->rjob_n[k] = 0; }
+        av_freep(&rs->rmat); rs->rmat_cap = rs->rmat_n = 0;
+    }
 
     for (int i = 0; i < 6; i++) {
         av_frame_free(&s->pic[i]);
     }
 
     return 0;
+}
+
+/* ---- dual-core reconstruction SCALING benchmark (not part of decode). Reconstructs luma rows
+ * [y0,y1) of a WxH frame using the REAL kernels: diagonal half-pel motion comp (u8avg, the expensive
+ * MC path) + a full 8x8 2D IDCT + clip-add. This is representative of decode reconstruction, which is
+ * ~80% of decode time. Run it on ONE core (full frame) vs TWO cores (each half) to measure whether the
+ * ARM11 memory bus lets a 2nd core add real throughput or caps it -> decides dual-core reconstruction. */
+void mobi_recon_bench(const uint8_t *ref, uint8_t *dst, int W, int H, int y0, int y1)
+{
+    for (int by = y0; by + 8 <= y1; by += 8) {
+        for (int bx = 0; bx + 8 <= W; bx += 8) {
+            const uint8_t *src = ref + (size_t)by * W + bx;
+            uint8_t *d = dst + (size_t)by * W + bx;
+            for (int y = 0; y < 8; y++) {           /* motion comp: diagonal half-pel average */
+                for (int x = 0; x < 8; x += 4)
+                    st4(d + x, u8avg(u8avg(ld4(src + x), ld4(src + x + 1)),
+                                     u8avg(ld4(src + x + W), ld4(src + x + 1 + W))));
+                d += W; src += W;
+            }
+            dctcoef blk[8][8], col[8];              /* residual: real 8x8 2D IDCT (8 rows + 8 cols) */
+            for (int y = 0; y < 8; y++) for (int x = 0; x < 8; x++) blk[y][x] = ((bx + x) ^ (by + y)) & 31;
+            for (int y = 0; y < 8; y++) idct(blk[y], 8);
+            for (int x = 0; x < 8; x++) { for (int y = 0; y < 8; y++) col[y] = blk[y][x];
+                                          idct(col, 8);
+                                          for (int y = 0; y < 8; y++) blk[y][x] = col[y]; }
+            d = dst + (size_t)by * W + bx;          /* clip-add the residual */
+            for (int y = 0; y < 8; y++) { for (int x = 0; x < 8; x++) { int v = d[x] + (blk[y][x] >> 6);
+                                          d[x] = v < 0 ? 0 : v > 255 ? 255 : v; } d += W; }
+        }
+    }
 }
 
 /* ---- standalone entry points (replaces FFCodec registration) ---- */
