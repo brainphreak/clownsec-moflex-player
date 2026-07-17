@@ -900,21 +900,88 @@ static void g_y2r_wait(C3D_Tex *tex) {
     svcFlushProcessDataCache(CUR_PROCESS_HANDLE, (u32)tex->data, tex->size);
 }
 
+/* draw an outlined button box (citro2d) + centered label */
+static void gp_btn(int x, int y, int w, int h, C2D_Text *label, u32 col, int fill) {
+    C2D_DrawRectSolid(x, y, 0, w, h, fill ? col : C2D_Color32(28, 28, 28, 255));
+    if (!fill) {   /* outline */
+        C2D_DrawRectSolid(x, y, 0, w, 2, col);           C2D_DrawRectSolid(x, y + h - 2, 0, w, 2, col);
+        C2D_DrawRectSolid(x, y, 0, 2, h, col);           C2D_DrawRectSolid(x + w - 2, y, 0, 2, h, col);
+    }
+    if (label) {
+        float tw = 0; C2D_TextGetDimensions(label, 0.5f, 0.5f, &tw, NULL);
+        C2D_DrawText(label, C2D_WithColor, x + (w - tw) / 2, y + (h - 15) / 2, 0, 0.5f, 0.5f,
+                     fill ? C2D_Color32(0, 0, 0, 255) : col);
+    }
+}
 static void g_panel(C3D_RenderTarget *bot, C2D_Text *ttitle, C2D_Text *ttime, C2D_Text *thint,
                     int64_t cur, int64_t dur, int playing, float vol) {
     u32 wht = C2D_Color32(255, 255, 255, 255), gry = C2D_Color32(150, 150, 150, 255);
+    u32 neon = C2D_Color32(80, 160, 255, 255), dim = C2D_Color32(90, 90, 90, 255), red = C2D_Color32(230, 70, 70, 255);
+    /* fixed labels parsed once */
+    static C2D_TextBuf lbuf; static C2D_Text tCC, tBACK, tOPEN, tEXIT; static int linit = 0;
+    if (!linit) { lbuf = C2D_TextBufNew(64);
+        C2D_TextParse(&tCC, lbuf, "CC");   C2D_TextOptimize(&tCC);
+        C2D_TextParse(&tBACK, lbuf, "BACK"); C2D_TextOptimize(&tBACK);
+        C2D_TextParse(&tOPEN, lbuf, "OPEN"); C2D_TextOptimize(&tOPEN);
+        C2D_TextParse(&tEXIT, lbuf, "EXIT"); C2D_TextOptimize(&tEXIT); linit = 1; }
+    static C2D_TextBuf bbuf; if (!bbuf) bbuf = C2D_TextBufNew(16);
+
     C2D_TargetClear(bot, C2D_Color32(0, 0, 0, 255));
     C2D_SceneBegin(bot);
     C2D_DrawText(ttitle, C2D_WithColor, 6, 4, 0, 0.6f, 0.6f, wht);
     C2D_DrawText(ttime,  C2D_WithColor, 6, 26, 0, 0.5f, 0.5f, gry);
+
+    /* battery: icon + % pinned to the top-right */
+    batt_refresh();
+    if (g_batt_pct >= 0) {
+        u32 bcol = g_batt_chg ? neon : (g_batt_pct <= 15 ? red :
+                   g_batt_pct <= 30 ? C2D_Color32(255, 180, 60, 255) : C2D_Color32(80, 220, 120, 255));
+        int bx = 292, by = 24, bw = 16, bh = 10;
+        C2D_DrawRectSolid(bx, by, 0, bw, bh, bcol);
+        C2D_DrawRectSolid(bx + 1, by + 1, 0, bw - 2, bh - 2, C2D_Color32(0, 0, 0, 255));   /* hollow body */
+        int fw = (bw - 4) * g_batt_pct / 100; if (fw < 1 && g_batt_pct > 0) fw = 1;
+        C2D_DrawRectSolid(bx + 2, by + 2, 0, fw, bh - 4, bcol);                            /* charge fill */
+        C2D_DrawRectSolid(bx + bw, by + 3, 0, 2, bh - 6, bcol);                            /* terminal nub */
+        char bs[8]; snprintf(bs, sizeof bs, "%d%%", g_batt_pct);
+        C2D_Text tb; C2D_TextBufClear(bbuf); C2D_TextParse(&tb, bbuf, bs); C2D_TextOptimize(&tb);
+        float tw = 0; C2D_TextGetDimensions(&tb, 0.45f, 0.45f, &tw, NULL);
+        C2D_DrawText(&tb, C2D_WithColor, bx - 5 - tw, 25, 0, 0.45f, 0.45f, bcol);
+    }
+
+    /* seek bar */
     double frac = dur > 0 ? (double)cur / (double)dur : 0; if (frac > 1) frac = 1;
     C2D_DrawRectSolid(BAR_X, BAR_Y, 0, BAR_W, BAR_H, C2D_Color32(60, 60, 60, 255));
     C2D_DrawRectSolid(BAR_X, BAR_Y, 0, (float)(BAR_W * frac), BAR_H, wht);
-    C2D_DrawRectSolid(BAR_X + (float)(BAR_W * frac) - 2, BAR_Y - 3, 0, 5, BAR_H + 6, C2D_Color32(80, 160, 255, 255));
+    C2D_DrawRectSolid(BAR_X + (float)(BAR_W * frac) - 2, BAR_Y - 3, 0, 5, BAR_H + 6, neon);
+
+    /* transport: RW (<<)   play/pause   FF (>>) */
+    C2D_DrawTriangle(RW_CX + 7, PLAY_CY - 9, neon, RW_CX + 7, PLAY_CY + 9, neon, RW_CX - 3, PLAY_CY, neon, 0);
+    C2D_DrawTriangle(RW_CX - 1, PLAY_CY - 9, neon, RW_CX - 1, PLAY_CY + 9, neon, RW_CX - 11, PLAY_CY, neon, 0);
+    C2D_DrawTriangle(FF_CX - 7, PLAY_CY - 9, neon, FF_CX - 7, PLAY_CY + 9, neon, FF_CX + 3, PLAY_CY, neon, 0);
+    C2D_DrawTriangle(FF_CX + 1, PLAY_CY - 9, neon, FF_CX + 1, PLAY_CY + 9, neon, FF_CX + 11, PLAY_CY, neon, 0);
     if (playing) { C2D_DrawRectSolid(PLAY_CX - 9, PLAY_CY - 13, 0, 6, 26, wht); C2D_DrawRectSolid(PLAY_CX + 3, PLAY_CY - 13, 0, 6, 26, wht); }
     else C2D_DrawTriangle(PLAY_CX - 8, PLAY_CY - 13, wht, PLAY_CX - 8, PLAY_CY + 13, wht, PLAY_CX + 12, PLAY_CY, wht, 0);
+
+    /* volume */
     C2D_DrawRectSolid(VOL_X, VOL_Y, 0, 12, VOL_H, C2D_Color32(60, 60, 60, 255));
     C2D_DrawRectSolid(VOL_X, VOL_Y + VOL_H * (1.0f - vol / 4.0f), 0, 12, VOL_H * (vol / 4.0f), wht);
+
+    /* CC toggle (glows when subs on) */
+    gp_btn(CC_X, CC_Y, CC_W, CC_H, &tCC, g_sub_on ? neon : dim, 0);
+
+    /* bottom-screen-off: crescent moon (video keeps playing on top) */
+    if (g_lcd_ok) {
+        gp_btn(DIM_X, DIM_Y, DIM_W, DIM_H, NULL, C2D_Color32(120, 120, 200, 255), 0);
+        int mx = DIM_X + DIM_W / 2, my = DIM_Y + DIM_H / 2, mr = 8;
+        C2D_DrawCircleSolid(mx, my, 0, mr, C2D_Color32(200, 220, 255, 255));
+        C2D_DrawCircleSolid(mx + 5, my - 2, 0, mr, C2D_Color32(28, 28, 28, 255));   /* carve -> crescent */
+    }
+
+    /* action buttons: BACK / OPEN / EXIT */
+    gp_btn(BKB_X, BTN_Y, BKB_W, BTN_H, &tBACK, C2D_Color32(200, 120, 220, 255), 0);
+    gp_btn(OPB_X, BTN_Y, OPB_W, BTN_H, &tOPEN, neon, 0);
+    gp_btn(EXB_X, BTN_Y, EXB_W, BTN_H, &tEXIT, red, 0);
+
     C2D_DrawText(thint, C2D_WithColor, 8, 222, 0, 0.42f, 0.42f, gry);
 }
 
@@ -1635,6 +1702,10 @@ static MoflexResult moflex_play_ring(const char *path) {
         return MOFLEX_FALLBACK;
     }
 
+    /* services for the panel controls (same as the classic path): battery level + bottom-screen backlight */
+    ptmuInit(); g_mcu_ok = R_SUCCEEDED(mcuHwcInit()); g_batt_pct = -1; g_batt_next = 0;
+    g_lcd_ok = R_SUCCEEDED(gspLcdInit()); g_screen_off = 0;
+
     /* grow the pair ring until the linear heap is nearly spent (reserve audio bank + GPU slack) */
     Tex3DS_SubTexture sub = { (u16)W, (u16)H, 0.0f, 1.0f, (float)W / GT_W, 1.0f - (float)H / GT_H };
     const size_t R3_RESERVE = (size_t)(R3_AWB * R3_ABUF * chn * 2) + (2u << 20);
@@ -1728,6 +1799,10 @@ static MoflexResult moflex_play_ring(const char *path) {
         u32 kd = hidKeysDown(), kh = hidKeysHeld();
         touchPosition tp; hidTouchRead(&tp);
 
+        /* bottom screen dark (moon): the top video keeps playing; the first input just wakes the
+         * backlight and is consumed so it doesn't also trigger a control. */
+        if (g_screen_off && kd) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; dirty = 1; kd = 0; }
+
         if (kd & KEY_B) { result = MOFLEX_QUIT_BACK; break; }
         if (kd & KEY_A) { playing = !playing; if (have_audio) ndspChnSetPaused(0, !playing);
                           s.paused = !playing; if (playing) LightEvent_Signal(&s.wake);
@@ -1759,6 +1834,10 @@ static MoflexResult moflex_play_ring(const char *path) {
                 seek_to_us = cur_us - 30000000; want_seek = 1;
             } else if (py >= PLAY_CY - 20 && py <= PLAY_CY + 20 && px >= FF_CX - 18 && px <= FF_CX + 18) {
                 seek_to_us = cur_us + 30000000; want_seek = 1;
+            } else if (px >= CC_X && px < CC_X + CC_W && py >= CC_Y && py < CC_Y + CC_H) {
+                g_sub_on = !g_sub_on; dirty = 1;   /* CC: toggle subtitles (full options menu = citro2d follow-up) */
+            } else if (g_lcd_ok && px >= DIM_X && px < DIM_X + DIM_W && py >= DIM_Y && py < DIM_Y + DIM_H) {
+                GSPLCD_PowerOffBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 1;   /* dark; any input wakes it */
             } else if (py >= BTN_Y && py < BTN_Y + BTN_H) {
                 if      (px >= BKB_X && px < BKB_X + BKB_W) { result = MOFLEX_QUIT_BACK; break; }
                 else if (px >= OPB_X && px < OPB_X + OPB_W) { result = MOFLEX_QUIT_OPEN; break; }
@@ -1844,9 +1923,11 @@ static MoflexResult moflex_play_ring(const char *path) {
         int64_t disp_us = (show >= 0) ? bts[show] : (last_shown >= 0 ? last_bts : cur_us);
         if (want_seek && (kh & (KEY_LEFT | KEY_RIGHT))) { disp_us = seek_to_us < 0 ? 0 : seek_to_us; dirty = 1; }  /* preview the accumulating seek target */
         const char *cue = subs_active(disp_us);   /* NULL if subs off or no cue now */
-        char tc[16], ts[64];
+        char tc[16], td[16], ts[64];
         fmt_time(disp_us, tc, sizeof tc);
-        snprintf(ts, sizeof ts, "%s  q%d/%d%s", tc, wr - rd, NB, pf_str);   /* q/NB = cushion depth / max */
+        fmt_time(dur_us, td, sizeof td);
+        snprintf(ts, sizeof ts, "%s / %s", tc, td);   /* clean current / duration (debug HUD removed) */
+        (void)pf_str;
         if (strcmp(ts, last_ts)) { snprintf(last_ts, sizeof last_ts, "%s", ts);
                                    C2D_TextBufClear(tmbuf); C2D_TextParse(&ttime, tmbuf, ts); C2D_TextOptimize(&ttime); }
         if (cue && *cue) {                          /* (re)parse only when the cue text changes */
@@ -1917,6 +1998,11 @@ static MoflexResult moflex_play_ring(const char *path) {
     if (dur_us > 0 && cur_us >= dur_us - 10000000) resume_clear(path);
     else if (cur_us > 3000000) resume_save_us(path, cur_us);
     if (vol_dirty) vol_save();
+    /* release panel services (restore backlight first so we never leave the screen dark) */
+    if (g_screen_off) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; }
+    if (g_lcd_ok) { gspLcdExit(); g_lcd_ok = 0; }
+    if (g_mcu_ok) { mcuHwcExit(); g_mcu_ok = 0; }
+    ptmuExit();
     if (have_audio) r3_audio_close();
     r3_vq_clear();
     C2D_TextBufDelete(sbuf); C2D_TextBufDelete(tmbuf); C2D_TextBufDelete(subbuf);
