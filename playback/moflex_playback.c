@@ -34,8 +34,8 @@ static int   g_sw_bank = -1;     /* software-banking depth (pairs banked ahead);
 #define SR_NB 16                 /* software banking ring depth (defined early so panel_draw can show it) */
 static int   g_lcd_ok = 0;       /* gsp::Lcd available -> bottom-screen-off feature usable */
 static int   g_screen_off = 0;   /* bottom backlight is currently off (movie keeps playing on top) */
-static int   g_touch_locked = 0; /* LOCK SCREEN: ignore touch; X/Y still work; any other button unlocks */
-static int   g_exb_lock = 0;     /* player EXB button shows LOCK SCREEN (ring engine) vs EXIT (others) */
+static int   g_touch_locked = 0; /* touch lock: L toggles it; buttons still work; touch shows a toast */
+static int   g_lock_toast = 0;   /* frames left to show the "SCREEN IS LOCKED" toast after a touch */
 
 /* ---- battery indicator (player panel) ---- */
 static int   g_mcu_ok = 0;       /* mcu::HWC available -> exact 0-100% */
@@ -628,10 +628,20 @@ static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing)
     ui_text(VOL_X - 16, VOL_Y - 12, 1, UI_INK, vs);   /* label above the slider (frees the button row) */
 
     /* action buttons (touch): BACK / OPEN / EXIT */
+    /* button legend / key map, above the action buttons on the left */
+    ui_text(6, 190, 1, UI_INK, "Y=SUBS X=DARK A=PLAY B=BACK L=LOCK");
     panel_btn2(BKB_X, BKB_W, "OPEN", "VIDEO",  UI_NEON);    /* -> open the video picker */
-    panel_btn2(OPB_X, OPB_W, "MANAGE", "VIDEOS", UI_NEONP); /* -> back to the library/home */
-    if (g_exb_lock) panel_btn2(EXB_X, EXB_W, "LOCK", "SCREEN", UI_NEONC);  /* ring: lock touch (B goes back) */
-    else            panel_btn2(EXB_X, EXB_W, "EXIT", NULL, UI_RED);
+    panel_btn2(OPB_X, OPB_W, "MANAGE", "VIDEOS", UI_NEONP); /* -> manage/library */
+    panel_btn2(EXB_X, EXB_W, "MAIN", NULL, UI_NEONC);      /* -> main screen (B goes back) */
+
+    /* touch-lock feedback: persistent marker + a brief toast when the locked screen is touched */
+    if (g_touch_locked) ui_text(UI_W - 58, 8, 1, UI_NEONC, "LOCKED");
+    if (g_lock_toast > 0) {
+        int bw = 172, bh = 30, bx = (UI_W - bw) / 2, by = (UI_H - bh) / 2;
+        ui_fill_round(bx, by, bw, bh, 8, UI_BG2);
+        ui_frame_round(bx, by, bw, bh, 8, UI_NEONC, 2);
+        ui_text_center(UI_W / 2, by + 11, 1, UI_NEONC, "SCREEN IS LOCKED");
+    }
     /* subtitles: CC toggle/options (glows when on) */
     ui_button(CC_X, CC_Y, CC_W, CC_H, "CC", g_sub_on, g_sub_on ? UI_NEON : UI_DIM);
     /* bottom-screen-off: a crescent-moon button (video keeps playing on top) */
@@ -1108,21 +1118,6 @@ static void g_submenu_sw(C3D_RenderTarget *bot, int is3d) {
     if (g_submenu == 2) srtpicker_render(); else submenu_render(is3d);
     ui_tex_present(bot);
 }
-/* the bottom screen while the touch is locked: a padlock + how to unlock (movie plays on top) */
-static void g_locked_sw(C3D_RenderTarget *bot) {
-    if (!ui_tex_init()) return;
-    ui_capture(1);
-    ui_begin(GFX_BOTTOM);
-    ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
-    int cx = UI_W / 2, cy = 66;
-    ui_frame_round(cx - 12, cy - 15, 24, 22, 11, UI_NEONC, 3);   /* shackle */
-    ui_fill_round(cx - 18, cy, 36, 30, 6, UI_NEONC);             /* body */
-    ui_fill_round(cx - 3, cy + 9, 6, 11, 3, UI_BG2);             /* keyhole */
-    ui_text_center(cx, cy + 48, 2, UI_NEONC, "TOUCH LOCKED");
-    ui_text_center(cx, cy + 80, 1, UI_INK, "Press any button to unlock");
-    ui_text_center(cx, cy + 98, 1, UI_DIM, "X = dark screen    Y = captions");
-    ui_tex_present(bot);
-}
 
 /* open the SRT picker: scan the movie folder + moviedata for .srt files */
 static void submenu_open_srt(const char *moviepath) {
@@ -1401,7 +1396,7 @@ static MoflexResult moflex_play_gpu(const char *path) {
                 } else if (py >= BTN_Y && py < BTN_Y + BTN_H) {   /* BACK / OPEN / EXIT */
                     if      (px >= BKB_X && px < BKB_X + BKB_W) { result = MOFLEX_QUIT_OPEN; break; }   /* OPEN VIDEO */
                     else if (px >= OPB_X && px < OPB_X + OPB_W) { result = MOFLEX_QUIT_BACK; break; }   /* MANAGE VIDEOS */
-                    else if (px >= EXB_X && px < EXB_X + EXB_W) { result = MOFLEX_QUIT_EXIT; break; }
+                    else if (px >= EXB_X && px < EXB_X + EXB_W) { result = MOFLEX_QUIT_BACK; break; }   /* MAIN */
                 }
             }
         }
@@ -1980,7 +1975,7 @@ static MoflexResult moflex_play_ring(const char *path) {
     int scrubbing = 0; int64_t scrub_us = 0;   /* touch-drag on the bar: preview while held, seek on release */
     int vol_drag = 0;                           /* touch-drag on the volume slider (applies live) */
     g_submenu = 0; g_sub_sel = 0;               /* subtitle menu starts closed */
-    g_touch_locked = 0; g_exb_lock = 1;         /* ring engine: EXB is LOCK SCREEN, touch starts unlocked */
+    g_touch_locked = 0; g_lock_toast = 0;       /* touch starts unlocked */
     int64_t rpos = resume_load(path), last_save = 0;
     if (rpos > 3000000 && (dur_us <= 0 || rpos < dur_us - 10000000)) { seek_to_us = rpos; want_seek = 1; last_save = rpos; }
     int vol_dirty = 0, save_pend = 0, save_delay = 0;
@@ -2034,21 +2029,16 @@ static MoflexResult moflex_play_ring(const char *path) {
         touchPosition tp; hidTouchRead(&tp);
         g_ring_apt_playing = playing;   /* so the suspend hook resumes audio only if we were playing */
 
-        /* bottom screen dark (moon): the top video keeps playing; the first input just wakes the
-         * backlight and is consumed so it doesn't also trigger a control. */
-        if (!g_touch_locked && g_screen_off && kd) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; dirty = 1; kd = 0; }
+        /* L toggles the touch lock. While locked, EVERY button still works (play/seek/subs/dark);
+         * only touch is ignored, and touching shows a brief "SCREEN IS LOCKED" toast. Only L unlocks. */
+        if (kd & KEY_L) { g_touch_locked = !g_touch_locked; g_lock_toast = 0; dirty = 1; }
+        if (g_touch_locked) {
+            if (kd & KEY_TOUCH) { g_lock_toast = 90; dirty = 1; }   /* touched while locked -> show why */
+            kd &= ~KEY_TOUCH; kh &= ~KEY_TOUCH;                     /* touch does nothing while locked */
+        }
+        if (g_lock_toast > 0) { g_lock_toast--; dirty = 1; }
 
-        if (g_touch_locked) {                  /* touch locked: X/Y still work; any OTHER button unlocks */
-            if (g_lcd_ok && (kd & KEY_X)) {    /* X: toggle the dark bottom screen without unlocking */
-                if (g_screen_off) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; }
-                else { GSPLCD_PowerOffBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 1; }
-            } else if (kd & KEY_Y) { g_sub_on = !g_sub_on; }   /* Y: toggle captions without unlocking */
-            else if (kd & ~KEY_TOUCH) {        /* any physical button (touch doesn't count) unlocks */
-                g_touch_locked = 0;
-                if (g_screen_off) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; }
-            }
-            dirty = 1;
-        } else if (g_submenu) {                /* subtitle menu owns input while open; movie plays on */
+        if (g_submenu) {                       /* subtitle menu owns input while open; movie plays on */
             submenu_input(kd, kh, tp, is3d, path);
             dirty = 1;
         } else {
@@ -2060,8 +2050,10 @@ static MoflexResult moflex_play_ring(const char *path) {
         if (kd & KEY_DOWN) { int s = (int)(g_vol / 0.25f + 0.9999f); g_vol = (s - 1) * 0.25f; if (g_vol < 0.25f) g_vol = 0.25f; vol_dirty = 1; }
         if (kd & KEY_Y)      { g_sub_on = !g_sub_on; dirty = 1; }   /* Y: quick-toggle subtitles */
         if (kd & KEY_SELECT) { g_submenu = 1; g_sub_sel = 0; dirty = 1; }   /* SELECT: open subtitle options */
-        if (kd & KEY_X && g_lcd_ok && !g_screen_off) {           /* X: screen off (any input, incl. X, wakes it above) */
-            GSPLCD_PowerOffBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 1;
+        if (kd & KEY_X && g_lcd_ok) {                            /* X: toggle the dark bottom screen */
+            if (g_screen_off) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; }
+            else { GSPLCD_PowerOffBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 1; }
+            dirty = 1;
         }
         {   int sdir = (kh & KEY_RIGHT) ? 1 : ((kh & KEY_LEFT) ? -1 : 0);
             if (sdir == 0) shold = 0;
@@ -2097,7 +2089,7 @@ static MoflexResult moflex_play_ring(const char *path) {
             } else if (py >= BTN_Y && py < BTN_Y + BTN_H) {
                 if      (px >= BKB_X && px < BKB_X + BKB_W) { result = MOFLEX_QUIT_OPEN; break; }   /* OPEN VIDEO */
                 else if (px >= OPB_X && px < OPB_X + OPB_W) { result = MOFLEX_QUIT_BACK; break; }   /* MANAGE VIDEOS */
-                else if (px >= EXB_X && px < EXB_X + EXB_W) { g_touch_locked = 1; dirty = 1; }      /* LOCK SCREEN */
+                else if (px >= EXB_X && px < EXB_X + EXB_W) { result = MOFLEX_QUIT_BACK; break; }   /* MAIN */
             }
         }
 
@@ -2231,9 +2223,8 @@ static MoflexResult moflex_play_ring(const char *path) {
             C2D_TargetClear(topR, black); C2D_SceneBegin(topR);
             C2D_DrawImageAt(is3d ? r3_imgR[b] : r3_imgL[b], 0, 0, 0, NULL, 1, 1);
             if (sub_valid) r3_draw_sub(&tsub, is3d ? g_sub_depth : 0, subcol, subout);
-            if (g_touch_locked) g_locked_sw(bot);                /* touch locked (movie keeps playing) */
-            else if (g_submenu) g_submenu_sw(bot, is3d);         /* subtitle options (movie keeps playing) */
-            else g_panel_sw(bot, title, disp_us, dur_us, playing);   /* release-style panel via texture */
+            if (g_submenu) g_submenu_sw(bot, is3d);              /* subtitle options (movie keeps playing) */
+            else g_panel_sw(bot, title, disp_us, dur_us, playing);   /* panel (shows lock toast if locked) */
             u64 _tg = svcGetSystemTick(); C3D_FrameEnd(0); pf_gpu += svcGetSystemTick() - _tg;
             dirty = 0;
             if (show >= 0) {
@@ -2535,7 +2526,7 @@ static MoflexResult moflex_play_classic(const char *path) {
                 } else if (py >= BTN_Y && py < BTN_Y + BTN_H) {   /* BACK / OPEN / EXIT */
                     if      (px >= BKB_X && px < BKB_X + BKB_W) { result = MOFLEX_QUIT_OPEN; break; }   /* OPEN VIDEO */
                     else if (px >= OPB_X && px < OPB_X + OPB_W) { result = MOFLEX_QUIT_BACK; break; }   /* MANAGE VIDEOS */
-                    else if (px >= EXB_X && px < EXB_X + EXB_W) { result = MOFLEX_QUIT_EXIT; break; }
+                    else if (px >= EXB_X && px < EXB_X + EXB_W) { result = MOFLEX_QUIT_BACK; break; }   /* MAIN */
                 }
             }
         }
@@ -2826,7 +2817,7 @@ static MoflexResult moflex_play_soft(const char *path) {
                 } else if (py >= BTN_Y && py < BTN_Y + BTN_H) {
                     if      (px >= BKB_X && px < BKB_X + BKB_W) { result = MOFLEX_QUIT_OPEN; break; }   /* OPEN VIDEO */
                     else if (px >= OPB_X && px < OPB_X + OPB_W) { result = MOFLEX_QUIT_BACK; break; }   /* MANAGE VIDEOS */
-                    else if (px >= EXB_X && px < EXB_X + EXB_W) { result = MOFLEX_QUIT_EXIT; break; }
+                    else if (px >= EXB_X && px < EXB_X + EXB_W) { result = MOFLEX_QUIT_BACK; break; }   /* MAIN */
                 }
             }
         }
