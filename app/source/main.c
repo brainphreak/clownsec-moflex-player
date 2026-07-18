@@ -1358,7 +1358,22 @@ static void lib_scan_dir(const char *dir, int depth) {
     closedir(d);
 }
 
+static void lib_normalize_shows(void) {
+    /* belt-and-braces: whatever code path touched the entries, a FOLDER url must always be a show
+     * (is_zip 2, folder-derived name). Cheap: only non-media-named entries get the stat. */
+    for (int i = 0; i < g_lib_n; i++) {
+        if (g_lib[i].is_zip == 2 || is_moflex(g_lib[i].fname)) continue;
+        struct stat st;
+        if (!stat(g_lib[i].url, &st) && S_ISDIR(st.st_mode)) {
+            g_lib[i].is_zip = 2;
+            show_name_from_dir(g_lib[i].url, g_lib[i].name, sizeof g_lib[i].name);
+            if (!strcasecmp(g_lib[i].category, "Uncategorized"))
+                snprintf(g_lib[i].category, sizeof g_lib[i].category, "TV Shows");
+        }
+    }
+}
 static void lib_save_cache(void) {
+    lib_normalize_shows();                                    /* never persist a demoted show entry */
     mkdir("sdmc:/moflex_player", 0777);                       /* cache so later opens are instant */
     FILE *f = fopen(LIB_CACHE, "wb");
     if (f) { int magic = LIB_MAGIC; fwrite(&magic, sizeof magic, 1, f);
@@ -1423,18 +1438,7 @@ static int lib_load_cache(void) {   /* cache-only: movie count, 0 if no valid ca
             fread(&n, sizeof n, 1, f) == 1 && n > 0 && n <= LIB_MAX &&
             (int)fread(g_lib, sizeof(CatEntry), n, f) == n) g_lib_n = n;
         fclose(f); }
-    /* heal caches written while the refresh bug demoted shows: a folder entry must be is_zip 2.
-     * Only non-media-named urls get the stat, so this costs a couple of syscalls, not thousands. */
-    for (int i = 0; i < g_lib_n; i++) {
-        if (g_lib[i].is_zip == 2 || is_moflex(g_lib[i].fname)) continue;
-        struct stat st;
-        if (!stat(g_lib[i].url, &st) && S_ISDIR(st.st_mode)) {
-            g_lib[i].is_zip = 2;
-            show_name_from_dir(g_lib[i].url, g_lib[i].name, sizeof g_lib[i].name);
-            if (!strcasecmp(g_lib[i].category, "Uncategorized"))
-                snprintf(g_lib[i].category, sizeof g_lib[i].category, "TV Shows");
-        }
-    }
+    lib_normalize_shows();   /* heal caches written while the refresh bug demoted shows */
     return g_lib_n;
 }
 static int lib_load(void) {   /* returns the movie count; loads the cache, else scans once */
