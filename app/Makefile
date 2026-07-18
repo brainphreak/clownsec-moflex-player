@@ -18,7 +18,8 @@ SOURCES  := source ../decoder ../ffmpeg_support ../playback ../net ../ui \
 FF_INC   := ../ffmpeg_support/include
 
 ARCH    := -march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft
-BUILD_TAG := $(shell date +%y%m%d.%H%M)
+BUILD_TAG ?= $(shell ./buildnum.sh)
+export BUILD_TAG
 CFLAGS  := -w -O3 -mword-relocations -ffunction-sections -D__3DS__ -D_GNU_SOURCE \
 	-DBUILD_TAG=\"$(BUILD_TAG)\" \
 	-Wno-error=implicit-function-declaration $(ARCH) $(INCLUDE)

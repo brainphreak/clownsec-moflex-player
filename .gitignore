@@ -22,3 +22,4 @@ pc_verify/out/
 # internal docs (not for the public repo)
 STATUS.md
 ASSEMBLY_PLAN.md
+.buildnum
