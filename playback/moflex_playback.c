@@ -1860,7 +1860,7 @@ static MoflexResult moflex_play_ring(const char *path) {
         C3D_FrameBegin(0);
         C2D_TargetClear(topL, black); C2D_SceneBegin(topL);
         C2D_TargetClear(topR, black); C2D_SceneBegin(topR);
-        g_panel(bot, &ttitle, &ttime, &thint, 0, dur_us, 1, g_vol);
+        g_panel_sw(bot, title, 0, dur_us, 1);   /* release-style panel via texture (matches the shipped UI) */
         C3D_FrameEnd(0);
     }
 
@@ -2047,7 +2047,7 @@ static MoflexResult moflex_play_ring(const char *path) {
             C2D_TargetClear(topR, black); C2D_SceneBegin(topR);
             C2D_DrawImageAt(is3d ? r3_imgR[b] : r3_imgL[b], 0, 0, 0, NULL, 1, 1);
             if (sub_valid) r3_draw_sub(&tsub, is3d ? g_sub_depth : 0, subcol, subout);
-            g_panel(bot, &ttitle, &ttime, &thint, disp_us, dur_us, playing, g_vol);
+            g_panel_sw(bot, title, disp_us, dur_us, playing);   /* release-style panel via texture */
             u64 _tg = svcGetSystemTick(); C3D_FrameEnd(0); pf_gpu += svcGetSystemTick() - _tg;
             dirty = 0;
             if (show >= 0) {
@@ -2107,6 +2107,7 @@ static MoflexResult moflex_play_ring(const char *path) {
     r3_vq_clear();
     C2D_TextBufDelete(sbuf); C2D_TextBufDelete(tmbuf); C2D_TextBufDelete(subbuf);
     for (int i = 0; i < NB; i++) { C3D_TexDelete(&r3_texL[i]); C3D_TexDelete(&r3_texR[i]); }
+    ui_tex_free();   /* release the software-UI panel texture before C3D shuts down */
     gspWaitForVBlank(); gspWaitForVBlank();
     C2D_Fini(); C3D_Fini(); y2rExit();
     gfxSet3D(false);
