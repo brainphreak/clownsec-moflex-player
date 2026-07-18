@@ -1573,9 +1573,17 @@ gdone:
 static ndspWaveBuf r3_wb[R3_AWB]; static int16_t *r3_ab[R3_AWB];
 static int r3_awi, r3_nawb, r3_arate, r3_achn, r3_aok, r3_acnt[R3_AWB];
 static long long r3_aplayed; static int64_t r3_apos;   /* elapsed audible us, -1 = not started */
+/* A/V seek anchor: audio restarts at the first audio packet after the landing (content r3_audio_t0),
+ * which can differ from the video landing by up to one packet. We capture BOTH once, right after the
+ * audio re-locks, into a CONSTANT r3_av_skew (bounded), and add it to apos in the present compare.
+ * Captured once (never re-derived from the drifting bts-rts) so it can't grow -> no runaway. */
+static int64_t r3_audio_t0 = -1;   /* content ts of the first audio sample after (re)start */
+static int64_t r3_av_skew = 0;     /* constant apos offset = audio_origin - video_origin */
+static int     r3_av_ready = 0;    /* r3_av_skew has been captured for this segment */
 static u64 r3_last;   /* last poll tick, for the phase-locked clock */
 static void r3_audio_setup(int arate, int chn) {
     r3_arate = arate; r3_achn = chn; r3_awi = 0; r3_aplayed = 0; r3_apos = -1; r3_last = 0;
+    r3_audio_t0 = -1; r3_av_skew = 0; r3_av_ready = 0;
     ndspChnReset(0); ndspChnSetInterp(0, NDSP_INTERP_POLYPHASE); ndspChnSetRate(0, (float)arate);
     ndspChnSetFormat(0, chn == 2 ? NDSP_FORMAT_STEREO_PCM16 : NDSP_FORMAT_MONO_PCM16);
     float mix[12]; memset(mix, 0, sizeof mix); mix[0] = mix[1] = 1.0f; ndspChnSetMix(0, mix);
@@ -1634,6 +1642,7 @@ static void r3_audio_flush(void) {   /* on seek: drop everything queued, clock o
     ndspChnWaveBufClear(0);
     for (int i = 0; i < r3_nawb; i++) { r3_wb[i].status = NDSP_WBUF_DONE; r3_acnt[i] = 1; }
     r3_awi = 0; r3_aplayed = 0; r3_apos = -1; r3_last = 0;
+    r3_audio_t0 = -1; r3_av_skew = 0; r3_av_ready = 0;   /* re-anchor A/V on the next lock */
     ndspChnSetPaused(0, true);
 }
 static void r3_audio_close(void) {
@@ -1773,7 +1782,10 @@ static void r3_produce(R3S *s) {
         if (!s->has_pending) { if (mfx_next_packet(s->m, &s->pending) != 1) { s->done = 1; break; } s->has_pending = 1; }
         int mt = s->m->streams[s->pending.stream_index].media_type;
         if (mt == MFX_TYPE_AUDIO && s->have_audio) {
-            if (r3_audio_feed(&s->pending)) s->has_pending = 0;
+            if (r3_audio_feed(&s->pending)) {
+                if (r3_audio_t0 < 0) { int64_t at = s->m->ts; r3_audio_t0 = at < 0 ? 0 : at; }  /* audio origin */
+                s->has_pending = 0;
+            }
             else { s->audio_pre_full = 1; break; }        /* bank full: hold packet, let main unpause audio */
         } else if (mt == MFX_TYPE_VIDEO) {
             int64_t vts = s->m->ts; if (vts < 0) vts = 0; if (s->dur_us > 0 && vts > s->dur_us) vts = s->dur_us;
@@ -2207,9 +2219,18 @@ static MoflexResult moflex_play_ring(const char *path) {
         const int64_t VS_HALF = 8356;
         int show = -1;
         if ((wr - rd) > 0 && ready[rd % NB]) {
-            while ((wr - rd) > 1 && ready[(rd + 1) % NB] && rts[(rd + 1) % NB] <= apos + VS_HALF) { ready[rd % NB] = 0; rd++; }
+            /* Capture the A/V anchor ONCE, the first frame after audio re-locks: right now bts-rts equals
+             * the true video origin (before any cadence drift). skew = audio_origin - video_origin, held
+             * constant thereafter and ignored if implausibly large (bad/absent timestamps). */
+            if (have_audio && !r3_av_ready && apos >= 0 && r3_audio_t0 >= 0) {
+                int64_t sk = r3_audio_t0 - (bts[rd % NB] - rts[rd % NB]);
+                r3_av_skew = (sk < -300000 || sk > 300000) ? 0 : sk;
+                r3_av_ready = 1;
+            }
+            int64_t ae = (have_audio && apos >= 0) ? apos + r3_av_skew : apos;
+            while ((wr - rd) > 1 && ready[(rd + 1) % NB] && rts[(rd + 1) % NB] <= ae + VS_HALF) { ready[rd % NB] = 0; rd++; }
             if (apos < 0) { if (last_shown < 0) show = rd % NB; }             /* pre-roll: show the landing pair */
-            else if (apos + VS_HALF >= rts[rd % NB]) show = rd % NB;
+            else if (ae + VS_HALF >= rts[rd % NB]) show = rd % NB;
         }
 
         /* ---- draw: video pair (or held frame) + subtitle overlay + bottom panel, one GPU frame ---- */
