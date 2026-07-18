@@ -18,7 +18,9 @@ SOURCES  := source ../decoder ../ffmpeg_support ../playback ../net ../ui \
 FF_INC   := ../ffmpeg_support/include
 
 ARCH    := -march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft
+BUILD_TAG := $(shell date +%y%m%d.%H%M)
 CFLAGS  := -w -O3 -mword-relocations -ffunction-sections -D__3DS__ -D_GNU_SOURCE \
+	-DBUILD_TAG=\"$(BUILD_TAG)\" \
 	-Wno-error=implicit-function-declaration $(ARCH) $(INCLUDE)
 LDFLAGS := -specs=3dsx.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
 LIBS    := -lcurl -lmbedtls -lmbedx509 -lmbedcrypto -lz -lcitro2d -lcitro3d -lctru -lm

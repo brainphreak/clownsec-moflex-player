@@ -24,6 +24,9 @@
 #include "branding.h"
 
 #define APP_VERSION "v1.0.0"
+#ifndef BUILD_TAG
+#define BUILD_TAG "dev"      /* set by the Makefile: date +%y%m%d.%H%M of the build */
+#endif
 #define MAXE     1024
 #define NAMELEN  256
 #define PATHLEN  1024
@@ -2531,6 +2534,8 @@ static void home_draw(int bsel, long long rpos) {
     /* title + neon divider */
     ui_text_center(UI_W / 2, 12, 2, UI_NEON, "CLOWNSEC");
     ui_text(UI_W - 52, 3, 1, UI_DIM, APP_VERSION);
+    { const char *bt = "b" BUILD_TAG;   /* build stamp under the version -> "which 1.0.0 is this?" */
+      ui_text(UI_W - 6 - ui_text_w(1, bt), 14, 1, UI_DIM, bt); }
 
     /* theme swatch button (tap or press Y) */
     {
