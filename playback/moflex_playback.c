@@ -1760,6 +1760,9 @@ typedef struct {
     volatile int run;                    /* worker loop control */
     volatile int paused;                 /* playback paused OR seeking: worker idles */
     volatile int audio_pre_full;         /* worker's audio bank filled before pre-roll (audio-front-loaded) */
+    volatile int aud_live;               /* main unpaused the DSP: bank-full now means audio is AHEAD (wait),
+                                            not-yet-live means DROP pre-roll audio to keep priming video
+                                            (the released engine's rule -- audio must never start first) */
     volatile long long wk_dec; volatile int wk_n; volatile long long wk_dmax;   /* worker decode ticks / pairs / max (HUD) */
     int has_pending; MfxPacket pending;  /* a demuxed packet held across produce calls (audio bank was full) */
     LightLock lock;                      /* held by worker while touching demux/decoder/ring; by main during seek */
@@ -1774,7 +1777,9 @@ static void r3_produce(R3S *s) {
         int mt = s->m->streams[s->pending.stream_index].media_type;
         if (mt == MFX_TYPE_AUDIO && s->have_audio) {
             if (r3_audio_feed(&s->pending)) s->has_pending = 0;
-            else { s->audio_pre_full = 1; break; }        /* bank full: hold packet, let main unpause audio */
+            else if (!s->aud_live) s->has_pending = 0;    /* pre-roll: bank full -> DROP, keep priming video
+                                                             (audio starts only once video is ready) */
+            else { s->audio_pre_full = 1; break; }        /* playing: audio is ahead -> pause reading */
         } else if (mt == MFX_TYPE_VIDEO) {
             int64_t vts = s->m->ts; if (vts < 0) vts = 0; if (s->dur_us > 0 && vts > s->dur_us) vts = s->dur_us;
             if (!r3_vq_push(s->pending.data, s->pending.size, vts, s->pending.keyframe)) break;
@@ -2150,7 +2155,7 @@ static MoflexResult moflex_play_ring(const char *path) {
             s.wr = 0; rd = 0; s.rd = 0; s.dpair = 0; s.skipping = 0; s.done = 0; s.has_pending = 0; last_shown = -1;
             r3_vq_clear();
             if (have_audio) r3_audio_flush();
-            gated = 0; s.audio_pre_full = 0; playing = 1; r3_wallset = 0;
+            gated = 0; s.audio_pre_full = 0; s.aud_live = 0; playing = 1; r3_wallset = 0;
             cur_us = seek_to_us; s.cur_us = seek_to_us;
             have_anchor = 0;   /* re-pin video to audio start on the first present after this seek */
             s.paused = 0;
@@ -2168,7 +2173,10 @@ static MoflexResult moflex_play_ring(const char *path) {
         if (!threaded && playing && !s.done && (s.wr - rd) < NB - 1) { r3_produce(&s); inline_produced = 1; }
 
         /* pre-roll: unpause audio once enough pairs are banked, or the worker's audio bank filled first */
-        if (have_audio && !gated && playing && (s.wr >= PRIME || s.audio_pre_full)) { gated = 1; ndspChnSetPaused(0, false); r3_apos = 0; }
+        /* Unpause audio ONLY once video pairs are banked (released engine's rule): audio and video then
+         * start together from the seek point -> aligned. Never on audio_pre_full alone -- that let audio
+         * run ahead over a frozen picture after a mid-GOP seek landing. */
+        if (have_audio && !gated && playing && s.wr >= PRIME) { gated = 1; s.aud_live = 1; ndspChnSetPaused(0, false); r3_apos = 0; }
 
         int wr = s.wr; __sync_synchronize();   /* snapshot the write index, then see the frame data behind it */
         int64_t apos;
