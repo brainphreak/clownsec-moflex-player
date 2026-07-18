@@ -986,7 +986,13 @@ static void catalog_browse(const Source *src) {
         /* ---- navigation: pick a category (+ optional genre), Show All, or X = search ---- */
         char filt_cat[32] = "", filt_genre[32] = "", filt_search[64] = "";
         if (ncat > 1) {
-            int c = catalog_pick("CATEGORY", src->name, cats, ncat, 1, NULL);
+            static char cdisp[24][32];   /* category rows with counts (selection uses cats[]) */
+            for (int k = 0; k < ncat; k++) {
+                int n = 0;
+                for (int i = 0; i < nc; i++) if (!strcasecmp(cat[i].category, cats[k])) n++;
+                snprintf(cdisp[k], 32, "%.24s (%d)", cats[k], n);
+            }
+            int c = catalog_pick("CATEGORY", src->name, cdisp, ncat, 1, NULL);
             if (c == -1) break;
             if (c == -4) { if (!kbd_text("Search this catalog", filt_search, sizeof filt_search)) continue; }
             else if (c >= 0) {
@@ -994,10 +1000,17 @@ static void catalog_browse(const Source *src) {
                 static char gens[64][32]; int ng = distinct_genres(cat, nc, filt_cat, gens, 64);
                 qsort(gens, ng, 32, strrow_cmp);   /* genres alphabetical */
                 if (ng > 0) {
+                    static char gdisp[64][32];   /* genre rows with counts (within this category) */
+                    for (int k = 0; k < ng; k++) {
+                        int n = 0;
+                        for (int i = 0; i < nc; i++)
+                            if (!strcasecmp(cat[i].category, filt_cat) && genre_match(cat[i].genres, gens[k])) n++;
+                        snprintf(gdisp[k], 32, "%.24s (%d)", gens[k], n);
+                    }
                     const char *mi[2] = { "View All", "Pick a Genre" };
                     int mm = ui_menu(filt_cat, NULL, mi, 2);
                     if (mm < 0) continue;
-                    if (mm == 1) { int g = catalog_pick("GENRE", filt_cat, gens, ng, 0, NULL);
+                    if (mm == 1) { int g = catalog_pick("GENRE", filt_cat, gdisp, ng, 0, NULL);
                                    if (g < 0) continue; snprintf(filt_genre, sizeof filt_genre, "%s", gens[g]); }
                 }
             }
@@ -1569,8 +1582,14 @@ static int library_view(char *out, size_t cap) {
     while (aptMainLoop() && !chose) {
         static char cats[24][32]; int ncat = lib_distinct_categories(cats, 24);
         qsort(cats, ncat, 32, strrow_cmp);
-        char sub[24]; snprintf(sub, sizeof sub, "%d movies", g_lib_n);
-        int c = catalog_pick("LIBRARY", sub, cats, ncat, 1, "* Rescan Library");
+        static char cdisp[24][32];   /* display rows with per-category counts (selection uses cats[]) */
+        for (int k = 0; k < ncat; k++) {
+            int n = 0;
+            for (int i = 0; i < g_lib_n; i++) if (!strcasecmp(lib_disp_cat(&g_lib[i]), cats[k])) n++;
+            snprintf(cdisp[k], 32, "%.24s (%d)", cats[k], n);
+        }
+        char sub[24]; snprintf(sub, sizeof sub, "%d videos", g_lib_n);
+        int c = catalog_pick("LIBRARY", sub, cdisp, ncat, 1, "* Rescan Library");
         if (c == -1) break;                                   /* B -> leave the library */
         if (c == -3) { lib_rescan(); if (g_lib_n == 0) { msg_screen("LIBRARY", "No movies found."); break; } continue; }
         if (c == -4) {                                        /* X -> search the whole library */
@@ -1609,9 +1628,16 @@ static int library_view(char *out, size_t cap) {
                         int r = library_list(fc, "", poster, &sortmode, out, cap);
                         if (r == LL_PLAY) chose = 1; else if (r == LL_RESCAN) rescan = 1;
                     } else {                                   /* Pick a Genre */
+                        static char gdisp[64][32];   /* genre rows with counts (within this category) */
+                        for (int k = 0; k < ng; k++) {
+                            int n = 0;
+                            for (int i = 0; i < g_lib_n; i++)
+                                if (!strcasecmp(lib_disp_cat(&g_lib[i]), fc) && genre_match(g_lib[i].genres, gens[k])) n++;
+                            snprintf(gdisp[k], 32, "%.24s (%d)", gens[k], n);
+                        }
                         int gen_back = 0;
                         while (!gen_back && !chose && !rescan && aptMainLoop()) {
-                            int g = catalog_pick("GENRE", fc, gens, ng, 0, NULL);
+                            int g = catalog_pick("GENRE", fc, gdisp, ng, 0, NULL);
                             if (g < 0) { gen_back = 1; break; }         /* back -> View All / Pick a Genre */
                             int r = library_list(fc, gens[g], poster, &sortmode, out, cap);
                             if (r == LL_PLAY) chose = 1; else if (r == LL_RESCAN) rescan = 1;
