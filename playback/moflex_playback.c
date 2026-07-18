@@ -632,7 +632,7 @@ static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing)
     ui_text(VOL_X - 16, VOL_Y - 12, 1, UI_INK, vs);   /* label above the slider (frees the button row) */
 
     /* action buttons: SAME row as the home screen (OPEN VIDEO / MANAGE / ADD VIDEO) */
-    ui_text(6, 190, 1, UI_INK, "Y=SUBS X=DARK A=PLAY B=BACK L=LOCK");   /* key map */
+    ui_text(6, 190, 1, UI_INK, "Y=SUBS X=DARK A=PLAY L=LOCK");   /* key map (B=back is universal) */
     ui_button(BKB_X, BTN_Y, BKB_W, BTN_H, "OPEN VIDEO", 0, UI_NEON);
     ui_button(OPB_X, BTN_Y, OPB_W, BTN_H, "MANAGE",     0, UI_NEON);
     ui_button(EXB_X, BTN_Y, EXB_W, BTN_H, "ADD VIDEO",  0, UI_NEON);
