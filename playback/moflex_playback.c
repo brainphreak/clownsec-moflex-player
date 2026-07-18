@@ -561,6 +561,16 @@ static void sub_overlay(int is3d, int64_t us) {
 /* debug timing overlay (per stereo pair), updated ~1x/sec from the loop */
 static int g_dbg_fps = 0, g_dbg_dec10 = 0, g_dbg_blit10 = 0, g_dbg_aud10 = 0;
 
+/* "touch is locked" toast box; drawn last so it sits on top of everything */
+static void panel_lock_toast(void) {
+    if (g_lock_toast <= 0) return;
+    int bw = 184, bh = 42, bx = (UI_W - bw) / 2, by = (UI_H - bh) / 2;
+    ui_fill_round(bx, by, bw, bh, 8, UI_BG2);
+    ui_frame_round(bx, by, bw, bh, 8, UI_NEONC, 2);
+    ui_text_center(UI_W / 2, by + 8, 1, UI_NEONC, "TOUCH IS LOCKED");
+    ui_text_center(UI_W / 2, by + 24, 1, UI_INK, "Press L to unlock");
+}
+
 /* a bottom-row action button with up to two centered lines (so longer labels fit the 96px width) */
 static void panel_btn2(int x, int w, const char *l1, const char *l2, u16 accent) {
     ui_button(x, BTN_Y, w, BTN_H, "", 0, accent);
@@ -636,15 +646,7 @@ static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing)
     panel_btn2(OPB_X, OPB_W, "MANAGE", "VIDEOS", UI_NEONP); /* -> manage/library */
     panel_btn2(EXB_X, EXB_W, "MAIN", NULL, UI_NEONC);      /* -> main screen (B goes back) */
 
-    /* touch-lock feedback: persistent marker + a brief toast when the locked screen is touched */
     if (g_touch_locked) ui_text(UI_W - 58, 8, 1, UI_NEONC, "LOCKED");
-    if (g_lock_toast > 0) {
-        int bw = 184, bh = 42, bx = (UI_W - bw) / 2, by = (UI_H - bh) / 2;
-        ui_fill_round(bx, by, bw, bh, 8, UI_BG2);
-        ui_frame_round(bx, by, bw, bh, 8, UI_NEONC, 2);
-        ui_text_center(UI_W / 2, by + 8, 1, UI_NEONC, "TOUCH IS LOCKED");
-        ui_text_center(UI_W / 2, by + 24, 1, UI_INK, "Press L to unlock");
-    }
     /* subtitles: CC toggle/options (glows when on) */
     ui_button(CC_X, CC_Y, CC_W, CC_H, "CC", g_sub_on, g_sub_on ? UI_NEON : UI_DIM);
     /* bottom-screen-off: a crescent-moon button (video keeps playing on top) */
@@ -654,6 +656,7 @@ static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing)
         ui_fill_round(mx - mr, my - mr, 2 * mr, 2 * mr, mr, UI_NEONC);                 /* full disc */
         ui_fill_round(mx - mr + 6, my - mr - 2, 2 * mr, 2 * mr, mr, UI_BG2); /* carve -> crescent */
     }
+    panel_lock_toast();   /* drawn LAST -> always on top of every control */
     ui_present();
 }
 
@@ -1122,6 +1125,15 @@ static void g_submenu_sw(C3D_RenderTarget *bot, int is3d) {
     if (!ui_tex_init()) return;
     ui_capture(1);
     if (g_submenu == 2) srtpicker_render(); else submenu_render(is3d);
+    ui_tex_present(bot);
+}
+/* dark bottom screen: pure black -- with ONLY the lock toast when it flashes on (never the panel) */
+static void g_dark_sw(C3D_RenderTarget *bot) {
+    if (!ui_tex_init()) return;
+    ui_capture(1);
+    ui_begin(GFX_BOTTOM);
+    ui_clear(0);          /* black */
+    panel_lock_toast();
     ui_tex_present(bot);
 }
 
@@ -2273,8 +2285,9 @@ static MoflexResult moflex_play_ring(const char *path) {
             C2D_TargetClear(topR, black); C2D_SceneBegin(topR);
             C2D_DrawImageAt(is3d ? r3_imgR[b] : r3_imgL[b], 0, 0, 0, NULL, 1, 1);
             if (sub_valid) r3_draw_sub(&tsub, is3d ? g_sub_depth : 0, subcol, subout);
-            if (g_submenu) g_submenu_sw(bot, is3d);              /* subtitle options (movie keeps playing) */
-            else g_panel_sw(bot, title, disp_us, dur_us, playing);   /* panel (shows lock toast if locked) */
+            if (g_screen_off) g_dark_sw(bot);                    /* dark: black + toast only, never the panel */
+            else if (g_submenu) g_submenu_sw(bot, is3d);         /* subtitle options (movie keeps playing) */
+            else g_panel_sw(bot, title, disp_us, dur_us, playing);   /* panel (lock toast on top) */
             u64 _tg = svcGetSystemTick(); C3D_FrameEnd(0); pf_gpu += svcGetSystemTick() - _tg;
             dirty = 0;
             if (show >= 0) {

@@ -700,10 +700,18 @@ static int download_resume_check(const char *url) {
     long long have = download_partial_bytes(url);
     if (have <= 0) return 1;                       /* nothing partial -> fresh download */
     char sz[24]; fmt_size(have, sz, sizeof sz);
-    char msg[128];
-    snprintf(msg, sizeof msg, "Unfinished download found\n(%s already saved).\n\nA = Resume    B = Start over", sz);
-    if (!confirm(msg)) download_discard_partial(url);   /* B -> start over: drop the partial */
+    char msg[96];
+    snprintf(msg, sizeof msg, "Unfinished download found\n(%s already saved).", sz);
+    int c = prompt2("DOWNLOAD", msg, "RESUME", "RESTART");   /* d-pad + A; B backs out */
+    if (c < 0) return 0;                                     /* B -> don't download at all */
+    if (c == 1) download_discard_partial(url);               /* RESTART: drop the partial */
     return 1;
+}
+
+/* download failed/cancelled: partial kept for resume; offer deleting it instead (B = keep + back) */
+static void download_cancel_msg(const char *url) {
+    if (prompt2("DOWNLOAD", "Cancelled -- progress saved.\nStart it again to resume.", "OK", "DELETE FILE") == 1)
+        download_discard_partial(url);
 }
 
 #define POSTER_W 132
@@ -1068,7 +1076,7 @@ static void catalog_browse(const Source *src) {
             snprintf(dest, sizeof(dest), "%s%s", destdir, e->fname);
             snprintf(g_dl_name, sizeof(g_dl_name), "%s", e->fname);
             g_last_prog = 0;
-            download_resume_check(e->url);   /* offer Resume / Start-over if a partial is left over */
+            if (!download_resume_check(e->url)) { redraw = 1; goto cont; }   /* B on the prompt -> back */
             bool ok = download_to_file(e->url, dest, dl_progress, NULL);
             if (ok && !e->is_zip) {   /* persist metadata + poster so the info panel shows for the local file */
                 fix_download_ext(dest, sizeof dest);   /* Drive items have no extension -> sniff + add it */
@@ -1099,11 +1107,10 @@ static void catalog_browse(const Source *src) {
                     char m[128]; snprintf(m, sizeof m, "Zip saved (not extracted):\n%s", e->fname);
                     msg_screen("DOWNLOAD", m);
                 }
-            } else {
-                char m[160]; snprintf(m, sizeof m, "%s\n%s", g_dl_name,
-                    ok ? "Download complete." : "Failed / cancelled.\n(Progress saved -- pick it again to resume.)");
+            } else if (ok) {
+                char m[160]; snprintf(m, sizeof m, "%s\nDownload complete.", g_dl_name);
                 msg_screen("DOWNLOAD", m);
-            }
+            } else download_cancel_msg(e->url);   /* progress saved; offers DELETE FILE, B keeps it */
             redraw = 1;
         }
     cont:
@@ -1597,9 +1604,9 @@ static void download_url_direct(void) {
     snprintf(dest, sizeof(dest), "%s%s", destdir, fname);
     snprintf(g_dl_name, sizeof(g_dl_name), "%s", fname);
     g_last_prog = 0;
-    download_resume_check(url);   /* offer Resume / Start-over if a partial is left over */
+    if (!download_resume_check(url)) return;   /* B on the prompt -> back */
     bool ok = download_to_file(url, dest, dl_progress, NULL);
-    if (!ok) { msg_screen("DOWNLOAD", "Failed / cancelled.\n(Progress saved -- start this\ndownload again to resume.)"); return; }
+    if (!ok) { download_cancel_msg(url); return; }   /* progress saved; offers DELETE FILE, B keeps it */
     size_t fl = strlen(fname);
     if (fl > 4 && !strcasecmp(fname + fl - 4, ".zip") && file_is_zip(dest) &&
         confirm("Extract the zip now?\n(No = keep the .zip file)")) {
