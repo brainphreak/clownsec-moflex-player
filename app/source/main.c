@@ -1956,16 +1956,16 @@ static void lib_scrape_missing(int *idx, int ni) {
 static void startup_new_movie_check(void) {
     if (lib_load_cache() == 0) {
         /* FIRST RUN: no library yet -- the most important time to create it. */
-        if (prompt2("MOVIE LIBRARY", "No movie library yet.\nScan the SD card for movies now?",
+        if (prompt2("VIDEO LIBRARY", "No video library yet.\nScan the SD card for videos now?",
                     "SCAN", "LATER") != 0) return;
         lib_rescan();
-        if (g_lib_n == 0) { msg_screen("LIBRARY", "No movies found on the SD card.\nDownload or add some first."); return; }
+        if (g_lib_n == 0) { msg_screen("LIBRARY", "No videos found on the SD card.\nDownload or add some first."); return; }
         int *idx = (int *)malloc(sizeof(int) * g_lib_n); int ni = 0;   /* offer art+info for all missing */
         if (idx) {
             for (int j = 0; j < g_lib_n; j++) if (!movieinfo_have(g_lib[j].url)) idx[ni++] = j;
             if (ni > 0) {
                 char msg[96];
-                snprintf(msg, sizeof msg, "Download art & info for the\n%d movie%s missing it?", ni, ni == 1 ? "" : "s");
+                snprintf(msg, sizeof msg, "Download art & info for the\n%d video%s missing it?", ni, ni == 1 ? "" : "s");
                 if (prompt2("GET INFO", msg, "DOWNLOAD", "SKIP") == 0) lib_scrape_missing(idx, ni);
             }
             free(idx);
@@ -1983,9 +1983,9 @@ static void startup_new_movie_check(void) {
     if (s_new_n == 0) { free(s_newlist); s_newlist = NULL; return; }
 
     char msg[96];
-    snprintf(msg, sizeof msg, "%d new movie%s found on the SD card.\nAdd new movies to Library?",
+    snprintf(msg, sizeof msg, "%d new video%s found on the SD card.\nAdd new videos to Library?",
              s_new_n, s_new_n == 1 ? "" : "s");
-    if (prompt2("NEW MOVIES", msg, "ADD", "LATER") != 0) { free(s_newlist); s_newlist = NULL; return; }
+    if (prompt2("NEW VIDEOS", msg, "ADD", "LATER") != 0) { free(s_newlist); s_newlist = NULL; return; }
     if (s_new_n <= NEWLIST_MAX) lib_add_new();   /* instant: append the found files, no second walk */
     else lib_rescan();                           /* too many to have tracked -> full rescan */
 
@@ -1999,7 +1999,11 @@ static void startup_new_movie_check(void) {
     }
     free(s_newlist); s_newlist = NULL;
     if (ni == 0) return;
-    snprintf(msg, sizeof msg, "Download art & info for the\n%d new movie%s?", ni, ni == 1 ? "" : "s");
+    /* say WHY the count can differ from the found count: some new videos already have info */
+    if (ni < s_new_n)
+        snprintf(msg, sizeof msg, "%d of the new videos have no\ninfo yet. Download art & info?", ni);
+    else
+        snprintf(msg, sizeof msg, "Download art & info for the\n%d new video%s?", ni, ni == 1 ? "" : "s");
     if (prompt2("GET INFO", msg, "DOWNLOAD", "SKIP") == 0) lib_scrape_missing(idx, ni);
 }
 
