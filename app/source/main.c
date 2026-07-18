@@ -945,7 +945,7 @@ static int catalog_pick(const char *title, const char *subtitle, char items[][32
                 int hh = th * VIS / total; if (hh < 12) hh = 12; int hy = ty + (th - hh) * top / maxs;
                 ui_fill_round(UI_W - 6, ty, 3, th, 1, TH_TRACK);
                 ui_fill_round(UI_W - 6, hy, 3, hh, 1, UI_NEON); }
-            ui_text_center(UI_W / 2, 226, 1, UI_DIM, "X search");
+            ui_text(8, 226, 1, UI_DIM, "X - search");   /* left-aligned so it can't read as a row */
             ui_present(); redraw = 0;
         }
         gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
@@ -1003,6 +1003,7 @@ static void catalog_browse(const Source *src) {
             }
         }
         /* ---- build the filtered + sorted index over cat[] ---- */
+cb_rebuild:;   /* X-search inside the list jumps back here with filt_search set */
         int ni = 0;
         for (int i = 0; i < nc; i++) {
             if (filt_cat[0] && strcasecmp(cat[i].category, filt_cat)) continue;
@@ -1010,7 +1011,8 @@ static void catalog_browse(const Source *src) {
             if (filt_search[0] && !ci_contains(cat[i].name, filt_search)) continue;   /* search box */
             idx[ni++] = i;
         }
-        if (ni == 0) { msg_screen("CATALOG", filt_search[0] ? "No movies match that search." : "Nothing here.");
+        if (ni == 0) { msg_screen("CATALOG", filt_search[0] ? "No videos match that search." : "Nothing here.");
+                       if (filt_search[0]) { filt_search[0] = 0; goto cb_rebuild; }   /* back to unfiltered */
                        if (ncat > 1) continue; else break; }
         g_scat = cat; g_smode = sortmode; qsort(idx, ni, sizeof(int), idx_cmp);
 
@@ -1026,6 +1028,11 @@ static void catalog_browse(const Source *src) {
         if (nav_repeat(k, kh, NAV_UP, &hfu))   { if (csel > 0) csel--; redraw = 1; }
         if (k & KEY_RIGHT) { csel += BR_ROWS; if (csel > ni - 1) csel = ni - 1; redraw = 1; }
         if (k & KEY_LEFT)  { csel -= BR_ROWS; if (csel < 0) csel = 0; redraw = 1; }
+        if (k & KEY_X) {   /* search WITHIN this view (whatever category/genre is filtered) */
+            char q[64];
+            if (kbd_text("Search", q, sizeof q)) { snprintf(filt_search, sizeof filt_search, "%s", q); goto cb_rebuild; }
+            redraw = 1;
+        }
         if (k & KEY_R) {   /* jump to next first-letter group */
             char c = firstc(cat[idx[csel]].name); int i = csel;
             while (i < ni && firstc(cat[idx[i]].name) == c) i++;
@@ -1387,6 +1394,7 @@ enum { LL_BACK = 0, LL_PLAY = 1, LL_RESCAN = 2 };
 static char s_lib_search[64] = "";   /* active library search query ("" = off) */
 static int lib_idxbuf[LIB_MAX];
 static int library_list(const char *filt_cat, const char *filt_genre, u16 *poster, int *sortmode, char *out, size_t cap) {
+ll_rebuild:;   /* X-search inside the list jumps back here with s_lib_search set */
     int *idx = lib_idxbuf, ni = 0;
     for (int i = 0; i < g_lib_n; i++) {
         if (filt_cat[0] && strcasecmp(lib_disp_cat(&g_lib[i]), filt_cat)) continue;
@@ -1394,7 +1402,11 @@ static int library_list(const char *filt_cat, const char *filt_genre, u16 *poste
         if (s_lib_search[0] && !ci_contains(g_lib[i].name, s_lib_search)) continue;   /* search box */
         idx[ni++] = i;
     }
-    if (ni == 0) { msg_screen("LIBRARY", s_lib_search[0] ? "No movies match that search." : "Nothing here."); return LL_BACK; }
+    if (ni == 0) {
+        msg_screen("LIBRARY", s_lib_search[0] ? "No videos match that search." : "Nothing here.");
+        if (s_lib_search[0]) { s_lib_search[0] = 0; goto ll_rebuild; }   /* back to the unfiltered list */
+        return LL_BACK;
+    }
     g_scat = g_lib; g_smode = *sortmode; qsort(idx, ni, sizeof(int), idx_cmp);
 
     int csel = 0, cscroll = 0, redraw = 1, hfu = 0, hfd = 0;
@@ -1417,7 +1429,11 @@ static int library_list(const char *filt_cat, const char *filt_genre, u16 *poste
                 while (i > 0 && firstc(g_lib[idx[i - 1]].name) == p) i--; }
             csel = i; redraw = 1; }
         if (k & KEY_A) play = 1;
-        if (k & KEY_X) { result = LL_RESCAN; break; }        /* rescan the whole library */
+        if (k & KEY_X) {   /* search WITHIN this view (whatever category/genre is filtered) */
+            char q[64];
+            if (kbd_text("Search", q, sizeof q)) { snprintf(s_lib_search, sizeof s_lib_search, "%s", q); goto ll_rebuild; }
+            redraw = 1;
+        }
         if (k & KEY_Y) { *sortmode = (*sortmode + 1) % 3; g_smode = *sortmode;
             qsort(idx, ni, sizeof(int), idx_cmp); csel = 0; cscroll = 0; shown = -1; redraw = 1; }
         if (csel < cscroll) cscroll = csel;
@@ -1503,6 +1519,7 @@ static int library_list(const char *filt_cat, const char *filt_genre, u16 *poste
         }
         gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
     }
+    s_lib_search[0] = 0;   /* an in-list search never leaks into the next list view */
     return result < 0 ? LL_BACK : result;
 }
 
@@ -1964,9 +1981,7 @@ static void startup_new_movie_check(void) {
         if (idx) {
             for (int j = 0; j < g_lib_n; j++) if (!movieinfo_have(g_lib[j].url)) idx[ni++] = j;
             if (ni > 0) {
-                char msg[96];
-                snprintf(msg, sizeof msg, "Download art & info for the\n%d video%s missing it?", ni, ni == 1 ? "" : "s");
-                if (prompt2("GET INFO", msg, "DOWNLOAD", "SKIP") == 0) lib_scrape_missing(idx, ni);
+                if (prompt2("GET INFO", "Download art & info?", "DOWNLOAD", "SKIP") == 0) lib_scrape_missing(idx, ni);
             }
             free(idx);
         }
@@ -1999,12 +2014,7 @@ static void startup_new_movie_check(void) {
     }
     free(s_newlist); s_newlist = NULL;
     if (ni == 0) return;
-    /* say WHY the count can differ from the found count: some new videos already have info */
-    if (ni < s_new_n)
-        snprintf(msg, sizeof msg, "%d of the new videos have no\ninfo yet. Download art & info?", ni);
-    else
-        snprintf(msg, sizeof msg, "Download art & info for the\n%d new video%s?", ni, ni == 1 ? "" : "s");
-    if (prompt2("GET INFO", msg, "DOWNLOAD", "SKIP") == 0) lib_scrape_missing(idx, ni);
+    if (prompt2("GET INFO", "Download art & info?", "DOWNLOAD", "SKIP") == 0) lib_scrape_missing(idx, ni);
 }
 
 static void lib_getinfo_menu(int *idx, int ni, int csel) {
