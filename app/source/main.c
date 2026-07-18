@@ -1742,6 +1742,8 @@ ll_rebuild:;   /* X-search inside the list jumps back here with s_lib_search set
 }
 
 /* Browse the library: category -> (View All / Pick a Genre) -> list. Back steps down one level. */
+static void lib_rescan_interactive(void);   /* rescan + report new count + offer art/info (below) */
+
 static int library_view(char *out, size_t cap) {
     if (lib_load() == 0) {
         msg_screen("LIBRARY", "No movies found on the SD card.\nDownload or add some first.");
@@ -1763,7 +1765,7 @@ static int library_view(char *out, size_t cap) {
         char sub[24]; snprintf(sub, sizeof sub, "%d videos", g_lib_n);
         int c = catalog_pick("LIBRARY", sub, cdisp, ncat, 1, "* Rescan Library");
         if (c == -1) break;                                   /* B -> leave the library */
-        if (c == -3) { lib_rescan(); if (g_lib_n == 0) { msg_screen("LIBRARY", "No movies found."); break; } continue; }
+        if (c == -3) { lib_rescan_interactive(); if (g_lib_n == 0) { msg_screen("LIBRARY", "No videos found."); break; } continue; }
         if (c == -4) {                                        /* X -> search the whole library */
             char q[64];
             if (kbd_text("Search your library", q, sizeof q)) {
@@ -2202,6 +2204,26 @@ static void lib_scrape_missing(int *idx, int ni) {
            cancelled ? "Cancelled.\n" : "", got, todo, todo == 1 ? "" : "s",
            (got < todo && !cancelled) ? "(no catalog match for the rest)" : "");
     msg_screen("GET INFO", m);
+}
+
+/* Rescan Library button: same experience as the startup flow -- say how many new videos were
+ * found, then offer art & info for whatever is missing it. */
+static void lib_rescan_interactive(void) {
+    int before = g_lib_n;
+    lib_rescan();
+    int added = g_lib_n - before; if (added < 0) added = 0;
+    char found[64];
+    if (added > 0) snprintf(found, sizeof found, "%d new video%s added.", added, added == 1 ? "" : "s");
+    else           snprintf(found, sizeof found, "No new videos found.");
+    int *idx = (int *)malloc(sizeof(int) * (g_lib_n ? g_lib_n : 1)); int ni = 0;
+    if (idx) for (int j = 0; j < g_lib_n; j++) if (!movieinfo_have(g_lib[j].url)) idx[ni++] = j;
+    if (ni > 0) {
+        char body[128];
+        snprintf(body, sizeof body, "%s\n%d video%s missing art & info.\nDownload art & info?",
+                 found, ni, ni == 1 ? "" : "s");
+        if (prompt2("LIBRARY", body, "DOWNLOAD", "SKIP") == 0) lib_scrape_missing(idx, ni);
+    } else msg_screen("LIBRARY", found);
+    free(idx);
 }
 
 /* ---- startup: detect movies added outside the app (browser download, PC copy, upload) and offer

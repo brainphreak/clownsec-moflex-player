@@ -59,7 +59,14 @@ int unzip_to_dir_cb(const char *zip_path, const char *dest_dir, int *total_out, 
             char out[1024];
             snprintf(out, sizeof(out), "%s%s", dir, name);
             mkparents(out);                                  /* create any sub-folders inside the zip */
-            if (zip_entry_fread(z, out) >= 0) extracted++;   /* >=0: any non-error counts as written */
+            /* Do NOT trust zip_entry_fread's return: after writing the file it chmod()s the
+             * archive's unix permissions, and chmod always fails on the 3DS SD -> every perfectly
+             * extracted file reported failure ("Extract FAILED" with all files present).
+             * Truth = the file exists with the exact uncompressed size. */
+            unsigned long long want = zip_entry_size(z);
+            zip_entry_fread(z, out);
+            struct stat st;
+            if (stat(out, &st) == 0 && (unsigned long long)st.st_size == want) extracted++;
         }
         zip_entry_close(z);
     }
