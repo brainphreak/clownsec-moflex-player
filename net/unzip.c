@@ -28,7 +28,8 @@ static int is_junk(const char *name) {
     return 0;
 }
 
-int unzip_to_dir(const char *zip_path, const char *dest_dir) {
+int unzip_to_dir_cb(const char *zip_path, const char *dest_dir, int *total_out, unzip_prog_cb cb) {
+    if (total_out) *total_out = 0;
     char dir[1024];
     snprintf(dir, sizeof(dir), "%s", dest_dir);
     size_t L = strlen(dir);
@@ -39,18 +40,34 @@ int unzip_to_dir(const char *zip_path, const char *dest_dir) {
     if (!z) return 0;
 
     ssize_t n = zip_entries_total(z);
+    /* pass 1: count the real files so progress has a denominator */
+    int total = 0;
+    for (ssize_t i = 0; i < n; i++) {
+        if (zip_entry_openbyindex(z, i) != 0) continue;
+        const char *name = zip_entry_name(z);
+        if (name && !zip_entry_isdir(z) && !is_junk(name)) total++;
+        zip_entry_close(z);
+    }
+    if (total_out) *total_out = total;
+
     int extracted = 0;
     for (ssize_t i = 0; i < n; i++) {
         if (zip_entry_openbyindex(z, i) != 0) continue;      /* skip an unreadable entry, keep going */
         const char *name = zip_entry_name(z);
         if (name && !zip_entry_isdir(z) && !is_junk(name)) {
+            if (cb) cb(extracted, total, name);
             char out[1024];
             snprintf(out, sizeof(out), "%s%s", dir, name);
             mkparents(out);                                  /* create any sub-folders inside the zip */
-            if (zip_entry_fread(z, out) == 0) extracted++;   /* one real file failing doesn't abort the rest */
+            if (zip_entry_fread(z, out) >= 0) extracted++;   /* >=0: any non-error counts as written */
         }
         zip_entry_close(z);
     }
     zip_close(z);
+    if (cb) cb(extracted, total, NULL);
     return extracted;
+}
+
+int unzip_to_dir(const char *zip_path, const char *dest_dir) {
+    return unzip_to_dir_cb(zip_path, dest_dir, NULL, NULL);
 }

@@ -954,6 +954,20 @@ static int catalog_pick(const char *title, const char *subtitle, char items[][32
 }
 
 static void lib_add_downloaded(const char *path, const CatEntry *src);   /* defined with the library code */
+static void lib_add_extracted(const char *folder, const CatEntry *src);  /* zip contents -> library (shows too) */
+
+/* live progress while a zip extracts: bar + n/total + current filename */
+static void unzip_prog(int done, int total, const char *name) {
+    ui_begin(GFX_BOTTOM); ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
+    ui_text_center(UI_W / 2, 84, 2, UI_NEON, "Extracting...");
+    if (name) { char nb[96]; const char *b = strrchr(name, '/'); ui_text_fit(UI_W / 2, 112, 1, UI_DIM, b ? b + 1 : name, UI_W - 16); (void)nb; }
+    int bx = 20, bw = UI_W - 40, by = 138, bh = 16;
+    ui_fill_round(bx, by, bw, bh, bh / 2, TH_TRACK);
+    if (total > 0) { int fw = (int)((long long)bw * done / total); if (fw > 0) ui_fill_round(bx, by, fw, bh, bh / 2, UI_NEON); }
+    char pl[32]; snprintf(pl, sizeof pl, "%d / %d files", done, total);
+    ui_text_center(UI_W / 2, by + bh + 10, 1, UI_INK, pl);
+    ui_present(); gfxFlushBuffers(); gfxSwapBuffers();
+}
 
 static void catalog_browse(const Source *src) {
     ui_begin(GFX_BOTTOM); ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
@@ -1111,15 +1125,15 @@ cb_rebuild:;   /* X-search inside the list jumps back here with filt_search set 
                     size_t sl = strlen(stem); if (sl > 4) stem[sl - 4] = 0;   /* drop .zip */
                     char folder[PATHLEN + NAMELEN];
                     snprintf(folder, sizeof(folder), "%s%s", destdir, stem);
-                    ui_begin(GFX_BOTTOM); ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
-                    ui_text_center(UI_W / 2, 100, 2, UI_NEON, "Extracting...");
-                    ui_text_fit(UI_W / 2, 130, 1, UI_DIM, stem, UI_W - 16); ui_present();
-                    gfxFlushBuffers(); gfxSwapBuffers();
-                    int nf = unzip_to_dir(dest, folder);
-                    remove(dest);   /* delete the .zip after extracting */
-                    char m[128];
-                    if (nf > 0) snprintf(m, sizeof m, "Extracted %d file%s into:\n%s", nf, nf == 1 ? "" : "s", stem);
-                    else        snprintf(m, sizeof m, "Extract FAILED.\n%s", stem);
+                    int tot = 0;
+                    int nf = unzip_to_dir_cb(dest, folder, &tot, unzip_prog);
+                    if (nf > 0) remove(dest);   /* delete the .zip only after something extracted */
+                    char m[160];
+                    if (nf > 0 && nf == tot) snprintf(m, sizeof m, "Extracted %d file%s into:\n%s", nf, nf == 1 ? "" : "s", stem);
+                    else if (nf > 0)         snprintf(m, sizeof m, "Extracted %d of %d files into:\n%s", nf, tot, stem);
+                    else if (tot == 0)       snprintf(m, sizeof m, "Could not open the zip.\n%s", stem);
+                    else                     snprintf(m, sizeof m, "Extract FAILED (0 of %d).\n%s", tot, stem);
+                    if (nf > 0) lib_add_extracted(folder, e);   /* shows/movies inside -> straight into the library */
                     msg_screen("DOWNLOAD", m);
                 } else {
                     char m[128]; snprintf(m, sizeof m, "Zip saved (not extracted):\n%s", e->fname);
@@ -1195,7 +1209,7 @@ cb_rebuild:;   /* X-search inside the list jumps back here with filt_search set 
 /* ================= Library: one flat, categorized view of every local movie ================= */
 #define LIB_MAX   3000
 #define LIB_CACHE "sdmc:/moflex_player/library.cache"
-#define LIB_MAGIC 0x4C494235   /* 'LIB5' -- bump to invalidate old caches when the scan changes */
+#define LIB_MAGIC 0x4C494236   /* 'LIB6' -- bump to invalidate old caches when the scan changes */
 static CatEntry *g_lib = NULL;   /* every playable movie on the SD, with its .nfo metadata */
 static int       g_lib_n = 0;
 
@@ -1212,21 +1226,90 @@ static int has_episode_tag(const char *s) {
         }
     return 0;
 }
-static void lib_episode_name(CatEntry *c) {
-    if (!has_episode_tag(c->fname)) return;
-    snprintf(c->name, sizeof c->name, "%s", c->fname);
-    strip_ext(c->name);
-    char *d = c->name;                       /* drop every "(3D)" tag + collapse the gap it leaves */
-    for (char *p = c->name; *p; ) {
+static void strip_3d_tags(char *s) {       /* drop every "(3D)" + collapse the gap it leaves */
+    char *d = s;
+    for (char *p = s; *p; ) {
         if (p[0] == '(' && p[1] == '3' && (p[2] == 'D' || p[2] == 'd') && p[3] == ')') {
             p += 4;
-            if (d > c->name && d[-1] == ' ' && (*p == ' ' || *p == 0)) d--;
+            if (d > s && d[-1] == ' ' && (*p == ' ' || *p == 0)) d--;
             continue;
         }
         *d++ = *p++;
     }
     *d = 0;
-    while (d > c->name && d[-1] == ' ') *--d = 0;   /* trim trailing spaces */
+    while (d > s && d[-1] == ' ') *--d = 0;
+}
+static void lib_episode_name(CatEntry *c) {
+    if (!has_episode_tag(c->fname)) return;
+    snprintf(c->name, sizeof c->name, "%s", c->fname);
+    strip_ext(c->name);
+    strip_3d_tags(c->name);
+}
+
+/* ---- TV SHOW folders: a directory holding SxxEyy-tagged episodes is ONE library entry
+ * (is_zip == 2, url = the folder). Picking it opens an episode list. ---- */
+static const char *ep_tag_at(const char *s) {   /* pointer to the SxxEyy tag, or NULL */
+    for (const char *p = s; *p; p++)
+        if ((*p == 's' || *p == 'S') && isdigit((unsigned char)p[1])) {
+            const char *q = p + 1; while (isdigit((unsigned char)*q)) q++;
+            if ((*q == 'e' || *q == 'E') && isdigit((unsigned char)q[1])) return p;
+        }
+    return NULL;
+}
+static void show_name_from_dir(const char *dirpath, char *out, size_t cap) {
+    size_t L = strlen(dirpath);
+    while (L > 1 && dirpath[L - 1] == '/') L--;
+    const char *b = dirpath;
+    for (size_t i = 0; i < L; i++) if (dirpath[i] == '/') b = dirpath + i + 1;
+    snprintf(out, cap, "%.*s", (int)(L - (size_t)(b - dirpath)), b);
+    for (char *p = out; *p; p++)   /* cut a trailing " - Season ..." qualifier */
+        if (p[0] == ' ' && p[1] == '-' && p[2] == ' ' && !strncasecmp(p + 3, "Season", 6)) { *p = 0; break; }
+}
+static void lib_add_show(const char *dirpath, const CatEntry *src) {
+    if (!g_lib || g_lib_n >= LIB_MAX) return;
+    char url[PATHLEN + NAMELEN];
+    snprintf(url, sizeof url, "%s", dirpath);
+    size_t L = strlen(url);
+    while (L > 1 && url[L - 1] == '/') url[--L] = 0;       /* stored WITHOUT trailing slash */
+    for (int i = 0; i < g_lib_n; i++) if (!strcmp(g_lib[i].url, url)) return;   /* already listed */
+    CatEntry *c = &g_lib[g_lib_n];
+    if (src) *c = *src;
+    else { memset(c, 0, sizeof *c); movieinfo_load(url, c); }
+    snprintf(c->url, sizeof c->url, "%s", url);
+    const char *b = strrchr(url, '/'); b = b ? b + 1 : url;
+    snprintf(c->fname, sizeof c->fname, "%s", b);
+    show_name_from_dir(url, c->name, sizeof c->name);
+    if (!c->category[0] || !strcasecmp(c->category, "Uncategorized"))
+        snprintf(c->category, sizeof c->category, "TV Shows");
+    c->is_zip = 2;
+    time_t now = time(NULL); struct tm *tmv = localtime(&now);
+    if (tmv) strftime(c->date, sizeof c->date, "%Y-%m-%d", tmv);
+    g_lib_n++;
+}
+static int epname_cmp(const void *a, const void *b) { return strcasecmp((const char *)a, (const char *)b); }
+/* Episode picker for a show folder: short names ("S01e01 - Title"). 1 = picked (out set). */
+static int show_pick_episode(const char *showname, const char *dirpath, char *out, size_t cap) {
+    static char files[64][NAMELEN]; static char eps[64][32]; int n = 0;
+    DIR *d = opendir(dirpath);
+    if (!d) return 0;
+    struct dirent *e;
+    while ((e = readdir(d)) && n < 64) {
+        if (e->d_name[0] == '.' || !is_moflex(e->d_name) || !has_episode_tag(e->d_name)) continue;
+        snprintf(files[n], sizeof files[0], "%s", e->d_name); n++;
+    }
+    closedir(d);
+    if (n == 0) return 0;
+    qsort(files, n, sizeof files[0], epname_cmp);   /* SxxEyy sorts into watch order */
+    for (int i = 0; i < n; i++) {
+        const char *tag = ep_tag_at(files[i]);
+        char nm[64]; snprintf(nm, sizeof nm, "%s", tag ? tag : files[i]);
+        strip_ext(nm); strip_3d_tags(nm);
+        snprintf(eps[i], 32, "%.31s", nm);
+    }
+    int c = catalog_pick("EPISODES", showname, eps, n, 0, NULL);
+    if (c < 0) return 0;
+    snprintf(out, cap, "%s/%s", dirpath, files[c]);
+    return 1;
 }
 
 static void lib_scan_dir(const char *dir, int depth) {
@@ -1246,6 +1329,10 @@ static void lib_scan_dir(const char *dir, int depth) {
             snprintf(sub, sizeof sub, "%s/", full);
             lib_scan_dir(sub, depth + 1);
         } else if (is_moflex(e->d_name)) {
+            if (has_episode_tag(e->d_name) && depth > 0) {   /* TV episode: its FOLDER becomes the entry */
+                lib_add_show(dir, NULL);
+                continue;
+            }
             if (cia_is_cia(e->d_name) && !cia_has_moflex(full)) continue;   /* skip non-movie CIAs */
             CatEntry *c = &g_lib[g_lib_n];
             movieinfo_load(full, c);                          /* name/genres/category/year/is3d from .nfo, if any */
@@ -1253,7 +1340,7 @@ static void lib_scan_dir(const char *dir, int depth) {
             snprintf(c->fname, sizeof c->fname, "%s", e->d_name);
             if (!c->name[0]) { snprintf(c->name, sizeof c->name, "%s", e->d_name); strip_ext(c->name); }
             if (!c->category[0]) snprintf(c->category, sizeof c->category, "Uncategorized");   /* Get Info fills the real one */
-            lib_episode_name(c);   /* episodes display their filename, not the shared show title */
+            lib_episode_name(c);   /* loose episodes (SD root) display their filename */
             c->is_zip = 0;
             time_t mt = st.st_mtime; struct tm *tmv = localtime(&mt);
             if (tmv) strftime(c->date, sizeof c->date, "%Y-%m-%d", tmv);   /* file date -> "sort by date added" */
@@ -1364,6 +1451,19 @@ static void lib_detect_dir(const char *dir, int depth) {
             snprintf(sub, sizeof sub, "%s/", full);
             lib_detect_dir(sub, depth + 1);
         } else if (is_moflex(e->d_name)) {
+            if (has_episode_tag(e->d_name) && depth > 0) {   /* episode: its FOLDER is the unit */
+                char parent[PATHLEN + NAMELEN];
+                snprintf(parent, sizeof parent, "%s", dir);
+                size_t pl = strlen(parent); while (pl > 1 && parent[pl - 1] == '/') parent[--pl] = 0;
+                if (lib_has_path(parent)) continue;          /* show already in the library */
+                int dup = 0;                                 /* count each new show folder once */
+                int tracked = s_new_n < NEWLIST_MAX ? s_new_n : NEWLIST_MAX;
+                for (int i = 0; i < tracked && !dup; i++) if (!strcmp(s_newlist[i], parent)) dup = 1;
+                if (dup) continue;
+                if (s_newlist && s_new_n < NEWLIST_MAX) snprintf(s_newlist[s_new_n], sizeof s_newlist[0], "%s", parent);
+                s_new_n++;
+                continue;
+            }
             if (lib_has_path(full)) continue;                              /* cheap string check first */
             if (cia_is_cia(e->d_name) && !cia_has_moflex(full)) continue;  /* open only NEW CIAs */
             if (s_newlist && s_new_n < NEWLIST_MAX) snprintf(s_newlist[s_new_n], sizeof s_newlist[0], "%s", full);
@@ -1378,6 +1478,8 @@ static void lib_add_new(void) {
     int tracked = s_new_n < NEWLIST_MAX ? s_new_n : NEWLIST_MAX;
     for (int i = 0; i < tracked && g_lib_n < LIB_MAX; i++) {
         const char *full = s_newlist[i];
+        struct stat stq;
+        if (!stat(full, &stq) && S_ISDIR(stq.st_mode)) { lib_add_show(full, NULL); continue; }   /* new show folder */
         const char *b = strrchr(full, '/'); b = b ? b + 1 : full;
         CatEntry *c = &g_lib[g_lib_n];
         movieinfo_load(full, c);                          /* .nfo if it already has one */
@@ -1431,6 +1533,46 @@ static void lib_add_downloaded(const char *path, const CatEntry *src) {
     c->is_zip = 0;
     time_t now = time(NULL); struct tm *tmv = localtime(&now);
     if (tmv) strftime(c->date, sizeof c->date, "%Y-%m-%d", tmv);
+    lib_save_cache();
+}
+
+/* After a zip extracts: put its contents in the library. Episode-tagged folders become ONE show
+ * entry (with the catalog's info + poster saved against the folder); plain movies add normally. */
+static void lib_add_extracted_dir(const char *dir, const CatEntry *src, int depth) {
+    if (depth > 4) return;
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *e; int eps = 0;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        char full[PATHLEN + NAMELEN];
+        snprintf(full, sizeof full, "%s/%s", dir, e->d_name);
+        struct stat st;
+        if (stat(full, &st)) continue;
+        if (S_ISDIR(st.st_mode)) lib_add_extracted_dir(full, src, depth + 1);
+        else if (is_moflex(e->d_name)) {
+            if (has_episode_tag(e->d_name)) eps++;
+            else if (src) lib_add_downloaded(full, src);
+            else { CatEntry blank; memset(&blank, 0, sizeof blank); lib_add_downloaded(full, &blank); }
+        }
+    }
+    closedir(d);
+    if (eps) {
+        lib_add_show(dir, src);
+        if (src) {   /* persist the show's info (+ poster if fetchable) against the folder path */
+            char url[PATHLEN + NAMELEN]; snprintf(url, sizeof url, "%s", dir);
+            size_t L = strlen(url); while (L > 1 && url[L - 1] == '/') url[--L] = 0;
+            u16 *pb = (u16 *)malloc((size_t)POSTER_W * POSTER_H * sizeof(u16));
+            int phave = pb && src->art[0] && poster_get(src->art, src->fname, pb, POSTER_W, POSTER_H);
+            movieinfo_save(url, src, phave ? pb : NULL, POSTER_W, POSTER_H);
+            free(pb);
+        }
+    }
+}
+static void lib_add_extracted(const char *folder, const CatEntry *src) {
+    if (g_lib_n == 0) lib_load_cache_only();   /* make sure the cache is in RAM first */
+    if (!g_lib) return;
+    lib_add_extracted_dir(folder, src, 0);
     lib_save_cache();
 }
 
@@ -1507,7 +1649,13 @@ ll_rebuild:;   /* X-search inside the list jumps back here with s_lib_search set
             }
         }
         if (result >= 0) break;
-        if (play) { snprintf(out, cap, "%s", g_lib[idx[csel]].url); result = LL_PLAY; break; }
+        if (play) {
+            CatEntry *pe = &g_lib[idx[csel]];
+            if (pe->is_zip == 2) {   /* a TV show: open the episode list inside its folder */
+                if (show_pick_episode(pe->name, pe->url, out, cap)) { result = LL_PLAY; break; }
+                redraw = 1;          /* backed out of the episode list -> stay on the library list */
+            } else { snprintf(out, cap, "%s", pe->url); result = LL_PLAY; break; }
+        }
         if (info) { lib_getinfo_menu(idx, ni, csel); shown = -1; redraw = 1; }   /* This / All-missing */
         if (csel != shown) { redraw = 1; phave = 0; settle = 0; }   /* moved -> reload local poster */
         /* Don't hit the SD for a poster while scrolling: a no-artwork ("Uncategorized") item
@@ -1690,9 +1838,14 @@ static void download_url_direct(void) {
         ui_text_center(UI_W / 2, 100, 2, UI_NEON, "Extracting...");
         ui_text_fit(UI_W / 2, 130, 1, UI_DIM, stem, UI_W - 16); ui_present();
         gfxFlushBuffers(); gfxSwapBuffers();
-        int nf = unzip_to_dir(dest, folder);
-        remove(dest);
-        char m[96]; snprintf(m, sizeof m, nf > 0 ? "Extracted %d file%s." : "Extract FAILED.", nf, nf == 1 ? "" : "s");
+        int tot = 0;
+        int nf = unzip_to_dir_cb(dest, folder, &tot, unzip_prog);
+        if (nf > 0) remove(dest);
+        char m[96];
+        if (nf > 0 && nf == tot) snprintf(m, sizeof m, "Extracted %d file%s.", nf, nf == 1 ? "" : "s");
+        else if (nf > 0)         snprintf(m, sizeof m, "Extracted %d of %d files.", nf, tot);
+        else                     snprintf(m, sizeof m, tot == 0 ? "Could not open the zip." : "Extract FAILED.");
+        if (nf > 0) lib_add_extracted(folder, NULL);
         msg_screen("DOWNLOAD", m);
     } else {
         msg_screen("DOWNLOAD", "Download complete.");
