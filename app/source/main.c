@@ -249,6 +249,44 @@ static int confirm(const char *prompt) {
     return 0;
 }
 
+/* Pre-played movie: ask whether to resume at the saved time or start fresh.
+ * Returns 1 = resume, 0 = start from beginning. */
+static int resume_prompt(const char *name, long long rp_us) {
+    int redraw = 1, tdown = 0, tx0 = 0, ty0 = 0;
+    int bw = 116, bh = 36, by = 158, resx = 30, begx = UI_W - 30 - bw;
+    int s = (int)(rp_us / 1000000);
+    char tbuf[16];
+    if (s >= 3600) snprintf(tbuf, sizeof tbuf, "%d:%02d:%02d", s / 3600, (s / 60) % 60, s % 60);
+    else           snprintf(tbuf, sizeof tbuf, "%d:%02d", s / 60, s % 60);
+    while (aptMainLoop()) {
+        hidScanInput();
+        u32 k = hidKeysDown(), ku = hidKeysUp();
+        if (k & KEY_A) return 1;
+        if (k & KEY_B) return 0;
+        touchPosition tp; hidTouchRead(&tp);
+        if (k & KEY_TOUCH) { tdown = 1; tx0 = tp.px; ty0 = tp.py; }
+        else if ((ku & KEY_TOUCH) && tdown) { tdown = 0;
+            if (ty0 >= by && ty0 < by + bh) {
+                if (tx0 >= resx && tx0 < resx + bw) return 1;
+                if (tx0 >= begx && tx0 < begx + bw) return 0;
+            }
+        }
+        if (redraw) {
+            ui_begin(GFX_BOTTOM);
+            ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
+            ui_text_fit(UI_W / 2, 52, 1, UI_DIM, name, UI_W - 16);
+            char q[48]; snprintf(q, sizeof q, "Resume at %s?", tbuf);
+            ui_text_center(UI_W / 2, 84, 2, UI_NEON, q);
+            ui_button(resx, by, bw, bh, "RESUME",    1, UI_NEON);
+            ui_button(begx, by, bw, bh, "BEGINNING", 0, UI_NEONP);
+            ui_text_center(UI_W / 2, 214, 1, UI_DIM, "A resume    B start from beginning");
+            ui_present(); redraw = 0;
+        }
+        gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
+    }
+    return 1;
+}
+
 /* ---------- UPLOAD (web server, on-demand only) ---------- */
 
 static void upload_screen(void) {
@@ -1904,6 +1942,8 @@ static MoflexResult play_movie(const char *path) {
       if (L > 7 && !strcasecmp(g_now_playing + L - 7, ".moflex")) g_now_playing[L - 7] = 0;
       else if (L > 4 && !strcasecmp(g_now_playing + L - 4, ".zip")) g_now_playing[L - 4] = 0;
       else if (L > 4 && !strcasecmp(g_now_playing + L - 4, ".cia")) g_now_playing[L - 4] = 0; }
+    { long long rp = moflex_resume_get(path);   /* pre-played -> resume or start fresh? */
+      if (rp > 3000000 && !resume_prompt(g_now_playing, rp)) moflex_resume_clear(path); }
     MoflexResult r = moflex_play(path);
     cia_clear_selection();
     consoleInit(GFX_BOTTOM, NULL);

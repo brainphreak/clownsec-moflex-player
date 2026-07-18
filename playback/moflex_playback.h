@@ -28,4 +28,7 @@ MoflexResult moflex_play(const char *path);
 /* Saved resume position (microseconds) for a movie, or 0 if none. */
 long long moflex_resume_get(const char *path);
 
+/* Forget the saved position (used by the "start from beginning" choice). */
+void moflex_resume_clear(const char *path);
+
 #endif

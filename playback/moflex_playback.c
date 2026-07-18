@@ -108,6 +108,7 @@ static int subenc_load(const char *movie) {             /* 0..4, or -1 if none s
 /* (subenc_save is gone -- the encoding is now written with the rest of the settings by subcfg_save;
  *  subenc_load stays as the read-side fallback for .enc files written by older builds.) */
 long long moflex_resume_get(const char *path) { return (long long)resume_load(path); }
+void moflex_resume_clear(const char *path) { resume_clear(path); }
 
 /* ---- YUV->RGB565 LUTs ---- */
 static int yl[256], rv[256], gu[256], gv[256], bu[256];
