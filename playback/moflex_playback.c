@@ -571,14 +571,6 @@ static void panel_lock_toast(void) {
     ui_text_center(UI_W / 2, by + 24, 1, UI_INK, "Press L to unlock");
 }
 
-/* a bottom-row action button with up to two centered lines (so longer labels fit the 96px width) */
-static void panel_btn2(int x, int w, const char *l1, const char *l2, u16 accent) {
-    ui_button(x, BTN_Y, w, BTN_H, "", 0, accent);
-    int cx = x + w / 2;
-    if (l2 && l2[0]) { ui_text_center(cx, BTN_Y + 4, 1, UI_INK, l1); ui_text_center(cx, BTN_Y + 15, 1, UI_INK, l2); }
-    else ui_text_center(cx, BTN_Y + (BTN_H - 8) / 2, 1, UI_INK, l1);
-}
-
 static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing) {
     ui_begin(GFX_BOTTOM);
     ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
@@ -639,12 +631,11 @@ static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing)
     char vs[8]; snprintf(vs, sizeof(vs), "%d%%", (int)(g_vol * 100 + 0.5f));
     ui_text(VOL_X - 16, VOL_Y - 12, 1, UI_INK, vs);   /* label above the slider (frees the button row) */
 
-    /* action buttons (touch): BACK / OPEN / EXIT */
-    /* button legend / key map, above the action buttons on the left */
-    ui_text(6, 190, 1, UI_INK, "Y=SUBS X=DARK A=PLAY B=BACK L=LOCK");
-    panel_btn2(BKB_X, BKB_W, "OPEN", "VIDEO",  UI_NEON);    /* -> open the video picker */
-    panel_btn2(OPB_X, OPB_W, "MANAGE", "VIDEOS", UI_NEONP); /* -> manage/library */
-    panel_btn2(EXB_X, EXB_W, "MAIN", NULL, UI_NEONC);      /* -> main screen (B goes back) */
+    /* action buttons: SAME row as the home screen (OPEN VIDEO / MANAGE / ADD VIDEO) */
+    ui_text(6, 190, 1, UI_INK, "Y=SUBS X=DARK A=PLAY B=BACK L=LOCK");   /* key map */
+    ui_button(BKB_X, BTN_Y, BKB_W, BTN_H, "OPEN VIDEO", 0, UI_NEON);
+    ui_button(OPB_X, BTN_Y, OPB_W, BTN_H, "MANAGE",     0, UI_NEON);
+    ui_button(EXB_X, BTN_Y, EXB_W, BTN_H, "ADD VIDEO",  0, UI_NEON);
 
     if (g_touch_locked) ui_text(UI_W - 58, 8, 1, UI_NEONC, "LOCKED");
     /* subtitles: CC toggle/options (glows when on) */
@@ -1409,7 +1400,7 @@ static MoflexResult moflex_play_gpu(const char *path) {
                 } else if (py >= BTN_Y && py < BTN_Y + BTN_H) {   /* BACK / OPEN / EXIT */
                     if      (px >= BKB_X && px < BKB_X + BKB_W) { result = MOFLEX_QUIT_OPEN; break; }   /* OPEN VIDEO */
                     else if (px >= OPB_X && px < OPB_X + OPB_W) { result = MOFLEX_QUIT_MANAGE; break; }   /* MANAGE VIDEOS */
-                    else if (px >= EXB_X && px < EXB_X + EXB_W) { result = MOFLEX_QUIT_MAIN; break; }   /* MAIN */
+                    else if (px >= EXB_X && px < EXB_X + EXB_W) { result = MOFLEX_QUIT_ADD; break; }   /* ADD VIDEO */
                 }
             }
         }
@@ -2139,7 +2130,7 @@ static MoflexResult moflex_play_ring(const char *path) {
             } else if (py >= BTN_Y && py < BTN_Y + BTN_H) {
                 if      (px >= BKB_X && px < BKB_X + BKB_W) { result = MOFLEX_QUIT_OPEN; break; }   /* OPEN VIDEO */
                 else if (px >= OPB_X && px < OPB_X + OPB_W) { result = MOFLEX_QUIT_MANAGE; break; }   /* MANAGE VIDEOS */
-                else if (px >= EXB_X && px < EXB_X + EXB_W) { result = MOFLEX_QUIT_MAIN; break; }   /* MAIN */
+                else if (px >= EXB_X && px < EXB_X + EXB_W) { result = MOFLEX_QUIT_ADD; break; }   /* ADD VIDEO */
             }
         }
 
@@ -2616,7 +2607,7 @@ static MoflexResult moflex_play_classic(const char *path) {
                 } else if (py >= BTN_Y && py < BTN_Y + BTN_H) {   /* BACK / OPEN / EXIT */
                     if      (px >= BKB_X && px < BKB_X + BKB_W) { result = MOFLEX_QUIT_OPEN; break; }   /* OPEN VIDEO */
                     else if (px >= OPB_X && px < OPB_X + OPB_W) { result = MOFLEX_QUIT_MANAGE; break; }   /* MANAGE VIDEOS */
-                    else if (px >= EXB_X && px < EXB_X + EXB_W) { result = MOFLEX_QUIT_MAIN; break; }   /* MAIN */
+                    else if (px >= EXB_X && px < EXB_X + EXB_W) { result = MOFLEX_QUIT_ADD; break; }   /* ADD VIDEO */
                 }
             }
         }
@@ -2907,7 +2898,7 @@ static MoflexResult moflex_play_soft(const char *path) {
                 } else if (py >= BTN_Y && py < BTN_Y + BTN_H) {
                     if      (px >= BKB_X && px < BKB_X + BKB_W) { result = MOFLEX_QUIT_OPEN; break; }   /* OPEN VIDEO */
                     else if (px >= OPB_X && px < OPB_X + OPB_W) { result = MOFLEX_QUIT_MANAGE; break; }   /* MANAGE VIDEOS */
-                    else if (px >= EXB_X && px < EXB_X + EXB_W) { result = MOFLEX_QUIT_MAIN; break; }   /* MAIN */
+                    else if (px >= EXB_X && px < EXB_X + EXB_W) { result = MOFLEX_QUIT_ADD; break; }   /* ADD VIDEO */
                 }
             }
         }

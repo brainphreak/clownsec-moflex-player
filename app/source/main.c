@@ -2604,7 +2604,8 @@ static void home_draw(int bsel, long long rpos) {
 }
 
 static int home_gui(void) {
-    int bsel = 0, redraw = 1;
+    static int bsel = 0;   /* remember the highlighted button across screens (B back keeps it) */
+    int redraw = 1;
     /* read the resume position ONCE (not every frame -- that hammered the SD card) */
     long long rpos = g_now_playing_path[0] ? moflex_resume_get(g_now_playing_path) : 0;
     while (aptMainLoop()) {
@@ -2680,22 +2681,23 @@ static int open_video(char *out, size_t cap) {
 }
 
 /* Play a movie and handle the player's exit buttons. Returns 1 if the app should exit, else 0 (home).
- *  - B / BACK      -> re-open the file browser AT THE FOLDER YOU CAME FROM (cwd persists), so you land
- *                     back where you were; picking a movie there plays it, backing out to root -> home.
- *  - OPEN VIDEO    -> the source chooser (Library / Filesystem).
- *  - MANAGE VIDEOS -> the manage browser, then home.
- *  - MAIN          -> home. */
-static int play_and_handle(const char *path) {
+ *  - B / BACK   -> TRUE back: to the home screen if the movie was resumed from home, else re-open the
+ *                  file browser at the movie's folder with it highlighted.
+ *  - OPEN VIDEO -> the source chooser (Library / Filesystem).
+ *  - MANAGE     -> the manage browser, then home.
+ *  - ADD VIDEO  -> the add-video menu (download / upload), then home. */
+static int play_and_handle(const char *path, int from_home) {
     MoflexResult r = play_movie(path);
     for (;;) {
         char np[PATHLEN + NAMELEN];
         if (r == MOFLEX_QUIT_OPEN) {
             int b = open_video(np, sizeof np);
             if (b == 1) return 1;
-            if (b == 2) { r = play_movie(np); continue; }
+            if (b == 2) { from_home = 0; r = play_movie(np); continue; }   /* picked via browser now */
             return 0;
         }
-        if (r == MOFLEX_QUIT_BACK) {                 /* actual back: resume the browser where we left it */
+        if (r == MOFLEX_QUIT_BACK) {
+            if (from_home) return 0;                 /* came from the home screen -> back IS home */
             if (g_now_playing_path[0]) browser_preselect_path(g_now_playing_path);   /* highlight that movie */
             int b = browser(MODE_PLAY, np, sizeof np);
             if (b == 1) return 1;
@@ -2703,7 +2705,8 @@ static int play_and_handle(const char *path) {
             return 0;                                /* backed out to root -> home */
         }
         if (r == MOFLEX_QUIT_MANAGE) { browser(MODE_MANAGE, NULL, 0); return 0; }
-        return (r == MOFLEX_QUIT_EXIT) ? 1 : 0;      /* MAIN/EOF -> home; app-close -> exit */
+        if (r == MOFLEX_QUIT_ADD)    { add_movies_menu(); return 0; }
+        return (r == MOFLEX_QUIT_EXIT) ? 1 : 0;      /* EOF -> home; app-close -> exit */
     }
 }
 
@@ -2735,12 +2738,12 @@ int main(void) {
             char path[PATHLEN + NAMELEN];
             int r = open_video(path, sizeof(path));
             if (r == 1) running = 0;
-            else if (r == 2 && play_and_handle(path)) running = 0;
+            else if (r == 2 && play_and_handle(path, 0)) running = 0;
         }
         else if (choice == 1) { add_movies_menu(); }
         else if (choice == 2) { if (browser(MODE_MANAGE, NULL, 0) == 1) running = 0; }
-        else if (choice == 3) {                  /* PLAY: resume the loaded movie */
-            if (g_now_playing_path[0] && play_and_handle(g_now_playing_path)) running = 0;
+        else if (choice == 3) {                  /* PLAY: resume the loaded movie; B goes back HERE */
+            if (g_now_playing_path[0] && play_and_handle(g_now_playing_path, 1)) running = 0;
         }
     }
 
