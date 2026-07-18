@@ -493,6 +493,28 @@ static void add_source_swkbd(void) {
     load_sources();
 }
 
+/* System keyboard: 1 on OK with non-empty text, 0 on cancel/empty. */
+static int kbd_text(const char *hint, char *out, size_t cap) {
+    SwkbdState s;
+    swkbdInit(&s, SWKBD_TYPE_NORMAL, 2, -1);
+    swkbdSetHintText(&s, hint);
+    out[0] = 0;
+    if (swkbdInputText(&s, out, cap) != SWKBD_BUTTON_RIGHT) return 0;
+    return out[0] != 0;
+}
+
+/* case-insensitive substring (for search) */
+static int ci_contains(const char *hay, const char *needle) {
+    if (!needle[0]) return 1;
+    size_t nl = strlen(needle);
+    for (const char *p = hay; *p; p++) {
+        size_t i = 0;
+        while (i < nl && p[i] && tolower((unsigned char)p[i]) == tolower((unsigned char)needle[i])) i++;
+        if (i == nl) return 1;
+    }
+    return 0;
+}
+
 /* Remove a user-added source (index >= 3; the built-in Clownsec/Zackk/3DSmovies stay). */
 #define BUILTIN_SOURCES 3
 static void remove_source(int idx) {
@@ -877,6 +899,7 @@ static int catalog_pick(const char *title, const char *subtitle, char items[][32
         hidScanInput();
         u32 k = hidKeysDown(), kh = hidKeysHeld(), ku = hidKeysUp();
         if (k & KEY_B) return -1;
+        if (k & KEY_X) return -4;   /* search (callers that don't search treat it as back) */
         if (k & KEY_DOWN) { if (sel < total - 1) sel++; redraw = 1; }
         if (k & KEY_UP)   { if (sel > 0) sel--; redraw = 1; }
         int act = (k & KEY_A) ? sel : -1;
@@ -913,7 +936,7 @@ static int catalog_pick(const char *title, const char *subtitle, char items[][32
                 int hh = th * VIS / total; if (hh < 12) hh = 12; int hy = ty + (th - hh) * top / maxs;
                 ui_fill_round(UI_W - 6, ty, 3, th, 1, TH_TRACK);
                 ui_fill_round(UI_W - 6, hy, 3, hh, 1, UI_NEON); }
-            ui_text_center(UI_W / 2, 226, 1, UI_DIM, "tap to choose    B back");
+            ui_text_center(UI_W / 2, 226, 1, UI_DIM, "tap to choose    X search    B back");
             ui_present(); redraw = 0;
         }
         gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
@@ -951,12 +974,13 @@ static void catalog_browse(const Source *src) {
     int sortmode = 0;
 
     while (idx && aptMainLoop()) {
-        /* ---- navigation: pick a category (+ optional genre), or Show All ---- */
-        char filt_cat[32] = "", filt_genre[32] = "";
+        /* ---- navigation: pick a category (+ optional genre), Show All, or X = search ---- */
+        char filt_cat[32] = "", filt_genre[32] = "", filt_search[64] = "";
         if (ncat > 1) {
             int c = catalog_pick("CATEGORY", src->name, cats, ncat, 1, NULL);
             if (c == -1) break;
-            if (c >= 0) {
+            if (c == -4) { if (!kbd_text("Search this catalog", filt_search, sizeof filt_search)) continue; }
+            else if (c >= 0) {
                 snprintf(filt_cat, sizeof filt_cat, "%s", cats[c]);
                 static char gens[64][32]; int ng = distinct_genres(cat, nc, filt_cat, gens, 64);
                 qsort(gens, ng, 32, strrow_cmp);   /* genres alphabetical */
@@ -974,9 +998,11 @@ static void catalog_browse(const Source *src) {
         for (int i = 0; i < nc; i++) {
             if (filt_cat[0] && strcasecmp(cat[i].category, filt_cat)) continue;
             if (filt_genre[0] && !genre_match(cat[i].genres, filt_genre)) continue;
+            if (filt_search[0] && !ci_contains(cat[i].name, filt_search)) continue;   /* search box */
             idx[ni++] = i;
         }
-        if (ni == 0) { msg_screen("CATALOG", "Nothing here."); if (ncat > 1) continue; else break; }
+        if (ni == 0) { msg_screen("CATALOG", filt_search[0] ? "No movies match that search." : "Nothing here.");
+                       if (ncat > 1) continue; else break; }
         g_scat = cat; g_smode = sortmode; qsort(idx, ni, sizeof(int), idx_cmp);
 
         int csel = 0, cscroll = 0, redraw = 1, hfu = 0, hfd = 0, requested = 0;
@@ -1327,15 +1353,17 @@ static void lib_add_downloaded(const char *path, const CatEntry *src) {
 /* ---- the scrollable movie list for one category/genre filter ----
  * returns LL_BACK (back a level), LL_PLAY (out[] set), or LL_RESCAN (X). */
 enum { LL_BACK = 0, LL_PLAY = 1, LL_RESCAN = 2 };
+static char s_lib_search[64] = "";   /* active library search query ("" = off) */
 static int lib_idxbuf[LIB_MAX];
 static int library_list(const char *filt_cat, const char *filt_genre, u16 *poster, int *sortmode, char *out, size_t cap) {
     int *idx = lib_idxbuf, ni = 0;
     for (int i = 0; i < g_lib_n; i++) {
         if (filt_cat[0] && strcasecmp(lib_disp_cat(&g_lib[i]), filt_cat)) continue;
         if (filt_genre[0] && !genre_match(g_lib[i].genres, filt_genre)) continue;
+        if (s_lib_search[0] && !ci_contains(g_lib[i].name, s_lib_search)) continue;   /* search box */
         idx[ni++] = i;
     }
-    if (ni == 0) { msg_screen("LIBRARY", "Nothing here."); return LL_BACK; }
+    if (ni == 0) { msg_screen("LIBRARY", s_lib_search[0] ? "No movies match that search." : "Nothing here."); return LL_BACK; }
     g_scat = g_lib; g_smode = *sortmode; qsort(idx, ni, sizeof(int), idx_cmp);
 
     int csel = 0, cscroll = 0, redraw = 1, hfu = 0, hfd = 0;
@@ -1464,6 +1492,17 @@ static int library_view(char *out, size_t cap) {
         int c = catalog_pick("LIBRARY", sub, cats, ncat, 1, "* Rescan Library");
         if (c == -1) break;                                   /* B -> leave the library */
         if (c == -3) { lib_rescan(); if (g_lib_n == 0) { msg_screen("LIBRARY", "No movies found."); break; } continue; }
+        if (c == -4) {                                        /* X -> search the whole library */
+            char q[64];
+            if (kbd_text("Search your library", q, sizeof q)) {
+                snprintf(s_lib_search, sizeof s_lib_search, "%s", q);
+                int r = library_list("", "", poster, &sortmode, out, cap);
+                s_lib_search[0] = 0;
+                if (r == LL_PLAY) chose = 1;
+                else if (r == LL_RESCAN) lib_rescan();
+            }
+            continue;
+        }
 
         int rescan = 0;
         if (c == -2) {                                        /* Show All -> list; back -> category */
