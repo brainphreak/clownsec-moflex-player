@@ -682,7 +682,6 @@ static int sub_modal(const char *title, const char *const *items, int n, int sta
         ui_text_center(UI_W / 2, 14, 2, UI_NEON, title);
         for (int i = 0; i < n; i++) { int by = top + i * step;
             ui_button(18, by, UI_W - 36, bh, items[i], i == sel, UI_NEONC); }
-        ui_text_center(UI_W / 2, 228, 1, UI_DIM, "A choose   B back");
         ui_present();
         gspWaitForVBlank();
     }
@@ -764,7 +763,6 @@ static void sub_depth_menu(int is3d) {
         ui_text_center(UI_W / 2, 74, 3, UI_NEONC, v);
         ui_button(30, 150, 120, 36, "< OUT", 0, UI_NEONP);
         ui_button(170, 150, 120, 36, "IN >", 0, UI_NEON);
-        ui_text_center(UI_W / 2, 212, 1, UI_DIM, "LEFT / RIGHT adjust    A done");
         ui_present();
         gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
     }
@@ -797,7 +795,6 @@ static void sub_offset_menu(void) {
         ui_text_center(UI_W / 2, 74, 3, UI_NEONC, v);
         ui_button(20, 150, 135, 36, "< EARLIER", 0, UI_NEONP);
         ui_button(165, 150, 135, 36, "LATER >", 0, UI_NEON);
-        ui_text_center(UI_W / 2, 212, 1, UI_DIM, "LEFT / RIGHT adjust    A done");
         ui_present();
         gspWaitForVBlank();
     }
@@ -1106,7 +1103,6 @@ static void submenu_render(int is3d) {
         char r[40]; submenu_label(act[i], r, sizeof r);
         ui_button(18, top + i * step, UI_W - 36, bh, r, i == g_sub_sel, UI_NEONC);
     }
-    ui_text_center(UI_W / 2, 228, 1, UI_DIM, "up/down  left/right change  A open  B close");
 }
 static void srtpicker_render(void) {
     int top, step, bh; submenu_layout(g_srt_n > 0 ? g_srt_n : 1, &top, &step, &bh);
@@ -1119,7 +1115,6 @@ static void srtpicker_render(void) {
     }
     for (int i = 0; i < g_srt_n; i++)
         ui_button(18, top + i * step, UI_W - 36, bh, g_srt_names[i], i == g_srt_sel, UI_NEONC);
-    ui_text_center(UI_W / 2, 228, 1, UI_DIM, "up/down select   A load   B back");
 }
 static void g_submenu_sw(C3D_RenderTarget *bot, int is3d) {
     if (!ui_tex_init()) return;

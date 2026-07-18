@@ -341,8 +341,7 @@ static void upload_screen(void) {
         if (k & KEY_B) break;
         touchPosition tp; hidTouchRead(&tp);
         if (k & KEY_TOUCH) { tdown = 1; tx0 = tp.px; ty0 = tp.py; }
-        else if ((ku & KEY_TOUCH) && tdown) { tdown = 0;
-            if (ty0 >= 206 && ty0 < 234 && tx0 >= 110 && tx0 < 210) break; }
+        else if ((ku & KEY_TOUCH) && tdown) tdown = 0;
         /* poll the server thread for live upload progress */
         long done = 0, total = 0; char nm[128] = "";
         int active = ok ? httpd_upload_progress(&done, &total, nm, sizeof nm) : 0;
@@ -375,7 +374,6 @@ static void upload_screen(void) {
                 ui_text_center(UI_W / 2, 118, 1, UI_DIM, "Upload any files from the page.");
                 ui_text_center(UI_W / 2, 134, 1, UI_DIM, "Browse folders + delete there too.");
             }
-            ui_button(110, 206, 100, 28, "Back", 0, UI_NEONP);
             ui_present();
             redraw = 0;
         }
@@ -947,7 +945,7 @@ static int catalog_pick(const char *title, const char *subtitle, char items[][32
                 int hh = th * VIS / total; if (hh < 12) hh = 12; int hy = ty + (th - hh) * top / maxs;
                 ui_fill_round(UI_W - 6, ty, 3, th, 1, TH_TRACK);
                 ui_fill_round(UI_W - 6, hy, 3, hh, 1, UI_NEON); }
-            ui_text_center(UI_W / 2, 226, 1, UI_DIM, "tap to choose    X search    B back");
+            ui_text_center(UI_W / 2, 226, 1, UI_DIM, "X search");
             ui_present(); redraw = 0;
         }
         gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
@@ -1718,7 +1716,7 @@ static int ui_menu(const char *title, const char *subtitle, const char *const *i
 static void add_movies_menu(void) {
     for (;;) {
         const char *items[] = { "DOWNLOAD  (catalog / URL)", "UPLOAD  (over Wi-Fi)" };
-        int c = ui_menu("ADD VIDEOS", NULL, items, 2);
+        int c = ui_menu("ADD VIDEO", NULL, items, 2);
         if (c < 0) break;
         if (c == 0) download_screen(); else upload_screen();
     }
@@ -2040,10 +2038,23 @@ static void manage_menu(void) {
     if (nentries == 0) return;
     char full[PATHLEN + NAMELEN];
     snprintf(full, sizeof(full), "%s%s", cwd, entries[sel].name);
-    const char *items[] = { "DELETE", "MOVE (cut)", "CANCEL" };
-    int c = ui_menu("MANAGE", entries[sel].name, items, 3);
-    if (c == 0) { if (confirm("Delete this item?")) { remove(full); scan(); } }
-    else if (c == 1) {
+    const char *items[] = { "RENAME", "DELETE", "MOVE (cut)", "CANCEL" };
+    int c = ui_menu("MANAGE", entries[sel].name, items, 4);
+    if (c == 0) {   /* rename in place (keyboard pre-filled with the current name) */
+        char nn[NAMELEN];
+        SwkbdState s;
+        swkbdInit(&s, SWKBD_TYPE_NORMAL, 2, -1);
+        swkbdSetHintText(&s, "New name");
+        swkbdSetInitialText(&s, entries[sel].name);
+        if (swkbdInputText(&s, nn, sizeof nn) == SWKBD_BUTTON_RIGHT && nn[0] && strcmp(nn, entries[sel].name)) {
+            char nf[PATHLEN + NAMELEN];
+            snprintf(nf, sizeof nf, "%s%s", cwd, nn);
+            if (rename(full, nf) == 0) scan();
+            else msg_screen("RENAME", "Could not rename\n(name in use or invalid).");
+        }
+    }
+    else if (c == 1) { if (confirm("Delete this item?")) { remove(full); scan(); } }
+    else if (c == 2) {
         snprintf(move_src, sizeof(move_src), "%s", full);
         snprintf(move_name, sizeof(move_name), "%s", entries[sel].name);
         move_pending = 1;
@@ -2106,7 +2117,6 @@ static int pick_moflex(const CiaMoflex *list, int n) {
                 int hh = th * VIS / n; if (hh < 12) hh = 12; int hy = ty + (th - hh) * top / maxs;
                 ui_fill_round(UI_W - 6, ty, 3, th, 1, TH_TRACK);
                 ui_fill_round(UI_W - 6, hy, 3, hh, 1, UI_NEON); }
-            ui_text_center(UI_W / 2, 226, 1, UI_DIM, "tap a video   B back");
             ui_present(); redraw = 0;
         }
         gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
@@ -2395,7 +2405,7 @@ typedef struct { int x, y, w, h; const char *label; int choice; } HomeBtn;
 static HomeBtn g_btns[3] = {
     {   8, 200,  94, 32, "OPEN VIDEO", 0 },
     { 110, 200, 100, 32, "MANAGE",     2 },
-    { 218, 200,  94, 32, "ADD VIDEOS", 1 },
+    { 218, 200,  94, 32, "ADD VIDEO", 1 },
 };
 #define HOME_PCX (UI_W / 2)   /* PLAY circle centre */
 #define HOME_PCY 120
@@ -2650,7 +2660,6 @@ static int open_pick(void) {
             ui_text_center(UI_W / 2, 18, 2, UI_NEON, "OPEN VIDEO");
             ui_button(34, 66, UI_W - 68, 52, "LIBRARY", sel == 0, UI_NEON);
             ui_button(34, 134, UI_W - 68, 52, "FILESYSTEM", sel == 1, UI_NEONP);
-            ui_text_center(UI_W / 2, 226, 1, UI_DIM, "A choose    B back");
             ui_present(); redraw = 0;
         }
         gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
