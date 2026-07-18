@@ -1109,7 +1109,10 @@ static void srtpicker_render(void) {
     ui_begin(GFX_BOTTOM);
     ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
     ui_text_center(UI_W / 2, 14, 2, UI_NEON, "LOAD SRT");
-    if (g_srt_n == 0) ui_text_center(UI_W / 2, 110, 1, UI_DIM, "No .srt files in the movie folder or moviedata.");
+    if (g_srt_n == 0) {   /* same two-line message as the released sub_load_menu */
+        ui_text_center(UI_W / 2, 100, 1, UI_INK, "No .srt files found in the");
+        ui_text_center(UI_W / 2, 118, 1, UI_INK, "movie folder or moviedata.");
+    }
     for (int i = 0; i < g_srt_n; i++)
         ui_button(18, top + i * step, UI_W - 36, bh, g_srt_names[i], i == g_srt_sel, UI_NEONC);
     ui_text_center(UI_W / 2, 228, 1, UI_DIM, "up/down select   A load   B back");
