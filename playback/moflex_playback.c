@@ -35,7 +35,8 @@ static int   g_sw_bank = -1;     /* software-banking depth (pairs banked ahead);
 static int   g_lcd_ok = 0;       /* gsp::Lcd available -> bottom-screen-off feature usable */
 static int   g_screen_off = 0;   /* bottom backlight is currently off (movie keeps playing on top) */
 static int   g_touch_locked = 0; /* touch lock: L toggles it; buttons still work; touch shows a toast */
-static int   g_lock_toast = 0;   /* frames left to show the "SCREEN IS LOCKED" toast after a touch */
+static int   g_lock_toast = 0;   /* frames left to show the "touch locked" toast after a locked touch */
+static int   g_backlight_on = 1; /* actual bottom backlight state (reconciled from g_screen_off + toast) */
 
 /* ---- battery indicator (player panel) ---- */
 static int   g_mcu_ok = 0;       /* mcu::HWC available -> exact 0-100% */
@@ -637,10 +638,11 @@ static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing)
     /* touch-lock feedback: persistent marker + a brief toast when the locked screen is touched */
     if (g_touch_locked) ui_text(UI_W - 58, 8, 1, UI_NEONC, "LOCKED");
     if (g_lock_toast > 0) {
-        int bw = 172, bh = 30, bx = (UI_W - bw) / 2, by = (UI_H - bh) / 2;
+        int bw = 184, bh = 42, bx = (UI_W - bw) / 2, by = (UI_H - bh) / 2;
         ui_fill_round(bx, by, bw, bh, 8, UI_BG2);
         ui_frame_round(bx, by, bw, bh, 8, UI_NEONC, 2);
-        ui_text_center(UI_W / 2, by + 11, 1, UI_NEONC, "SCREEN IS LOCKED");
+        ui_text_center(UI_W / 2, by + 8, 1, UI_NEONC, "TOUCH IS LOCKED");
+        ui_text_center(UI_W / 2, by + 24, 1, UI_INK, "Press L to unlock");
     }
     /* subtitles: CC toggle/options (glows when on) */
     ui_button(CC_X, CC_Y, CC_W, CC_H, "CC", g_sub_on, g_sub_on ? UI_NEON : UI_DIM);
@@ -1723,7 +1725,7 @@ static void mp_ring_apt_hook(APT_HookType hook, void *param) {
             if (g_ring_apt_audio) ndspChnSetPaused(0, true);
             g_ring_susp = 1;                            /* stop the worker from starting a new Y2R... */
             if (g_ring_lock) { LightLock_Lock(g_ring_lock); LightLock_Unlock(g_ring_lock); }  /* ...and drain any in flight */
-            if (g_screen_off) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; }
+            if (g_screen_off) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; } g_backlight_on = 1;
             if (g_lcd_ok) gspLcdExit();                 /* release gsp::Lcd (else HOME hard-locks) */
             y2rExit();                                  /* release Y2R for the applet */
             gfxSet3D(false);
@@ -1732,6 +1734,7 @@ static void mp_ring_apt_hook(APT_HookType hook, void *param) {
         case APTHOOK_ONWAKEUP:
             g_y2r_init(g_ring_apt_w, g_ring_apt_h, g_ring_apt_bpp);      /* re-acquire Y2R */
             if (g_lcd_ok) gspLcdInit();                                  /* re-acquire gsp::Lcd */
+            g_backlight_on = 1;                                          /* applet left the backlight on */
             if (g_ring_apt_audio && g_ring_apt_playing) ndspChnSetPaused(0, false);
             g_ring_susp = 0;                            /* let the worker produce again */
             if (g_ring_wake) LightEvent_Signal(g_ring_wake);
@@ -1975,7 +1978,7 @@ static MoflexResult moflex_play_ring(const char *path) {
     int scrubbing = 0; int64_t scrub_us = 0;   /* touch-drag on the bar: preview while held, seek on release */
     int vol_drag = 0;                           /* touch-drag on the volume slider (applies live) */
     g_submenu = 0; g_sub_sel = 0;               /* subtitle menu starts closed */
-    g_touch_locked = 0; g_lock_toast = 0;       /* touch starts unlocked */
+    g_touch_locked = 0; g_lock_toast = 0; g_backlight_on = 1;   /* touch unlocked, backlight on */
     int64_t rpos = resume_load(path), last_save = 0;
     if (rpos > 3000000 && (dur_us <= 0 || rpos < dur_us - 10000000)) { seek_to_us = rpos; want_seek = 1; last_save = rpos; }
     int vol_dirty = 0, save_pend = 0, save_delay = 0;
@@ -2029,14 +2032,35 @@ static MoflexResult moflex_play_ring(const char *path) {
         touchPosition tp; hidTouchRead(&tp);
         g_ring_apt_playing = playing;   /* so the suspend hook resumes audio only if we were playing */
 
-        /* L toggles the touch lock. While locked, EVERY button still works (play/seek/subs/dark);
-         * only touch is ignored, and touching shows a brief "SCREEN IS LOCKED" toast. Only L unlocks. */
+        /* L toggles the touch lock (buttons always work; only touch is gated). */
         if (kd & KEY_L) { g_touch_locked = !g_touch_locked; g_lock_toast = 0; dirty = 1; }
-        if (g_touch_locked) {
-            if (kd & KEY_TOUCH) { g_lock_toast = 90; dirty = 1; }   /* touched while locked -> show why */
-            kd &= ~KEY_TOUCH; kh &= ~KEY_TOUCH;                     /* touch does nothing while locked */
+
+        /* Dark bottom screen: ANY button wakes it; touching wakes it when unlocked, or (when locked)
+         * flashes the "touch locked" message. Either way a touch on the dark screen NEVER reaches the
+         * (invisible) controls. */
+        if (g_screen_off) {
+            if (kd & ~KEY_TOUCH) { g_screen_off = 0; dirty = 1; kd = 0; }   /* a button woke it (consumed) */
+            else if (kd & KEY_TOUCH) {
+                if (g_touch_locked) g_lock_toast = 90;   /* stay dark; flash the message (backlight below) */
+                else g_screen_off = 0;                   /* touch woke it */
+                dirty = 1;
+            }
+            kd &= ~KEY_TOUCH; kh &= ~KEY_TOUCH;          /* touch on a dark screen drives no control */
         }
+        else if (g_touch_locked) {                       /* lit + locked: touch only shows the message */
+            if (kd & KEY_TOUCH) { g_lock_toast = 90; dirty = 1; }
+            kd &= ~KEY_TOUCH; kh &= ~KEY_TOUCH;
+        }
+
         if (g_lock_toast > 0) { g_lock_toast--; dirty = 1; }
+
+        /* reconcile the physical backlight: on unless the user darkened it -- and even then, briefly on
+         * to show the touch-locked toast so they can read why touch isn't waking it. */
+        if (g_lcd_ok) {
+            int on = (!g_screen_off) || (g_lock_toast > 0);
+            if (on != g_backlight_on) { if (on) GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM);
+                                        else GSPLCD_PowerOffBacklight(GSPLCD_SCREEN_BOTTOM); g_backlight_on = on; }
+        }
 
         if (g_submenu) {                       /* subtitle menu owns input while open; movie plays on */
             submenu_input(kd, kh, tp, is3d, path);
@@ -2050,11 +2074,7 @@ static MoflexResult moflex_play_ring(const char *path) {
         if (kd & KEY_DOWN) { int s = (int)(g_vol / 0.25f + 0.9999f); g_vol = (s - 1) * 0.25f; if (g_vol < 0.25f) g_vol = 0.25f; vol_dirty = 1; }
         if (kd & KEY_Y)      { g_sub_on = !g_sub_on; dirty = 1; }   /* Y: quick-toggle subtitles */
         if (kd & KEY_SELECT) { g_submenu = 1; g_sub_sel = 0; dirty = 1; }   /* SELECT: open subtitle options */
-        if (kd & KEY_X && g_lcd_ok) {                            /* X: toggle the dark bottom screen */
-            if (g_screen_off) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; }
-            else { GSPLCD_PowerOffBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 1; }
-            dirty = 1;
-        }
+        if (kd & KEY_X && g_lcd_ok) { g_screen_off = !g_screen_off; dirty = 1; }   /* X: toggle dark screen */
         {   int sdir = (kh & KEY_RIGHT) ? 1 : ((kh & KEY_LEFT) ? -1 : 0);
             if (sdir == 0) shold = 0;
             else { int fire = (kd & (KEY_RIGHT | KEY_LEFT)) ? 1 : 0;
@@ -2085,7 +2105,7 @@ static MoflexResult moflex_play_ring(const char *path) {
             } else if (px >= CC_X && px < CC_X + CC_W && py >= CC_Y && py < CC_Y + CC_H) {
                 g_submenu = 1; g_sub_sel = 0; dirty = 1;   /* CC: open the subtitle options menu */
             } else if (g_lcd_ok && px >= DIM_X && px < DIM_X + DIM_W && py >= DIM_Y && py < DIM_Y + DIM_H) {
-                GSPLCD_PowerOffBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 1;   /* dark; any input wakes it */
+                g_screen_off = 1; dirty = 1;   /* moon: darken (a button or touch wakes it; reconcile handles backlight) */
             } else if (py >= BTN_Y && py < BTN_Y + BTN_H) {
                 if      (px >= BKB_X && px < BKB_X + BKB_W) { result = MOFLEX_QUIT_OPEN; break; }   /* OPEN VIDEO */
                 else if (px >= OPB_X && px < OPB_X + OPB_W) { result = MOFLEX_QUIT_BACK; break; }   /* MANAGE VIDEOS */
