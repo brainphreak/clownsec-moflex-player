@@ -249,6 +249,44 @@ static int confirm(const char *prompt) {
     return 0;
 }
 
+/* Generic two-button modal: d-pad moves the highlight, A activates it, B backs out.
+ * body may contain '\n' line breaks. Returns 0 (left button), 1 (right), or -1 on B. */
+static int prompt2(const char *title, const char *body, const char *lbl0, const char *lbl1) {
+    int redraw = 1, tdown = 0, tx0 = 0, ty0 = 0, psel = 0;
+    int bw = 116, bh = 36, by = 158, x0 = 30, x1 = UI_W - 30 - bw;
+    while (aptMainLoop()) {
+        hidScanInput();
+        u32 k = hidKeysDown(), ku = hidKeysUp();
+        if (k & (KEY_LEFT | KEY_RIGHT)) { psel = !psel; redraw = 1; }
+        if (k & KEY_A) return psel;
+        if (k & KEY_B) return -1;
+        touchPosition tp; hidTouchRead(&tp);
+        if (k & KEY_TOUCH) { tdown = 1; tx0 = tp.px; ty0 = tp.py; }
+        else if ((ku & KEY_TOUCH) && tdown) { tdown = 0;
+            if (ty0 >= by && ty0 < by + bh) {
+                if (tx0 >= x0 && tx0 < x0 + bw) return 0;
+                if (tx0 >= x1 && tx0 < x1 + bw) return 1;
+            }
+        }
+        if (redraw) {
+            ui_begin(GFX_BOTTOM);
+            ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
+            ui_text_center(UI_W / 2, 48, 2, UI_NEON, title);
+            int ly = 88; const char *p = body; char line[64];
+            while (*p) {
+                int j = 0; while (*p && *p != '\n' && j < 63) line[j++] = *p++;
+                line[j] = 0; if (*p == '\n') p++;
+                ui_text_fit(UI_W / 2, ly, 1, UI_INK, line, UI_W - 16); ly += 16;
+            }
+            ui_button(x0, by, bw, bh, lbl0, psel == 0, UI_NEON);
+            ui_button(x1, by, bw, bh, lbl1, psel == 1, UI_NEONP);
+            ui_present(); redraw = 0;
+        }
+        gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
+    }
+    return -1;
+}
+
 /* Pre-played movie: ask whether to resume at the saved time or start fresh.
  * D-pad moves between the buttons, A activates the highlighted one, B backs out.
  * Returns 1 = resume, 0 = start over, -1 = back to the previous screen. */
@@ -1195,7 +1233,7 @@ static int lib_distinct_categories(char out[][32], int max) {
     return n;
 }
 
-static int lib_load(void) {   /* returns the movie count; loads the cache, else scans once */
+static int lib_load_cache(void) {   /* cache-only: movie count, 0 if no valid cache (never scans) */
     if (g_lib_n > 0) return g_lib_n;                          /* already in RAM this session */
     if (!g_lib) g_lib = (CatEntry *)malloc(sizeof(CatEntry) * LIB_MAX);
     if (!g_lib) return 0;
@@ -1205,8 +1243,47 @@ static int lib_load(void) {   /* returns the movie count; loads the cache, else 
             fread(&n, sizeof n, 1, f) == 1 && n > 0 && n <= LIB_MAX &&
             (int)fread(g_lib, sizeof(CatEntry), n, f) == n) g_lib_n = n;
         fclose(f); }
-    if (g_lib_n == 0) lib_rescan();
     return g_lib_n;
+}
+static int lib_load(void) {   /* returns the movie count; loads the cache, else scans once */
+    if (lib_load_cache() == 0) lib_rescan();
+    return g_lib_n;
+}
+
+/* ---- startup new-movie detection: walk the SD with the same filters as the library scan and
+ * collect movie files that aren't in the cached library (added via browser/PC/upload). ---- */
+#define NEWLIST_MAX 64
+static char (*s_newlist)[PATHLEN + NAMELEN];   /* first NEWLIST_MAX new paths (malloc'd for the check) */
+static int  s_new_n;                           /* TOTAL new movies found (may exceed NEWLIST_MAX) */
+
+static int lib_has_path(const char *full) {
+    for (int i = 0; i < g_lib_n; i++) if (!strcmp(g_lib[i].url, full)) return 1;
+    return 0;
+}
+static void lib_detect_dir(const char *dir, int depth) {
+    if (depth > 8) return;
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        char full[PATHLEN + NAMELEN];
+        snprintf(full, sizeof full, "%s%s", dir, e->d_name);
+        struct stat st;
+        if (stat(full, &st)) continue;
+        if (S_ISDIR(st.st_mode)) {
+            if (is_hidden_dir(e->d_name)) continue;
+            char sub[PATHLEN];
+            snprintf(sub, sizeof sub, "%s/", full);
+            lib_detect_dir(sub, depth + 1);
+        } else if (is_moflex(e->d_name)) {
+            if (cia_is_cia(e->d_name) && !cia_has_moflex(full)) continue;
+            if (lib_has_path(full)) continue;
+            if (s_newlist && s_new_n < NEWLIST_MAX) snprintf(s_newlist[s_new_n], sizeof s_newlist[0], "%s", full);
+            s_new_n++;
+        }
+    }
+    closedir(d);
 }
 
 /* load the library cache into RAM if present, WITHOUT falling back to a full SD scan */
@@ -1802,6 +1879,40 @@ static void lib_scrape_missing(int *idx, int ni) {
            cancelled ? "Cancelled.\n" : "", got, todo, todo == 1 ? "" : "s",
            (got < todo && !cancelled) ? "(no catalog match for the rest)" : "");
     msg_screen("GET INFO", m);
+}
+
+/* ---- startup: detect movies added outside the app (browser download, PC copy, upload) and offer
+ * a rescan; after rescanning, offer art + info download for the new arrivals. ---- */
+static void startup_new_movie_check(void) {
+    if (lib_load_cache() == 0) return;   /* no library yet: the first Library open scans anyway */
+
+    ui_begin(GFX_BOTTOM); ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
+    ui_text_center(UI_W / 2, 104, 1, UI_DIM, "Checking for new movies..."); ui_present();
+    gfxFlushBuffers(); gfxSwapBuffers();
+
+    s_newlist = malloc(sizeof *s_newlist * NEWLIST_MAX);
+    s_new_n = 0;
+    lib_detect_dir("sdmc:/", 0);
+    if (s_new_n == 0) { free(s_newlist); s_newlist = NULL; return; }
+
+    char msg[96];
+    snprintf(msg, sizeof msg, "%d new movie%s found on the SD card.\nRescan the library now?",
+             s_new_n, s_new_n == 1 ? "" : "s");
+    if (prompt2("NEW MOVIES", msg, "RESCAN", "LATER") != 0) { free(s_newlist); s_newlist = NULL; return; }
+    lib_rescan();
+
+    /* offer art + info for the new arrivals that don't have any yet */
+    static int idx[NEWLIST_MAX]; int ni = 0;
+    int tracked = s_new_n < NEWLIST_MAX ? s_new_n : NEWLIST_MAX;
+    for (int i = 0; i < tracked; i++) {
+        if (movieinfo_have(s_newlist[i])) continue;
+        for (int j = 0; j < g_lib_n; j++)
+            if (!strcmp(g_lib[j].url, s_newlist[i])) { idx[ni++] = j; break; }
+    }
+    free(s_newlist); s_newlist = NULL;
+    if (ni == 0) return;
+    snprintf(msg, sizeof msg, "Download art & info for the\n%d new movie%s?", ni, ni == 1 ? "" : "s");
+    if (prompt2("GET INFO", msg, "DOWNLOAD", "SKIP") == 0) lib_scrape_missing(idx, ni);
 }
 
 static void lib_getinfo_menu(int *idx, int ni, int csel) {
@@ -2512,6 +2623,8 @@ int main(void) {
     consoleInit(GFX_BOTTOM, NULL);
     gfxSetDoubleBuffering(GFX_BOTTOM, false);
     branding_show();                                  /* 3D CLOWNSEC logo on top */
+
+    startup_new_movie_check();   /* movies added outside the app -> offer rescan (+ art/info) */
 
     int running = 1;
     while (running && aptMainLoop()) {
