@@ -2183,22 +2183,36 @@ static MoflexResult moflex_play_ring(const char *path) {
              * Peek forward counting blocks, then re-seek to the landing for the real prime. */
             s.eye_swap = 0;
             if (is3d) {
-                MfxPacket pk; int64_t bt = m.ts; long cnt = 0; int cum = 0, nb = 0;
+                /* Collect raw block samples (span_us, packet count) from the landing... */
+                MfxPacket pk; int64_t bt = m.ts; long cnt = 0; int nb = 0;
+                int64_t spans[12]; long cnts[12];
                 for (long g = 0; g < 20000 && nb < 12; g++) {
                     if (mfx_next_packet(&m, &pk) != 1) break;
                     if (m.streams[pk.stream_index].media_type != MFX_TYPE_VIDEO) continue;
-                    if (m.ts != bt) {
-                        long F = (long)((double)(m.ts - bt) * 2.0 / (double)pair_dur + 0.5);
-                        int step = (int)(cnt - F);
-                        if (step == 1 || step == -1) {   /* pins the whole chain back to the landing */
-                            int pred = (step == 1 ? 0 : 1) - cum;
-                            if (pred == 1) s.eye_swap = 1;   /* landing starts on a RIGHT eye */
-                            nb = 99; break;
-                        }
-                        cum += step; nb++;
-                        bt = m.ts; cnt = 0;
-                    }
+                    if (m.ts != bt) { spans[nb] = m.ts - bt; cnts[nb] = cnt; nb++; bt = m.ts; cnt = 0; }
                     cnt++;
+                }
+                /* ...then judge them under BOTH timebase conventions: Nintendo's tb is the EYE
+                 * period (declared 2x rate); our encoder's tb is the PAIR period. A candidate is
+                 * trusted ONLY if every span sits exactly on its frame grid (eps 0.02 -- Nintendo
+                 * muxes are exact; ms-rounded muxes drift and are rejected) and steps stay in
+                 * -1..+1. The first exact +-1 pins the landing parity; anything suspicious means
+                 * NO swap (the safe default -- validated 50/50 on movie.moflex, 0 false swaps on
+                 * our own encodes, pc_verify/test_stereo10.c). */
+                for (int cand = 0; cand < 2; cand++) {
+                    double eye = cand ? (double)pair_dur * 0.5 : (double)pair_dur;
+                    int okc = 1, cum = 0, verdict = -1;
+                    for (int k = 0; k < nb && okc; k++) {
+                        double fx = (double)spans[k] / eye;
+                        long F = (long)(fx + 0.5);
+                        double d = fx - (double)F; if (d < 0) d = -d;
+                        if (d > 0.02) { okc = 0; break; }
+                        int step = (int)(cnts[k] - F);
+                        if (step == 1 || step == -1) { verdict = (step == 1 ? 0 : 1) - cum; break; }
+                        if (step != 0) { okc = 0; break; }
+                    }
+                    if (okc && (verdict == 0 || verdict == 1)) { s.eye_swap = verdict; break; }
+                    if (okc && verdict < 0) break;   /* exact grid, no split seen -> landing is L */
                 }
                 do_seek(&m, &ctx, seek_to_us);   /* rewind to the landing for the real prime */
             }
