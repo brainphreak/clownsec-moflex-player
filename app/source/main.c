@@ -1295,21 +1295,44 @@ static void lib_detect_dir(const char *dir, int depth) {
         if (e->d_name[0] == '.') continue;
         char full[PATHLEN + NAMELEN];
         snprintf(full, sizeof full, "%s%s", dir, e->d_name);
-        struct stat st;
-        if (stat(full, &st)) continue;
-        if (S_ISDIR(st.st_mode)) {
+        /* d_type avoids a stat() per entry (the slow part of the walk on FAT) */
+        int isdir;
+        if (e->d_type != DT_UNKNOWN) isdir = (e->d_type == DT_DIR);
+        else { struct stat st; if (stat(full, &st)) continue; isdir = S_ISDIR(st.st_mode); }
+        if (isdir) {
             if (is_hidden_dir(e->d_name)) continue;
             char sub[PATHLEN];
             snprintf(sub, sizeof sub, "%s/", full);
             lib_detect_dir(sub, depth + 1);
         } else if (is_moflex(e->d_name)) {
-            if (cia_is_cia(e->d_name) && !cia_has_moflex(full)) continue;
-            if (lib_has_path(full)) continue;
+            if (lib_has_path(full)) continue;                              /* cheap string check first */
+            if (cia_is_cia(e->d_name) && !cia_has_moflex(full)) continue;  /* open only NEW CIAs */
             if (s_newlist && s_new_n < NEWLIST_MAX) snprintf(s_newlist[s_new_n], sizeof s_newlist[0], "%s", full);
             s_new_n++;
         }
     }
     closedir(d);
+}
+
+/* Append the detected new files straight into the library (no second SD walk). */
+static void lib_add_new(void) {
+    int tracked = s_new_n < NEWLIST_MAX ? s_new_n : NEWLIST_MAX;
+    for (int i = 0; i < tracked && g_lib_n < LIB_MAX; i++) {
+        const char *full = s_newlist[i];
+        const char *b = strrchr(full, '/'); b = b ? b + 1 : full;
+        CatEntry *c = &g_lib[g_lib_n];
+        movieinfo_load(full, c);                          /* .nfo if it already has one */
+        snprintf(c->url, sizeof c->url, "%s", full);
+        snprintf(c->fname, sizeof c->fname, "%s", b);
+        if (!c->name[0]) { snprintf(c->name, sizeof c->name, "%s", b); strip_ext(c->name); }
+        if (!c->category[0]) snprintf(c->category, sizeof c->category, "Uncategorized");
+        c->is_zip = 0;
+        struct stat st;
+        if (!stat(full, &st)) { time_t mt = st.st_mtime; struct tm *tmv = localtime(&mt);
+            if (tmv) strftime(c->date, sizeof c->date, "%Y-%m-%d", tmv); }
+        g_lib_n++;
+    }
+    lib_save_cache();
 }
 
 /* load the library cache into RAM if present, WITHOUT falling back to a full SD scan */
@@ -1952,10 +1975,11 @@ static void startup_new_movie_check(void) {
     if (s_new_n == 0) { free(s_newlist); s_newlist = NULL; return; }
 
     char msg[96];
-    snprintf(msg, sizeof msg, "%d new movie%s found on the SD card.\nRescan the library now?",
+    snprintf(msg, sizeof msg, "%d new movie%s found on the SD card.\nAdd new movies to Library?",
              s_new_n, s_new_n == 1 ? "" : "s");
-    if (prompt2("NEW MOVIES", msg, "RESCAN", "LATER") != 0) { free(s_newlist); s_newlist = NULL; return; }
-    lib_rescan();
+    if (prompt2("NEW MOVIES", msg, "ADD", "LATER") != 0) { free(s_newlist); s_newlist = NULL; return; }
+    if (s_new_n <= NEWLIST_MAX) lib_add_new();   /* instant: append the found files, no second walk */
+    else lib_rescan();                           /* too many to have tracked -> full rescan */
 
     /* offer art + info for the new arrivals that don't have any yet */
     static int idx[NEWLIST_MAX]; int ni = 0;
