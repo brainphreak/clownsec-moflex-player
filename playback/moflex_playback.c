@@ -557,6 +557,14 @@ static void sub_overlay(int is3d, int64_t us) {
 /* debug timing overlay (per stereo pair), updated ~1x/sec from the loop */
 static int g_dbg_fps = 0, g_dbg_dec10 = 0, g_dbg_blit10 = 0, g_dbg_aud10 = 0;
 
+/* a bottom-row action button with up to two centered lines (so longer labels fit the 96px width) */
+static void panel_btn2(int x, int w, const char *l1, const char *l2, u16 accent) {
+    ui_button(x, BTN_Y, w, BTN_H, "", 0, accent);
+    int cx = x + w / 2;
+    if (l2 && l2[0]) { ui_text_center(cx, BTN_Y + 4, 1, UI_INK, l1); ui_text_center(cx, BTN_Y + 15, 1, UI_INK, l2); }
+    else ui_text_center(cx, BTN_Y + (BTN_H - 8) / 2, 1, UI_INK, l1);
+}
+
 static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing) {
     ui_begin(GFX_BOTTOM);
     ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
@@ -618,9 +626,9 @@ static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing)
     ui_text(VOL_X - 16, VOL_Y - 12, 1, UI_INK, vs);   /* label above the slider (frees the button row) */
 
     /* action buttons (touch): BACK / OPEN / EXIT */
-    ui_button(BKB_X, BTN_Y, BKB_W, BTN_H, "BACK", 0, UI_NEONP);
-    ui_button(OPB_X, BTN_Y, OPB_W, BTN_H, "OPEN", 0, UI_NEON);
-    ui_button(EXB_X, BTN_Y, EXB_W, BTN_H, "EXIT", 0, UI_RED);
+    panel_btn2(BKB_X, BKB_W, "OPEN", "VIDEO",  UI_NEON);    /* -> open the video picker */
+    panel_btn2(OPB_X, OPB_W, "MANAGE", "VIDEOS", UI_NEONP); /* -> back to the library/home */
+    panel_btn2(EXB_X, EXB_W, "EXIT", NULL, UI_RED);
     /* subtitles: CC toggle/options (glows when on) */
     ui_button(CC_X, CC_Y, CC_W, CC_H, "CC", g_sub_on, g_sub_on ? UI_NEON : UI_DIM);
     /* bottom-screen-off: a crescent-moon button (video keeps playing on top) */
@@ -1011,12 +1019,8 @@ static int ui_tex_init(void) {
 }
 static void ui_tex_free(void) { if (g_uitex_ok) { C3D_TexDelete(&g_uitex); g_uitex_ok = 0; } }
 
-/* Drop-in for g_panel(): render the release panel to the offscreen buffer, lift it into the texture,
- * draw it on the bottom. Same layout constants as the touch handler, so the controls still line up. */
-static void g_panel_sw(C3D_RenderTarget *bot, const char *title, int64_t cur, int64_t dur, int playing) {
-    if (!ui_tex_init()) return;
-    ui_capture(1);
-    panel_draw(title, cur, dur, playing);       /* fills g_buf; ui_present() is a no-op under capture */
+/* lift the offscreen UI buffer (already drawn) into the texture and draw it on the bottom screen */
+static void ui_tex_present(C3D_RenderTarget *bot) {
     ui_capture(0);
     const u16 *src = ui_pixels();                /* pixel (x,y) at [x*UI_H + (UI_H-1-y)] (rotated fb) */
     u16 *dst = (u16 *)g_uitex.data;
@@ -1027,6 +1031,129 @@ static void g_panel_sw(C3D_RenderTarget *bot, const char *title, int64_t cur, in
     C2D_TargetClear(bot, C2D_Color32(0, 0, 0, 255));
     C2D_SceneBegin(bot);
     C2D_DrawImageAt(g_uiimg, 0, 0, 0, NULL, 1, 1);
+}
+
+/* Drop-in for g_panel(): render the release panel to the offscreen buffer, then texture it. */
+static void g_panel_sw(C3D_RenderTarget *bot, const char *title, int64_t cur, int64_t dur, int playing) {
+    if (!ui_tex_init()) return;
+    ui_capture(1);
+    panel_draw(title, cur, dur, playing);       /* fills g_buf; ui_present() is a no-op under capture */
+    ui_tex_present(bot);
+}
+
+/* ==================== NON-BLOCKING SUBTITLE MENU (ring engine, live preview) ====================
+ * The shipped sub_menu() is a blocking modal that draws to the framebuffer -- it can't run while
+ * citro2d owns the GPU and the movie plays. This renders the same options to the offscreen buffer
+ * every frame (textured onto the bottom like the panel) and takes one frame of input at a time, so
+ * the movie keeps playing on top and size/position/depth/encoding changes preview live. ============ */
+static int g_submenu = 0;      /* 0 = closed, 1 = options list, 2 = SRT file picker */
+static int g_sub_sel = 0;      /* selected row in the options list */
+static int g_sub_rep = 0;      /* left/right hold-repeat counter (delay/depth) */
+static int g_srt_sel = 0, g_srt_n = 0;
+static char g_srt_names[8][128], g_srt_paths[8][512];
+
+/* action codes per row, in display order (depth row only when 3D). Returns row count. */
+static int submenu_actions(int is3d, int *act) {
+    int n = 0;
+    act[n++] = 0; act[n++] = 1; act[n++] = 2; act[n++] = 3; act[n++] = 6;
+    if (is3d) act[n++] = 4;
+    act[n++] = 5;
+    return n;
+}
+#define SUBM_Y0 44
+#define SUBM_RH 24
+static void submenu_render(int is3d) {
+    int act[8]; int n = submenu_actions(is3d, act);
+    ui_begin(GFX_BOTTOM);
+    ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
+    ui_text_center(UI_W / 2, 12, 2, UI_NEON, "SUBTITLES");
+    for (int i = 0; i < n; i++) {
+        int y = SUBM_Y0 + i * SUBM_RH, sel = (i == g_sub_sel);
+        if (sel) ui_fill_round(10, y - 3, UI_W - 20, SUBM_RH - 4, 6, TH_SEL);
+        char r[40];
+        switch (act[i]) {
+            case 0: snprintf(r, sizeof r, "Subtitles:  %s", g_sub_on ? "ON" : "OFF"); break;
+            case 1: snprintf(r, sizeof r, "Position:  %s", g_sub_top ? "Top" : "Bottom"); break;
+            case 2: snprintf(r, sizeof r, "Size:  %s", g_sub_size == 1 ? "Small" : g_sub_size == 2 ? "Medium" : "Large"); break;
+            case 3: { int64_t da = g_sub_off < 0 ? -g_sub_off : g_sub_off;
+                      snprintf(r, sizeof r, "Delay:  %c%d.%02d s", g_sub_off < 0 ? '-' : '+', (int)(da / 1000000), (int)((da % 1000000) / 10000)); } break;
+            case 6: snprintf(r, sizeof r, "Encoding:  %s%s", g_sub_enc_name[g_sub_enc], g_sub_mode < 0 ? " (UTF-8)" : ""); break;
+            case 4: snprintf(r, sizeof r, "Depth (3D):  %+d", g_sub_depth); break;
+            default: snprintf(r, sizeof r, "Load SRT file..."); break;
+        }
+        ui_text(20, y + 2, 1, sel ? UI_NEON : UI_INK, r);
+        if (sel && (act[i] == 3 || act[i] == 4)) ui_text(UI_W - 46, y + 2, 1, UI_NEONC, "<>");
+    }
+    ui_text_center(UI_W / 2, UI_H - 14, 1, UI_DIM, "up/down select   left/right or A change   B close");
+}
+static void srtpicker_render(void) {
+    ui_begin(GFX_BOTTOM);
+    ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
+    ui_text_center(UI_W / 2, 12, 2, UI_NEON, "LOAD SRT");
+    if (g_srt_n == 0) ui_text_center(UI_W / 2, 110, 1, UI_DIM, "No .srt files in the movie folder or moviedata.");
+    for (int i = 0; i < g_srt_n; i++) {
+        int y = SUBM_Y0 + i * SUBM_RH, sel = (i == g_srt_sel);
+        if (sel) ui_fill_round(10, y - 3, UI_W - 20, SUBM_RH - 4, 6, TH_SEL);
+        ui_text_clipped(20, y + 2, 1, sel ? UI_NEON : UI_INK, g_srt_names[i], 20, UI_W - 20);
+    }
+    ui_text_center(UI_W / 2, UI_H - 14, 1, UI_DIM, "up/down select   A load   B back");
+}
+static void g_submenu_sw(C3D_RenderTarget *bot, int is3d) {
+    if (!ui_tex_init()) return;
+    ui_capture(1);
+    if (g_submenu == 2) srtpicker_render(); else submenu_render(is3d);
+    ui_tex_present(bot);
+}
+
+/* open the SRT picker: scan the movie folder + moviedata for .srt files */
+static void submenu_open_srt(const char *moviepath) {
+    const char *b = strrchr(moviepath, '/');
+    char dir[512]; int dl = b ? (int)(b - moviepath + 1) : 0;
+    snprintf(dir, sizeof dir, "%.*s", dl, moviepath);
+    g_srt_n = sub_srt_scan(dir, g_srt_names, g_srt_paths, 0, 8);
+    g_srt_n = sub_srt_scan("sdmc:/moflex_player/moviedata/", g_srt_names, g_srt_paths, g_srt_n, 8);
+    g_srt_sel = 0; g_submenu = 2;
+}
+
+/* one frame of menu input; returns 1 when the whole menu should close (config persisted). */
+static int submenu_input(u32 kd, u32 kh, int is3d, const char *moviepath) {
+    if (g_submenu == 2) {   /* SRT file picker */
+        if (kd & KEY_B) { g_submenu = 1; return 0; }
+        if (g_srt_n > 0) {
+            if (kd & KEY_DOWN) g_srt_sel = (g_srt_sel + 1) % g_srt_n;
+            if (kd & KEY_UP)   g_srt_sel = (g_srt_sel + g_srt_n - 1) % g_srt_n;
+            if (kd & KEY_A) { if (subs_load(g_srt_paths[g_srt_sel])) g_sub_on = 1; g_submenu = 1; }
+        }
+        return 0;
+    }
+    int act[8]; int n = submenu_actions(is3d, act);
+    if (g_sub_sel >= n) g_sub_sel = n - 1;
+    if (g_sub_sel < 0)  g_sub_sel = 0;
+    if (kd & KEY_B) { subcfg_save(moviepath); g_submenu = 0; return 1; }
+    if (kd & KEY_DOWN) g_sub_sel = (g_sub_sel + 1) % n;
+    if (kd & KEY_UP)   g_sub_sel = (g_sub_sel + n - 1) % n;
+    int a = act[g_sub_sel];
+    int press = (kd & KEY_RIGHT) ? 1 : (kd & KEY_LEFT) ? -1 : 0;   /* single tap: toggles/cycles */
+    if (kd & KEY_A) press = 1;
+    int held = (kh & KEY_RIGHT) ? 1 : (kh & KEY_LEFT) ? -1 : 0;    /* hold-repeat: delay/depth */
+    int rep = 0;
+    if (!held) g_sub_rep = 0;
+    else { rep = (kd & (KEY_LEFT | KEY_RIGHT)) ? held : 0;
+           if (!rep) { g_sub_rep++; if (g_sub_rep > 10 && g_sub_rep % 3 == 0) rep = held; } }
+    switch (a) {
+        case 0: if (press) { if (g_nsubs > 0) g_sub_on = !g_sub_on; } break;
+        case 1: if (press) g_sub_top = !g_sub_top; break;
+        case 2: if (press > 0) g_sub_size = g_sub_size >= 3 ? 1 : g_sub_size + 1;
+                else if (press < 0) g_sub_size = g_sub_size <= 1 ? 3 : g_sub_size - 1; break;
+        case 3: if (rep) { g_sub_off += (int64_t)rep * 250000;
+                           if (g_sub_off < -60000000) g_sub_off = -60000000;
+                           if (g_sub_off >  60000000) g_sub_off =  60000000; } break;
+        case 4: if (rep) { g_sub_depth += rep; if (g_sub_depth < -16) g_sub_depth = -16; if (g_sub_depth > 16) g_sub_depth = 16; } break;
+        case 6: if (press) { g_sub_enc = (g_sub_enc + (press < 0 ? 4 : 1)) % 5;
+                             if (g_sub_file[0]) { char w[512]; snprintf(w, sizeof w, "%s", g_sub_file); subs_load(w); } } break;
+        default: if (kd & KEY_A) submenu_open_srt(moviepath); break;   /* Load SRT... */
+    }
+    return 0;
 }
 
 /* ---- audio worker: runs on core 1, owns ndsp, reads its OWN file handle so it feeds the DSP
@@ -1237,8 +1364,8 @@ static MoflexResult moflex_play_gpu(const char *path) {
                     else if (px >= RW_CX - 18 && px <= RW_CX + 18) { seek_to_us = cur_us - 30000000; want_seek = 1; }
                     else if (px >= FF_CX - 18 && px <= FF_CX + 18) { seek_to_us = cur_us + 30000000; want_seek = 1; }
                 } else if (py >= BTN_Y && py < BTN_Y + BTN_H) {   /* BACK / OPEN / EXIT */
-                    if      (px >= BKB_X && px < BKB_X + BKB_W) { result = MOFLEX_QUIT_BACK; break; }
-                    else if (px >= OPB_X && px < OPB_X + OPB_W) { result = MOFLEX_QUIT_OPEN; break; }
+                    if      (px >= BKB_X && px < BKB_X + BKB_W) { result = MOFLEX_QUIT_OPEN; break; }   /* OPEN VIDEO */
+                    else if (px >= OPB_X && px < OPB_X + OPB_W) { result = MOFLEX_QUIT_BACK; break; }   /* MANAGE VIDEOS */
                     else if (px >= EXB_X && px < EXB_X + EXB_W) { result = MOFLEX_QUIT_EXIT; break; }
                 }
             }
@@ -1817,6 +1944,7 @@ static MoflexResult moflex_play_ring(const char *path) {
     int64_t cur_us = 0, dur_us = m.duration_us, seek_to_us = 0; int want_seek = 0, shold = 0;
     int scrubbing = 0; int64_t scrub_us = 0;   /* touch-drag on the bar: preview while held, seek on release */
     int vol_drag = 0;                           /* touch-drag on the volume slider (applies live) */
+    g_submenu = 0; g_sub_sel = 0;               /* subtitle menu starts closed */
     int64_t rpos = resume_load(path), last_save = 0;
     if (rpos > 3000000 && (dur_us <= 0 || rpos < dur_us - 10000000)) { seek_to_us = rpos; want_seek = 1; last_save = rpos; }
     int vol_dirty = 0, save_pend = 0, save_delay = 0;
@@ -1874,12 +2002,21 @@ static MoflexResult moflex_play_ring(const char *path) {
          * backlight and is consumed so it doesn't also trigger a control. */
         if (g_screen_off && kd) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; dirty = 1; kd = 0; }
 
+        if (g_submenu) {                       /* subtitle menu owns input while open; movie plays on */
+            submenu_input(kd, kh, is3d, path);
+            dirty = 1;
+        } else {
         if (kd & KEY_B) { result = MOFLEX_QUIT_BACK; break; }
         if (kd & KEY_A) { playing = !playing; if (have_audio) ndspChnSetPaused(0, !playing);
                           s.paused = !playing; if (playing) LightEvent_Signal(&s.wake);
                           save_pend = !playing; save_delay = 30; }
         if (kd & KEY_UP)   { int s = (int)(g_vol / 0.25f + 0.0001f); g_vol = (s + 1) * 0.25f; if (g_vol > 4.0f) g_vol = 4.0f; vol_dirty = 1; }
         if (kd & KEY_DOWN) { int s = (int)(g_vol / 0.25f + 0.9999f); g_vol = (s - 1) * 0.25f; if (g_vol < 0.25f) g_vol = 0.25f; vol_dirty = 1; }
+        if (kd & KEY_Y)      { g_sub_on = !g_sub_on; dirty = 1; }   /* Y: quick-toggle subtitles */
+        if (kd & KEY_SELECT) { g_submenu = 1; g_sub_sel = 0; dirty = 1; }   /* SELECT: open subtitle options */
+        if (kd & KEY_X && g_lcd_ok && !g_screen_off) {           /* X: screen off (any input, incl. X, wakes it above) */
+            GSPLCD_PowerOffBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 1;
+        }
         {   int sdir = (kh & KEY_RIGHT) ? 1 : ((kh & KEY_LEFT) ? -1 : 0);
             if (sdir == 0) shold = 0;
             else { int fire = (kd & (KEY_RIGHT | KEY_LEFT)) ? 1 : 0;
@@ -1908,12 +2045,12 @@ static MoflexResult moflex_play_ring(const char *path) {
             } else if (py >= PLAY_CY - 20 && py <= PLAY_CY + 20 && px >= FF_CX - 18 && px <= FF_CX + 18) {
                 seek_to_us = cur_us + 30000000; want_seek = 1;
             } else if (px >= CC_X && px < CC_X + CC_W && py >= CC_Y && py < CC_Y + CC_H) {
-                g_sub_on = !g_sub_on; dirty = 1;   /* CC: toggle subtitles (full options menu = citro2d follow-up) */
+                g_submenu = 1; g_sub_sel = 0; dirty = 1;   /* CC: open the subtitle options menu */
             } else if (g_lcd_ok && px >= DIM_X && px < DIM_X + DIM_W && py >= DIM_Y && py < DIM_Y + DIM_H) {
                 GSPLCD_PowerOffBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 1;   /* dark; any input wakes it */
             } else if (py >= BTN_Y && py < BTN_Y + BTN_H) {
-                if      (px >= BKB_X && px < BKB_X + BKB_W) { result = MOFLEX_QUIT_BACK; break; }
-                else if (px >= OPB_X && px < OPB_X + OPB_W) { result = MOFLEX_QUIT_OPEN; break; }
+                if      (px >= BKB_X && px < BKB_X + BKB_W) { result = MOFLEX_QUIT_OPEN; break; }   /* OPEN VIDEO */
+                else if (px >= OPB_X && px < OPB_X + OPB_W) { result = MOFLEX_QUIT_BACK; break; }   /* MANAGE VIDEOS */
                 else if (px >= EXB_X && px < EXB_X + EXB_W) { result = MOFLEX_QUIT_EXIT; break; }
             }
         }
@@ -1941,6 +2078,7 @@ static MoflexResult moflex_play_ring(const char *path) {
                 dirty = 1;
             } else vol_drag = 0;
         }
+        }   /* end transport input (skipped while the subtitle menu is open) */
 
         /* ---- seek: pause the worker (own demux+decoder), reset ring/demux/audio, PRIME the landing
          *      frame into slot 0, then resume. Held D-pad only accumulates the target; fires on release. ---- */
@@ -2047,7 +2185,8 @@ static MoflexResult moflex_play_ring(const char *path) {
             C2D_TargetClear(topR, black); C2D_SceneBegin(topR);
             C2D_DrawImageAt(is3d ? r3_imgR[b] : r3_imgL[b], 0, 0, 0, NULL, 1, 1);
             if (sub_valid) r3_draw_sub(&tsub, is3d ? g_sub_depth : 0, subcol, subout);
-            g_panel_sw(bot, title, disp_us, dur_us, playing);   /* release-style panel via texture */
+            if (g_submenu) g_submenu_sw(bot, is3d);              /* subtitle options (movie keeps playing) */
+            else g_panel_sw(bot, title, disp_us, dur_us, playing);   /* release-style panel via texture */
             u64 _tg = svcGetSystemTick(); C3D_FrameEnd(0); pf_gpu += svcGetSystemTick() - _tg;
             dirty = 0;
             if (show >= 0) {
@@ -2347,8 +2486,8 @@ static MoflexResult moflex_play_classic(const char *path) {
                     else if (px >= RW_CX - 18 && px <= RW_CX + 18) { seek_to_us = cur_us - 30000000; want_seek = 1; }
                     else if (px >= FF_CX - 18 && px <= FF_CX + 18) { seek_to_us = cur_us + 30000000; want_seek = 1; }
                 } else if (py >= BTN_Y && py < BTN_Y + BTN_H) {   /* BACK / OPEN / EXIT */
-                    if      (px >= BKB_X && px < BKB_X + BKB_W) { result = MOFLEX_QUIT_BACK; break; }
-                    else if (px >= OPB_X && px < OPB_X + OPB_W) { result = MOFLEX_QUIT_OPEN; break; }
+                    if      (px >= BKB_X && px < BKB_X + BKB_W) { result = MOFLEX_QUIT_OPEN; break; }   /* OPEN VIDEO */
+                    else if (px >= OPB_X && px < OPB_X + OPB_W) { result = MOFLEX_QUIT_BACK; break; }   /* MANAGE VIDEOS */
                     else if (px >= EXB_X && px < EXB_X + EXB_W) { result = MOFLEX_QUIT_EXIT; break; }
                 }
             }
@@ -2638,8 +2777,8 @@ static MoflexResult moflex_play_soft(const char *path) {
                     else if (px >= RW_CX - 18 && px <= RW_CX + 18) { seek_to_us = cur_us - 30000000; want_seek = 1; }
                     else if (px >= FF_CX - 18 && px <= FF_CX + 18) { seek_to_us = cur_us + 30000000; want_seek = 1; }
                 } else if (py >= BTN_Y && py < BTN_Y + BTN_H) {
-                    if      (px >= BKB_X && px < BKB_X + BKB_W) { result = MOFLEX_QUIT_BACK; break; }
-                    else if (px >= OPB_X && px < OPB_X + OPB_W) { result = MOFLEX_QUIT_OPEN; break; }
+                    if      (px >= BKB_X && px < BKB_X + BKB_W) { result = MOFLEX_QUIT_OPEN; break; }   /* OPEN VIDEO */
+                    else if (px >= OPB_X && px < OPB_X + OPB_W) { result = MOFLEX_QUIT_BACK; break; }   /* MANAGE VIDEOS */
                     else if (px >= EXB_X && px < EXB_X + EXB_W) { result = MOFLEX_QUIT_EXIT; break; }
                 }
             }
