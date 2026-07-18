@@ -637,7 +637,8 @@ static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing)
     ui_button(OPB_X, BTN_Y, OPB_W, BTN_H, "MANAGE",     0, UI_NEON);
     ui_button(EXB_X, BTN_Y, EXB_W, BTN_H, "ADD VIDEO",  0, UI_NEON);
 
-    if (g_touch_locked) ui_text(UI_W - 58, 8, 1, UI_NEONC, "LOCKED");
+    if (g_touch_locked)   /* below the battery so a long movie title can't overlap it */
+        ui_text(UI_W - 8 - ui_text_w(1, "LOCKED"), 38, 1, UI_NEONC, "LOCKED");
     /* subtitles: CC toggle/options (glows when on) */
     ui_button(CC_X, CC_Y, CC_W, CC_H, "CC", g_sub_on, g_sub_on ? UI_NEON : UI_DIM);
     /* bottom-screen-off: a crescent-moon button (video keeps playing on top) */
@@ -2088,9 +2089,12 @@ static MoflexResult moflex_play_ring(const char *path) {
             dirty = 1;
         } else {
         if (kd & KEY_B) { result = MOFLEX_QUIT_BACK; break; }
-        if (kd & KEY_A) { playing = !playing; if (have_audio) ndspChnSetPaused(0, !playing);
-                          s.paused = !playing; if (playing) LightEvent_Signal(&s.wake);
-                          save_pend = !playing; save_delay = 30; }
+        if (kd & KEY_A) {
+            if (s.done && (s.wr - rd) == 0) { seek_to_us = 0; want_seek = 1; }   /* at the end: replay */
+            else { playing = !playing; if (have_audio) ndspChnSetPaused(0, !playing);
+                   s.paused = !playing; if (playing) LightEvent_Signal(&s.wake);
+                   save_pend = !playing; save_delay = 30; }
+        }
         if (kd & KEY_UP)   { int s = (int)(g_vol / 0.25f + 0.0001f); g_vol = (s + 1) * 0.25f; if (g_vol > 4.0f) g_vol = 4.0f; vol_dirty = 1; }
         if (kd & KEY_DOWN) { int s = (int)(g_vol / 0.25f + 0.9999f); g_vol = (s - 1) * 0.25f; if (g_vol < 0.25f) g_vol = 0.25f; vol_dirty = 1; }
         if (kd & KEY_Y)      { g_sub_on = !g_sub_on; dirty = 1; }   /* Y: quick-toggle subtitles */
@@ -2326,7 +2330,15 @@ static MoflexResult moflex_play_ring(const char *path) {
         }
         if (vol_dirty && !save_pend) { vol_save(); vol_dirty = 0; }
 
-        if (s.done && (s.wr - rd) == 0) { result = MOFLEX_QUIT_BACK; break; }   /* EOF fully drained */
+        /* movie finished: STOP in the player (last frame held, bar parked at the end) instead of
+         * exiting as if B was pressed. A replays from the start; B leaves as usual. */
+        if (s.done && (s.wr - rd) == 0 && playing) {
+            playing = 0; s.paused = 1;
+            if (have_audio) ndspChnSetPaused(0, true);
+            resume_clear(path);                      /* finished -> no resume point */
+            if (dur_us > 0) cur_us = dur_us;
+            dirty = 1;
+        }
         /* No banking on this thread now: when no new frame is due (and no UI change), pace to VBlank so
          * the present-due check runs once per refresh -> steady cadence. Present iterations (show>=0)
          * skip this, so C3D_FrameEnd is never double-waited. */
@@ -2866,7 +2878,10 @@ static MoflexResult moflex_play_soft(const char *path) {
         if (g_screen_off) { if (kd) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; dirty = 1; } goto sr_after_input; }
 
         if (kd & KEY_B) { result = MOFLEX_QUIT_BACK; break; }
-        if (kd & KEY_A) { playing = !playing; if (have_audio) ndspChnSetPaused(0, !playing); dirty = 1; save_pend = !playing; save_delay = 30; }
+        if (kd & KEY_A) {
+            if (done && r3_vqc == 0 && (wr - rd) == 0) { seek_to_us = 0; want_seek = 1; }   /* at the end: replay */
+            else { playing = !playing; if (have_audio) ndspChnSetPaused(0, !playing); dirty = 1; save_pend = !playing; save_delay = 30; }
+        }
         if (kd & KEY_UP)   { int s = (int)(g_vol / 0.25f + 0.0001f); g_vol = (s + 1) * 0.25f; if (g_vol > 4.0f) g_vol = 4.0f; vol_dirty = 1; dirty = 1; }
         if (kd & KEY_DOWN) { int s = (int)(g_vol / 0.25f + 0.9999f); g_vol = (s - 1) * 0.25f; if (g_vol < 0.25f) g_vol = 0.25f; vol_dirty = 1; dirty = 1; }
         {   int sdir = (kh & KEY_RIGHT) ? 1 : ((kh & KEY_LEFT) ? -1 : 0);
@@ -2998,7 +3013,14 @@ static MoflexResult moflex_play_soft(const char *path) {
         }
         if (vol_dirty && !save_pend) { vol_save(); vol_dirty = 0; }
 
-        if (done && r3_vqc == 0 && (wr - rd) == 0) { result = MOFLEX_QUIT_BACK; break; }
+        /* movie finished: STOP in the player (A replays from the start, B leaves) */
+        if (done && r3_vqc == 0 && (wr - rd) == 0 && playing) {
+            playing = 0;
+            if (have_audio) ndspChnSetPaused(0, true);
+            resume_clear(path);
+            if (dur_us > 0) cur_us = dur_us;
+            dirty = 1;
+        }
         if (show < 0 && !worked && !dirty) gspWaitForVBlank();
     }
     if (!aptMainLoop() && result == MOFLEX_QUIT_BACK) result = MOFLEX_QUIT_EXIT;
