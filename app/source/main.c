@@ -2407,18 +2407,31 @@ static int open_video(char *out, size_t cap) {
     }
 }
 
-/* Play a movie; if the user taps OPEN in the player, jump straight to the chooser to pick
- * another (looping). Returns 1 if the app should exit. */
+/* Play a movie and handle the player's exit buttons. Returns 1 if the app should exit, else 0 (home).
+ *  - B / BACK      -> re-open the file browser AT THE FOLDER YOU CAME FROM (cwd persists), so you land
+ *                     back where you were; picking a movie there plays it, backing out to root -> home.
+ *  - OPEN VIDEO    -> the source chooser (Library / Filesystem).
+ *  - MANAGE VIDEOS -> the manage browser, then home.
+ *  - MAIN          -> home. */
 static int play_and_handle(const char *path) {
     MoflexResult r = play_movie(path);
-    while (r == MOFLEX_QUIT_OPEN) {
+    for (;;) {
         char np[PATHLEN + NAMELEN];
-        int b = open_video(np, sizeof np);
-        if (b == 1) return 1;             /* exit */
-        if (b == 2) r = play_movie(np);   /* picked a file -> play it */
-        else return 0;                    /* backed out -> home screen */
+        if (r == MOFLEX_QUIT_OPEN) {
+            int b = open_video(np, sizeof np);
+            if (b == 1) return 1;
+            if (b == 2) { r = play_movie(np); continue; }
+            return 0;
+        }
+        if (r == MOFLEX_QUIT_BACK) {                 /* actual back: resume the browser where we left it */
+            int b = browser(MODE_PLAY, np, sizeof np);
+            if (b == 1) return 1;
+            if (b == 2) { r = play_movie(np); continue; }
+            return 0;                                /* backed out to root -> home */
+        }
+        if (r == MOFLEX_QUIT_MANAGE) { browser(MODE_MANAGE, NULL, 0); return 0; }
+        return (r == MOFLEX_QUIT_EXIT) ? 1 : 0;      /* MAIN/EOF -> home; app-close -> exit */
     }
-    return (r == MOFLEX_QUIT_EXIT) ? 1 : 0;
 }
 
 /* ---------- main ---------- */

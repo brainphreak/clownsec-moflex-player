@@ -1397,8 +1397,8 @@ static MoflexResult moflex_play_gpu(const char *path) {
                     else if (px >= FF_CX - 18 && px <= FF_CX + 18) { seek_to_us = cur_us + 30000000; want_seek = 1; }
                 } else if (py >= BTN_Y && py < BTN_Y + BTN_H) {   /* BACK / OPEN / EXIT */
                     if      (px >= BKB_X && px < BKB_X + BKB_W) { result = MOFLEX_QUIT_OPEN; break; }   /* OPEN VIDEO */
-                    else if (px >= OPB_X && px < OPB_X + OPB_W) { result = MOFLEX_QUIT_BACK; break; }   /* MANAGE VIDEOS */
-                    else if (px >= EXB_X && px < EXB_X + EXB_W) { result = MOFLEX_QUIT_BACK; break; }   /* MAIN */
+                    else if (px >= OPB_X && px < OPB_X + OPB_W) { result = MOFLEX_QUIT_MANAGE; break; }   /* MANAGE VIDEOS */
+                    else if (px >= EXB_X && px < EXB_X + EXB_W) { result = MOFLEX_QUIT_MAIN; break; }   /* MAIN */
                 }
             }
         }
@@ -2120,8 +2120,8 @@ static MoflexResult moflex_play_ring(const char *path) {
                 g_screen_off = 1; dirty = 1;   /* moon: darken (a button or touch wakes it; reconcile handles backlight) */
             } else if (py >= BTN_Y && py < BTN_Y + BTN_H) {
                 if      (px >= BKB_X && px < BKB_X + BKB_W) { result = MOFLEX_QUIT_OPEN; break; }   /* OPEN VIDEO */
-                else if (px >= OPB_X && px < OPB_X + OPB_W) { result = MOFLEX_QUIT_BACK; break; }   /* MANAGE VIDEOS */
-                else if (px >= EXB_X && px < EXB_X + EXB_W) { result = MOFLEX_QUIT_BACK; break; }   /* MAIN */
+                else if (px >= OPB_X && px < OPB_X + OPB_W) { result = MOFLEX_QUIT_MANAGE; break; }   /* MANAGE VIDEOS */
+                else if (px >= EXB_X && px < EXB_X + EXB_W) { result = MOFLEX_QUIT_MAIN; break; }   /* MAIN */
             }
         }
 
@@ -2566,8 +2566,8 @@ static MoflexResult moflex_play_classic(const char *path) {
                     else if (px >= FF_CX - 18 && px <= FF_CX + 18) { seek_to_us = cur_us + 30000000; want_seek = 1; }
                 } else if (py >= BTN_Y && py < BTN_Y + BTN_H) {   /* BACK / OPEN / EXIT */
                     if      (px >= BKB_X && px < BKB_X + BKB_W) { result = MOFLEX_QUIT_OPEN; break; }   /* OPEN VIDEO */
-                    else if (px >= OPB_X && px < OPB_X + OPB_W) { result = MOFLEX_QUIT_BACK; break; }   /* MANAGE VIDEOS */
-                    else if (px >= EXB_X && px < EXB_X + EXB_W) { result = MOFLEX_QUIT_BACK; break; }   /* MAIN */
+                    else if (px >= OPB_X && px < OPB_X + OPB_W) { result = MOFLEX_QUIT_MANAGE; break; }   /* MANAGE VIDEOS */
+                    else if (px >= EXB_X && px < EXB_X + EXB_W) { result = MOFLEX_QUIT_MAIN; break; }   /* MAIN */
                 }
             }
         }
@@ -2857,8 +2857,8 @@ static MoflexResult moflex_play_soft(const char *path) {
                     else if (px >= FF_CX - 18 && px <= FF_CX + 18) { seek_to_us = cur_us + 30000000; want_seek = 1; }
                 } else if (py >= BTN_Y && py < BTN_Y + BTN_H) {
                     if      (px >= BKB_X && px < BKB_X + BKB_W) { result = MOFLEX_QUIT_OPEN; break; }   /* OPEN VIDEO */
-                    else if (px >= OPB_X && px < OPB_X + OPB_W) { result = MOFLEX_QUIT_BACK; break; }   /* MANAGE VIDEOS */
-                    else if (px >= EXB_X && px < EXB_X + EXB_W) { result = MOFLEX_QUIT_BACK; break; }   /* MAIN */
+                    else if (px >= OPB_X && px < OPB_X + OPB_W) { result = MOFLEX_QUIT_MANAGE; break; }   /* MANAGE VIDEOS */
+                    else if (px >= EXB_X && px < EXB_X + EXB_W) { result = MOFLEX_QUIT_MAIN; break; }   /* MAIN */
                 }
             }
         }
