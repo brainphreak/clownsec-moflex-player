@@ -23,7 +23,7 @@
 #include "ui_gfx.h"
 #include "branding.h"
 
-#define APP_VERSION "v1.0.0"
+#define APP_VERSION "v1.1.0b"
 #ifndef BUILD_TAG
 #define BUILD_TAG "dev"      /* set by the Makefile: date +%y%m%d.%H%M of the build */
 #endif
