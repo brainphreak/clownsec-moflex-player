@@ -2174,6 +2174,11 @@ static MoflexResult moflex_play_ring(const char *path) {
                     if (mfx_next_packet(&m, &pk) != 1) break;
                     if (m.streams[pk.stream_index].media_type != MFX_TYPE_VIDEO) continue;
                     vseen++;
+                    /* 3D: video packets alternate L,R,L,R from the sync-marker landing. Only START a
+                     * pair on an even-index packet (odd vseen) -- accepting an R as the "left" swaps
+                     * the eyes for the rest of playback (seen on Nintendo's movie.moflex, whose sparse
+                     * keyframes push us into the any-frame fallback below). */
+                    if (is3d && !(vseen & 1)) continue;
                     if (!pk.keyframe && vseen < 30) continue;
                     lts = m.ts;
                     AVPacket ap; ap.data = pk.data; ap.size = pk.size; int gL = 0;
@@ -2181,7 +2186,7 @@ static MoflexResult moflex_play_ring(const char *path) {
                     if (is3d) {
                         int haveR = 0; MfxPacket pr;
                         for (int g2 = 0; g2 < 8; g2++) { if (mfx_next_packet(&m, &pr) != 1) break;
-                            if (m.streams[pr.stream_index].media_type == MFX_TYPE_VIDEO) { haveR = 1; break; } }
+                            if (m.streams[pr.stream_index].media_type == MFX_TYPE_VIDEO) { haveR = 1; vseen++; break; } }
                         int gR = 0;
                         if (!haveR || !(mobi_decode(&ctx, fR, &gR, &(AVPacket){ .data = pr.data, .size = pr.size }) >= 0 && gR)) continue;
                         g_y2r_start(fL, &r3_texL[0], W, H); g_y2r_wait(&r3_texL[0]);
