@@ -1187,6 +1187,35 @@ static CatEntry *g_lib = NULL;   /* every playable movie on the SD, with its .nf
 static int       g_lib_n = 0;
 
 /* recurse the SD (skipping the hidden system folders), collecting .moflex / movie-.cia files */
+/* TV episodes: a catalog match gives every episode of a show the SAME title, so the library showed
+ * one name 10x with no way to tell episodes apart. If the filename carries an SxxEyy tag, display
+ * the filename instead (it already reads "Show - S01e01 - Episode Title"); the show's poster,
+ * category, and genres still come from the info. "(3D)" tags and the extension are stripped. */
+static int has_episode_tag(const char *s) {
+    for (const char *p = s; *p; p++)
+        if ((*p == 's' || *p == 'S') && isdigit((unsigned char)p[1])) {
+            const char *q = p + 1; while (isdigit((unsigned char)*q)) q++;
+            if ((*q == 'e' || *q == 'E') && isdigit((unsigned char)q[1])) return 1;
+        }
+    return 0;
+}
+static void lib_episode_name(CatEntry *c) {
+    if (!has_episode_tag(c->fname)) return;
+    snprintf(c->name, sizeof c->name, "%s", c->fname);
+    strip_ext(c->name);
+    char *d = c->name;                       /* drop every "(3D)" tag + collapse the gap it leaves */
+    for (char *p = c->name; *p; ) {
+        if (p[0] == '(' && p[1] == '3' && (p[2] == 'D' || p[2] == 'd') && p[3] == ')') {
+            p += 4;
+            if (d > c->name && d[-1] == ' ' && (*p == ' ' || *p == 0)) d--;
+            continue;
+        }
+        *d++ = *p++;
+    }
+    *d = 0;
+    while (d > c->name && d[-1] == ' ') *--d = 0;   /* trim trailing spaces */
+}
+
 static void lib_scan_dir(const char *dir, int depth) {
     if (g_lib_n >= LIB_MAX || depth > 8) return;
     DIR *d = opendir(dir);
@@ -1211,6 +1240,7 @@ static void lib_scan_dir(const char *dir, int depth) {
             snprintf(c->fname, sizeof c->fname, "%s", e->d_name);
             if (!c->name[0]) { snprintf(c->name, sizeof c->name, "%s", e->d_name); strip_ext(c->name); }
             if (!c->category[0]) snprintf(c->category, sizeof c->category, "Uncategorized");   /* Get Info fills the real one */
+            lib_episode_name(c);   /* episodes display their filename, not the shared show title */
             c->is_zip = 0;
             time_t mt = st.st_mtime; struct tm *tmv = localtime(&mt);
             if (tmv) strftime(c->date, sizeof c->date, "%Y-%m-%d", tmv);   /* file date -> "sort by date added" */
@@ -1256,6 +1286,7 @@ static void lib_refresh_entry(int i) {
     snprintf(ce->url, sizeof ce->url, "%s", path);
     snprintf(ce->date, sizeof ce->date, "%s", date);
     if (!ce->category[0]) snprintf(ce->category, sizeof ce->category, "Uncategorized");
+    lib_episode_name(ce);
     ce->is_zip = 0;
 }
 
@@ -1341,6 +1372,7 @@ static void lib_add_new(void) {
         snprintf(c->fname, sizeof c->fname, "%s", b);
         if (!c->name[0]) { snprintf(c->name, sizeof c->name, "%s", b); strip_ext(c->name); }
         if (!c->category[0]) snprintf(c->category, sizeof c->category, "Uncategorized");
+        lib_episode_name(c);
         c->is_zip = 0;
         struct stat st;
         if (!stat(full, &st)) { time_t mt = st.st_mtime; struct tm *tmv = localtime(&mt);
@@ -1382,6 +1414,7 @@ static void lib_add_downloaded(const char *path, const CatEntry *src) {
     if (title[0]) snprintf(c->name, sizeof c->name, "%s", title);
     else { snprintf(c->name, sizeof c->name, "%s", bn); strip_ext(c->name); }
     if (!c->category[0]) snprintf(c->category, sizeof c->category, "Uncategorized");
+    lib_episode_name(c);
     c->is_zip = 0;
     time_t now = time(NULL); struct tm *tmv = localtime(&now);
     if (tmv) strftime(c->date, sizeof c->date, "%Y-%m-%d", tmv);
