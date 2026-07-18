@@ -559,7 +559,6 @@ static void sub_overlay(int is3d, int64_t us) {
 
 /* debug timing overlay (per stereo pair), updated ~1x/sec from the loop */
 static int g_dbg_fps = 0, g_dbg_dec10 = 0, g_dbg_blit10 = 0, g_dbg_aud10 = 0;
-static char g_av_diag[24] = "";   /* DIAG: post-seek A/V measurement, shown on the time row when set */
 
 /* a bottom-row action button with up to two centered lines (so longer labels fit the 96px width) */
 static void panel_btn2(int x, int w, const char *l1, const char *l2, u16 accent) {
@@ -580,7 +579,6 @@ static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing)
     fmt_time(dur, td, sizeof(td));
     snprintf(line, sizeof(line), "%s / %s", tc, td);
     ui_text(10, 26, 1, UI_NEONC, line);
-    if (g_av_diag[0]) ui_text(150, 26, 1, UI_RGB(255, 180, 60), g_av_diag);   /* DIAG (temporary) */
 
     /* battery: small icon + % at the far right of the time row (cyan while charging) */
     batt_refresh();
@@ -1582,7 +1580,6 @@ static long long r3_aplayed; static int64_t r3_apos;   /* elapsed audible us, -1
 static int64_t r3_audio_t0 = -1;   /* content ts of the first audio sample after (re)start */
 static int64_t r3_av_skew = 0;     /* constant apos offset = audio_origin - video_origin */
 static int     r3_av_ready = 0;    /* r3_av_skew has been captured for this segment */
-static int64_t r3_av_raw = 0;      /* DIAG: the measured skew BEFORE the sanity clamp */
 static u64 r3_last;   /* last poll tick, for the phase-locked clock */
 static void r3_audio_setup(int arate, int chn) {
     r3_arate = arate; r3_achn = chn; r3_awi = 0; r3_aplayed = 0; r3_apos = -1; r3_last = 0;
@@ -1992,8 +1989,6 @@ static MoflexResult moflex_play_ring(const char *path) {
     int64_t cur_us = 0, dur_us = m.duration_us, seek_to_us = 0; int want_seek = 0, shold = 0;
     int scrubbing = 0; int64_t scrub_us = 0;   /* touch-drag on the bar: preview while held, seek on release */
     int vol_drag = 0;                           /* touch-drag on the volume slider (applies live) */
-    int dbg_show = 0;                           /* DIAG: presents left to show the post-seek A/V numbers */
-    g_av_diag[0] = 0;
     g_submenu = 0; g_sub_sel = 0;               /* subtitle menu starts closed */
     g_touch_locked = 0; g_lock_toast = 0; g_backlight_on = 1;   /* touch unlocked, backlight on */
     int64_t rpos = resume_load(path), last_save = 0;
@@ -2195,7 +2190,6 @@ static MoflexResult moflex_play_ring(const char *path) {
             s.paused = 0;
             WORKER_UNLOCK();   /* resume the decode thread from the new position */
             want_seek = 0;
-            dbg_show = 400;    /* DIAG: show the measured A/V numbers for ~13s after this seek */
         }
 
         if (kd) dirty = 1;   /* any control input -> repaint the held frame / panel */
@@ -2230,7 +2224,6 @@ static MoflexResult moflex_play_ring(const char *path) {
              * constant thereafter and ignored if implausibly large (bad/absent timestamps). */
             if (have_audio && !r3_av_ready && apos >= 0 && r3_audio_t0 >= 0) {
                 int64_t sk = r3_audio_t0 - (bts[rd % NB] - rts[rd % NB]);
-                r3_av_raw = sk;   /* DIAG: keep the unclamped measurement for the overlay */
                 r3_av_skew = (sk < -300000 || sk > 300000) ? 0 : sk;
                 r3_av_ready = 1;
             }
@@ -2249,12 +2242,6 @@ static MoflexResult moflex_play_ring(const char *path) {
         fmt_time(disp_us, tc, sizeof tc);
         fmt_time(dur_us, td, sizeof td);
         snprintf(ts, sizeof ts, "%s / %s", tc, td);   /* clean current / duration (debug HUD removed) */
-        /* DIAG: expose the post-seek A/V measurement to the panel for ~13s (raw gap / applied, ms) */
-        if (dbg_show > 0 && r3_av_ready) {
-            snprintf(g_av_diag, sizeof g_av_diag, "d%+d/%+dms", (int)(r3_av_raw / 1000), (int)(r3_av_skew / 1000));
-            if (show >= 0) { dbg_show--; dirty = 1; }
-            if (dbg_show == 0) g_av_diag[0] = 0;
-        }
         (void)pf_str;
         if (strcmp(ts, last_ts)) { snprintf(last_ts, sizeof last_ts, "%s", ts);
                                    C2D_TextBufClear(tmbuf); C2D_TextParse(&ttime, tmbuf, ts); C2D_TextOptimize(&ttime); }
