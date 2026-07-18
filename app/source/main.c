@@ -1884,7 +1884,24 @@ static void lib_scrape_missing(int *idx, int ni) {
 /* ---- startup: detect movies added outside the app (browser download, PC copy, upload) and offer
  * a rescan; after rescanning, offer art + info download for the new arrivals. ---- */
 static void startup_new_movie_check(void) {
-    if (lib_load_cache() == 0) return;   /* no library yet: the first Library open scans anyway */
+    if (lib_load_cache() == 0) {
+        /* FIRST RUN: no library yet -- the most important time to create it. */
+        if (prompt2("MOVIE LIBRARY", "No movie library yet.\nScan the SD card for movies now?",
+                    "SCAN", "LATER") != 0) return;
+        lib_rescan();
+        if (g_lib_n == 0) { msg_screen("LIBRARY", "No movies found on the SD card.\nDownload or add some first."); return; }
+        int *idx = (int *)malloc(sizeof(int) * g_lib_n); int ni = 0;   /* offer art+info for all missing */
+        if (idx) {
+            for (int j = 0; j < g_lib_n; j++) if (!movieinfo_have(g_lib[j].url)) idx[ni++] = j;
+            if (ni > 0) {
+                char msg[96];
+                snprintf(msg, sizeof msg, "Download art & info for the\n%d movie%s missing it?", ni, ni == 1 ? "" : "s");
+                if (prompt2("GET INFO", msg, "DOWNLOAD", "SKIP") == 0) lib_scrape_missing(idx, ni);
+            }
+            free(idx);
+        }
+        return;
+    }
 
     ui_begin(GFX_BOTTOM); ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
     ui_text_center(UI_W / 2, 104, 1, UI_DIM, "Checking for new movies..."); ui_present();
