@@ -1287,18 +1287,19 @@ static void lib_add_show(const char *dirpath, const CatEntry *src) {
     g_lib_n++;
 }
 static int epname_cmp(const void *a, const void *b) { return strcasecmp((const char *)a, (const char *)b); }
-/* Episode picker for a show folder: short names ("S01e01 - Title"). 1 = picked (out set). */
+/* Episode picker for a show folder: short names ("S01e01 - Title").
+ * 1 = picked (out set), 0 = backed out, -1 = no episodes found. */
 static int show_pick_episode(const char *showname, const char *dirpath, char *out, size_t cap) {
     static char files[64][NAMELEN]; static char eps[64][32]; int n = 0;
     DIR *d = opendir(dirpath);
-    if (!d) return 0;
+    if (!d) return -1;
     struct dirent *e;
     while ((e = readdir(d)) && n < 64) {
         if (e->d_name[0] == '.' || !is_moflex(e->d_name) || !has_episode_tag(e->d_name)) continue;
         snprintf(files[n], sizeof files[0], "%s", e->d_name); n++;
     }
     closedir(d);
-    if (n == 0) return 0;
+    if (n == 0) return -1;
     qsort(files, n, sizeof files[0], epname_cmp);   /* SxxEyy sorts into watch order */
     for (int i = 0; i < n; i++) {
         const char *tag = ep_tag_at(files[i]);
@@ -1380,6 +1381,7 @@ static void lib_rescan(void) {
 static void lib_refresh_entry(int i) {
     if (i < 0 || i >= g_lib_n) return;
     CatEntry *ce = &g_lib[i];
+    int was_show = (ce->is_zip == 2);   /* NEVER demote a show folder (this bug made shows unplayable) */
     char path[CAT_URLLEN]; snprintf(path, sizeof path, "%s", ce->url);
     char date[12];         snprintf(date, sizeof date, "%s", ce->date);
     movieinfo_load(path, ce);
@@ -1387,7 +1389,13 @@ static void lib_refresh_entry(int i) {
     snprintf(ce->date, sizeof ce->date, "%s", date);
     if (!ce->category[0]) snprintf(ce->category, sizeof ce->category, "Uncategorized");
     lib_episode_name(ce);
-    ce->is_zip = 0;
+    if (was_show) {
+        ce->is_zip = 2;
+        show_name_from_dir(ce->url, ce->name, sizeof ce->name);
+        const char *b = strrchr(ce->url, '/'); b = b ? b + 1 : ce->url;
+        snprintf(ce->fname, sizeof ce->fname, "%s", b);
+        if (!strcasecmp(ce->category, "Uncategorized")) snprintf(ce->category, sizeof ce->category, "TV Shows");
+    } else ce->is_zip = 0;
 }
 
 /* the category a library entry is shown under: "Moflex" (a format) folds into Uncategorized */
@@ -1415,6 +1423,18 @@ static int lib_load_cache(void) {   /* cache-only: movie count, 0 if no valid ca
             fread(&n, sizeof n, 1, f) == 1 && n > 0 && n <= LIB_MAX &&
             (int)fread(g_lib, sizeof(CatEntry), n, f) == n) g_lib_n = n;
         fclose(f); }
+    /* heal caches written while the refresh bug demoted shows: a folder entry must be is_zip 2.
+     * Only non-media-named urls get the stat, so this costs a couple of syscalls, not thousands. */
+    for (int i = 0; i < g_lib_n; i++) {
+        if (g_lib[i].is_zip == 2 || is_moflex(g_lib[i].fname)) continue;
+        struct stat st;
+        if (!stat(g_lib[i].url, &st) && S_ISDIR(st.st_mode)) {
+            g_lib[i].is_zip = 2;
+            show_name_from_dir(g_lib[i].url, g_lib[i].name, sizeof g_lib[i].name);
+            if (!strcasecmp(g_lib[i].category, "Uncategorized"))
+                snprintf(g_lib[i].category, sizeof g_lib[i].category, "TV Shows");
+        }
+    }
     return g_lib_n;
 }
 static int lib_load(void) {   /* returns the movie count; loads the cache, else scans once */
@@ -1651,9 +1671,13 @@ ll_rebuild:;   /* X-search inside the list jumps back here with s_lib_search set
         if (result >= 0) break;
         if (play) {
             CatEntry *pe = &g_lib[idx[csel]];
-            if (pe->is_zip == 2) {   /* a TV show: open the episode list inside its folder */
-                if (show_pick_episode(pe->name, pe->url, out, cap)) { result = LL_PLAY; break; }
-                redraw = 1;          /* backed out of the episode list -> stay on the library list */
+            struct stat pst;   /* robust: treat ANY directory entry as a show, however it was created */
+            int is_show = pe->is_zip == 2 || (!stat(pe->url, &pst) && S_ISDIR(pst.st_mode));
+            if (is_show) {     /* a TV show: open the episode list inside its folder */
+                int pr = show_pick_episode(pe->name, pe->url, out, cap);
+                if (pr == 1) { result = LL_PLAY; break; }
+                if (pr < 0) msg_screen("EPISODES", "No episodes found in\nthis show's folder.");
+                redraw = 1;    /* backed out of the episode list -> stay on the library list */
             } else { snprintf(out, cap, "%s", pe->url); result = LL_PLAY; break; }
         }
         if (info) { lib_getinfo_menu(idx, ni, csel); shown = -1; redraw = 1; }   /* This / All-missing */
@@ -2895,14 +2919,18 @@ static int open_pick(void) {
 }
 
 /* OPEN VIDEO: pick a source, then a movie. Returns 0 = home, 1 = exit app, 2 = play out[]. */
+/* where the last picked movie came from, so BACK in the player returns to the right place */
+enum { PLAY_FROM_BROWSER = 0, PLAY_FROM_HOME = 1, PLAY_FROM_LIBRARY = 2 };
+static int s_pick_origin = PLAY_FROM_BROWSER;
+
 static int open_video(char *out, size_t cap) {
     for (;;) {
         int pick = open_pick();
         if (pick < 0) return 0;                                 /* back -> home */
-        if (pick == 0) { if (library_view(out, cap)) return 2;  /* Library; backed out -> chooser */ }
+        if (pick == 0) { if (library_view(out, cap)) { s_pick_origin = PLAY_FROM_LIBRARY; return 2; } }
         else { int r = browser(MODE_PLAY, out, cap);            /* Filesystem */
                if (r == 1) return 1;
-               if (r == 2) return 2; }                           /* r==0 backed out -> chooser */
+               if (r == 2) { s_pick_origin = PLAY_FROM_BROWSER; return 2; } }   /* r==0 backed out -> chooser */
     }
 }
 
@@ -2912,18 +2940,22 @@ static int open_video(char *out, size_t cap) {
  *  - OPEN VIDEO -> the source chooser (Library / Filesystem).
  *  - MANAGE     -> the manage browser, then home.
  *  - ADD VIDEO  -> the add-video menu (download / upload), then home. */
-static int play_and_handle(const char *path, int from_home) {
+static int play_and_handle(const char *path, int origin) {
     MoflexResult r = play_movie(path);
     for (;;) {
         char np[PATHLEN + NAMELEN];
         if (r == MOFLEX_QUIT_OPEN) {
             int b = open_video(np, sizeof np);
             if (b == 1) return 1;
-            if (b == 2) { from_home = 0; r = play_movie(np); continue; }   /* picked via browser now */
+            if (b == 2) { origin = s_pick_origin; r = play_movie(np); continue; }
             return 0;
         }
         if (r == MOFLEX_QUIT_BACK) {
-            if (from_home) return 0;                 /* came from the home screen -> back IS home */
+            if (origin == PLAY_FROM_HOME) return 0;              /* back IS the home screen */
+            if (origin == PLAY_FROM_LIBRARY) {                   /* back to the library */
+                if (library_view(np, sizeof np)) { r = play_movie(np); continue; }
+                return 0;                                        /* backed out of the library -> home */
+            }
             if (g_now_playing_path[0]) browser_preselect_path(g_now_playing_path);   /* highlight that movie */
             int b = browser(MODE_PLAY, np, sizeof np);
             if (b == 1) return 1;
@@ -2964,12 +2996,12 @@ int main(void) {
             char path[PATHLEN + NAMELEN];
             int r = open_video(path, sizeof(path));
             if (r == 1) running = 0;
-            else if (r == 2 && play_and_handle(path, 0)) running = 0;
+            else if (r == 2 && play_and_handle(path, s_pick_origin)) running = 0;
         }
         else if (choice == 1) { add_movies_menu(); }
         else if (choice == 2) { if (browser(MODE_MANAGE, NULL, 0) == 1) running = 0; }
         else if (choice == 3) {                  /* PLAY: resume the loaded movie; B goes back HERE */
-            if (g_now_playing_path[0] && play_and_handle(g_now_playing_path, 1)) running = 0;
+            if (g_now_playing_path[0] && play_and_handle(g_now_playing_path, PLAY_FROM_HOME)) running = 0;
         }
     }
 
