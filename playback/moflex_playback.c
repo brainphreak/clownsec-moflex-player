@@ -34,6 +34,8 @@ static int   g_sw_bank = -1;     /* software-banking depth (pairs banked ahead);
 #define SR_NB 16                 /* software banking ring depth (defined early so panel_draw can show it) */
 static int   g_lcd_ok = 0;       /* gsp::Lcd available -> bottom-screen-off feature usable */
 static int   g_screen_off = 0;   /* bottom backlight is currently off (movie keeps playing on top) */
+static int   g_touch_locked = 0; /* LOCK SCREEN: ignore touch; X/Y still work; any other button unlocks */
+static int   g_exb_lock = 0;     /* player EXB button shows LOCK SCREEN (ring engine) vs EXIT (others) */
 
 /* ---- battery indicator (player panel) ---- */
 static int   g_mcu_ok = 0;       /* mcu::HWC available -> exact 0-100% */
@@ -628,7 +630,8 @@ static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing)
     /* action buttons (touch): BACK / OPEN / EXIT */
     panel_btn2(BKB_X, BKB_W, "OPEN", "VIDEO",  UI_NEON);    /* -> open the video picker */
     panel_btn2(OPB_X, OPB_W, "MANAGE", "VIDEOS", UI_NEONP); /* -> back to the library/home */
-    panel_btn2(EXB_X, EXB_W, "EXIT", NULL, UI_RED);
+    if (g_exb_lock) panel_btn2(EXB_X, EXB_W, "LOCK", "SCREEN", UI_NEONC);  /* ring: lock touch (B goes back) */
+    else            panel_btn2(EXB_X, EXB_W, "EXIT", NULL, UI_RED);
     /* subtitles: CC toggle/options (glows when on) */
     ui_button(CC_X, CC_Y, CC_W, CC_H, "CC", g_sub_on, g_sub_on ? UI_NEON : UI_DIM);
     /* bottom-screen-off: a crescent-moon button (video keeps playing on top) */
@@ -1060,48 +1063,64 @@ static int submenu_actions(int is3d, int *act) {
     act[n++] = 5;
     return n;
 }
-#define SUBM_Y0 44
-#define SUBM_RH 24
+/* row layout shared by render + touch hit-testing (mirrors sub_modal's adaptive rows) */
+static void submenu_layout(int n, int *top, int *step, int *bh) {
+    *top = 40; *step = (218 - *top) / (n > 0 ? n : 1); if (*step > 30) *step = 30;
+    *bh = *step - 4; if (*bh > 26) *bh = 26; if (*bh < 15) *bh = 15;
+}
+static void submenu_label(int a, char *r, int cap) {
+    switch (a) {
+        case 0: snprintf(r, cap, "Subtitles:  %s", g_sub_on ? "ON" : "OFF"); break;
+        case 1: snprintf(r, cap, "Position:  %s", g_sub_top ? "Top" : "Bottom"); break;
+        case 2: snprintf(r, cap, "Size:  %s", g_sub_size == 1 ? "Small" : g_sub_size == 2 ? "Medium" : "Large"); break;
+        case 3: { int64_t da = g_sub_off < 0 ? -g_sub_off : g_sub_off;
+                  snprintf(r, cap, "Delay:  %c%d.%02d s", g_sub_off < 0 ? '-' : '+', (int)(da / 1000000), (int)((da % 1000000) / 10000)); } break;
+        case 6: snprintf(r, cap, "Encoding:  %s%s", g_sub_enc_name[g_sub_enc], g_sub_mode < 0 ? " (UTF-8)" : ""); break;
+        case 4: snprintf(r, cap, "Depth (3D):  %+d", g_sub_depth); break;
+        default: snprintf(r, cap, "Load SRT file..."); break;
+    }
+}
 static void submenu_render(int is3d) {
     int act[8]; int n = submenu_actions(is3d, act);
+    int top, step, bh; submenu_layout(n, &top, &step, &bh);
     ui_begin(GFX_BOTTOM);
     ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
-    ui_text_center(UI_W / 2, 12, 2, UI_NEON, "SUBTITLES");
+    ui_text_center(UI_W / 2, 14, 2, UI_NEON, "SUBTITLES");
     for (int i = 0; i < n; i++) {
-        int y = SUBM_Y0 + i * SUBM_RH, sel = (i == g_sub_sel);
-        if (sel) ui_fill_round(10, y - 3, UI_W - 20, SUBM_RH - 4, 6, TH_SEL);
-        char r[40];
-        switch (act[i]) {
-            case 0: snprintf(r, sizeof r, "Subtitles:  %s", g_sub_on ? "ON" : "OFF"); break;
-            case 1: snprintf(r, sizeof r, "Position:  %s", g_sub_top ? "Top" : "Bottom"); break;
-            case 2: snprintf(r, sizeof r, "Size:  %s", g_sub_size == 1 ? "Small" : g_sub_size == 2 ? "Medium" : "Large"); break;
-            case 3: { int64_t da = g_sub_off < 0 ? -g_sub_off : g_sub_off;
-                      snprintf(r, sizeof r, "Delay:  %c%d.%02d s", g_sub_off < 0 ? '-' : '+', (int)(da / 1000000), (int)((da % 1000000) / 10000)); } break;
-            case 6: snprintf(r, sizeof r, "Encoding:  %s%s", g_sub_enc_name[g_sub_enc], g_sub_mode < 0 ? " (UTF-8)" : ""); break;
-            case 4: snprintf(r, sizeof r, "Depth (3D):  %+d", g_sub_depth); break;
-            default: snprintf(r, sizeof r, "Load SRT file..."); break;
-        }
-        ui_text(20, y + 2, 1, sel ? UI_NEON : UI_INK, r);
-        if (sel && (act[i] == 3 || act[i] == 4)) ui_text(UI_W - 46, y + 2, 1, UI_NEONC, "<>");
+        char r[40]; submenu_label(act[i], r, sizeof r);
+        ui_button(18, top + i * step, UI_W - 36, bh, r, i == g_sub_sel, UI_NEONC);
     }
-    ui_text_center(UI_W / 2, UI_H - 14, 1, UI_DIM, "up/down select   left/right or A change   B close");
+    ui_text_center(UI_W / 2, 228, 1, UI_DIM, "up/down  left/right change  A open  B close");
 }
 static void srtpicker_render(void) {
+    int top, step, bh; submenu_layout(g_srt_n > 0 ? g_srt_n : 1, &top, &step, &bh);
     ui_begin(GFX_BOTTOM);
     ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
-    ui_text_center(UI_W / 2, 12, 2, UI_NEON, "LOAD SRT");
+    ui_text_center(UI_W / 2, 14, 2, UI_NEON, "LOAD SRT");
     if (g_srt_n == 0) ui_text_center(UI_W / 2, 110, 1, UI_DIM, "No .srt files in the movie folder or moviedata.");
-    for (int i = 0; i < g_srt_n; i++) {
-        int y = SUBM_Y0 + i * SUBM_RH, sel = (i == g_srt_sel);
-        if (sel) ui_fill_round(10, y - 3, UI_W - 20, SUBM_RH - 4, 6, TH_SEL);
-        ui_text_clipped(20, y + 2, 1, sel ? UI_NEON : UI_INK, g_srt_names[i], 20, UI_W - 20);
-    }
-    ui_text_center(UI_W / 2, UI_H - 14, 1, UI_DIM, "up/down select   A load   B back");
+    for (int i = 0; i < g_srt_n; i++)
+        ui_button(18, top + i * step, UI_W - 36, bh, g_srt_names[i], i == g_srt_sel, UI_NEONC);
+    ui_text_center(UI_W / 2, 228, 1, UI_DIM, "up/down select   A load   B back");
 }
 static void g_submenu_sw(C3D_RenderTarget *bot, int is3d) {
     if (!ui_tex_init()) return;
     ui_capture(1);
     if (g_submenu == 2) srtpicker_render(); else submenu_render(is3d);
+    ui_tex_present(bot);
+}
+/* the bottom screen while the touch is locked: a padlock + how to unlock (movie plays on top) */
+static void g_locked_sw(C3D_RenderTarget *bot) {
+    if (!ui_tex_init()) return;
+    ui_capture(1);
+    ui_begin(GFX_BOTTOM);
+    ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
+    int cx = UI_W / 2, cy = 66;
+    ui_frame_round(cx - 12, cy - 15, 24, 22, 11, UI_NEONC, 3);   /* shackle */
+    ui_fill_round(cx - 18, cy, 36, 30, 6, UI_NEONC);             /* body */
+    ui_fill_round(cx - 3, cy + 9, 6, 11, 3, UI_BG2);             /* keyhole */
+    ui_text_center(cx, cy + 48, 2, UI_NEONC, "TOUCH LOCKED");
+    ui_text_center(cx, cy + 80, 1, UI_INK, "Press any button to unlock");
+    ui_text_center(cx, cy + 98, 1, UI_DIM, "X = dark screen    Y = captions");
     ui_tex_present(bot);
 }
 
@@ -1115,14 +1134,23 @@ static void submenu_open_srt(const char *moviepath) {
     g_srt_sel = 0; g_submenu = 2;
 }
 
+/* return the row a touch at (px,py) hit, or -1; also reports which half (left/right) was tapped */
+static int submenu_hit(int px, int py, int n, int *side) {
+    int top, step, bh; submenu_layout(n, &top, &step, &bh);
+    for (int i = 0; i < n; i++) { int by = top + i * step;
+        if (py >= by && py < by + bh && px >= 18 && px < UI_W - 18) { *side = px < UI_W / 2 ? -1 : 1; return i; } }
+    return -1;
+}
 /* one frame of menu input; returns 1 when the whole menu should close (config persisted). */
-static int submenu_input(u32 kd, u32 kh, int is3d, const char *moviepath) {
+static int submenu_input(u32 kd, u32 kh, touchPosition tp, int is3d, const char *moviepath) {
     if (g_submenu == 2) {   /* SRT file picker */
         if (kd & KEY_B) { g_submenu = 1; return 0; }
         if (g_srt_n > 0) {
             if (kd & KEY_DOWN) g_srt_sel = (g_srt_sel + 1) % g_srt_n;
             if (kd & KEY_UP)   g_srt_sel = (g_srt_sel + g_srt_n - 1) % g_srt_n;
-            if (kd & KEY_A) { if (subs_load(g_srt_paths[g_srt_sel])) g_sub_on = 1; g_submenu = 1; }
+            int side, hit = (kd & KEY_TOUCH) ? submenu_hit(tp.px, tp.py, g_srt_n, &side) : -1;
+            if (hit >= 0) g_srt_sel = hit;
+            if ((kd & KEY_A) || hit >= 0) { if (subs_load(g_srt_paths[g_srt_sel])) g_sub_on = 1; g_submenu = 1; }
         }
         return 0;
     }
@@ -1132,6 +1160,9 @@ static int submenu_input(u32 kd, u32 kh, int is3d, const char *moviepath) {
     if (kd & KEY_B) { subcfg_save(moviepath); g_submenu = 0; return 1; }
     if (kd & KEY_DOWN) g_sub_sel = (g_sub_sel + 1) % n;
     if (kd & KEY_UP)   g_sub_sel = (g_sub_sel + n - 1) % n;
+
+    int t_side = 0, t_row = (kd & KEY_TOUCH) ? submenu_hit(tp.px, tp.py, n, &t_side) : -1;
+    if (t_row >= 0) g_sub_sel = t_row;
     int a = act[g_sub_sel];
     int press = (kd & KEY_RIGHT) ? 1 : (kd & KEY_LEFT) ? -1 : 0;   /* single tap: toggles/cycles */
     if (kd & KEY_A) press = 1;
@@ -1140,6 +1171,10 @@ static int submenu_input(u32 kd, u32 kh, int is3d, const char *moviepath) {
     if (!held) g_sub_rep = 0;
     else { rep = (kd & (KEY_LEFT | KEY_RIGHT)) ? held : 0;
            if (!rep) { g_sub_rep++; if (g_sub_rep > 10 && g_sub_rep % 3 == 0) rep = held; } }
+    if (t_row >= 0) {                                  /* a row was tapped this frame */
+        if (a == 3 || a == 4) rep = t_side;            /* delay/depth: left half -, right half + */
+        else press = 1;                                /* toggle/cycle/encoding/load: activate */
+    }
     switch (a) {
         case 0: if (press) { if (g_nsubs > 0) g_sub_on = !g_sub_on; } break;
         case 1: if (press) g_sub_top = !g_sub_top; break;
@@ -1151,7 +1186,7 @@ static int submenu_input(u32 kd, u32 kh, int is3d, const char *moviepath) {
         case 4: if (rep) { g_sub_depth += rep; if (g_sub_depth < -16) g_sub_depth = -16; if (g_sub_depth > 16) g_sub_depth = 16; } break;
         case 6: if (press) { g_sub_enc = (g_sub_enc + (press < 0 ? 4 : 1)) % 5;
                              if (g_sub_file[0]) { char w[512]; snprintf(w, sizeof w, "%s", g_sub_file); subs_load(w); } } break;
-        default: if (kd & KEY_A) submenu_open_srt(moviepath); break;   /* Load SRT... */
+        default: if (press) submenu_open_srt(moviepath); break;   /* Load SRT... */
     }
     return 0;
 }
@@ -1945,6 +1980,7 @@ static MoflexResult moflex_play_ring(const char *path) {
     int scrubbing = 0; int64_t scrub_us = 0;   /* touch-drag on the bar: preview while held, seek on release */
     int vol_drag = 0;                           /* touch-drag on the volume slider (applies live) */
     g_submenu = 0; g_sub_sel = 0;               /* subtitle menu starts closed */
+    g_touch_locked = 0; g_exb_lock = 1;         /* ring engine: EXB is LOCK SCREEN, touch starts unlocked */
     int64_t rpos = resume_load(path), last_save = 0;
     if (rpos > 3000000 && (dur_us <= 0 || rpos < dur_us - 10000000)) { seek_to_us = rpos; want_seek = 1; last_save = rpos; }
     int vol_dirty = 0, save_pend = 0, save_delay = 0;
@@ -2000,10 +2036,20 @@ static MoflexResult moflex_play_ring(const char *path) {
 
         /* bottom screen dark (moon): the top video keeps playing; the first input just wakes the
          * backlight and is consumed so it doesn't also trigger a control. */
-        if (g_screen_off && kd) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; dirty = 1; kd = 0; }
+        if (!g_touch_locked && g_screen_off && kd) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; dirty = 1; kd = 0; }
 
-        if (g_submenu) {                       /* subtitle menu owns input while open; movie plays on */
-            submenu_input(kd, kh, is3d, path);
+        if (g_touch_locked) {                  /* touch locked: X/Y still work; any OTHER button unlocks */
+            if (g_lcd_ok && (kd & KEY_X)) {    /* X: toggle the dark bottom screen without unlocking */
+                if (g_screen_off) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; }
+                else { GSPLCD_PowerOffBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 1; }
+            } else if (kd & KEY_Y) { g_sub_on = !g_sub_on; }   /* Y: toggle captions without unlocking */
+            else if (kd & ~KEY_TOUCH) {        /* any physical button (touch doesn't count) unlocks */
+                g_touch_locked = 0;
+                if (g_screen_off) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; }
+            }
+            dirty = 1;
+        } else if (g_submenu) {                /* subtitle menu owns input while open; movie plays on */
+            submenu_input(kd, kh, tp, is3d, path);
             dirty = 1;
         } else {
         if (kd & KEY_B) { result = MOFLEX_QUIT_BACK; break; }
@@ -2051,7 +2097,7 @@ static MoflexResult moflex_play_ring(const char *path) {
             } else if (py >= BTN_Y && py < BTN_Y + BTN_H) {
                 if      (px >= BKB_X && px < BKB_X + BKB_W) { result = MOFLEX_QUIT_OPEN; break; }   /* OPEN VIDEO */
                 else if (px >= OPB_X && px < OPB_X + OPB_W) { result = MOFLEX_QUIT_BACK; break; }   /* MANAGE VIDEOS */
-                else if (px >= EXB_X && px < EXB_X + EXB_W) { result = MOFLEX_QUIT_EXIT; break; }
+                else if (px >= EXB_X && px < EXB_X + EXB_W) { g_touch_locked = 1; dirty = 1; }      /* LOCK SCREEN */
             }
         }
 
@@ -2185,7 +2231,8 @@ static MoflexResult moflex_play_ring(const char *path) {
             C2D_TargetClear(topR, black); C2D_SceneBegin(topR);
             C2D_DrawImageAt(is3d ? r3_imgR[b] : r3_imgL[b], 0, 0, 0, NULL, 1, 1);
             if (sub_valid) r3_draw_sub(&tsub, is3d ? g_sub_depth : 0, subcol, subout);
-            if (g_submenu) g_submenu_sw(bot, is3d);              /* subtitle options (movie keeps playing) */
+            if (g_touch_locked) g_locked_sw(bot);                /* touch locked (movie keeps playing) */
+            else if (g_submenu) g_submenu_sw(bot, is3d);         /* subtitle options (movie keeps playing) */
             else g_panel_sw(bot, title, disp_us, dur_us, playing);   /* release-style panel via texture */
             u64 _tg = svcGetSystemTick(); C3D_FrameEnd(0); pf_gpu += svcGetSystemTick() - _tg;
             dirty = 0;
