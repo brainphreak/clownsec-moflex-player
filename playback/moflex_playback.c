@@ -1777,6 +1777,8 @@ static void mp_ring_apt_hook(APT_HookType hook, void *param) {
 typedef struct {
     MfxDemux *m; AVCodecContext *ctx; AVFrame *fL, *fR;
     int W, H, is3d, NB, have_audio; int64_t pair_dur, dur_us;
+    volatile int eye_swap;               /* 3D: stream at the seek landing starts on a RIGHT eye ->
+                                            route the first of each popped pair to the R texture */
     volatile int wr, rd;                 /* ring: worker advances wr, main advances rd (both atomic ints) */
     volatile long long dpair;            /* decode content position (pairs) */
     volatile long long cur_us;           /* last decoded movie-time (us), for resume/HUD */
@@ -1851,8 +1853,13 @@ static void r3_produce(R3S *s) {
         int64_t vts2; p = r3_vq_pop(&n, &vts2, &kf); ap.data = p; ap.size = n;
         int gotR = 0; int okR = (mobi_decode(s->ctx, s->fR, &gotR, &ap) >= 0 && gotR); free(p);
         if (okL && okR) {
-            g_y2r_start(s->fL, &r3_texL[slot], s->W, s->H); g_y2r_wait(&r3_texL[slot]);
-            g_y2r_start(s->fR, &r3_texR[slot], s->W, s->H); g_y2r_wait(&r3_texR[slot]);
+            /* eye routing: normally (first,second) = (L,R); after a seek that landed on a RIGHT
+             * eye (pairs span block boundaries in some Nintendo muxes) the stream runs R,L,R,L --
+             * route the first frame to the R texture so depth stays correct. */
+            C3D_Tex *tA = s->eye_swap ? &r3_texR[slot] : &r3_texL[slot];
+            C3D_Tex *tB = s->eye_swap ? &r3_texL[slot] : &r3_texR[slot];
+            g_y2r_start(s->fL, tA, s->W, s->H); g_y2r_wait(tA);
+            g_y2r_start(s->fR, tB, s->W, s->H); g_y2r_wait(tB);
             r3_rts[slot] = dpair * s->pair_dur; r3_bts[slot] = vts;
             __sync_synchronize(); r3_ready[slot] = 1; s->wr = s->wr + 1;   /* publish AFTER the data is ready */
         }
@@ -2178,19 +2185,42 @@ static MoflexResult moflex_play_ring(const char *path) {
             if (have_audio) r3_audio_flush();
             gated = 0; s.audio_pre_full = 0; playing = 1; r3_wallset = 0;
             cur_us = seek_to_us; s.cur_us = seek_to_us;
+            /* 3D EYE PARITY: pairs can span block boundaries (Nintendo muxes), so a marker landing
+             * starts on a RIGHT eye about half the time -- nothing in the packets says which. But
+             * block arithmetic does: each block's packet count vs its ts span shifts the phase by
+             * (count - span); since the phase is only ever 0 or 1, the first nonzero step resolves
+             * the landing's eye exactly (validated 50/50 landings, 0 wrong, on movie.moflex).
+             * Peek forward counting blocks, then re-seek to the landing for the real prime. */
+            s.eye_swap = 0;
+            if (is3d) {
+                MfxPacket pk; int64_t bt = m.ts; long cnt = 0; int cum = 0, nb = 0;
+                for (long g = 0; g < 20000 && nb < 12; g++) {
+                    if (mfx_next_packet(&m, &pk) != 1) break;
+                    if (m.streams[pk.stream_index].media_type != MFX_TYPE_VIDEO) continue;
+                    if (m.ts != bt) {
+                        long F = (long)((double)(m.ts - bt) * 2.0 / (double)pair_dur + 0.5);
+                        int step = (int)(cnt - F);
+                        if (step == 1 || step == -1) {   /* pins the whole chain back to the landing */
+                            int pred = (step == 1 ? 0 : 1) - cum;
+                            if (pred == 1) s.eye_swap = 1;   /* landing starts on a RIGHT eye */
+                            nb = 99; break;
+                        }
+                        cum += step; nb++;
+                        bt = m.ts; cnt = 0;
+                    }
+                    cnt++;
+                }
+                do_seek(&m, &ctx, seek_to_us);   /* rewind to the landing for the real prime */
+            }
             /* FAST PRIME: decode the landing keyframe pair straight into slot 0 (bounded keyframe scan;
-             * else take the next decodable frame) so the picture appears at once and audio resyncs. */
+             * else take the next decodable frame) so the picture appears at once and audio resyncs.
+             * Eye routing honors s.eye_swap (first frame -> R when the landing starts on a right eye). */
             {
                 MfxPacket pk; int64_t lts = seek_to_us; int vseen = 0;
                 for (int guard = 0; guard < 4000; guard++) {
                     if (mfx_next_packet(&m, &pk) != 1) break;
                     if (m.streams[pk.stream_index].media_type != MFX_TYPE_VIDEO) continue;
                     vseen++;
-                    /* 3D: video packets alternate L,R,L,R from the sync-marker landing. Only START a
-                     * pair on an even-index packet (odd vseen) -- accepting an R as the "left" swaps
-                     * the eyes for the rest of playback (seen on Nintendo's movie.moflex, whose sparse
-                     * keyframes push us into the any-frame fallback below). */
-                    if (is3d && !(vseen & 1)) continue;
                     if (!pk.keyframe && vseen < 30) continue;
                     lts = m.ts;
                     AVPacket ap; ap.data = pk.data; ap.size = pk.size; int gL = 0;
@@ -2198,11 +2228,13 @@ static MoflexResult moflex_play_ring(const char *path) {
                     if (is3d) {
                         int haveR = 0; MfxPacket pr;
                         for (int g2 = 0; g2 < 8; g2++) { if (mfx_next_packet(&m, &pr) != 1) break;
-                            if (m.streams[pr.stream_index].media_type == MFX_TYPE_VIDEO) { haveR = 1; vseen++; break; } }
+                            if (m.streams[pr.stream_index].media_type == MFX_TYPE_VIDEO) { haveR = 1; break; } }
                         int gR = 0;
                         if (!haveR || !(mobi_decode(&ctx, fR, &gR, &(AVPacket){ .data = pr.data, .size = pr.size }) >= 0 && gR)) continue;
-                        g_y2r_start(fL, &r3_texL[0], W, H); g_y2r_wait(&r3_texL[0]);
-                        g_y2r_start(fR, &r3_texR[0], W, H); g_y2r_wait(&r3_texR[0]);
+                        C3D_Tex *tA = s.eye_swap ? &r3_texR[0] : &r3_texL[0];
+                        C3D_Tex *tB = s.eye_swap ? &r3_texL[0] : &r3_texR[0];
+                        g_y2r_start(fL, tA, W, H); g_y2r_wait(tA);
+                        g_y2r_start(fR, tB, W, H); g_y2r_wait(tB);
                     } else { g_y2r_start(fL, &r3_texL[0], W, H); g_y2r_wait(&r3_texL[0]); }
                     rts[0] = 0; bts[0] = lts; ready[0] = 1; s.wr = 1; s.dpair = 1; cur_us = lts; s.cur_us = lts;
                     break;
