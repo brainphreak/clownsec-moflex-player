@@ -52,6 +52,15 @@ static char  cwd[PATHLEN] = "sdmc:/";
 static char  g_now_playing[NAMELEN] = "";   /* last-played movie name (ext hidden, for GUI title) */
 static char  g_now_playing_path[PATHLEN + NAMELEN] = "";   /* full path, for resume from home */
 static int   sel = 0, scroll = 0;
+static char  s_presel[NAMELEN] = "";   /* entry to highlight on the next browser() entry (BACK from player) */
+
+/* Point the browser at a file: cwd = its folder, and highlight+scroll to it on entry. */
+static void browser_preselect_path(const char *path) {
+    const char *b = strrchr(path, '/');
+    if (!b) return;
+    snprintf(cwd, sizeof cwd, "%.*s", (int)(b - path + 1), path);   /* folder, incl. trailing '/' */
+    snprintf(s_presel, sizeof s_presel, "%s", b + 1);
+}
 
 /* move (cut/paste) clipboard */
 static int  move_pending = 0;
@@ -1995,6 +2004,12 @@ static void browser_redraw(int mode) { browser_draw_gfx(mode); }
 static int browser(int mode, char *sel_out, size_t sel_cap) {
     s_filter_movies = (mode != MODE_MANAGE) ? 1 : s_manage_movies_only;   /* play=movies; manage=toggle */
     scan();
+    if (s_presel[0]) {   /* BACK from the player: highlight + scroll to the movie that was playing */
+        for (int i = 0; i < nentries; i++)
+            if (!strcmp(entries[i].name, s_presel)) { sel = i; break; }
+        s_presel[0] = 0;
+        BR_FOLLOW();
+    }
     browser_redraw(mode);
     if (mode == MODE_PLAY) gfxSet3D(false);   /* top becomes a 2D poster/info panel while browsing */
     int hfu = 0, hfd = 0;
@@ -2424,6 +2439,7 @@ static int play_and_handle(const char *path) {
             return 0;
         }
         if (r == MOFLEX_QUIT_BACK) {                 /* actual back: resume the browser where we left it */
+            if (g_now_playing_path[0]) browser_preselect_path(g_now_playing_path);   /* highlight that movie */
             int b = browser(MODE_PLAY, np, sizeof np);
             if (b == 1) return 1;
             if (b == 2) { r = play_movie(np); continue; }
