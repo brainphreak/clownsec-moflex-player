@@ -1573,9 +1573,17 @@ gdone:
 static ndspWaveBuf r3_wb[R3_AWB]; static int16_t *r3_ab[R3_AWB];
 static int r3_awi, r3_nawb, r3_arate, r3_achn, r3_aok, r3_acnt[R3_AWB];
 static long long r3_aplayed; static int64_t r3_apos;   /* elapsed audible us, -1 = not started */
+/* A/V seek anchor: audio restarts at the first audio packet after the landing (content r3_audio_t0),
+ * which can differ from the video landing by up to one packet. We capture BOTH once, right after the
+ * audio re-locks, into a CONSTANT r3_av_skew (bounded), and add it to apos in the present compare.
+ * Captured once (never re-derived from the drifting bts-rts) so it can't grow -> no runaway. */
+static int64_t r3_audio_t0 = -1;   /* content ts of the first audio sample after (re)start */
+static int64_t r3_av_skew = 0;     /* constant apos offset = audio_origin - video_origin */
+static int     r3_av_ready = 0;    /* r3_av_skew has been captured for this segment */
 static u64 r3_last;   /* last poll tick, for the phase-locked clock */
 static void r3_audio_setup(int arate, int chn) {
     r3_arate = arate; r3_achn = chn; r3_awi = 0; r3_aplayed = 0; r3_apos = -1; r3_last = 0;
+    r3_audio_t0 = -1; r3_av_skew = 0; r3_av_ready = 0;
     ndspChnReset(0); ndspChnSetInterp(0, NDSP_INTERP_POLYPHASE); ndspChnSetRate(0, (float)arate);
     ndspChnSetFormat(0, chn == 2 ? NDSP_FORMAT_STEREO_PCM16 : NDSP_FORMAT_MONO_PCM16);
     float mix[12]; memset(mix, 0, sizeof mix); mix[0] = mix[1] = 1.0f; ndspChnSetMix(0, mix);
@@ -1634,6 +1642,7 @@ static void r3_audio_flush(void) {   /* on seek: drop everything queued, clock o
     ndspChnWaveBufClear(0);
     for (int i = 0; i < r3_nawb; i++) { r3_wb[i].status = NDSP_WBUF_DONE; r3_acnt[i] = 1; }
     r3_awi = 0; r3_aplayed = 0; r3_apos = -1; r3_last = 0;
+    r3_audio_t0 = -1; r3_av_skew = 0; r3_av_ready = 0;   /* re-anchor A/V on the next lock */
     ndspChnSetPaused(0, true);
 }
 static void r3_audio_close(void) {
@@ -1773,7 +1782,10 @@ static void r3_produce(R3S *s) {
         if (!s->has_pending) { if (mfx_next_packet(s->m, &s->pending) != 1) { s->done = 1; break; } s->has_pending = 1; }
         int mt = s->m->streams[s->pending.stream_index].media_type;
         if (mt == MFX_TYPE_AUDIO && s->have_audio) {
-            if (r3_audio_feed(&s->pending)) s->has_pending = 0;
+            if (r3_audio_feed(&s->pending)) {
+                if (r3_audio_t0 < 0) { int64_t at = s->m->ts; r3_audio_t0 = at < 0 ? 0 : at; }  /* audio origin */
+                s->has_pending = 0;
+            }
             else { s->audio_pre_full = 1; break; }        /* bank full: hold packet, let main unpause audio */
         } else if (mt == MFX_TYPE_VIDEO) {
             int64_t vts = s->m->ts; if (vts < 0) vts = 0; if (s->dur_us > 0 && vts > s->dur_us) vts = s->dur_us;
@@ -1977,7 +1989,6 @@ static MoflexResult moflex_play_ring(const char *path) {
     int64_t cur_us = 0, dur_us = m.duration_us, seek_to_us = 0; int want_seek = 0, shold = 0;
     int scrubbing = 0; int64_t scrub_us = 0;   /* touch-drag on the bar: preview while held, seek on release */
     int vol_drag = 0;                           /* touch-drag on the volume slider (applies live) */
-    int64_t v_anchor = 0; int have_anchor = 0;  /* pin the first shown frame to audio start (like the release) */
     g_submenu = 0; g_sub_sel = 0;               /* subtitle menu starts closed */
     g_touch_locked = 0; g_lock_toast = 0; g_backlight_on = 1;   /* touch unlocked, backlight on */
     int64_t rpos = resume_load(path), last_save = 0;
@@ -2139,9 +2150,8 @@ static MoflexResult moflex_play_ring(const char *path) {
         }
         }   /* end transport input (skipped while the subtitle menu is open) */
 
-        /* ---- seek (release method): reposition the demux, reset ring/audio, then let the worker decode
-         *      audio AND video together from the seek point. NO forward keyframe scan that skips audio --
-         *      that desynced A/V. The first shown frame is pinned to the audio start via v_anchor below. ---- */
+        /* ---- seek: pause the worker (own demux+decoder), reset ring/demux/audio, PRIME the landing
+         *      frame into slot 0, then resume. Held D-pad only accumulates the target; fires on release. ---- */
         if (want_seek && !(kh & (KEY_LEFT | KEY_RIGHT))) {
             WORKER_LOCK();   /* blocks until the decode thread finishes its current pair and releases */
             if (dur_us > 0) { if (seek_to_us < 0) seek_to_us = 0; if (seek_to_us > dur_us) seek_to_us = dur_us; }
@@ -2152,7 +2162,31 @@ static MoflexResult moflex_play_ring(const char *path) {
             if (have_audio) r3_audio_flush();
             gated = 0; s.audio_pre_full = 0; playing = 1; r3_wallset = 0;
             cur_us = seek_to_us; s.cur_us = seek_to_us;
-            have_anchor = 0;   /* re-pin video to audio start on the first present after this seek */
+            /* FAST PRIME: decode the landing keyframe pair straight into slot 0 (bounded keyframe scan;
+             * else take the next decodable frame) so the picture appears at once and audio resyncs. */
+            {
+                MfxPacket pk; int64_t lts = seek_to_us; int vseen = 0;
+                for (int guard = 0; guard < 4000; guard++) {
+                    if (mfx_next_packet(&m, &pk) != 1) break;
+                    if (m.streams[pk.stream_index].media_type != MFX_TYPE_VIDEO) continue;
+                    vseen++;
+                    if (!pk.keyframe && vseen < 30) continue;
+                    lts = m.ts;
+                    AVPacket ap; ap.data = pk.data; ap.size = pk.size; int gL = 0;
+                    if (!(mobi_decode(&ctx, fL, &gL, &ap) >= 0 && gL)) continue;
+                    if (is3d) {
+                        int haveR = 0; MfxPacket pr;
+                        for (int g2 = 0; g2 < 8; g2++) { if (mfx_next_packet(&m, &pr) != 1) break;
+                            if (m.streams[pr.stream_index].media_type == MFX_TYPE_VIDEO) { haveR = 1; break; } }
+                        int gR = 0;
+                        if (!haveR || !(mobi_decode(&ctx, fR, &gR, &(AVPacket){ .data = pr.data, .size = pr.size }) >= 0 && gR)) continue;
+                        g_y2r_start(fL, &r3_texL[0], W, H); g_y2r_wait(&r3_texL[0]);
+                        g_y2r_start(fR, &r3_texR[0], W, H); g_y2r_wait(&r3_texR[0]);
+                    } else { g_y2r_start(fL, &r3_texL[0], W, H); g_y2r_wait(&r3_texL[0]); }
+                    rts[0] = 0; bts[0] = lts; ready[0] = 1; s.wr = 1; s.dpair = 1; cur_us = lts; s.cur_us = lts;
+                    break;
+                }
+            }
             s.paused = 0;
             WORKER_UNLOCK();   /* resume the decode thread from the new position */
             want_seek = 0;
@@ -2185,13 +2219,18 @@ static MoflexResult moflex_play_ring(const char *path) {
         const int64_t VS_HALF = 8356;
         int show = -1;
         if ((wr - rd) > 0 && ready[rd % NB]) {
-            /* v_anchor: rebase the video timeline so the first frame ready when audio starts sits at
-             * apos 0. Because audio and video now decode from the same seek point, this keeps them
-             * aligned without any explicit skew (the release method). */
-            if (!have_anchor) { v_anchor = rts[rd % NB]; have_anchor = 1; }
-            while ((wr - rd) > 1 && ready[(rd + 1) % NB] && (rts[(rd + 1) % NB] - v_anchor) <= apos + VS_HALF) { ready[rd % NB] = 0; rd++; }
+            /* Capture the A/V anchor ONCE, the first frame after audio re-locks: right now bts-rts equals
+             * the true video origin (before any cadence drift). skew = audio_origin - video_origin, held
+             * constant thereafter and ignored if implausibly large (bad/absent timestamps). */
+            if (have_audio && !r3_av_ready && apos >= 0 && r3_audio_t0 >= 0) {
+                int64_t sk = r3_audio_t0 - (bts[rd % NB] - rts[rd % NB]);
+                r3_av_skew = (sk < -300000 || sk > 300000) ? 0 : sk;
+                r3_av_ready = 1;
+            }
+            int64_t ae = (have_audio && apos >= 0) ? apos + r3_av_skew : apos;
+            while ((wr - rd) > 1 && ready[(rd + 1) % NB] && rts[(rd + 1) % NB] <= ae + VS_HALF) { ready[rd % NB] = 0; rd++; }
             if (apos < 0) { if (last_shown < 0) show = rd % NB; }             /* pre-roll: show the landing pair */
-            else if (apos + VS_HALF >= (rts[rd % NB] - v_anchor)) show = rd % NB;
+            else if (ae + VS_HALF >= rts[rd % NB]) show = rd % NB;
         }
 
         /* ---- draw: video pair (or held frame) + subtitle overlay + bottom panel, one GPU frame ---- */
