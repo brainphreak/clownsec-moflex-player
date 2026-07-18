@@ -280,7 +280,7 @@ static int resume_prompt(const char *name, long long rp_us) {
             char q[48]; snprintf(q, sizeof q, "Resume at %s?", tbuf);
             ui_text_center(UI_W / 2, 84, 2, UI_NEON, q);
             ui_button(resx, by, bw, bh, "RESUME",     sel == 0, UI_NEON);
-            ui_button(begx, by, bw, bh, "START OVER", sel == 1, UI_NEONP);
+            ui_button(begx, by, bw, bh, "RESTART", sel == 1, UI_NEONP);
             ui_present(); redraw = 0;
         }
         gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
