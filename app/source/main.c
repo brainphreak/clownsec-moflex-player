@@ -2360,11 +2360,16 @@ static void lib_edit_menu(int li) {
 }
 
 static void lib_getinfo_menu(int *idx, int ni, int csel) {
-    const char *items[4] = { "This movie", "All here (missing only)", "Edit info", "Cancel" };
-    int c = ui_menu("GET INFO", g_lib[idx[csel]].name, items, 4);
-    if (c == 0) lib_scrape_one(idx[csel]);
-    else if (c == 1) lib_scrape_missing(idx, ni);
-    else if (c == 2) lib_edit_menu(idx[csel]);
+    (void)ni;   /* batch fetch lives in the rescan flow now */
+    const char *items[2] = { "Download Info", "Edit Info" };
+    int c = ui_menu("VIDEO INFO", g_lib[idx[csel]].name, items, 2);   /* B backs out */
+    if (c == 0) {
+        /* never silently overwrite hand edits: confirm before re-downloading existing info */
+        if (movieinfo_have(g_lib[idx[csel]].url) &&
+            prompt2("DOWNLOAD INFO", "Info already exists for this video.\nUpdating replaces any edits.",
+                    "UPDATE", "KEEP") != 0) return;
+        lib_scrape_one(idx[csel]);
+    } else if (c == 1) lib_edit_menu(idx[csel]);
 }
 
 /* GET INFO chooser (X in Open Video): fetch metadata for just this movie, or every movie in
@@ -2372,20 +2377,23 @@ static void lib_getinfo_menu(int *idx, int ni, int csel) {
 static void getinfo_menu(void) {
     if (nentries == 0) return;
     int is_movie = !entries[sel].is_dir && is_moflex(entries[sel].name);
-    const char *items[3]; int act[3]; int n = 0;
-    if (is_movie) { items[n] = "This movie";                act[n++] = 0; }
-    items[n] = "All movies here (missing only)"; act[n++] = 1;
-    items[n] = "Cancel";                         act[n++] = 2;
-    int c = ui_menu("GET INFO", is_movie ? entries[sel].name : NULL, items, n);
+    const char *items[2]; int act[2]; int n = 0;
+    if (is_movie) { items[n] = "Download Info";          act[n++] = 0; }
+    items[n] = "Download All Missing Here"; act[n++] = 1;
+    int c = ui_menu("VIDEO INFO", is_movie ? entries[sel].name : NULL, items, n);   /* B backs out */
     if (c < 0) return;
     int a = act[c];
     if (a == 0) {
         char full[PATHLEN + NAMELEN]; snprintf(full, sizeof full, "%s%s", cwd, entries[sel].name);
-        int r = scrape_one(full);   /* forces a refresh, even if it already has info */
+        /* never silently overwrite existing/edited info */
+        if (movieinfo_have(full) &&
+            prompt2("DOWNLOAD INFO", "Info already exists for this video.\nUpdating replaces any edits.",
+                    "UPDATE", "KEEP") != 0) return;
+        int r = scrape_one(full);
         const char *msg = r == 1 ? "Info + artwork saved."
                         : r == 2 ? "Info saved, but the poster\ndidn't download. Try again for the art."
                                  : "No catalog had this title.";
-        msg_screen("GET INFO", msg);
+        msg_screen("DOWNLOAD INFO", msg);
     } else if (a == 1) {
         scrape_folder();
     }
