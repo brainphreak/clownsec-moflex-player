@@ -1596,7 +1596,7 @@ static void r3_audio_setup(int arate, int chn) {
         if (!r3_ab[r3_nawb]) break;
         r3_wb[r3_nawb].status = NDSP_WBUF_DONE;
     }
-    if (r3_nawb < 8) { r3_aok = 0; return; }
+    if (r3_nawb < 8) { r3_audio_close(); return; }   /* leaking these bricked later C2D_Init -> dark screens */
     ndspChnSetPaused(0, true);   /* paused: bank audio during pre-roll, unpause aligned to content-0 */
     r3_aok = 1;
 }
@@ -1648,11 +1648,10 @@ static void r3_audio_flush(void) {   /* on seek: drop everything queued, clock o
     r3_audio_t0 = -1; r3_av_skew = 0; r3_av_ready = 0;   /* re-anchor A/V on the next lock */
     ndspChnSetPaused(0, true);
 }
-static void r3_audio_close(void) {
-    if (!r3_aok) return;
+static void r3_audio_close(void) {   /* safe to call in ANY state: frees partial allocations too */
     ndspChnWaveBufClear(0); ndspChnReset(0);
-    for (int i = 0; i < R3_AWB; i++) if (r3_ab[i]) linearFree(r3_ab[i]);
-    r3_aok = 0;
+    for (int i = 0; i < R3_AWB; i++) if (r3_ab[i]) { linearFree(r3_ab[i]); r3_ab[i] = NULL; }
+    r3_nawb = 0; r3_aok = 0;
 }
 
 /* ---- compressed-video BACKLOG. Phase 1 stashes video packets here while feeding audio ahead, so
@@ -1933,7 +1932,13 @@ static MoflexResult moflex_play_ring(const char *path) {
         mobi_close(&ctx); free(ctx.priv_data); mfx_close(&m); fclose(f);
         return MOFLEX_FALLBACK;
     }
-    C2D_Init(C2D_DEFAULT_MAX_OBJECTS); C2D_Prepare();
+    if (!C2D_Init(C2D_DEFAULT_MAX_OBJECTS)) {   /* unchecked before: silent no-op draws = dark screens */
+        C3D_Fini();
+        gfxSet3D(false); av_frame_free(&fL); av_frame_free(&fR);
+        mobi_close(&ctx); free(ctx.priv_data); mfx_close(&m); fclose(f);
+        return MOFLEX_FALLBACK;
+    }
+    C2D_Prepare();
     C3D_RenderTarget *topL = C2D_CreateScreenTarget(GFX_TOP, GFX_LEFT);
     C3D_RenderTarget *topR = C2D_CreateScreenTarget(GFX_TOP, GFX_RIGHT);
     C3D_RenderTarget *bot  = C2D_CreateScreenTarget(GFX_BOTTOM, GFX_LEFT);
@@ -2387,7 +2392,7 @@ static MoflexResult moflex_play_ring(const char *path) {
     if (g_lcd_ok) { gspLcdExit(); g_lcd_ok = 0; }
     if (g_mcu_ok) { mcuHwcExit(); g_mcu_ok = 0; }
     ptmuExit();
-    if (have_audio) r3_audio_close();
+    r3_audio_close();   /* unconditional: also frees a partial bank when setup failed */
     r3_vq_clear();
     C2D_TextBufDelete(sbuf); C2D_TextBufDelete(tmbuf); C2D_TextBufDelete(subbuf);
     for (int i = 0; i < NB; i++) { C3D_TexDelete(&r3_texL[i]); C3D_TexDelete(&r3_texR[i]); }
@@ -3047,7 +3052,7 @@ static MoflexResult moflex_play_soft(const char *path) {
     if (vol_dirty) vol_save();
     if (dur_us > 0 && cur_us >= dur_us - 10000000) resume_clear(path);
     else if (cur_us > 3000000) resume_save_us(path, cur_us);
-    if (have_audio) r3_audio_close();
+    r3_audio_close();   /* unconditional: also frees a partial bank when setup failed */
     r3_vq_clear();
     y2r_video_exit();
     for (int i = 0; i < SR_NB; i++) { free(sr_yL[i]); free(sr_yR[i]); sr_yL[i] = sr_yR[i] = NULL; }
