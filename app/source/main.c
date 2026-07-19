@@ -1620,11 +1620,20 @@ static void lib_detect_dir(const char *dir, int depth) {
             snprintf(sub, sizeof sub, "%s/", full);
             lib_detect_dir(sub, depth + 1);
         } else if (is_moflex(e->d_name)) {
-            if (has_episode_tag(e->d_name) && depth > 0) {   /* episode: its FOLDER is the unit */
+            if (has_episode_tag(e->d_name) && depth > 0) {   /* episode: its SHOW is the unit */
                 char parent[PATHLEN + NAMELEN];
                 snprintf(parent, sizeof parent, "%s", dir);
                 size_t pl = strlen(parent); while (pl > 1 && parent[pl - 1] == '/') parent[--pl] = 0;
-                if (lib_has_path(parent)) continue;          /* show already in the library */
+                if (lib_has_path(parent)) continue;          /* single-show folder already listed */
+                char pfx[96]; ep_show_prefix(e->d_name, pfx, sizeof pfx);
+                if (pfx[0]) {                                /* flat multi-show folder: check the
+                                                                virtual "<dir>/<Show>" entry too --
+                                                                without this the same episodes were
+                                                                flagged "new" on every startup */
+                    char vurl[PATHLEN + NAMELEN];
+                    snprintf(vurl, sizeof vurl, "%s/%s", parent, pfx);
+                    if (lib_has_path(vurl)) continue;
+                }
                 int dup = 0;                                 /* count each new show folder once */
                 int tracked = s_new_n < NEWLIST_MAX ? s_new_n : NEWLIST_MAX;
                 for (int i = 0; i < tracked && !dup; i++) if (!strcmp(s_newlist[i], parent)) dup = 1;
@@ -2423,9 +2432,20 @@ static void startup_new_movie_check(void) {
     lib_detect_dir("sdmc:/", 0);
     if (s_new_n == 0) { free(s_newlist); s_newlist = NULL; return; }
 
-    char msg[96];
-    snprintf(msg, sizeof msg, "%d new video%s found on the SD card.\nAdd new videos to Library?",
-             s_new_n, s_new_n == 1 ? "" : "s");
+    char msg[200];
+    {   /* name the finds so "it keeps finding something" is diagnosable at a glance */
+        char n1[40] = "", n2[40] = "";
+        int tracked = s_new_n < NEWLIST_MAX ? s_new_n : NEWLIST_MAX;
+        for (int i = 0, shown = 0; i < tracked && shown < 2; i++, shown++) {
+            const char *b = strrchr(s_newlist[i], '/'); b = b ? b + 1 : s_newlist[i];
+            char nm[64]; snprintf(nm, sizeof nm, "%s", b); strip_ext(nm);
+            snprintf(shown == 0 ? n1 : n2, 40, "%.38s", nm);
+        }
+        if (s_new_n == 1)      snprintf(msg, sizeof msg, "Found:\n%s\nAdd it to the Library?", n1);
+        else if (s_new_n == 2) snprintf(msg, sizeof msg, "Found:\n%s\n%s\nAdd them to the Library?", n1, n2);
+        else                   snprintf(msg, sizeof msg, "Found %d new videos, e.g.:\n%s\n%s\nAdd them to the Library?",
+                                        s_new_n, n1, n2);
+    }
     if (prompt2("NEW VIDEOS", msg, "ADD", "LATER") != 0) { free(s_newlist); s_newlist = NULL; return; }
     if (s_new_n <= NEWLIST_MAX) lib_add_new();   /* instant: append the found files, no second walk */
     else lib_rescan();                           /* too many to have tracked -> full rescan */
