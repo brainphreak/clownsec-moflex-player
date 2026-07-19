@@ -2231,6 +2231,11 @@ static MoflexResult moflex_play_ring(const char *path) {
                     if (mfx_next_packet(&m, &pk) != 1) break;
                     if (m.streams[pk.stream_index].media_type != MFX_TYPE_VIDEO) continue;
                     vseen++;
+                    /* 3D: a pair may only START at an EVEN offset from the landing -- that keeps the
+                     * stream's eye phase (which s.eye_swap already resolved). Files with keyframes on
+                     * RIGHT eyes (community encodes keyframe both eyes) otherwise made the prime start
+                     * a pair on an R: reversed depth + left eye one frame behind, randomly per seek. */
+                    if (is3d && !(vseen & 1)) continue;
                     if (!pk.keyframe && vseen < 30) continue;
                     lts = m.ts;
                     AVPacket ap; ap.data = pk.data; ap.size = pk.size; int gL = 0;
@@ -2238,7 +2243,7 @@ static MoflexResult moflex_play_ring(const char *path) {
                     if (is3d) {
                         int haveR = 0; MfxPacket pr;
                         for (int g2 = 0; g2 < 8; g2++) { if (mfx_next_packet(&m, &pr) != 1) break;
-                            if (m.streams[pr.stream_index].media_type == MFX_TYPE_VIDEO) { haveR = 1; break; } }
+                            if (m.streams[pr.stream_index].media_type == MFX_TYPE_VIDEO) { haveR = 1; vseen++; break; } }
                         int gR = 0;
                         if (!haveR || !(mobi_decode(&ctx, fR, &gR, &(AVPacket){ .data = pr.data, .size = pr.size }) >= 0 && gR)) continue;
                         C3D_Tex *tA = s.eye_swap ? &r3_texR[0] : &r3_texL[0];
