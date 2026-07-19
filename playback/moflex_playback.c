@@ -1742,12 +1742,12 @@ static void mp_ring_apt_hook(APT_HookType hook, void *param) {
             if (g_ring_lock) { LightLock_Lock(g_ring_lock); LightLock_Unlock(g_ring_lock); }  /* ...and drain any in flight */
             if (g_screen_off) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; } g_backlight_on = 1;
             if (g_lcd_ok) gspLcdExit();                 /* release gsp::Lcd (else HOME hard-locks) */
-            y2rExit();                                  /* release Y2R for the applet */
+            if (g_ring_apt_w) y2rExit();                /* release Y2R (only if it's up yet) */
             gfxSet3D(false);
             break;
         case APTHOOK_ONRESTORE:
         case APTHOOK_ONWAKEUP:
-            g_y2r_init(g_ring_apt_w, g_ring_apt_h, g_ring_apt_bpp);      /* re-acquire Y2R */
+            if (g_ring_apt_w) g_y2r_init(g_ring_apt_w, g_ring_apt_h, g_ring_apt_bpp);   /* re-acquire Y2R */
             if (g_lcd_ok) gspLcdInit();                                  /* re-acquire gsp::Lcd */
             g_backlight_on = 1;                                          /* applet left the backlight on */
             if (g_ring_apt_audio && g_ring_apt_playing) ndspChnSetPaused(0, false);
@@ -1936,17 +1936,24 @@ static MoflexResult moflex_play_ring(const char *path) {
         p = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, &fw, &fh); if (p) memset(p, 0, (size_t)fw * fh * 3);
         gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();   /* paced: unpaced swaps here crashed gsp */
     }
+    /* Register the suspend hook NOW, before the seconds-long GPU/Y2R/audio setup: HOME or sleep
+     * during that window used to suspend with our state half-built (black screens / gsp faults).
+     * The hook's fields start disarmed (w=0 -> no Y2R handling) and are armed as resources come up. */
+    g_ring_apt_w = 0; g_ring_apt_audio = 0; g_ring_apt_playing = 1;
+    aptHook(&g_ring_apt_cookie, mp_ring_apt_hook, NULL);
     /* GPU setup. On the Old 3DS the (unpinned) linear heap can be too small for citro3d's command
      * buffer or the screen targets -- and a FAILED C3D_Init followed by C2D drawing is a write to an
      * unmapped target (the "data abort / write / translation section" crash). Check every step and
      * fall back to the classic (no-GPU) path instead of faulting. */
     gfxSet3D(is3d);
     if (!C3D_Init(C3D_DEFAULT_CMDBUF_SIZE)) {
+        aptUnhook(&g_ring_apt_cookie);
         gfxSet3D(false); av_frame_free(&fL); av_frame_free(&fR);
         mobi_close(&ctx); free(ctx.priv_data); mfx_close(&m); fclose(f);
         return MOFLEX_FALLBACK;
     }
     if (!C2D_Init(C2D_DEFAULT_MAX_OBJECTS)) {   /* unchecked before: silent no-op draws = dark screens */
+        aptUnhook(&g_ring_apt_cookie);
         C3D_Fini();
         gfxSet3D(false); av_frame_free(&fL); av_frame_free(&fR);
         mobi_close(&ctx); free(ctx.priv_data); mfx_close(&m); fclose(f);
@@ -1957,6 +1964,7 @@ static MoflexResult moflex_play_ring(const char *path) {
     C3D_RenderTarget *topR = C2D_CreateScreenTarget(GFX_TOP, GFX_RIGHT);
     C3D_RenderTarget *bot  = C2D_CreateScreenTarget(GFX_BOTTOM, GFX_LEFT);
     if (!topL || !topR || !bot) {
+        aptUnhook(&g_ring_apt_cookie);
         C2D_Fini(); C3D_Fini(); gfxSet3D(false);
         av_frame_free(&fL); av_frame_free(&fR);
         mobi_close(&ctx); free(ctx.priv_data); mfx_close(&m); fclose(f);
@@ -1982,6 +1990,7 @@ static MoflexResult moflex_play_ring(const char *path) {
     /* Not enough linear heap for a usable ring on this console -> tear down and let the caller run the
      * classic path (which needs no GPU ring). This is what prevented the `wr % NB` divide-by-zero fault. */
     if (NB < 2) {
+        aptUnhook(&g_ring_apt_cookie);
         for (int i = 0; i < NB; i++) { C3D_TexDelete(&r3_texL[i]); C3D_TexDelete(&r3_texR[i]); }
         C2D_Fini(); C3D_Fini();
         gfxSetScreenFormat(GFX_TOP, GSP_BGR8_OES); gfxSetScreenFormat(GFX_BOTTOM, GSP_RGB565_OES); gfxSet3D(false);
@@ -1991,12 +2000,9 @@ static MoflexResult moflex_play_ring(const char *path) {
     }
     g_y2r_init(W, H, r3_bpp);
     if (have_audio) { r3_audio_setup(arate, chn); if (!r3_aok) have_audio = 0; }   /* alloc failed -> wall-clock */
-    /* Register our suspend hook: the libctru default only saves the GPU, but we also hold Y2R,
-     * gsp::Lcd (moon), and an ndsp channel -- keeping those across a HOME/sleep transition hard-locks
-     * the GSP (needs a power-off). The hook hands them back on suspend and re-acquires on restore. */
+    /* the hook was registered right after gfx init; now that Y2R/audio are up, arm its fields */
     g_ring_apt_w = W; g_ring_apt_h = H; g_ring_apt_bpp = r3_bpp;
     g_ring_apt_audio = have_audio; g_ring_apt_playing = 1;
-    aptHook(&g_ring_apt_cookie, mp_ring_apt_hook, NULL);
 
     C2D_TextBuf sbuf = C2D_TextBufNew(256), tmbuf = C2D_TextBufNew(48);
     C2D_Text ttitle, thint, ttime;
