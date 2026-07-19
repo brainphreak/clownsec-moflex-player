@@ -1601,8 +1601,23 @@ static int lib_has_path(const char *full) {
     for (int i = 0; i < g_lib_n; i++) if (!strcmp(g_lib[i].url, full)) return 1;
     return 0;
 }
+/* Background detection runs on a worker thread while the UI may rescan the library, so it checks
+ * coverage against a hash SNAPSHOT of the urls taken before the thread starts (never touches
+ * g_lib concurrently). */
+static u64 *s_dt_hash; static int s_dt_nh;
+static volatile int s_dt_done = 0, s_dt_abort = 0, s_dt_consumed = 1;
+static u64 dt_fnv(const char *str) {
+    u64 h = 1469598103934665603ull;
+    for (const unsigned char *p = (const unsigned char *)str; *p; p++) { h ^= *p; h *= 1099511628211ull; }
+    return h;
+}
+static int dt_covered(const char *full) {
+    u64 h = dt_fnv(full);
+    for (int i = 0; i < s_dt_nh; i++) if (s_dt_hash[i] == h) return 1;
+    return 0;
+}
 static void lib_detect_dir(const char *dir, int depth) {
-    if (depth > 8) return;
+    if (depth > 8 || s_dt_abort) return;
     DIR *d = opendir(dir);
     if (!d) return;
     struct dirent *e;
@@ -1624,7 +1639,7 @@ static void lib_detect_dir(const char *dir, int depth) {
                 char parent[PATHLEN + NAMELEN];
                 snprintf(parent, sizeof parent, "%s", dir);
                 size_t pl = strlen(parent); while (pl > 1 && parent[pl - 1] == '/') parent[--pl] = 0;
-                if (lib_has_path(parent)) continue;          /* single-show folder already listed */
+                if (dt_covered(parent)) continue;            /* single-show folder already listed */
                 char pfx[96]; ep_show_prefix(e->d_name, pfx, sizeof pfx);
                 if (pfx[0]) {                                /* flat multi-show folder: check the
                                                                 virtual "<dir>/<Show>" entry too --
@@ -1632,7 +1647,7 @@ static void lib_detect_dir(const char *dir, int depth) {
                                                                 flagged "new" on every startup */
                     char vurl[PATHLEN + NAMELEN];
                     snprintf(vurl, sizeof vurl, "%s/%s", parent, pfx);
-                    if (lib_has_path(vurl)) continue;
+                    if (dt_covered(vurl)) continue;
                 }
                 int dup = 0;                                 /* count each new show folder once */
                 int tracked = s_new_n < NEWLIST_MAX ? s_new_n : NEWLIST_MAX;
@@ -1642,7 +1657,7 @@ static void lib_detect_dir(const char *dir, int depth) {
                 s_new_n++;
                 continue;
             }
-            if (lib_has_path(full)) continue;                              /* cheap string check first */
+            if (dt_covered(full)) continue;                                /* cheap hash check first */
             if (cia_is_cia(e->d_name) && !cia_has_moflex(full)) continue;  /* open only NEW CIAs */
             if (s_newlist && s_new_n < NEWLIST_MAX) snprintf(s_newlist[s_new_n], sizeof s_newlist[0], "%s", full);
             s_new_n++;
@@ -2405,6 +2420,13 @@ static void lib_rescan_interactive(void) {
 
 /* ---- startup: detect movies added outside the app (browser download, PC copy, upload) and offer
  * a rescan; after rescanning, offer art + info download for the new arrivals. ---- */
+static int startup_detect_poll(void);
+static void detect_worker(void *arg) {
+    (void)arg;
+    lib_detect_dir("sdmc:/", 0);
+    s_dt_done = 1;
+}
+
 static void startup_new_movie_check(void) {
     if (lib_load_cache() == 0) {
         /* FIRST RUN: no library yet -- the most important time to create it. */
@@ -2423,14 +2445,28 @@ static void startup_new_movie_check(void) {
         return;
     }
 
-    ui_begin(GFX_BOTTOM); ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
-    ui_text_center(UI_W / 2, 104, 1, UI_DIM, "Checking for new movies..."); ui_present();
-    gfxFlushBuffers(); gfxSwapBuffers();
-
+    /* Library exists: the SD walk takes ~30s+ on big cards, so it runs on a BACKGROUND thread.
+     * Snapshot the library urls as hashes first (the walk never touches g_lib, so the user can
+     * browse/rescan freely meanwhile); the home screen polls and prompts when the walk finishes. */
+    free(s_dt_hash);
+    s_dt_hash = (u64 *)malloc(sizeof(u64) * (g_lib_n ? g_lib_n : 1));
+    s_dt_nh = 0;
+    if (!s_dt_hash) return;
+    for (int i = 0; i < g_lib_n; i++) s_dt_hash[s_dt_nh++] = dt_fnv(g_lib[i].url);
     s_newlist = malloc(sizeof *s_newlist * NEWLIST_MAX);
-    s_new_n = 0;
-    lib_detect_dir("sdmc:/", 0);
-    if (s_new_n == 0) { free(s_newlist); s_newlist = NULL; return; }
+    if (!s_newlist) { free(s_dt_hash); s_dt_hash = NULL; return; }
+    s_new_n = 0; s_dt_done = 0; s_dt_abort = 0; s_dt_consumed = 0;
+    s32 prio = 0x30; svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
+    if (!threadCreate(detect_worker, NULL, 32 * 1024, prio + 1, -2, true))
+        detect_worker(NULL);   /* couldn't thread -> fall back to the old synchronous walk */
+}
+
+/* Home screen polls this once per frame; runs the prompts when the background walk lands. */
+static int startup_detect_poll(void) {
+    if (s_dt_consumed || !s_dt_done) return 0;
+    s_dt_consumed = 1;
+    free(s_dt_hash); s_dt_hash = NULL;
+    if (s_new_n == 0) { free(s_newlist); s_newlist = NULL; return 0; }
 
     char msg[200];
     {   /* name the finds so "it keeps finding something" is diagnosable at a glance */
@@ -2446,7 +2482,7 @@ static void startup_new_movie_check(void) {
         else                   snprintf(msg, sizeof msg, "Found %d new videos, e.g.:\n%s\n%s\nAdd them to the Library?",
                                         s_new_n, n1, n2);
     }
-    if (prompt2("NEW VIDEOS", msg, "ADD", "LATER") != 0) { free(s_newlist); s_newlist = NULL; return; }
+    if (prompt2("NEW VIDEOS", msg, "ADD", "LATER") != 0) { free(s_newlist); s_newlist = NULL; return 1; }
     int before = g_lib_n;
     if (s_new_n <= NEWLIST_MAX) lib_add_new();   /* instant: append the found files, no second walk */
     else lib_rescan();                           /* too many to have tracked -> full rescan */
@@ -2470,9 +2506,10 @@ static void startup_new_movie_check(void) {
     free(s_newlist); s_newlist = NULL;
     char am[96];
     snprintf(am, sizeof am, "%d video%s added to the Library.", added, added == 1 ? "" : "s");
-    if (ni == 0) { msg_screen("NEW VIDEOS", am); return; }   /* always confirm what happened */
+    if (ni == 0) { msg_screen("NEW VIDEOS", am); return 1; }   /* always confirm what happened */
     snprintf(am + strlen(am), sizeof am - strlen(am), "\nDownload art & info?");
     if (prompt2("NEW VIDEOS", am, "DOWNLOAD", "SKIP") == 0) lib_scrape_missing(idx, ni);
+    return 1;
 }
 
 /* Edit a library entry's info by hand (re-organize genres/categories on the console).
@@ -3128,9 +3165,11 @@ static void home_draw(int bsel, long long rpos) {
 static int home_gui(void) {
     static int bsel = 0;   /* remember the highlighted button across screens (B back keeps it) */
     int redraw = 1;
+    if (startup_detect_poll()) redraw = 1;   /* background new-video check landed while we were away */
     /* read the resume position ONCE (not every frame -- that hammered the SD card) */
     long long rpos = g_now_playing_path[0] ? moflex_resume_get(g_now_playing_path) : 0;
     while (aptMainLoop()) {
+        if (startup_detect_poll()) redraw = 1;
         hidScanInput();
         u32 k = hidKeysDown();
         if (k & KEY_START) return -1;
@@ -3320,6 +3359,8 @@ int main(void) {
             if (g_now_playing_path[0] && play_and_handle(g_now_playing_path, PLAY_FROM_HOME)) running = 0;
         }
     }
+    s_dt_abort = 1;   /* stop the background SD walk before teardown */
+    for (int w = 0; w < 20 && !s_dt_done && !s_dt_consumed; w++) svcSleepThread(25 * 1000 * 1000LL);
 
     downloader_exit();
     socExit();
