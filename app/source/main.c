@@ -1209,7 +1209,7 @@ cb_rebuild:;   /* X-search inside the list jumps back here with filt_search set 
 /* ================= Library: one flat, categorized view of every local movie ================= */
 #define LIB_MAX   3000
 #define LIB_CACHE "sdmc:/moflex_player/library.cache"
-#define LIB_MAGIC 0x4C494236   /* 'LIB6' -- bump to invalidate old caches when the scan changes */
+#define LIB_MAGIC 0x4C494237   /* 'LIB7' -- bump to invalidate old caches when the scan changes */
 static CatEntry *g_lib = NULL;   /* every playable movie on the SD, with its .nfo metadata */
 static int       g_lib_n = 0;
 
@@ -1265,15 +1265,28 @@ static void show_name_from_dir(const char *dirpath, char *out, size_t cap) {
     for (char *p = out; *p; p++)   /* cut a trailing " - Season ..." qualifier */
         if (p[0] == ' ' && p[1] == '-' && p[2] == ' ' && !strncasecmp(p + 3, "Season", 6)) { *p = 0; break; }
 }
-static void lib_add_show(const char *dirpath, const CatEntry *src) {
+/* show name from an EPISODE FILENAME: everything before the SxxEyy tag, trimmed */
+static void ep_show_prefix(const char *fname, char *out, size_t cap) {
+    const char *tag = ep_tag_at(fname);
+    if (!tag) { out[0] = 0; return; }
+    size_t L = (size_t)(tag - fname);
+    while (L > 0 && (fname[L - 1] == ' ' || fname[L - 1] == '-')) L--;
+    if (L >= cap) L = cap - 1;
+    memcpy(out, fname, L); out[L] = 0;
+}
+/* Add ONE show entry. name may be NULL (derive from the folder). url may be a real folder OR a
+ * virtual "<folder>/<Show Name>" key when several shows share one folder. */
+static void lib_add_show_named(const char *urlpath, const char *name, const CatEntry *src) {
     if (!g_lib || g_lib_n >= LIB_MAX) return;
     char url[PATHLEN + NAMELEN];
-    snprintf(url, sizeof url, "%s", dirpath);
+    snprintf(url, sizeof url, "%s", urlpath);
     size_t L = strlen(url);
     while (L > 1 && url[L - 1] == '/') url[--L] = 0;       /* stored WITHOUT trailing slash */
     for (int i = 0; i < g_lib_n; i++) if (!strcmp(g_lib[i].url, url)) return;   /* already listed */
     /* multiple season folders share one show name -> ONE entry (the episode picker combines them) */
-    char newname[CAT_NAMELEN]; show_name_from_dir(url, newname, sizeof newname);
+    char newname[CAT_NAMELEN];
+    if (name && name[0]) snprintf(newname, sizeof newname, "%s", name);
+    else show_name_from_dir(url, newname, sizeof newname);
     for (int i = 0; i < g_lib_n; i++)
         if (g_lib[i].is_zip == 2 && !strcasecmp(g_lib[i].name, newname)) return;
     CatEntry *c = &g_lib[g_lib_n];
@@ -1282,7 +1295,7 @@ static void lib_add_show(const char *dirpath, const CatEntry *src) {
     snprintf(c->url, sizeof c->url, "%s", url);
     const char *b = strrchr(url, '/'); b = b ? b + 1 : url;
     snprintf(c->fname, sizeof c->fname, "%s", b);
-    show_name_from_dir(url, c->name, sizeof c->name);
+    snprintf(c->name, sizeof c->name, "%s", newname);
     if (!c->category[0] || !strcasecmp(c->category, "Uncategorized"))
         snprintf(c->category, sizeof c->category, "TV Shows");
     c->is_zip = 2;
@@ -1290,15 +1303,46 @@ static void lib_add_show(const char *dirpath, const CatEntry *src) {
     if (tmv) strftime(c->date, sizeof c->date, "%Y-%m-%d", tmv);
     g_lib_n++;
 }
+static void lib_add_show(const char *dirpath, const CatEntry *src) { lib_add_show_named(dirpath, NULL, src); }
+/* Group a folder's episodes by show-name prefix: ONE entry per SHOW, not per folder. A flat folder
+ * holding many shows (e.g. "SHOWS/") gets one entry per show via a virtual "<dir>/<Show>" key; a
+ * single-show folder keeps the REAL folder as its url so existing artwork/info keys stay valid. */
+static void lib_add_shows_in_dir(const char *dir, const CatEntry *src) {
+    char pref[24][96]; int np = 0;
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.' || !is_moflex(e->d_name) || !has_episode_tag(e->d_name)) continue;
+        char pfx[96]; ep_show_prefix(e->d_name, pfx, sizeof pfx);
+        if (!pfx[0]) continue;
+        int found = 0;
+        for (int i = 0; i < np && !found; i++) if (!strcasecmp(pref[i], pfx)) found = 1;
+        if (!found && np < 24) snprintf(pref[np++], sizeof pref[0], "%s", pfx);
+    }
+    closedir(d);
+    if (np == 0) return;
+    if (np == 1) { lib_add_show_named(dir, pref[0], src); return; }   /* real folder url, show-named */
+    for (int i = 0; i < np; i++) {                                    /* several shows share this folder */
+        char vurl[PATHLEN + NAMELEN];
+        size_t L = strlen(dir);
+        snprintf(vurl, sizeof vurl, "%s%s%s", dir, (L && dir[L - 1] == '/') ? "" : "/", pref[i]);
+        lib_add_show_named(vurl, pref[i], src);
+    }
+}
 static int epname_cmp(const void *a, const void *b) { return strcasecmp((const char *)a, (const char *)b); }
 #define EP_MAX 100
 static char s_epfile[EP_MAX][PATHLEN + NAMELEN];   /* full episode paths (may span season folders) */
-static void ep_collect_dir(const char *dirpath, int *n) {
+static void ep_collect_dir_named(const char *dirpath, const char *showname, int *n) {
     DIR *d = opendir(dirpath);
     if (!d) return;
     struct dirent *e;
     while ((e = readdir(d)) && *n < EP_MAX) {
         if (e->d_name[0] == '.' || !is_moflex(e->d_name) || !has_episode_tag(e->d_name)) continue;
+        if (showname && showname[0]) {   /* only this show's episodes (flat multi-show folders) */
+            char pfx[96]; ep_show_prefix(e->d_name, pfx, sizeof pfx);
+            if (strcasecmp(pfx, showname)) continue;
+        }
         snprintf(s_epfile[*n], sizeof s_epfile[0], "%s/%s", dirpath, e->d_name); (*n)++;
     }
     closedir(d);
@@ -1306,30 +1350,39 @@ static void ep_collect_dir(const char *dirpath, int *n) {
 /* Episode picker for a show: lists episodes from EVERY sibling season folder whose derived show
  * name matches (so "…Season 1…" and "…Season 2…" combine into one show).
  * 1 = picked (out set), 0 = backed out, -1 = no episodes found. */
-static int show_pick_episode(const char *showname, const char *dirpath, char *out, size_t cap) {
+static int show_pick_episode(const char *showname, const char *url, char *out, size_t cap) {
     static char eps[EP_MAX][32]; int n = 0;
-    /* find sibling folders of the same show in the parent directory */
-    const char *sl = strrchr(dirpath, '/');
-    if (sl) {
-        char parent[PATHLEN + NAMELEN];
-        snprintf(parent, sizeof parent, "%.*s", (int)(sl - dirpath + 1), dirpath);   /* incl. '/' */
-        DIR *pd = opendir(parent);
+    struct stat st;
+    int real = (stat(url, &st) == 0 && S_ISDIR(st.st_mode));
+    const char *sl = strrchr(url, '/');
+    char parent[PATHLEN + NAMELEN];
+    snprintf(parent, sizeof parent, "%.*s", sl ? (int)(sl - url + 1) : 0, url);   /* incl. '/' */
+    if (real) {
+        ep_collect_dir_named(url, showname, &n);
+        if (n == 0) ep_collect_dir_named(url, NULL, &n);   /* folder-named show: take everything */
+        DIR *pd = parent[0] ? opendir(parent) : NULL;      /* sibling season folders, same show */
         if (pd) {
             struct dirent *pe;
             while ((pe = readdir(pd)) && n < EP_MAX) {
                 if (pe->d_name[0] == '.' || is_hidden_dir(pe->d_name)) continue;
                 char cand[PATHLEN + NAMELEN];
                 snprintf(cand, sizeof cand, "%s%s", parent, pe->d_name);
-                struct stat st;
-                if (stat(cand, &st) || !S_ISDIR(st.st_mode)) continue;
+                if (!strcmp(cand, url)) continue;
+                struct stat s2;
+                if (stat(cand, &s2) || !S_ISDIR(s2.st_mode)) continue;
                 char nm[NAMELEN]; show_name_from_dir(cand, nm, sizeof nm);
                 if (strcasecmp(nm, showname)) continue;
-                ep_collect_dir(cand, &n);
+                ep_collect_dir_named(cand, NULL, &n);
             }
             closedir(pd);
         }
+    } else {
+        /* virtual "<dir>/<Show>" key: the episodes sit flat in the parent, filtered by prefix */
+        char pdir[PATHLEN + NAMELEN];
+        snprintf(pdir, sizeof pdir, "%s", parent);
+        size_t L = strlen(pdir); while (L > 1 && pdir[L - 1] == '/') pdir[--L] = 0;
+        ep_collect_dir_named(pdir, showname, &n);
     }
-    if (n == 0) ep_collect_dir(dirpath, &n);   /* fallback: just this folder */
     if (n == 0) return -1;
     qsort(s_epfile, n, sizeof s_epfile[0], epname_cmp);   /* SxxEyy sorts into watch order */
     for (int i = 0; i < n; i++) {
@@ -1349,6 +1402,7 @@ static void lib_scan_dir(const char *dir, int depth) {
     if (g_lib_n >= LIB_MAX || depth > 8) return;
     DIR *d = opendir(dir);
     if (!d) return;
+    int shows_done = 0;   /* episode grouping runs once per directory */
     struct dirent *e;
     while ((e = readdir(d)) && g_lib_n < LIB_MAX) {
         if (e->d_name[0] == '.') continue;
@@ -1362,8 +1416,8 @@ static void lib_scan_dir(const char *dir, int depth) {
             snprintf(sub, sizeof sub, "%s/", full);
             lib_scan_dir(sub, depth + 1);
         } else if (is_moflex(e->d_name)) {
-            if (has_episode_tag(e->d_name) && depth > 0) {   /* TV episode: its FOLDER becomes the entry */
-                lib_add_show(dir, NULL);
+            if (has_episode_tag(e->d_name) && depth > 0) {   /* TV episode: grouped into SHOW entries */
+                if (!shows_done) { lib_add_shows_in_dir(dir, NULL); shows_done = 1; }
                 continue;
             }
             if (cia_is_cia(e->d_name) && !cia_has_moflex(full)) continue;   /* skip non-movie CIAs */
@@ -1438,6 +1492,7 @@ static void lib_refresh_entry(int i) {
     if (i < 0 || i >= g_lib_n) return;
     CatEntry *ce = &g_lib[i];
     int was_show = (ce->is_zip == 2);   /* NEVER demote a show folder (this bug made shows unplayable) */
+    char oldname[CAT_NAMELEN]; snprintf(oldname, sizeof oldname, "%s", ce->name);
     char path[CAT_URLLEN]; snprintf(path, sizeof path, "%s", ce->url);
     char date[12];         snprintf(date, sizeof date, "%s", ce->date);
     movieinfo_load(path, ce);
@@ -1447,7 +1502,7 @@ static void lib_refresh_entry(int i) {
     lib_episode_name(ce);
     if (was_show) {
         ce->is_zip = 2;
-        show_name_from_dir(ce->url, ce->name, sizeof ce->name);
+        snprintf(ce->name, sizeof ce->name, "%s", oldname);   /* show names come from episode prefixes */
         const char *b = strrchr(ce->url, '/'); b = b ? b + 1 : ce->url;
         snprintf(ce->fname, sizeof ce->fname, "%s", b);
         if (!strcasecmp(ce->category, "Uncategorized")) snprintf(ce->category, sizeof ce->category, "TV Shows");
@@ -1544,7 +1599,7 @@ static void lib_add_new(void) {
     for (int i = 0; i < tracked && g_lib_n < LIB_MAX; i++) {
         const char *full = s_newlist[i];
         struct stat stq;
-        if (!stat(full, &stq) && S_ISDIR(stq.st_mode)) { lib_add_show(full, NULL); continue; }   /* new show folder */
+        if (!stat(full, &stq) && S_ISDIR(stq.st_mode)) { lib_add_shows_in_dir(full, NULL); continue; }   /* new show folder(s) */
         const char *b = strrchr(full, '/'); b = b ? b + 1 : full;
         CatEntry *c = &g_lib[g_lib_n];
         movieinfo_load(full, c);                          /* .nfo if it already has one */
@@ -1623,7 +1678,7 @@ static void lib_add_extracted_dir(const char *dir, const CatEntry *src, int dept
     }
     closedir(d);
     if (eps) {
-        lib_add_show(dir, src);
+        lib_add_shows_in_dir(dir, src);
         if (src) {   /* persist the show's info (+ poster if fetchable) against the folder path */
             char url[PATHLEN + NAMELEN]; snprintf(url, sizeof url, "%s", dir);
             size_t L = strlen(url); while (L > 1 && url[L - 1] == '/') url[--L] = 0;
