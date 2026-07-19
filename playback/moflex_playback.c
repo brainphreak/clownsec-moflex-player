@@ -1584,6 +1584,7 @@ static int64_t r3_audio_t0 = -1;   /* content ts of the first audio sample after
 static int64_t r3_av_skew = 0;     /* constant apos offset = audio_origin - video_origin */
 static int     r3_av_ready = 0;    /* r3_av_skew has been captured for this segment */
 static u64 r3_last;   /* last poll tick, for the phase-locked clock */
+static void r3_audio_close(void);   /* used by the setup failure path below */
 static void r3_audio_setup(int arate, int chn) {
     r3_arate = arate; r3_achn = chn; r3_awi = 0; r3_aplayed = 0; r3_apos = -1; r3_last = 0;
     r3_audio_t0 = -1; r3_av_skew = 0; r3_av_ready = 0;
