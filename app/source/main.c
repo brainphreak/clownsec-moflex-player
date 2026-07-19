@@ -58,7 +58,8 @@ static char  g_now_playing_path[PATHLEN + NAMELEN] = "";   /* full path, for res
 #define RECENT_FILE   "sdmc:/moflex_player/recent.txt"
 #define RECENT_MAX    20
 static void recent_add(const char *path) {   /* most-recent-first, deduped, capped */
-    char list[RECENT_MAX][PATHLEN + NAMELEN]; int n = 0;
+    static char list[RECENT_MAX][PATHLEN + NAMELEN];   /* static: 15KB would overflow the 3DS stack */
+    int n = 0;
     FILE *f = fopen(RECENT_FILE, "rb");
     if (f) {
         char ln[PATHLEN + NAMELEN];
@@ -1351,7 +1352,7 @@ static void lib_add_show(const char *dirpath, const CatEntry *src) { lib_add_sho
  * holding many shows (e.g. "SHOWS/") gets one entry per show via a virtual "<dir>/<Show>" key; a
  * single-show folder keeps the REAL folder as its url so existing artwork/info keys stay valid. */
 static void lib_add_shows_in_dir(const char *dir, const CatEntry *src) {
-    char pref[24][96]; int np = 0;
+    static char pref[24][96]; int np = 0;   /* static: called from deep scan recursion */
     DIR *d = opendir(dir);
     if (!d) return;
     struct dirent *e;
