@@ -1982,7 +1982,12 @@ static void download_screen(void) {
  * Returns the chosen index, or -1 on B/cancel. Draws the bottom screen only. */
 static int ui_menu(const char *title, const char *subtitle, const char *const *items, int n) {
     int sel = 0, redraw = 1, tdown = 0, tx0 = 0, ty0 = 0, tmoved = 0;
-    int bx = 24, bw = UI_W - 48, bh = 32, gap = 8, y0 = subtitle ? 74 : 62;
+    int bx = 24, bw = UI_W - 48, y0 = subtitle ? 74 : 62;
+    /* adaptive pitch: every item must fit on screen (6+ items overflowed the fixed 40px rows) */
+    int avail = 234 - y0;
+    int pitch = n > 0 ? avail / n : 40; if (pitch > 40) pitch = 40;
+    int bh = pitch - 6; if (bh > 32) bh = 32; if (bh < 16) bh = 16;
+    int gap = pitch - bh;
     while (aptMainLoop()) {
         hidScanInput();
         u32 k = hidKeysDown(), kh = hidKeysHeld(), ku = hidKeysUp();
