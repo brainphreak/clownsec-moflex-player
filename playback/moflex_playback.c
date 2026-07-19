@@ -1934,7 +1934,7 @@ static MoflexResult moflex_play_ring(const char *path) {
         u16 fw = 0, fh = 0; u8 *p;
         p = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, &fw, &fh);  if (p) memset(p, 0, (size_t)fw * fh * 3);
         p = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, &fw, &fh); if (p) memset(p, 0, (size_t)fw * fh * 3);
-        gfxFlushBuffers(); gfxSwapBuffers();
+        gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();   /* paced: unpaced swaps here crashed gsp */
     }
     /* GPU setup. On the Old 3DS the (unpinned) linear heap can be too small for citro3d's command
      * buffer or the screen targets -- and a FAILED C3D_Init followed by C2D drawing is a write to an
@@ -2193,7 +2193,35 @@ static MoflexResult moflex_play_ring(const char *path) {
         if (want_seek && !(kh & (KEY_LEFT | KEY_RIGHT))) {
             WORKER_LOCK();   /* blocks until the decode thread finishes its current pair and releases */
             if (dur_us > 0) { if (seek_to_us < 0) seek_to_us = 0; if (seek_to_us > dur_us) seek_to_us = dur_us; }
+            /* Land on the last KEYFRAME at/before the target. P-frames don't decode after a flush
+             * (references freed), so the old forward hunt started 3-20s LATE on sparse-keyframe
+             * encodes (reported: resume at 48:03 actually started ~48:20). Nintendo files land on
+             * keyframes directly (checked first, no extra reads); otherwise a bounded 20s back-
+             * window finds the last keyframe before the target -> resume starts slightly EARLY,
+             * like every streaming app. Validated in pc_verify/test_resume2.c. */
+            int64_t land_tgt = seek_to_us;
             do_seek(&m, &ctx, seek_to_us);
+            {
+                MfxPacket pk; int direct_kf = 0;
+                for (int g = 0; g < 200; g++) {
+                    if (mfx_next_packet(&m, &pk) != 1) break;
+                    if (m.streams[pk.stream_index].media_type != MFX_TYPE_VIDEO) continue;
+                    direct_kf = pk.keyframe; break;
+                }
+                if (!direct_kf) {
+                    int64_t back = seek_to_us - 20000000; if (back < 0) back = 0;
+                    do_seek(&m, &ctx, back);
+                    int64_t kf_marker = -1, cur_marker = m.ts;
+                    for (long g = 0; g < 60000; g++) {
+                        if (mfx_next_packet(&m, &pk) != 1) break;
+                        if (m.ts != cur_marker) { if (m.ts > seek_to_us) break; cur_marker = m.ts; }
+                        if (m.streams[pk.stream_index].media_type != MFX_TYPE_VIDEO) continue;
+                        if (pk.keyframe) kf_marker = cur_marker;
+                    }
+                    if (kf_marker >= 0) land_tgt = kf_marker;
+                }
+            }
+            do_seek(&m, &ctx, land_tgt);
             for (int i = rd; i < s.wr; i++) ready[i % NB] = 0;
             s.wr = 0; rd = 0; s.rd = 0; s.dpair = 0; s.skipping = 0; s.done = 0; s.has_pending = 0; last_shown = -1;
             r3_vq_clear();
@@ -2215,7 +2243,7 @@ static MoflexResult moflex_play_ring(const char *path) {
                  * R-first landing in movie.moflex resolves in ONE step (test_stereo13.c). The grid
                  * trust gate (eps 0.02, steps in -1..+1) keeps ms-rounded muxes untouched; swap
                  * routing remains only as a last resort. */
-                int64_t tgt = seek_to_us; int rfirst = 0;
+                int64_t tgt = land_tgt; int rfirst = 0;
                 double eye = (double)pair_dur * 0.5;   /* uniform now that tb_is_eye fixes pacing */
                 for (int attempt = 0; ; attempt++) {
                     int64_t land_ts = m.ts;
@@ -2439,7 +2467,7 @@ static MoflexResult moflex_play_ring(const char *path) {
             u16 fw = 0, fh = 0; u8 *p;
             p = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, &fw, &fh);  if (p) memset(p, 0, (size_t)fw * fh * 3);
             p = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, &fw, &fh); if (p) memset(p, 0, (size_t)fw * fh * 3);
-            gfxFlushBuffers(); gfxSwapBuffers();
+            gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();   /* paced: unpaced swaps here crashed gsp */
         }
     }
     av_frame_free(&fL); av_frame_free(&fR);
