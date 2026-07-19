@@ -2447,20 +2447,32 @@ static void startup_new_movie_check(void) {
                                         s_new_n, n1, n2);
     }
     if (prompt2("NEW VIDEOS", msg, "ADD", "LATER") != 0) { free(s_newlist); s_newlist = NULL; return; }
+    int before = g_lib_n;
     if (s_new_n <= NEWLIST_MAX) lib_add_new();   /* instant: append the found files, no second walk */
     else lib_rescan();                           /* too many to have tracked -> full rescan */
+    int added = g_lib_n - before; if (added < 0) added = 0;
 
-    /* offer art + info for the new arrivals that don't have any yet */
+    /* offer art + info for the new arrivals that don't have any yet. A recorded FOLDER maps to the
+     * show entries it produced (real url OR virtual "<dir>/<Show>" children). */
     static int idx[NEWLIST_MAX]; int ni = 0;
     int tracked = s_new_n < NEWLIST_MAX ? s_new_n : NEWLIST_MAX;
     for (int i = 0; i < tracked; i++) {
-        if (movieinfo_have(s_newlist[i])) continue;
-        for (int j = 0; j < g_lib_n; j++)
-            if (!strcmp(g_lib[j].url, s_newlist[i])) { idx[ni++] = j; break; }
+        size_t pl = strlen(s_newlist[i]);
+        for (int j = 0; j < g_lib_n && ni < NEWLIST_MAX; j++) {
+            int match = !strcmp(g_lib[j].url, s_newlist[i]) ||
+                        (g_lib[j].is_zip == 2 && !strncmp(g_lib[j].url, s_newlist[i], pl) && g_lib[j].url[pl] == '/');
+            if (!match || movieinfo_have(g_lib[j].url)) continue;
+            int dup = 0;
+            for (int k = 0; k < ni; k++) if (idx[k] == j) dup = 1;
+            if (!dup) idx[ni++] = j;
+        }
     }
     free(s_newlist); s_newlist = NULL;
-    if (ni == 0) return;
-    if (prompt2("GET INFO", "Download art & info?", "DOWNLOAD", "SKIP") == 0) lib_scrape_missing(idx, ni);
+    char am[96];
+    snprintf(am, sizeof am, "%d video%s added to the Library.", added, added == 1 ? "" : "s");
+    if (ni == 0) { msg_screen("NEW VIDEOS", am); return; }   /* always confirm what happened */
+    snprintf(am + strlen(am), sizeof am - strlen(am), "\nDownload art & info?");
+    if (prompt2("NEW VIDEOS", am, "DOWNLOAD", "SKIP") == 0) lib_scrape_missing(idx, ni);
 }
 
 /* Edit a library entry's info by hand (re-organize genres/categories on the console).
