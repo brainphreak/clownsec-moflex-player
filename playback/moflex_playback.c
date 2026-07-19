@@ -2018,10 +2018,11 @@ static MoflexResult moflex_play_ring(const char *path) {
     int64_t cur_us = 0, dur_us = m.duration_us, seek_to_us = 0; int want_seek = 0, shold = 0;
     int scrubbing = 0; int64_t scrub_us = 0;   /* touch-drag on the bar: preview while held, seek on release */
     int vol_drag = 0;                           /* touch-drag on the volume slider (applies live) */
+    int resume_exact = 0;                       /* resume only: decode forward to the EXACT saved second */
     g_submenu = 0; g_sub_sel = 0;               /* subtitle menu starts closed */
     g_touch_locked = 0; g_lock_toast = 0; g_backlight_on = 1;   /* touch unlocked, backlight on */
     int64_t rpos = resume_load(path), last_save = 0;
-    if (rpos > 3000000 && (dur_us <= 0 || rpos < dur_us - 10000000)) { seek_to_us = rpos; want_seek = 1; last_save = rpos; }
+    if (rpos > 3000000 && (dur_us <= 0 || rpos < dur_us - 10000000)) { seek_to_us = rpos; want_seek = 1; last_save = rpos; resume_exact = 1; }
     int vol_dirty = 0, save_pend = 0, save_delay = 0;
     char last_ts[64] = "", last_sub[256] = "";
     u64 r3_wall0 = 0; int r3_wallset = 0;                 /* fallback real-time clock when no audio */
@@ -2305,6 +2306,47 @@ static MoflexResult moflex_play_ring(const char *path) {
                     } else { g_y2r_start(fL, &r3_texL[0], W, H); g_y2r_wait(&r3_texL[0]); }
                     rts[0] = 0; bts[0] = lts; ready[0] = 1; s.wr = 1; s.dpair = 1; cur_us = lts; s.cur_us = lts;
                     break;
+                }
+            }
+            /* RESUME ONLY: the keyframe landing can be several seconds early on sparse-keyframe
+             * encodes. Decode forward (references live, no display) to the EXACT saved second,
+             * repainting the panel's bar as it advances. Capped at 30s of content. */
+            if (resume_exact) {
+                resume_exact = 0;
+                if (s.wr == 1 && cur_us < seek_to_us && seek_to_us - cur_us <= 30000000) {
+                    MfxPacket pk2; int64_t cts = cur_us, last_paint = cur_us; int aborted = 0;
+                    while (cts + pair_dur <= seek_to_us && !aborted) {
+                        int need = is3d ? 2 : 1;
+                        for (int e = 0; e < need && !aborted; e++) {
+                            for (;;) {
+                                if (mfx_next_packet(&m, &pk2) != 1) { aborted = 1; break; }
+                                if (m.streams[pk2.stream_index].media_type != MFX_TYPE_VIDEO) continue;
+                                AVPacket ap2; ap2.data = pk2.data; ap2.size = pk2.size;
+                                int gotf = 0;
+                                mobi_decode(&ctx, e == 0 ? fL : fR, &gotf, &ap2);
+                                break;   /* exactly one video packet per eye, decoded or not */
+                            }
+                        }
+                        if (aborted) break;
+                        cts = m.ts > cts ? m.ts : cts + pair_dur;
+                        if (cts - last_paint >= 1000000) {   /* live progress: the bar walks to the target */
+                            last_paint = cts;
+                            C3D_FrameBegin(0);
+                            C2D_TargetClear(topL, black); C2D_SceneBegin(topL);
+                            C2D_TargetClear(topR, black); C2D_SceneBegin(topR);
+                            g_panel_sw(bot, title, cts, dur_us, 1);
+                            C3D_FrameEnd(0);
+                        }
+                    }
+                    if (!aborted) {   /* re-Y2R the frame we actually reached into slot 0 */
+                        if (is3d) {
+                            C3D_Tex *tA = s.eye_swap ? &r3_texR[0] : &r3_texL[0];
+                            C3D_Tex *tB = s.eye_swap ? &r3_texL[0] : &r3_texR[0];
+                            g_y2r_start(fL, tA, W, H); g_y2r_wait(tA);
+                            g_y2r_start(fR, tB, W, H); g_y2r_wait(tB);
+                        } else { g_y2r_start(fL, &r3_texL[0], W, H); g_y2r_wait(&r3_texL[0]); }
+                        bts[0] = cts; cur_us = cts; s.cur_us = cts;
+                    }
                 }
             }
             s.paused = 0;
