@@ -56,6 +56,8 @@ typedef struct {
     int64_t  file_size;     /* size of the moflex window (whole file, or the region inside a CIA) */
     int64_t  base;          /* byte offset of the moflex within the file (0 = plain .moflex) */
     int64_t  duration_us;   /* estimated total duration (microseconds) */
+    int      tb_is_eye;     /* 3D: the declared timebase is the EYE-frame period (Nintendo files
+                               declare ~48-60 = the L+R packet rate), so a display PAIR lasts 2x it */
     int      audio_only;    /* if set, mfx_next_packet skips (seeks past) non-audio chunks */
 
     unsigned br_last, br_pos;  /* bit reader */

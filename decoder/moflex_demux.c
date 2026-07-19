@@ -287,14 +287,18 @@ int mfx_detect_stereo(MfxDemux *m) {
         if (m->ts - t0 >= 2000000) break;   /* 2s of content is plenty to see the 1x vs 2x ratio */
     }
     int stereo = 1;
+    m->tb_is_eye = 0;
     if (t0 >= 0 && m->ts > t0 && vc > 4) {
         double dfps = (double)vc / ((double)(m->ts - t0) / 1e6);
         /* Interleaved 3D shows up two ways depending on how the frame rate was declared:
          *  - our transcodes declare the DISPLAY rate (24-30) -> actual packet rate is ~2x it.
          *  - Nintendo's files declare the PACKET rate itself (~48-60 = L+R for 24-30fps) -> ratio ~1x,
-         *    but the declared rate is implausibly high for a real display rate on this hardware. */
-        stereo = (dfps / tbfps) > 1.5
-              || (tbfps >= 47.0 && dfps / tbfps > 0.75);   /* declared rate is actually the 2x packet rate */
+         *    but the declared rate is implausibly high for a real display rate on this hardware.
+         *    In that case the timebase is the EYE period: a display pair lasts 2x it (tb_is_eye,
+         *    else the player paces video at double speed and audio falls behind). */
+        if ((dfps / tbfps) > 1.5) stereo = 1;
+        else if (tbfps >= 47.0 && dfps / tbfps > 0.75) { stereo = 1; m->tb_is_eye = 1; }
+        else stereo = 0;
     }
     /* rewind demux to the start for playback */
     io_seek(m, 0, SEEK_SET);

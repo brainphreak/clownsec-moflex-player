@@ -1285,6 +1285,7 @@ static MoflexResult moflex_play_gpu(const char *path) {
         int64_t pd = (int64_t)m.streams[vi].tb_num * 1000000 / m.streams[vi].tb_den;
         if (pd >= 16000 && pd <= 100000) pair_dur = pd;
     }
+    if (is3d && m.tb_is_eye) pair_dur *= 2;   /* Nintendo declares the EYE rate: a pair lasts 2x */
 
     AVCodecContext ctx; memset(&ctx, 0, sizeof ctx);
     ctx.width = W; ctx.height = H; ctx.priv_data = calloc(1, mobi_ctx_size());
@@ -1888,6 +1889,7 @@ static MoflexResult moflex_play_ring(const char *path) {
         int64_t pd = (int64_t)m.streams[vi].tb_num * 1000000 / m.streams[vi].tb_den;
         if (pd >= 16000 && pd <= 100000) pair_dur = pd;
     }
+    if (is3d && m.tb_is_eye) pair_dur *= 2;   /* Nintendo declares the EYE rate: a pair lasts 2x */
 
     AVCodecContext ctx; memset(&ctx, 0, sizeof ctx);
     ctx.width = W; ctx.height = H; ctx.priv_data = calloc(1, mobi_ctx_size());
@@ -2198,23 +2200,22 @@ static MoflexResult moflex_play_ring(const char *path) {
                  * this can't stall the load like the old 20000-packet collection did.
                  * Validated (pc_verify/test_stereo11.c): movie.moflex 50/50 landings correct,
                  * our encodes 0 false swaps, max 173 packets peeked. */
+                /* eye period is uniformly pair_dur/2 now that tb_is_eye corrects the pacing */
                 MfxPacket pk; int64_t bt = m.ts; long cnt = 0; int nb = 0;
-                int okc[2] = { 1, 1 }, decided = 0;
-                for (long g = 0; g < 1500 && nb < 4 && !decided && (okc[0] || okc[1]); g++) {
+                int okc = 1, decided = 0;
+                double eye = (double)pair_dur * 0.5;
+                for (long g = 0; g < 1500 && nb < 4 && !decided && okc; g++) {
                     if (mfx_next_packet(&m, &pk) != 1) break;
                     if (m.streams[pk.stream_index].media_type != MFX_TYPE_VIDEO) continue;
                     if (m.ts != bt) {
-                        int64_t span = m.ts - bt; long c0 = cnt;
-                        for (int cand = 0; cand < 2 && !decided; cand++) {
-                            if (!okc[cand]) continue;
-                            double eye = cand ? (double)pair_dur * 0.5 : (double)pair_dur;
-                            double fx = (double)span / eye;
-                            long F = (long)(fx + 0.5);
-                            double d = fx - (double)F; if (d < 0) d = -d;
-                            if (d > 0.02) { okc[cand] = 0; continue; }
-                            int step = (int)(c0 - F);
+                        double fx = (double)(m.ts - bt) / eye;
+                        long F = (long)(fx + 0.5);
+                        double d = fx - (double)F; if (d < 0) d = -d;
+                        if (d > 0.02) okc = 0;                    /* inexact grid (ms-rounded mux) -> never swap */
+                        else {
+                            int step = (int)(cnt - F);
                             if (step == 1 || step == -1) { if (step == -1) s.eye_swap = 1; decided = 1; }
-                            else if (step != 0) okc[cand] = 0;
+                            else if (step != 0) okc = 0;          /* wild step -> distrust */
                         }
                         nb++; bt = m.ts; cnt = 0;
                     }
@@ -2837,6 +2838,7 @@ static MoflexResult moflex_play_soft(const char *path) {
     int64_t pair_dur = 40000;
     if (m.streams[vi].tb_den > 0) { int64_t pd = (int64_t)m.streams[vi].tb_num * 1000000 / m.streams[vi].tb_den;
         if (pd >= 16000 && pd <= 100000) pair_dur = pd; }
+    if (is3d && m.tb_is_eye) pair_dur *= 2;   /* Nintendo declares the EYE rate: a pair lasts 2x */
 
     AVCodecContext ctx; memset(&ctx, 0, sizeof ctx);
     ctx.width = W; ctx.height = H; ctx.priv_data = calloc(1, mobi_ctx_size());
