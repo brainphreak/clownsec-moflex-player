@@ -952,14 +952,18 @@ static int catalog_pick(const char *title, const char *subtitle, char items[][32
     int has_extra = (extra && extra[0]) ? 1 : 0;
     int total = n + (show_all ? 1 : 0) + has_extra;
     int sel = 0, top = 0, redraw = 1, td = 0, tx0 = 0, ty0 = 0, tsc0 = 0, tmv = 0;
+    int hfu = 0, hfd = 0;
     const int VIS = 5, ry0 = 54, rh = 30, gap = 4;
     while (aptMainLoop()) {
         hidScanInput();
         u32 k = hidKeysDown(), kh = hidKeysHeld(), ku = hidKeysUp();
         if (k & KEY_B) return -1;
         if (k & KEY_X) return -4;   /* search (callers that don't search treat it as back) */
-        if (k & KEY_DOWN) { if (sel < total - 1) sel++; redraw = 1; }
-        if (k & KEY_UP)   { if (sel > 0) sel--; redraw = 1; }
+        /* same fast navigation as the movie lists: hold to repeat, left/right = page jump */
+        if (nav_repeat(k, kh, NAV_DOWN, &hfd)) { if (sel < total - 1) sel++; redraw = 1; }
+        if (nav_repeat(k, kh, NAV_UP, &hfu))   { if (sel > 0) sel--; redraw = 1; }
+        if (k & KEY_RIGHT) { sel += VIS; if (sel > total - 1) sel = total - 1; redraw = 1; }
+        if (k & KEY_LEFT)  { sel -= VIS; if (sel < 0) sel = 0; redraw = 1; }
         int act = (k & KEY_A) ? sel : -1;
         touchPosition tp; hidTouchRead(&tp);
         if (k & KEY_TOUCH) { td = 1; tx0 = tp.px; ty0 = tp.py; tsc0 = top; tmv = 0; }
@@ -2130,12 +2134,13 @@ static int ui_menu(const char *title, const char *subtitle, const char *const *i
     int pitch = n > 0 ? avail / n : 40; if (pitch > 40) pitch = 40;
     int bh = pitch - 6; if (bh > 32) bh = 32; if (bh < 16) bh = 16;
     int gap = pitch - bh;
+    int hfu = 0, hfd = 0;
     while (aptMainLoop()) {
         hidScanInput();
         u32 k = hidKeysDown(), kh = hidKeysHeld(), ku = hidKeysUp();
         if (k & KEY_B) return -1;
-        if (k & KEY_DOWN) { sel = (sel + 1) % n; redraw = 1; }
-        if (k & KEY_UP)   { sel = (sel + n - 1) % n; redraw = 1; }
+        if (nav_repeat(k, kh, NAV_DOWN, &hfd)) { sel = (sel + 1) % n; redraw = 1; }
+        if (nav_repeat(k, kh, NAV_UP, &hfu))   { sel = (sel + n - 1) % n; redraw = 1; }
         if (k & KEY_A) return sel;
         touchPosition tp; hidTouchRead(&tp);
         if (k & KEY_TOUCH) { tdown = 1; tx0 = tp.px; ty0 = tp.py; tmoved = 0; }
