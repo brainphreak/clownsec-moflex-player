@@ -1927,6 +1927,15 @@ static MoflexResult moflex_play_ring(const char *path) {
      * its own console after moflex_play() returns, so this is safe). Restored the same way on exit. */
     gfxExit();
     gfxInitDefault();
+    /* Freshly allocated framebuffers hold GARBAGE, and the GPU setup below takes long enough for it
+     * to flash on screen (the brief bottom-screen glitch on open). Black out both buffers of both
+     * screens FIRST, before anything slow runs. */
+    for (int fb = 0; fb < 2; fb++) {
+        u16 fw = 0, fh = 0; u8 *p;
+        p = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, &fw, &fh);  if (p) memset(p, 0, (size_t)fw * fh * 3);
+        p = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, &fw, &fh); if (p) memset(p, 0, (size_t)fw * fh * 3);
+        gfxFlushBuffers(); gfxSwapBuffers();
+    }
     /* GPU setup. On the Old 3DS the (unpinned) linear heap can be too small for citro3d's command
      * buffer or the screen targets -- and a FAILED C3D_Init followed by C2D drawing is a write to an
      * unmapped target (the "data abort / write / translation section" crash). Check every step and
@@ -2416,7 +2425,15 @@ static MoflexResult moflex_play_ring(const char *path) {
     /* Hand a CLEAN gfx state back to the app ONLY when returning to it (BACK/OPEN). On EXIT the app is
      * closing -- doing gfxExit()+gfxInitDefault() during the applet close hangs on "closing software",
      * so skip it and let the process tear down. */
-    if (result != MOFLEX_QUIT_EXIT) { gfxExit(); gfxInitDefault(); }
+    if (result != MOFLEX_QUIT_EXIT) {
+        gfxExit(); gfxInitDefault();
+        for (int fb = 0; fb < 2; fb++) {   /* fresh buffers hold garbage: black them before the app repaints */
+            u16 fw = 0, fh = 0; u8 *p;
+            p = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, &fw, &fh);  if (p) memset(p, 0, (size_t)fw * fh * 3);
+            p = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, &fw, &fh); if (p) memset(p, 0, (size_t)fw * fh * 3);
+            gfxFlushBuffers(); gfxSwapBuffers();
+        }
+    }
     av_frame_free(&fL); av_frame_free(&fR);
     mobi_close(&ctx); free(ctx.priv_data); mfx_close(&m); fclose(f);
     return result;
