@@ -567,8 +567,8 @@ static void panel_lock_toast(void) {
     int bw = 184, bh = 42, bx = (UI_W - bw) / 2, by = (UI_H - bh) / 2;
     ui_fill_round(bx, by, bw, bh, 8, UI_BG2);
     ui_frame_round(bx, by, bw, bh, 8, UI_NEONC, 2);
-    ui_text_center(UI_W / 2, by + 8, 1, UI_NEONC, "TOUCH IS LOCKED");
-    ui_text_center(UI_W / 2, by + 24, 1, UI_INK, "Press L to unlock");
+    ui_text_center(UI_W / 2, by + 8, 1, UI_NEONC, "SCREEN IS LOCKED");
+    ui_text_center(UI_W / 2, by + 24, 1, UI_INK, "Press L + R to unlock");
 }
 
 static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing) {
@@ -632,7 +632,7 @@ static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing)
     ui_text(VOL_X - 16, VOL_Y - 12, 1, UI_INK, vs);   /* label above the slider (frees the button row) */
 
     /* action buttons: SAME row as the home screen (OPEN VIDEO / MANAGE / ADD VIDEO) */
-    ui_text(6, 190, 1, UI_INK, "Y=SUBS X=DARK A=PLAY L=LOCK");   /* key map (B=back is universal) */
+    ui_text(6, 190, 1, UI_INK, "Y=SUBS X=DARK A=PLAY L+R=LOCK");   /* key map (B=back is universal) */
     ui_button(BKB_X, BTN_Y, BKB_W, BTN_H, "OPEN VIDEO", 0, UI_NEON);
     ui_button(OPB_X, BTN_Y, OPB_W, BTN_H, "MANAGE",     0, UI_NEON);
     ui_button(EXB_X, BTN_Y, EXB_W, BTN_H, "ADD VIDEO",  0, UI_NEON);
@@ -2065,24 +2065,23 @@ static MoflexResult moflex_play_ring(const char *path) {
         touchPosition tp; hidTouchRead(&tp);
         g_ring_apt_playing = playing;   /* so the suspend hook resumes audio only if we were playing */
 
-        /* L toggles the touch lock (buttons always work; only touch is gated). */
-        if (kd & KEY_L) { g_touch_locked = !g_touch_locked; g_lock_toast = 0; dirty = 1; }
+        /* L+R together toggles the FULL lock: touch AND every button are dead while locked; only
+         * pressing L+R again unlocks. (L alone used to lock touch-only, but stray button presses
+         * were just as much of a problem in a pocket/bag.) */
+        if ((kh & KEY_L) && (kh & KEY_R) && (kd & (KEY_L | KEY_R))) {
+            g_touch_locked = !g_touch_locked; g_lock_toast = 0; dirty = 1; kd = 0; kh = 0;
+        }
+        if (g_touch_locked) {
+            if (kd) { g_lock_toast = 90; dirty = 1; }   /* any attempt -> flash WHY nothing responds */
+            kd = 0; kh = 0;                             /* fully inert (dark screen stays dark too) */
+        }
 
-        /* Dark bottom screen: ANY button wakes it; touching wakes it when unlocked, or (when locked)
-         * flashes the "touch locked" message. Either way a touch on the dark screen NEVER reaches the
-         * (invisible) controls. */
+        /* Dark bottom screen: ANY button wakes it; touching wakes it too. A touch on the dark
+         * screen NEVER reaches the (invisible) controls. */
         if (g_screen_off) {
             if (kd & ~KEY_TOUCH) { g_screen_off = 0; dirty = 1; kd = 0; }   /* a button woke it (consumed) */
-            else if (kd & KEY_TOUCH) {
-                if (g_touch_locked) g_lock_toast = 90;   /* stay dark; flash the message (backlight below) */
-                else g_screen_off = 0;                   /* touch woke it */
-                dirty = 1;
-            }
+            else if (kd & KEY_TOUCH) { g_screen_off = 0; dirty = 1; }       /* touch woke it */
             kd &= ~KEY_TOUCH; kh &= ~KEY_TOUCH;          /* touch on a dark screen drives no control */
-        }
-        else if (g_touch_locked) {                       /* lit + locked: touch only shows the message */
-            if (kd & KEY_TOUCH) { g_lock_toast = 90; dirty = 1; }
-            kd &= ~KEY_TOUCH; kh &= ~KEY_TOUCH;
         }
 
         if (g_lock_toast > 0) { g_lock_toast--; dirty = 1; }
