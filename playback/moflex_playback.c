@@ -2014,6 +2014,7 @@ static MoflexResult moflex_play_ring(const char *path) {
     int vol_dirty = 0, save_pend = 0, save_delay = 0;
     char last_ts[64] = "", last_sub[256] = "";
     u64 r3_wall0 = 0; int r3_wallset = 0;                 /* fallback real-time clock when no audio */
+    u64 pause_wall = 0;                                   /* when the pause began (clock re-anchor on resume) */
     C2D_Text tsub; int sub_valid = 0;                     /* cached parsed cue (re-parsed only on change) */
 
     /* profiler + CADENCE METER (v2/v3 = frames held 2/3 refreshes = good; bad = held 1 or 4+ = judder) */
@@ -2100,6 +2101,8 @@ static MoflexResult moflex_play_ring(const char *path) {
         if (kd & KEY_A) {
             if (s.done && (s.wr - rd) == 0) { seek_to_us = 0; want_seek = 1; }   /* at the end: replay */
             else { playing = !playing; if (have_audio) ndspChnSetPaused(0, !playing);
+                   if (!playing) pause_wall = osGetTime();
+                   else { r3_last = 0; if (r3_wallset) r3_wall0 += osGetTime() - pause_wall; }
                    s.paused = !playing; if (playing) LightEvent_Signal(&s.wake);
                    save_pend = !playing; save_delay = 30; }
         }
@@ -2130,6 +2133,8 @@ static MoflexResult moflex_play_ring(const char *path) {
                 vol_drag = 1;    /* begin volume drag; applies live (tracked in the vol block below) */
             } else if (py >= PLAY_CY - 20 && py <= PLAY_CY + 20 && px >= PLAY_CX - 20 && px <= PLAY_CX + 20) {
                 playing = !playing; if (have_audio) ndspChnSetPaused(0, !playing);
+                if (!playing) pause_wall = osGetTime();
+                else { r3_last = 0; if (r3_wallset) r3_wall0 += osGetTime() - pause_wall; }
                 s.paused = !playing; if (playing) LightEvent_Signal(&s.wake); save_pend = !playing; save_delay = 30;
             } else if (py >= PLAY_CY - 20 && py <= PLAY_CY + 20 && px >= RW_CX - 18 && px <= RW_CX + 18) {
                 seek_to_us = cur_us - 30000000; want_seek = 1;
@@ -2263,7 +2268,7 @@ static MoflexResult moflex_play_ring(const char *path) {
 
         if (kd) dirty = 1;   /* any control input -> repaint the held frame / panel */
 
-        if (have_audio) r3_audio_poll();   /* main thread owns the audio master clock (r3_apos) */
+        if (have_audio && playing) r3_audio_poll();   /* clock FROZEN while paused -> pause is instant */
 
         /* Old-3DS (not threaded): decode a pair INLINE here, once per iteration, when there's ring room.
          * (New-3DS does this on the decode thread instead.) */
@@ -2287,7 +2292,7 @@ static MoflexResult moflex_play_ring(const char *path) {
          * VSync instead of always the next one -- removes the occasional over-hold blip. */
         const int64_t VS_HALF = 8356;
         int show = -1;
-        if ((wr - rd) > 0 && ready[rd % NB]) {
+        if (playing && (wr - rd) > 0 && ready[rd % NB]) {
             /* Capture the A/V anchor ONCE, the first frame after audio re-locks: right now bts-rts equals
              * the true video origin (before any cadence drift). skew = audio_origin - video_origin, held
              * constant thereafter and ignored if implausibly large (bad/absent timestamps). */
@@ -2890,7 +2895,7 @@ static MoflexResult moflex_play_soft(const char *path) {
     if (rpos > 3000000 && (dur_us <= 0 || rpos < dur_us - 10000000)) { seek_to_us = rpos; want_seek = 1; last_save = rpos; }
     int vol_dirty = 0, save_pend = 0, save_delay = 0;
     MfxPacket pending;
-    u64 r3_wall0 = 0; int r3_wallset = 0;
+    u64 r3_wall0 = 0; int r3_wallset = 0; u64 pause_wall = 0;
     memset(sr_ready, 0, sizeof sr_ready);
     MoflexResult result = MOFLEX_QUIT_BACK;
 
@@ -2907,7 +2912,9 @@ static MoflexResult moflex_play_soft(const char *path) {
         if (kd & KEY_B) { result = MOFLEX_QUIT_BACK; break; }
         if (kd & KEY_A) {
             if (done && r3_vqc == 0 && (wr - rd) == 0) { seek_to_us = 0; want_seek = 1; }   /* at the end: replay */
-            else { playing = !playing; if (have_audio) ndspChnSetPaused(0, !playing); dirty = 1; save_pend = !playing; save_delay = 30; }
+            else { playing = !playing; if (have_audio) ndspChnSetPaused(0, !playing); dirty = 1; save_pend = !playing; save_delay = 30;
+                    if (!playing) pause_wall = osGetTime();
+                    else { r3_last = 0; if (r3_wallset) r3_wall0 += osGetTime() - pause_wall; } }
         }
         if (kd & KEY_UP)   { int s = (int)(g_vol / 0.25f + 0.0001f); g_vol = (s + 1) * 0.25f; if (g_vol > 4.0f) g_vol = 4.0f; vol_dirty = 1; dirty = 1; }
         if (kd & KEY_DOWN) { int s = (int)(g_vol / 0.25f + 0.9999f); g_vol = (s - 1) * 0.25f; if (g_vol < 0.25f) g_vol = 0.25f; vol_dirty = 1; dirty = 1; }
@@ -2934,7 +2941,9 @@ static MoflexResult moflex_play_soft(const char *path) {
                     if (have_audio) ndspChnSetPaused(0, !playing); dirty = 1;
                     if (!playing) { want_seek = 1; seek_to_us = cur_us; }
                 } else if (py >= PLAY_CY - 20 && py <= PLAY_CY + 20) {
-                    if (px >= PLAY_CX - 20 && px <= PLAY_CX + 20) { playing = !playing; if (have_audio) ndspChnSetPaused(0, !playing); dirty = 1; save_pend = !playing; save_delay = 30; }
+                    if (px >= PLAY_CX - 20 && px <= PLAY_CX + 20) { playing = !playing; if (have_audio) ndspChnSetPaused(0, !playing); dirty = 1; save_pend = !playing; save_delay = 30;
+                    if (!playing) pause_wall = osGetTime();
+                    else { r3_last = 0; if (r3_wallset) r3_wall0 += osGetTime() - pause_wall; } }
                     else if (px >= RW_CX - 18 && px <= RW_CX + 18) { seek_to_us = cur_us - 30000000; want_seek = 1; }
                     else if (px >= FF_CX - 18 && px <= FF_CX + 18) { seek_to_us = cur_us + 30000000; want_seek = 1; }
                 } else if (py >= BTN_Y && py < BTN_Y + BTN_H) {
@@ -3005,7 +3014,7 @@ static MoflexResult moflex_play_soft(const char *path) {
         }
 
         if (have_audio && !gated && playing && wr >= PRIME) { gated = 1; ndspChnSetPaused(0, false); r3_apos = 0; }
-        if (have_audio) r3_audio_poll();
+        if (have_audio && playing) r3_audio_poll();   /* clock frozen while paused -> instant pause */
 
         int64_t apos;
         if (have_audio) apos = r3_apos;
@@ -3013,7 +3022,7 @@ static MoflexResult moflex_play_soft(const char *path) {
                apos = r3_wallset ? (int64_t)(osGetTime() - r3_wall0) * 1000 : -1; }
 
         int show = -1;
-        if ((wr - rd) > 0 && sr_ready[rd % SR_NB]) {
+        if (playing && (wr - rd) > 0 && sr_ready[rd % SR_NB]) {
             if (!have_anchor) { v_anchor = sr_rts[rd % SR_NB]; have_anchor = 1; }
             while ((wr - rd) > 1 && sr_ready[(rd + 1) % SR_NB] && (sr_rts[(rd + 1) % SR_NB] - v_anchor) <= apos) { sr_ready[rd % SR_NB] = 0; rd++; }
             if (apos < 0) { if (last_shown < 0) show = rd % SR_NB; }
