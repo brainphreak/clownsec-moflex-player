@@ -2080,6 +2080,13 @@ static MoflexResult moflex_play_ring(const char *path) {
         u32 kd = hidKeysDown(), kh = hidKeysHeld();
         touchPosition tp; hidTouchRead(&tp);
         g_ring_apt_playing = playing;   /* so the suspend hook resumes audio only if we were playing */
+        if (g_ring_apt_redraw) {        /* back from HOME/sleep: the suspend hook turned 3D OFF for the
+                                         * applet -- re-enable it (this was never consumed: 3D stayed
+                                         * flat after lid close/HOME until the movie was re-entered) */
+            g_ring_apt_redraw = 0;
+            gfxSet3D(is3d);
+            dirty = 1;
+        }
 
         /* L+R together toggles the FULL lock: touch AND every button are dead while locked; only
          * pressing L+R again unlocks. (L alone used to lock touch-only, but stray button presses
