@@ -55,6 +55,27 @@ static char  cwd[PATHLEN] = "sdmc:/";
 static char  g_now_playing[NAMELEN] = "";   /* last-played movie name (ext hidden, for GUI title) */
 static char  g_now_playing_path[PATHLEN + NAMELEN] = "";   /* full path, for resume from home */
 #define LASTPLAY_FILE "sdmc:/moflex_player/lastplay.txt"
+#define RECENT_FILE   "sdmc:/moflex_player/recent.txt"
+#define RECENT_MAX    20
+static void recent_add(const char *path) {   /* most-recent-first, deduped, capped */
+    char list[RECENT_MAX][PATHLEN + NAMELEN]; int n = 0;
+    FILE *f = fopen(RECENT_FILE, "rb");
+    if (f) {
+        char ln[PATHLEN + NAMELEN];
+        while (n < RECENT_MAX && fgets(ln, sizeof ln, f)) {
+            char *nl = strchr(ln, '\n'); if (nl) *nl = 0;
+            if (!ln[0] || !strcmp(ln, path)) continue;
+            snprintf(list[n++], sizeof list[0], "%s", ln);
+        }
+        fclose(f);
+    }
+    mkdir("sdmc:/moflex_player", 0777);
+    f = fopen(RECENT_FILE, "wb");
+    if (!f) return;
+    fprintf(f, "%s\n", path);
+    for (int i = 0; i < n && i < RECENT_MAX - 1; i++) fprintf(f, "%s\n", list[i]);
+    fclose(f);
+}
 static void lastplay_save(const char *path) {   /* remember across app restarts */
     mkdir("sdmc:/moflex_player", 0777);
     FILE *f = fopen(LASTPLAY_FILE, "wb");
@@ -2610,6 +2631,7 @@ static MoflexResult play_movie(const char *path) {
     }
     snprintf(g_now_playing_path, sizeof(g_now_playing_path), "%s", path);
     lastplay_save(path);   /* survive app restarts */
+    recent_add(path);      /* RECENTLY PLAYED list */
     { const char *base = strrchr(title_src, '/'); base = base ? base + 1 : title_src;
       snprintf(g_now_playing, sizeof(g_now_playing), "%s", base);
       size_t L = strlen(g_now_playing);   /* hide extension in the title */
@@ -3105,24 +3127,51 @@ static int home_gui(void) {
 }
 
 /* OPEN VIDEO chooser: Library (categorized) or Filesystem (folders). Returns 0 = back, 1 = Library, -1 = cancel. */
+/* pick from the recently-played list (most recent first; missing files pruned). 1 = picked. */
+static int recent_pick(char *out, size_t cap) {
+    static char paths[RECENT_MAX][PATHLEN + NAMELEN];
+    static char names[RECENT_MAX][32]; int n = 0;
+    FILE *f = fopen(RECENT_FILE, "rb");
+    if (f) {
+        char ln[PATHLEN + NAMELEN];
+        while (n < RECENT_MAX && fgets(ln, sizeof ln, f)) {
+            char *nl = strchr(ln, '\n'); if (nl) *nl = 0;
+            struct stat st;
+            if (!ln[0] || stat(ln, &st)) continue;   /* deleted since -> drop from the list */
+            snprintf(paths[n], sizeof paths[0], "%s", ln);
+            const char *b = strrchr(ln, '/'); b = b ? b + 1 : ln;
+            char nm[64]; snprintf(nm, sizeof nm, "%s", b); strip_ext(nm);
+            snprintf(names[n], 32, "%.31s", nm); n++;
+        }
+        fclose(f);
+    }
+    if (n == 0) { msg_screen("RECENTLY PLAYED", "Nothing played yet."); return 0; }
+    int c = catalog_pick("RECENTLY PLAYED", NULL, names, n, 0, NULL);
+    if (c < 0) return 0;
+    snprintf(out, cap, "%s", paths[c]);
+    return 1;
+}
+
 static int open_pick(void) {
     int sel = 0, redraw = 1;
     while (aptMainLoop()) {
         hidScanInput();
         u32 k = hidKeysDown();
         if (k & KEY_B) return -1;
-        if (k & (KEY_DOWN | KEY_RIGHT)) { sel = 1; redraw = 1; }
-        if (k & (KEY_UP | KEY_LEFT))    { sel = 0; redraw = 1; }
+        if (k & (KEY_DOWN | KEY_RIGHT)) { if (sel < 2) sel++; redraw = 1; }
+        if (k & (KEY_UP | KEY_LEFT))    { if (sel > 0) sel--; redraw = 1; }
         if (k & KEY_A) return sel;
         if (k & KEY_TOUCH) { touchPosition tp; hidTouchRead(&tp);
-            if (tp.py >= 66 && tp.py < 118)  return 0;
-            if (tp.py >= 134 && tp.py < 186) return 1; }
+            if (tp.py >= 52 && tp.py < 100)  return 0;
+            if (tp.py >= 112 && tp.py < 160) return 1;
+            if (tp.py >= 172 && tp.py < 220) return 2; }
         if (redraw) {
             ui_begin(GFX_BOTTOM);
             ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
-            ui_text_center(UI_W / 2, 18, 2, UI_NEON, "OPEN VIDEO");
-            ui_button(34, 66, UI_W - 68, 52, "LIBRARY", sel == 0, UI_NEON);
-            ui_button(34, 134, UI_W - 68, 52, "FILESYSTEM", sel == 1, UI_NEONP);
+            ui_text_center(UI_W / 2, 16, 2, UI_NEON, "OPEN VIDEO");
+            ui_button(34,  52, UI_W - 68, 48, "LIBRARY",         sel == 0, UI_NEON);
+            ui_button(34, 112, UI_W - 68, 48, "FILESYSTEM",      sel == 1, UI_NEONP);
+            ui_button(34, 172, UI_W - 68, 48, "RECENTLY PLAYED", sel == 2, UI_NEONC);
             ui_present(); redraw = 0;
         }
         gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
@@ -3140,6 +3189,7 @@ static int open_video(char *out, size_t cap) {
         int pick = open_pick();
         if (pick < 0) return 0;                                 /* back -> home */
         if (pick == 0) { if (library_view(out, cap)) { s_pick_origin = PLAY_FROM_LIBRARY; return 2; } }
+        else if (pick == 2) { if (recent_pick(out, cap)) { s_pick_origin = PLAY_FROM_BROWSER; return 2; } }
         else { int r = browser(MODE_PLAY, out, cap);            /* Filesystem */
                if (r == 1) return 1;
                if (r == 2) { s_pick_origin = PLAY_FROM_BROWSER; return 2; } }   /* r==0 backed out -> chooser */
