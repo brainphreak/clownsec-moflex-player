@@ -3258,7 +3258,7 @@ static int open_pick(void) {
 
 /* OPEN VIDEO: pick a source, then a movie. Returns 0 = home, 1 = exit app, 2 = play out[]. */
 /* where the last picked movie came from, so BACK in the player returns to the right place */
-enum { PLAY_FROM_BROWSER = 0, PLAY_FROM_HOME = 1, PLAY_FROM_LIBRARY = 2 };
+enum { PLAY_FROM_BROWSER = 0, PLAY_FROM_HOME = 1, PLAY_FROM_LIBRARY = 2, PLAY_FROM_RECENT = 3 };
 static int s_pick_origin = PLAY_FROM_BROWSER;
 
 static int open_video(char *out, size_t cap) {
@@ -3266,7 +3266,7 @@ static int open_video(char *out, size_t cap) {
         int pick = open_pick();
         if (pick < 0) return 0;                                 /* back -> home */
         if (pick == 0) { if (library_view(out, cap)) { s_pick_origin = PLAY_FROM_LIBRARY; return 2; } }
-        else if (pick == 2) { if (recent_pick(out, cap)) { s_pick_origin = PLAY_FROM_BROWSER; return 2; } }
+        else if (pick == 2) { if (recent_pick(out, cap)) { s_pick_origin = PLAY_FROM_RECENT; return 2; } }
         else { int r = browser(MODE_PLAY, out, cap);            /* Filesystem */
                if (r == 1) return 1;
                if (r == 2) { s_pick_origin = PLAY_FROM_BROWSER; return 2; } }   /* r==0 backed out -> chooser */
@@ -3305,6 +3305,10 @@ static int play_and_handle(const char *path, int origin) {
         }
         if (r == MOFLEX_QUIT_BACK) {
             if (origin == PLAY_FROM_HOME) return 0;              /* back IS the home screen */
+            if (origin == PLAY_FROM_RECENT) {                    /* back to the recents list */
+                if (recent_pick(np, sizeof np)) { r = play_movie(np); continue; }
+                return 0;                                        /* backed out of recents -> home */
+            }
             if (origin == PLAY_FROM_LIBRARY) {                   /* back to the EXACT library list */
                 if (lib_resume_list(np, sizeof np)) { r = play_movie(np); continue; }
                 if (library_view(np, sizeof np)) { r = play_movie(np); continue; }   /* list backed out -> categories */
