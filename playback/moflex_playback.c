@@ -1708,11 +1708,13 @@ static int64_t r3_bts[R3_NB_MAX];   /* absolute movie time (m.ts) for subs/seekb
 static void r3_draw_sub(C2D_Text *t, int dx, u32 col, u32 outline) {
     float sc = 0.5f + 0.25f * (float)(g_sub_size - 1);   /* 1->0.5  2->0.75  3->1.0 */
     float w = 0, h = 0; C2D_TextGetDimensions(t, sc, sc, &w, &h);
-    float x = (SCR_W - w) * 0.5f + (float)dx;
+    /* AlignCenter centers EVERY line of a multi-line cue (block-left positioning made 2-line
+     * cues look left-aligned); x is then the center line, not the left edge */
+    float x = SCR_W * 0.5f + (float)dx;
     float y = g_sub_top ? 8.0f : (SCR_H - h - 10.0f);
     for (int oy = -1; oy <= 1; oy++) for (int ox = -1; ox <= 1; ox++)
-        if (ox || oy) C2D_DrawText(t, C2D_WithColor, x + ox, y + oy, 0, sc, sc, outline);
-    C2D_DrawText(t, C2D_WithColor, x, y, 0, sc, sc, col);
+        if (ox || oy) C2D_DrawText(t, C2D_WithColor | C2D_AlignCenter, x + ox, y + oy, 0, sc, sc, outline);
+    C2D_DrawText(t, C2D_WithColor | C2D_AlignCenter, x, y, 0, sc, sc, col);
 }
 
 /* HOME/sleep handling for the GPU ring path. Without releasing Y2R before the applet takes the GPU,

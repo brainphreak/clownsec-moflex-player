@@ -54,6 +54,28 @@ static int   nentries;
 static char  cwd[PATHLEN] = "sdmc:/";
 static char  g_now_playing[NAMELEN] = "";   /* last-played movie name (ext hidden, for GUI title) */
 static char  g_now_playing_path[PATHLEN + NAMELEN] = "";   /* full path, for resume from home */
+#define LASTPLAY_FILE "sdmc:/moflex_player/lastplay.txt"
+static void lastplay_save(const char *path) {   /* remember across app restarts */
+    mkdir("sdmc:/moflex_player", 0777);
+    FILE *f = fopen(LASTPLAY_FILE, "wb");
+    if (f) { fprintf(f, "%s\n", path); fclose(f); }
+}
+static void lastplay_restore(void) {   /* home screen boots with the last movie loaded on PLAY */
+    FILE *f = fopen(LASTPLAY_FILE, "rb");
+    if (!f) return;
+    char pth[PATHLEN + NAMELEN] = "";
+    if (fgets(pth, sizeof pth, f)) { char *nl = strchr(pth, '\n'); if (nl) *nl = 0; }
+    fclose(f);
+    struct stat st;
+    if (!pth[0] || stat(pth, &st)) return;         /* file gone -> nothing to restore */
+    snprintf(g_now_playing_path, sizeof g_now_playing_path, "%s", pth);
+    const char *base = strrchr(pth, '/'); base = base ? base + 1 : pth;
+    snprintf(g_now_playing, sizeof g_now_playing, "%s", base);
+    size_t L = strlen(g_now_playing);
+    if (L > 7 && !strcasecmp(g_now_playing + L - 7, ".moflex")) g_now_playing[L - 7] = 0;
+    else if (L > 4 && !strcasecmp(g_now_playing + L - 4, ".zip")) g_now_playing[L - 4] = 0;
+    else if (L > 4 && !strcasecmp(g_now_playing + L - 4, ".cia")) g_now_playing[L - 4] = 0;
+}
 static int   sel = 0, scroll = 0;
 static char  s_presel[NAMELEN] = "";   /* entry to highlight on the next browser() entry (BACK from player) */
 
@@ -2587,6 +2609,7 @@ static MoflexResult play_movie(const char *path) {
         cia_set_selection(path, list[sel].off, list[sel].size, title_src == titlebuf ? titlebuf : NULL);
     }
     snprintf(g_now_playing_path, sizeof(g_now_playing_path), "%s", path);
+    lastplay_save(path);   /* survive app restarts */
     { const char *base = strrchr(title_src, '/'); base = base ? base + 1 : title_src;
       snprintf(g_now_playing, sizeof(g_now_playing), "%s", base);
       size_t L = strlen(g_now_playing);   /* hide extension in the title */
@@ -3191,6 +3214,7 @@ int main(void) {
     branding_show();                                  /* 3D CLOWNSEC logo on top */
 
     startup_new_movie_check();   /* movies added outside the app -> offer rescan (+ art/info) */
+    lastplay_restore();          /* home boots with the last-played movie ready on PLAY */
 
     int running = 1;
     while (running && aptMainLoop()) {
