@@ -1645,8 +1645,13 @@ static void lib_add_extracted(const char *folder, const CatEntry *src) {
  * returns LL_BACK (back a level), LL_PLAY (out[] set), or LL_RESCAN (X). */
 enum { LL_BACK = 0, LL_PLAY = 1, LL_RESCAN = 2 };
 static char s_lib_search[64] = "";   /* active library search query ("" = off) */
+static char s_lib_last_cat[32] = "", s_lib_last_genre[32] = "";   /* filters of the last list shown */
+static char s_lib_presel[PATHLEN + NAMELEN] = "";                 /* highlight this url on next list open */
 static int lib_idxbuf[LIB_MAX];
 static int library_list(const char *filt_cat, const char *filt_genre, u16 *poster, int *sortmode, char *out, size_t cap) {
+    /* remember where we are so BACK from the player can reopen this exact list */
+    snprintf(s_lib_last_cat, sizeof s_lib_last_cat, "%s", filt_cat);
+    snprintf(s_lib_last_genre, sizeof s_lib_last_genre, "%s", filt_genre);
 ll_rebuild:;   /* X-search inside the list jumps back here with s_lib_search set */
     int *idx = lib_idxbuf, ni = 0;
     for (int i = 0; i < g_lib_n; i++) {
@@ -1663,6 +1668,15 @@ ll_rebuild:;   /* X-search inside the list jumps back here with s_lib_search set
     g_scat = g_lib; g_smode = *sortmode; qsort(idx, ni, sizeof(int), idx_cmp);
 
     int csel = 0, cscroll = 0, redraw = 1, hfu = 0, hfd = 0;
+    if (s_lib_presel[0]) {   /* BACK from the player: highlight the movie that was playing */
+        for (int i = 0; i < ni; i++) {
+            CatEntry *e = &g_lib[idx[i]];
+            size_t ul = strlen(e->url);
+            if (!strcmp(e->url, s_lib_presel) ||   /* exact, or the SHOW folder of a played episode */
+                (e->is_zip == 2 && !strncmp(s_lib_presel, e->url, ul) && s_lib_presel[ul] == '/')) { csel = i; break; }
+        }
+        s_lib_presel[0] = 0;   /* one-shot (the follow logic scrolls it into view) */
+    }
     int shown = -1, phave = 0, settle = 0;
     int td = 0, tx0 = 0, ty0 = 0, tsc0 = 0, tmv = 0, tbar = 0, result = -1, marq_off = 0;
     while (aptMainLoop() && result < 0) {
@@ -3060,6 +3074,20 @@ static int open_video(char *out, size_t cap) {
  *  - OPEN VIDEO -> the source chooser (Library / Filesystem).
  *  - MANAGE     -> the manage browser, then home.
  *  - ADD VIDEO  -> the add-video menu (download / upload), then home. */
+/* Reopen the library EXACTLY where the last movie was picked: same category/genre list, that
+ * movie highlighted and scrolled into view. 1 = picked another movie (out set), 0 = backed out. */
+static int lib_resume_list(char *out, size_t cap) {
+    if (lib_load() == 0) return 0;
+    gfxSet3D(false);
+    u16 *poster = (u16 *)malloc((size_t)POSTER_W * POSTER_H * sizeof(u16));
+    int sortmode = 0;
+    snprintf(s_lib_presel, sizeof s_lib_presel, "%s", g_now_playing_path);
+    int r = library_list(s_lib_last_cat, s_lib_last_genre, poster, &sortmode, out, cap);
+    branding_show();
+    free(poster);
+    return r == LL_PLAY;
+}
+
 static int play_and_handle(const char *path, int origin) {
     MoflexResult r = play_movie(path);
     for (;;) {
@@ -3072,8 +3100,9 @@ static int play_and_handle(const char *path, int origin) {
         }
         if (r == MOFLEX_QUIT_BACK) {
             if (origin == PLAY_FROM_HOME) return 0;              /* back IS the home screen */
-            if (origin == PLAY_FROM_LIBRARY) {                   /* back to the library */
-                if (library_view(np, sizeof np)) { r = play_movie(np); continue; }
+            if (origin == PLAY_FROM_LIBRARY) {                   /* back to the EXACT library list */
+                if (lib_resume_list(np, sizeof np)) { r = play_movie(np); continue; }
+                if (library_view(np, sizeof np)) { r = play_movie(np); continue; }   /* list backed out -> categories */
                 return 0;                                        /* backed out of the library -> home */
             }
             if (g_now_playing_path[0]) browser_preselect_path(g_now_playing_path);   /* highlight that movie */
