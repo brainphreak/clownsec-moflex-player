@@ -2088,8 +2088,10 @@ static MoflexResult moflex_play_ring(const char *path) {
         /* Dark bottom screen: ANY button wakes it; touching wakes it too. A touch on the dark
          * screen NEVER reaches the (invisible) controls. */
         if (g_screen_off) {
-            if (kd & ~KEY_TOUCH) { g_screen_off = 0; dirty = 1; kd = 0; }   /* a button woke it (consumed) */
-            else if (kd & KEY_TOUCH) { g_screen_off = 0; dirty = 1; }       /* touch woke it */
+            /* L/R never wake it: they're the lock combo, and its first key would light the screen
+             * before the second key completes the lock */
+            if (kd & ~(KEY_TOUCH | KEY_L | KEY_R)) { g_screen_off = 0; dirty = 1; kd = 0; }   /* button woke it */
+            else if (kd & KEY_TOUCH) { g_screen_off = 0; dirty = 1; }                          /* touch woke it */
             kd &= ~KEY_TOUCH; kh &= ~KEY_TOUCH;          /* touch on a dark screen drives no control */
         }
 
