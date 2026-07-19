@@ -2320,11 +2320,51 @@ static void startup_new_movie_check(void) {
     if (prompt2("GET INFO", "Download art & info?", "DOWNLOAD", "SKIP") == 0) lib_scrape_missing(idx, ni);
 }
 
+/* Edit a library entry's info by hand (re-organize genres/categories on the console).
+ * Fields edit via the keyboard (pre-filled); SAVE persists to the .nfo (poster untouched). */
+static void lib_edit_menu(int li) {
+    if (li < 0 || li >= g_lib_n) return;
+    CatEntry e = g_lib[li];   /* edit a copy; nothing changes until SAVE */
+    for (;;) {
+        char i0[48], i1[44], i2[48], i3[24];
+        snprintf(i0, sizeof i0, "Name: %.36s", e.name);
+        snprintf(i1, sizeof i1, "Category: %.28s", e.category);
+        snprintf(i2, sizeof i2, "Genres: %.34s", e.genres);
+        snprintf(i3, sizeof i3, "Year: %d", e.year);
+        const char *items[6] = { i0, i1, i2, i3, "SAVE", "Cancel" };
+        int c = ui_menu("EDIT INFO", e.fname, items, 6);
+        if (c < 0 || c == 5) return;
+        if (c == 4) {
+            movieinfo_save(e.url, &e, NULL, 0, 0);   /* NULL poster = keep the existing art */
+            lib_refresh_entry(li);
+            lib_save_cache();
+            msg_screen("EDIT INFO", "Saved.");
+            return;
+        }
+        SwkbdState s;
+        char buf[160]; char yb[8];
+        if (c == 3) { swkbdInit(&s, SWKBD_TYPE_NUMPAD, 1, 4); snprintf(yb, sizeof yb, "%d", e.year); swkbdSetInitialText(&s, yb); }
+        else {
+            swkbdInit(&s, SWKBD_TYPE_NORMAL, 2, -1);
+            swkbdSetInitialText(&s, c == 0 ? e.name : c == 1 ? e.category : e.genres);
+        }
+        swkbdSetHintText(&s, c == 0 ? "Name" : c == 1 ? "Category (e.g. Movies, TV Shows)"
+                          : c == 2 ? "Genres (comma separated)" : "Year");
+        if (swkbdInputText(&s, buf, sizeof buf) != SWKBD_BUTTON_RIGHT) continue;
+        if (c == 0 && buf[0]) { snprintf(e.name, sizeof e.name, "%s", buf);
+                                snprintf(e.title, sizeof e.title, "%s", buf); }   /* title is what persists */
+        else if (c == 1 && buf[0]) snprintf(e.category, sizeof e.category, "%s", buf);
+        else if (c == 2) snprintf(e.genres, sizeof e.genres, "%s", buf);
+        else if (c == 3) e.year = atoi(buf);
+    }
+}
+
 static void lib_getinfo_menu(int *idx, int ni, int csel) {
-    const char *items[3] = { "This movie", "All here (missing only)", "Cancel" };
-    int c = ui_menu("GET INFO", g_lib[idx[csel]].name, items, 3);
+    const char *items[4] = { "This movie", "All here (missing only)", "Edit info", "Cancel" };
+    int c = ui_menu("GET INFO", g_lib[idx[csel]].name, items, 4);
     if (c == 0) lib_scrape_one(idx[csel]);
     else if (c == 1) lib_scrape_missing(idx, ni);
+    else if (c == 2) lib_edit_menu(idx[csel]);
 }
 
 /* GET INFO chooser (X in Open Video): fetch metadata for just this movie, or every movie in
