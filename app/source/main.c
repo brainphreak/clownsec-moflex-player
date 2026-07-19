@@ -51,6 +51,11 @@ typedef struct { char name[NAMELEN]; int is_dir; } Entry;
 
 static Entry entries[MAXE];
 static int   nentries;
+/* The libctru default main stack is 32KB -- too tight for our UI call chains (home -> library ->
+ * list -> episode picker, each with path buffers). Crashes showed up as random faults in
+ * whichever screen happened to be deepest. 128KB gives ample headroom. */
+unsigned int __stacksize__ = 128 * 1024;
+
 static char  cwd[PATHLEN] = "sdmc:/";
 static char  g_now_playing[NAMELEN] = "";   /* last-played movie name (ext hidden, for GUI title) */
 static char  g_now_playing_path[PATHLEN + NAMELEN] = "";   /* full path, for resume from home */
