@@ -2206,37 +2206,43 @@ static MoflexResult moflex_play_ring(const char *path) {
              * Peek forward counting blocks, then re-seek to the landing for the real prime. */
             s.eye_swap = 0;
             if (is3d) {
-                /* Judge each block AS IT ARRIVES under BOTH timebase conventions (Nintendo tb =
-                 * EYE period; our encoder tb = PAIR period), and stop the instant both die or a
-                 * verdict lands. A candidate is trusted only if every span sits exactly on its
-                 * frame grid (eps 0.02; ms-rounded muxes drift and are rejected) with steps in
-                 * -1..+1; the first exact +-1 pins the landing parity, anything else = no swap.
-                 * Tight caps: our files kill both candidates after ONE block (~100 packets), so
-                 * this can't stall the load like the old 20000-packet collection did.
-                 * Validated (pc_verify/test_stereo11.c): movie.moflex 50/50 landings correct,
-                 * our encodes 0 false swaps, max 173 packets peeked. */
-                /* eye period is uniformly pair_dur/2 now that tb_is_eye corrects the pacing */
-                MfxPacket pk; int64_t bt = m.ts; long cnt = 0; int nb = 0;
-                int okc = 1, decided = 0;
-                double eye = (double)pair_dur * 0.5;
-                for (long g = 0; g < 1500 && nb < 4 && !decided && okc; g++) {
-                    if (mfx_next_packet(&m, &pk) != 1) break;
-                    if (m.streams[pk.stream_index].media_type != MFX_TYPE_VIDEO) continue;
-                    if (m.ts != bt) {
-                        double fx = (double)(m.ts - bt) / eye;
-                        long F = (long)(fx + 0.5);
-                        double d = fx - (double)F; if (d < 0) d = -d;
-                        if (d > 0.02) okc = 0;                    /* inexact grid (ms-rounded mux) -> never swap */
-                        else {
-                            int step = (int)(cnt - F);
-                            if (step == 1 || step == -1) { if (step == -1) s.eye_swap = 1; decided = 1; }
-                            else if (step != 0) okc = 0;          /* wild step -> distrust */
+                /* A landing that starts on a RIGHT eye would pair R(t) with L(t+1) -- eyes from
+                 * ADJACENT pairs, a visible 33ms offset between the eyes (reported: "left 34L with
+                 * right 35R"). Instead: detect R-first and STEP THE SEEK BACK one block (~1s) to an
+                 * L-first boundary -- intact pairs, clean keyframe, no swap. Validated: every
+                 * R-first landing in movie.moflex resolves in ONE step (test_stereo13.c). The grid
+                 * trust gate (eps 0.02, steps in -1..+1) keeps ms-rounded muxes untouched; swap
+                 * routing remains only as a last resort. */
+                int64_t tgt = seek_to_us; int rfirst = 0;
+                double eye = (double)pair_dur * 0.5;   /* uniform now that tb_is_eye fixes pacing */
+                for (int attempt = 0; ; attempt++) {
+                    int64_t land_ts = m.ts;
+                    MfxPacket pk; int64_t bt = m.ts; long cnt = 0; int nb = 0;
+                    int okc = 1, decided = 0;
+                    rfirst = 0;
+                    for (long g = 0; g < 1500 && nb < 4 && !decided && okc; g++) {
+                        if (mfx_next_packet(&m, &pk) != 1) break;
+                        if (m.streams[pk.stream_index].media_type != MFX_TYPE_VIDEO) continue;
+                        if (m.ts != bt) {
+                            double fx = (double)(m.ts - bt) / eye;
+                            long F = (long)(fx + 0.5);
+                            double d = fx - (double)F; if (d < 0) d = -d;
+                            if (d > 0.02) okc = 0;                /* inexact grid -> never swap */
+                            else {
+                                int step = (int)(cnt - F);
+                                if (step == 1 || step == -1) { if (step == -1) rfirst = 1; decided = 1; }
+                                else if (step != 0) okc = 0;      /* wild step -> distrust */
+                            }
+                            nb++; bt = m.ts; cnt = 0;
                         }
-                        nb++; bt = m.ts; cnt = 0;
+                        cnt++;
                     }
-                    cnt++;
+                    if (!rfirst || attempt >= 3) break;
+                    tgt = land_ts - 1; if (tgt < 0) tgt = 0;      /* previous marker boundary */
+                    do_seek(&m, &ctx, tgt);
                 }
-                do_seek(&m, &ctx, seek_to_us);   /* rewind to the landing for the real prime */
+                s.eye_swap = rfirst;                              /* only if stepping found no L-first */
+                do_seek(&m, &ctx, tgt);                           /* rewind to the (final) landing */
             }
             /* FAST PRIME: decode the landing keyframe pair straight into slot 0 (bounded keyframe scan;
              * else take the next decodable frame) so the picture appears at once and audio resyncs.
