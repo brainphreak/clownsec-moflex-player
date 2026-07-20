@@ -1845,6 +1845,7 @@ static int lib_has_path(const char *full) {
  * g_lib concurrently). */
 static u64 *s_dt_hash; static int s_dt_nh;
 static volatile int s_dt_done = 0, s_dt_abort = 0, s_dt_consumed = 1;
+static volatile int s_dt_pause = 0, s_dt_paused = 0;   /* suspend the SD walk during playback */
 static u64 dt_fnv(const char *str) {
     u64 h = 1469598103934665603ull;
     for (const unsigned char *p = (const unsigned char *)str; *p; p++) { h ^= *p; h *= 1099511628211ull; }
@@ -1861,6 +1862,9 @@ static void lib_detect_dir(const char *dir, int depth) {
     if (!d) return;
     struct dirent *e;
     while ((e = readdir(d))) {
+        while (s_dt_pause && !s_dt_abort) { s_dt_paused = 1; svcSleepThread(50 * 1000 * 1000LL); }  /* park while a movie plays */
+        s_dt_paused = 0;
+        if (s_dt_abort) break;
         if (e->d_name[0] == '.') continue;
         char full[PATHLEN + NAMELEN];
         snprintf(full, sizeof full, "%s%s", dir, e->d_name);
@@ -2846,6 +2850,7 @@ static volatile int s_dtw_exit = 1;   /* worker thread fully finished (fetch inc
 static void update_check(void) {   /* runs on the worker thread; ~10 byte fetch */
     for (int try = 0; try < 8 && !s_dt_abort; try++) {
         if (try) for (int w = 0; w < 50 && !s_dt_abort; w++) svcSleepThread(100 * 1000 * 1000LL);   /* 5s, abortable */
+        while (s_dt_pause && !s_dt_abort) svcSleepThread(50 * 1000 * 1000LL);   /* don't fetch while a movie plays */
         if (osGetWifiStrength() == 0) continue;   /* offline or still associating -> retry, never block */
         char *buf = NULL; size_t len = 0;
         if (!download_to_mem(LATEST_URL, &buf, &len, 256) || !buf) continue;   /* busy/queue contention -> retry */
@@ -3192,7 +3197,12 @@ static MoflexResult play_movie(const char *path) {
           if (rc < 0) { cia_clear_selection(); branding_show(); return MOFLEX_QUIT_BACK; }   /* B -> back */
           if (rc == 0) moflex_resume_clear(path);                                            /* start over */
       } }
+    /* stop the background SD walk from fighting the movie for the card (slow loads/resumes) */
+    int was_scanning = !s_dt_done && !s_dt_consumed;
+    if (was_scanning) { s_dt_pause = 1;
+        for (int w = 0; w < 6 && !s_dt_paused && !s_dt_done; w++) svcSleepThread(30 * 1000 * 1000LL); }  /* let it park (<=180ms) */
     MoflexResult r = moflex_play(path);
+    if (was_scanning) s_dt_pause = 0;   /* resume the walk now that we are back on the menu */
     if (r == MOFLEX_ERROR) msg_screen("PLAY", "Could not play this file.\nIt does not look like a\nvalid moflex video.");
     cia_clear_selection();
     consoleInit(GFX_BOTTOM, NULL);
@@ -3820,7 +3830,7 @@ int main(void) {
     /* sockets: init once, shared by the web server (UPLOAD) and curl (DOWNLOAD) */
     u32 *soc_buf = (u32 *)memalign(0x1000, SOC_BUF_SZ);
     if (soc_buf) socInit(soc_buf, SOC_BUF_SZ);
-    downloader_init();   /* curl_global_init is NOT thread-safe: run it here, before any download thread exists */
+    downloader_prime();   /* instant: real curl_global_init now happens lazily on a worker (keeps startup snappy) */
 
     gfxSetScreenFormat(GFX_BOTTOM, GSP_RGB565_OES);   /* match ui_gfx (u16) */
     consoleInit(GFX_BOTTOM, NULL);

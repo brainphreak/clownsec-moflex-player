@@ -10,12 +10,19 @@
 /* soc service is initialized once by the app (net_soc_init in main); curl uses it. */
 
 static bool g_ready;
+static LightLock g_init_lock;   /* serialize the one-time curl_global_init across worker threads */
+static bool g_lock_ready;
+
+/* Call once on the main thread at startup (instant) so downloader_init can be called from any
+ * worker thread thereafter -- the slow curl_global_init then happens lazily off the main thread. */
+void downloader_prime(void) { LightLock_Init(&g_init_lock); g_lock_ready = true; }
 
 bool downloader_init(void) {
     if (g_ready) return true;
-    if (curl_global_init(CURL_GLOBAL_DEFAULT) != 0) return false;
-    g_ready = true;
-    return true;
+    if (g_lock_ready) LightLock_Lock(&g_init_lock);
+    if (!g_ready && curl_global_init(CURL_GLOBAL_DEFAULT) == 0) g_ready = true;   /* NOT thread-safe -> locked */
+    if (g_lock_ready) LightLock_Unlock(&g_init_lock);
+    return g_ready;
 }
 void downloader_exit(void) {
     if (g_ready) { curl_global_cleanup(); g_ready = false; }

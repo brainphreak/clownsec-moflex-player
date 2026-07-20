@@ -31,6 +31,9 @@ void download_discard_partial(const char *url);
 
 /* Download url -> malloc'd buffer (NUL-terminated). Caller frees *out.
  * Good for fetching the catalog JSON. Caps at max_bytes. */
+/* Prime the thread-safe lazy init (call once on the main thread at startup). */
+void downloader_prime(void);
+
 bool download_to_mem(const char *url, char **out, size_t *out_len, size_t max_bytes);
 
 /* Set a global abort hook: if it returns non-zero, the CURRENT transfer aborts. Used to make
