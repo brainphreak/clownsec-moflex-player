@@ -1676,6 +1676,7 @@ gdone:
 static ndspWaveBuf r3_wb[R3_AWB]; static int16_t *r3_ab[R3_AWB];
 static int r3_awi, r3_nawb, r3_arate, r3_achn, r3_aok, r3_acnt[R3_AWB];
 static long long r3_aplayed; static int64_t r3_apos;   /* elapsed audible us, -1 = not started */
+static volatile u32 g_r3_last_present;   /* osGetTime() of the last shown frame -- elision starving-guard */
 /* A/V seek anchor: audio restarts at the first audio packet after the landing (content r3_audio_t0),
  * which can differ from the video landing by up to one packet. We capture BOTH once, right after the
  * audio re-locks, into a CONSTANT r3_av_skew (bounded), and add it to apos in the present compare.
@@ -1865,7 +1866,7 @@ static void mp_ring_apt_hook(APT_HookType hook, void *param) {
  * and lets decode run ahead to build a cushion. Producer/consumer, like the official player. */
 typedef struct {
     MfxDemux *m; AVCodecContext *ctx; AVFrame *fL, *fR;
-    int W, H, is3d, NB, have_audio; int64_t pair_dur, dur_us;
+    int W, H, is3d, NB, have_audio, old3ds; int64_t pair_dur, dur_us;
     volatile int eye_swap;               /* 3D: stream at the seek landing starts on a RIGHT eye ->
                                             route the first of each popped pair to the R texture */
     volatile int wr, rd;                 /* ring: worker advances wr, main advances rd (both atomic ints) */
@@ -1910,8 +1911,8 @@ static void r3_produce(R3S *s) {
     int target  = (r3_kfpc > 0) ? r3_kfp[r3_kfph] : -1;
     int canskip = (apos_pair >= 0) && (target > (int)dpair) && (target <= apos_pair);
     int drift   = (apos_pair >= 0) ? apos_pair - (int)dpair : 0;
-    const int DRIFT_MAX = 20;   /* let the present drop-loop absorb decode spikes; only skip to a keyframe
-                                 * when SUSTAINED far behind (spikes recover via the fast frames after them) */
+    const int DRIFT_MAX = s->old3ds ? 6 : 20;   /* Old-3DS: resync early+often (short ghost, avtest's value).
+                                 * New-3DS: let the present drop-loop absorb spikes (it rarely skips anyway). */
     if (!s->skipping && canskip && drift > DRIFT_MAX) s->skipping = 1;
     if (s->skipping) {
         /* CLEAN catch-up: discard packets WITHOUT decoding until the queue head is a KEYFRAME, then
@@ -1919,7 +1920,8 @@ static void r3_produce(R3S *s) {
          * that corrupts the whole GOP and the blockiness bleeds into the following calm scenes. The
          * cost is a brief freeze on the last clean frame, resolved the instant a keyframe lands. */
         if (r3_vqc == 0) { s->dpair = dpair + 1; return; }                 /* nothing buffered yet -> hold */
-        if (r3_vq_head_is_kf()) { s->skipping = 0; mobi_flush(s->ctx); }   /* landed clean -> decode below */
+        if (r3_vq_head_is_kf()) { s->skipping = 0; if (!s->old3ds) mobi_flush(s->ctx); }   /* Old-3DS: NO flush,
+                             * keep stale-but-valid refs (ghost that decays) vs NULL refs (the flush freeze). */
         else {
             int n, kf; int64_t ts; free(r3_vq_pop(&n, &ts, &kf)); if (r3_vqc > 0) free(r3_vq_pop(&n, &ts, &kf));
             s->dpair = dpair + 1;
@@ -1934,14 +1936,24 @@ static void r3_produce(R3S *s) {
     uint8_t *p = r3_vq_pop(&n, &vts, &kf); ap.data = p; ap.size = n;
     int okL = (mobi_decode(s->ctx, s->fL, &gotL, &ap) >= 0 && gotL); free(p);
     s->cur_us = vts;
+    /* Old-3DS catch-up ELISION: a pair already behind the audio clock will be discarded unseen by
+     * present, so decode it (references must stay perfect) but skip the Y2R + ring publish. Force a real
+     * display if nothing's shown for 100ms so the picture keeps moving (~10fps) while catching up. */
+    int elide = 0;
+    if (s->old3ds && r3_apos >= 0) {
+        int64_t this_ts = dpair * s->pair_dur;
+        int stale = (this_ts + s->pair_dur < r3_apos);
+        int starving = ((u32)osGetTime() - g_r3_last_present) >= 100;
+        elide = stale && !starving;
+    }
     if (!s->is3d) {
-        if (okL) { g_y2r_start(s->fL, &r3_texL[slot], s->W, s->H); g_y2r_wait(&r3_texL[slot]);
+        if (okL && !elide) { g_y2r_start(s->fL, &r3_texL[slot], s->W, s->H); g_y2r_wait(&r3_texL[slot]);
                    r3_rts[slot] = dpair * s->pair_dur; r3_bts[slot] = vts;
                    __sync_synchronize(); r3_ready[slot] = 1; s->wr = s->wr + 1; }
     } else if (r3_vqc > 0) {
         int64_t vts2; p = r3_vq_pop(&n, &vts2, &kf); ap.data = p; ap.size = n;
         int gotR = 0; int okR = (mobi_decode(s->ctx, s->fR, &gotR, &ap) >= 0 && gotR); free(p);
-        if (okL && okR) {
+        if (okL && okR && !elide) {
             /* eye routing: normally (first,second) = (L,R); after a seek that landed on a RIGHT
              * eye (pairs span block boundaries in some Nintendo muxes) the stream runs R,L,R,L --
              * route the first frame to the R texture so depth stays correct. */
@@ -2143,7 +2155,7 @@ static MoflexResult moflex_play_ring(const char *path) {
     /* ---- start the DECODE THREAD (producer). It fills the ring; this (main) thread only presents. ---- */
     R3S s; memset(&s, 0, sizeof s);
     s.m = &m; s.ctx = &ctx; s.fL = fL; s.fR = fR;
-    s.W = W; s.H = H; s.is3d = is3d; s.NB = NB; s.have_audio = have_audio;
+    s.W = W; s.H = H; s.is3d = is3d; s.NB = NB; s.have_audio = have_audio; s.old3ds = !r3_isnew;
     s.pair_dur = pair_dur; s.dur_us = dur_us; s.run = 1;
     s.paused = want_seek ? 1 : 0;   /* if resuming, stay paused until the seek/prime below sets us up */
     LightLock_Init(&s.lock); LightEvent_Init(&s.wake, RESET_ONESHOT);
@@ -2549,6 +2561,7 @@ static MoflexResult moflex_play_ring(const char *path) {
                                 if (v == 2) cad_v2++; else if (v == 3) cad_v3++; else cad_vx++; }
                 cad_last = nt;
                 ready[show] = 0; last_shown = show; last_bts = bts[show]; cur_us = bts[show]; rd++;
+                g_r3_last_present = (u32)osGetTime();   /* elision starving-guard: the picture actually changed */
             }
         }
         if (s.rd != rd) { s.rd = rd; LightEvent_Signal(&s.wake); }   /* freed slot(s) -> wake the decode thread */
@@ -3310,17 +3323,12 @@ MoflexResult moflex_play(const char *path) {
      * clock) -- my simplified drop overshoots audio and freezes. Flip to 1 to A/B the ring. */
     #define RING_3D_ENABLE 1
 #if RING_3D_ENABLE
-    if (is3d) {
-        bool isnew = false; APT_CheckNew3DS(&isnew);
-        if (isnew) {                                      /* New-3DS: threaded RING engine -- decode
-                                                           * outpaces real time, banks ahead, judder-free,
-                                                           * fluid seek. */
-            MoflexResult r = moflex_play_ring(path);
-            if (r != MOFLEX_FALLBACK) return r;
-        }
-        /* Old-3DS 3D -> stable CLASSIC path below (v1.0 behavior). The threaded ring engine only helps
-         * when decode outpaces real time (New-3DS); on Old-3DS heavy files it can't, so keep the proven
-         * classic path here. Experimental Old-3DS A/V-sync work lives on the old3ds-avsync branch. */
+    if (is3d) {                                           /* Both consoles use the RING now: New-3DS threaded,
+                                                           * Old-3DS inline (banking + avtest's no-flush catch-up
+                                                           * + display elision). Falls back to classic if the
+                                                           * ring can't allocate its buffers. */
+        MoflexResult r = moflex_play_ring(path);
+        if (r != MOFLEX_FALLBACK) return r;
     }
 #else
     (void)is3d;
