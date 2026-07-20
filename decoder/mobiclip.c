@@ -668,7 +668,33 @@ static inline void idct_job(ReconSet *rs, const ReconJob *j) {
 #define MOBI_SIMD_IDCT 0x04000000   /* packed 2-row IDCT (experiment) */
 static void idct_writeback(dctcoef *mat, uint8_t *dst, int linesize, int size, int ac, unsigned rowmask)
 {
-#define MOBI_FUSED_IDCT 0x08000000   /* fused column pass: no transpose, no mat[] 2nd-write (official-style) */
+#define MOBI_FUSED_IDCT   0x08000000   /* fused column pass, PACKED residual write (simd_add_clip4) */
+#define MOBI_FUSED_SCALAR 0x02000000   /* same fusion but SCALAR per-pixel add+clip, packed byte store (official shape) */
+    if (mobi_opt & MOBI_FUSED_SCALAR) {
+        if ((mobi_opt & 4) && ac == 0) {
+            dctcoef t[8] = { 0 }; t[0] = mat[0]; idct(t, size);
+            dctcoef u[8] = { 0 }; u[0] = t[0];    idct(u, size);
+            int d = u[0] >> 6;
+            for (int y = 0; y < size; y++) { for (int x = 0; x < size; x++) dst[x] = av_clip_uint8(dst[x] + d); dst += linesize; }
+            return;
+        }
+        if (mobi_opt & 2) { for (int y = 0; y < size; y++) if (rowmask & (1u << y)) idct(&mat[y * size], size); }
+        else                for (int y = 0; y < size; y++) idct(&mat[y * size], size);
+        for (int y = 0; y < size; y++) {
+            dctcoef col[8];
+            for (int k = 0; k < size; k++) col[k] = mat[k * size + y];
+            idct(col, size);
+            for (int x = 0; x < size; x += 4) {           /* scalar add+clip, then ONE packed byte store */
+                unsigned p0 = av_clip_uint8(dst[x]     + (col[x]     >> 6));
+                unsigned p1 = av_clip_uint8(dst[x + 1] + (col[x + 1] >> 6));
+                unsigned p2 = av_clip_uint8(dst[x + 2] + (col[x + 2] >> 6));
+                unsigned p3 = av_clip_uint8(dst[x + 3] + (col[x + 3] >> 6));
+                st4(dst + x, p0 | (p1 << 8) | (p2 << 16) | (p3 << 24));
+            }
+            dst += linesize;
+        }
+        return;
+    }
     if (mobi_opt & MOBI_FUSED_IDCT) {
         if ((mobi_opt & 4) && ac == 0) {          /* DC-only shortcut (same as scalar path) */
             dctcoef t[8] = { 0 }; t[0] = mat[0]; idct(t, size);
