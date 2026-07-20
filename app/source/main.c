@@ -1045,9 +1045,11 @@ static void fix_download_ext(char *dest, size_t cap) {
     FILE *f = fopen(dest, "rb"); if (!f) return;
     unsigned char b[4] = {0}; size_t r = fread(b, 1, 4, f); fclose(f);
     if (r < 4) return;
-    const char *ext = ".moflex";
-    if (b[0] == 0x20 && b[1] == 0x20 && b[2] == 0 && b[3] == 0) ext = ".cia";
+    const char *ext = NULL;   /* rename only on a POSITIVE match -- an .srt must stay an .srt */
+    if (b[0] == 0x4C && b[1] == 0x32) ext = ".moflex";                            /* moflex sync */
+    else if (b[0] == 0x20 && b[1] == 0x20 && b[2] == 0 && b[3] == 0) ext = ".cia";
     else if (b[0] == 'P' && b[1] == 'K' && b[2] == 3 && b[3] == 4) ext = ".zip";
+    if (!ext) return;
     char nd[PATHLEN + NAMELEN]; snprintf(nd, sizeof nd, "%s%s", dest, ext);
     if (rename(dest, nd) == 0) snprintf(dest, cap, "%s", nd);
 }
@@ -1633,16 +1635,41 @@ static void lib_scan_dir(const char *dir, int depth) {
 }
 
 static void lib_normalize_shows(void) {
+    /* heal ".srt.moflex"-style names the old download sniffer created: restore the real
+     * extension on the SD and drop the bogus library entry */
+    static const char *junk[] = { ".srt", ".txt", ".nfo", ".jpg", ".png" };
+    for (int i = 0; i < g_lib_n; i++) {
+        size_t L = strlen(g_lib[i].fname);
+        if (!(L > 7 && !strcasecmp(g_lib[i].fname + L - 7, ".moflex"))) continue;
+        int bad = 0;
+        for (unsigned j = 0; j < sizeof junk / sizeof *junk && !bad; j++) {
+            size_t jl = strlen(junk[j]);
+            if (L - 7 > jl && !strncasecmp(g_lib[i].fname + L - 7 - jl, junk[j], jl)) bad = 1;
+        }
+        if (!bad) continue;
+        size_t UL = strlen(g_lib[i].url);
+        if (UL > 7) {
+            char nu[CAT_URLLEN]; snprintf(nu, sizeof nu, "%.*s", (int)(UL - 7), g_lib[i].url);
+            rename(g_lib[i].url, nu);
+        }
+        memmove(&g_lib[i], &g_lib[i + 1], (size_t)(g_lib_n - i - 1) * sizeof(CatEntry));
+        g_lib_n--; i--;
+    }
     /* belt-and-braces: whatever code path touched the entries, a FOLDER url must always be a show
      * (is_zip 2, folder-derived name). Cheap: only non-media-named entries get the stat. */
     for (int i = 0; i < g_lib_n; i++) {
         if (g_lib[i].is_zip == 2 || is_moflex(g_lib[i].fname)) continue;
         struct stat st;
-        if (!stat(g_lib[i].url, &st) && S_ISDIR(st.st_mode)) {
+        if (stat(g_lib[i].url, &st)) continue;
+        if (S_ISDIR(st.st_mode)) {
             g_lib[i].is_zip = 2;
             show_name_from_dir(g_lib[i].url, g_lib[i].name, sizeof g_lib[i].name);
             if (!strcasecmp(g_lib[i].category, "Uncategorized"))
                 snprintf(g_lib[i].category, sizeof g_lib[i].category, "TV Shows");
+        } else {
+            /* a plain file that is not a playable video (e.g. a subtitle) -> not an entry */
+            memmove(&g_lib[i], &g_lib[i + 1], (size_t)(g_lib_n - i - 1) * sizeof(CatEntry));
+            g_lib_n--; i--;
         }
     }
     /* collapse duplicate show entries (one per show name; season folders combine in the picker) */
@@ -1847,6 +1874,7 @@ static int lib_load_cache_only(void) {
  * with its info + poster -- no rescan needed. Skips if no library exists yet (the file has a
  * .nfo, so the first library scan will include it correctly). */
 static void lib_add_downloaded(const char *path, const CatEntry *src) {
+    if (!is_moflex(path)) return;   /* companions (subs, art, nfo) stay on the SD but are not entries */
     if (g_lib_n == 0) { lib_load_cache_only(); if (g_lib_n == 0) return; }  /* no cache -> leave to scan */
     if (!g_lib) return;
     int at = -1;
@@ -3033,6 +3061,7 @@ static MoflexResult play_movie(const char *path) {
           if (rc == 0) moflex_resume_clear(path);                                            /* start over */
       } }
     MoflexResult r = moflex_play(path);
+    if (r == MOFLEX_ERROR) msg_screen("PLAY", "Could not play this file.\nIt does not look like a\nvalid moflex video.");
     cia_clear_selection();
     consoleInit(GFX_BOTTOM, NULL);
     gfxSetDoubleBuffering(GFX_BOTTOM, false);

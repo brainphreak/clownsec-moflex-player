@@ -212,7 +212,7 @@ int mfx_open_window(MfxDemux *m, FILE *f, int64_t base, int64_t size) {
     m->rn = m->rp = 0; m->rbase = 0; m->eof = 0;   /* reset buffered reader */
 
     int ret = moflex_read_sync(m);
-    if (ret < 0) return ret;
+    if (ret != 0) return -1;   /* a moflex always begins with the 0x4C32 sync -- anything else is not one */
     io_seek(m, 0, SEEK_SET);   /* AVFMTCTX_NOHEADER: restart for packets */
     return 0;
 }
