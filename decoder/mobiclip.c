@@ -83,6 +83,8 @@ static inline uint32_t u8avg(uint32_t a, uint32_t b) {
 static inline uint32_t simd_uxtb16(uint32_t a)      { uint32_t r; __asm__("uxtb16 %0,%1"        :"=r"(r):"r"(a)); return r; }
 static inline uint32_t simd_uxtb16_ror8(uint32_t a) { uint32_t r; __asm__("uxtb16 %0,%1,ror #8" :"=r"(r):"r"(a)); return r; }
 static inline uint32_t simd_sadd16(uint32_t a, uint32_t b) { uint32_t r; __asm__("sadd16 %0,%1,%2":"=r"(r):"r"(a),"r"(b)); return r; }
+static inline uint32_t simd_ssub16(uint32_t a, uint32_t b) { uint32_t r; __asm__("ssub16 %0,%1,%2":"=r"(r):"r"(a),"r"(b)); return r; }
+static inline uint32_t simd_shadd16(uint32_t a, uint32_t b){ uint32_t r; __asm__("shadd16 %0,%1,%2":"=r"(r):"r"(a),"r"(b)); return r; }
 static inline uint32_t simd_usat16_8(uint32_t a)    { uint32_t r; __asm__("usat16 %0,#8,%1"     :"=r"(r):"r"(a)); return r; }
 #else
 static inline uint32_t simd_uxtb16(uint32_t a)      { return a & 0x00ff00ffu; }
@@ -90,6 +92,16 @@ static inline uint32_t simd_uxtb16_ror8(uint32_t a) { return (a >> 8) & 0x00ff00
 static inline uint32_t simd_sadd16(uint32_t a, uint32_t b) {
     int lo = (int)(int16_t)(a & 0xffff) + (int)(int16_t)(b & 0xffff);
     int hi = (int)(int16_t)(a >> 16)    + (int)(int16_t)(b >> 16);
+    return ((uint32_t)lo & 0xffff) | ((uint32_t)hi << 16);
+}
+static inline uint32_t simd_ssub16(uint32_t a, uint32_t b) {
+    int lo = (int)(int16_t)(a & 0xffff) - (int)(int16_t)(b & 0xffff);
+    int hi = (int)(int16_t)(a >> 16)    - (int)(int16_t)(b >> 16);
+    return ((uint32_t)lo & 0xffff) | ((uint32_t)hi << 16);
+}
+static inline uint32_t simd_shadd16(uint32_t a, uint32_t b) {   /* signed halving add: (a+b)>>1 per lane */
+    int lo = ((int)(int16_t)(a & 0xffff) + (int)(int16_t)(b & 0xffff)) >> 1;
+    int hi = ((int)(int16_t)(a >> 16)    + (int)(int16_t)(b >> 16))    >> 1;
     return ((uint32_t)lo & 0xffff) | ((uint32_t)hi << 16);
 }
 static inline uint32_t simd_usat16_8(uint32_t a) {
@@ -559,6 +571,40 @@ static void idct(dctcoef *arr, int size)
     arr[7] = tmp[0] - x0;
 }
 
+/* ---- PACKED 2-row IDCT (opt MOBI_SIMD_IDCT): each u32 lane = one row; process two rows at once
+ * with sadd16/ssub16/shadd16. Bit-exact with idct() as long as intermediates fit int16 (real content
+ * peaks ~8k; a per-block coeff gate keeps it safe). Shifts: SH1=>>1, SH2=>>2 via signed halving add. ---- */
+static inline uint32_t P16(int lo, int hi){ return ((uint32_t)lo & 0xffff) | ((uint32_t)hi << 16); }
+static inline int P_lo(uint32_t a){ return (int16_t)(a & 0xffff); }
+static inline int P_hi(uint32_t a){ return (int16_t)(a >> 16); }
+#define SH1(a) simd_shadd16((a), 0)
+#define SH2(a) simd_shadd16(simd_shadd16((a), 0), 0)
+static void inverse4_pair(uint32_t *w){
+    uint32_t a = simd_sadd16(w[0], w[2]), b = simd_ssub16(w[0], w[2]);
+    uint32_t c = simd_sadd16(w[1], SH1(w[3])), d = simd_ssub16(SH1(w[1]), w[3]);
+    w[0] = simd_sadd16(a, c); w[1] = simd_sadd16(b, d); w[2] = simd_ssub16(b, d); w[3] = simd_ssub16(a, c);
+}
+static void idct8_pair(uint32_t *w){
+    uint32_t tmp[4] = { w[0], w[2], w[4], w[6] };
+    inverse4_pair(tmp);
+    uint32_t e = simd_ssub16(simd_ssub16(simd_sadd16(w[7], w[1]), w[3]), SH1(w[3]));
+    uint32_t f = simd_sadd16(simd_sadd16(simd_ssub16(w[7], w[1]), w[5]), SH1(w[5]));
+    uint32_t g = simd_ssub16(simd_ssub16(simd_ssub16(w[5], w[3]), w[7]), SH1(w[7]));
+    uint32_t h = simd_sadd16(simd_sadd16(simd_sadd16(w[5], w[3]), w[1]), SH1(w[1]));
+    uint32_t x3 = simd_sadd16(g, SH2(h)), x2 = simd_sadd16(e, SH2(f));
+    uint32_t x1 = simd_ssub16(SH2(e), f), x0 = simd_ssub16(h, SH2(g));
+    w[0] = simd_sadd16(tmp[0], x0); w[1] = simd_sadd16(tmp[1], x1); w[2] = simd_sadd16(tmp[2], x2); w[3] = simd_sadd16(tmp[3], x3);
+    w[4] = simd_ssub16(tmp[3], x3); w[5] = simd_ssub16(tmp[2], x2); w[6] = simd_ssub16(tmp[1], x1); w[7] = simd_ssub16(tmp[0], x0);
+}
+static void idct4_pair(uint32_t *w){ inverse4_pair(w); }
+/* Transform two adjacent rows (rowA=&mat[y*size], rowB=&mat[(y+1)*size]) of an int16 block in place. */
+static void idct_pair_rows(dctcoef *rowA, dctcoef *rowB, int size){
+    uint32_t w[8];
+    for (int i = 0; i < size; i++) w[i] = P16(rowA[i], rowB[i]);
+    if (size == 8) idct8_pair(w); else idct4_pair(w);
+    for (int i = 0; i < size; i++) { rowA[i] = (dctcoef)P_lo(w[i]); rowB[i] = (dctcoef)P_hi(w[i]); }
+}
+
 static inline void read_run_encoding(GetBitContext *gb, int tab_idx,
                                      int *last, int *run, int *level)
 {
@@ -619,8 +665,24 @@ static inline void idct_job(ReconSet *rs, const ReconJob *j) {
 
 /* the RECONSTRUCT half of add_coefficients: IDCT the coefficient block (mat) and add it to dst,
  * saturating. Extracted verbatim from add_coefficients_impl so inline + replay are bit-identical. */
+#define MOBI_SIMD_IDCT 0x04000000   /* packed 2-row IDCT (experiment) */
 static void idct_writeback(dctcoef *mat, uint8_t *dst, int linesize, int size, int ac, unsigned rowmask)
 {
+    if (mobi_opt & MOBI_SIMD_IDCT) {                 /* packed 2-row transform (both passes) */
+        for (int y = 0; y < size; y += 2) idct_pair_rows(&mat[y * size], &mat[(y + 1) * size], size);
+        for (int y = 0; y < size; y++)               /* transpose (scalar) */
+            for (int x = y + 1; x < size; x++) {
+                dctcoef t = mat[x * size + y]; mat[x * size + y] = mat[y * size + x]; mat[y * size + x] = t;
+            }
+        for (int y = 0; y < size; y += 2) idct_pair_rows(&mat[y * size], &mat[(y + 1) * size], size);
+        for (int y = 0; y < size; y++) {
+            dctcoef *mr = &mat[y * size];
+            for (int x = 0; x < size; x += 4)
+                st4(dst + x, simd_add_clip4(ld4(dst + x), mr[x] >> 6, mr[x + 1] >> 6, mr[x + 2] >> 6, mr[x + 3] >> 6));
+            dst += linesize;
+        }
+        return;
+    }
     if ((mobi_opt & 4) && ac == 0) {          /* DC-only block -> uniform delta */
         dctcoef t[8] = { 0 }; t[0] = mat[0]; idct(t, size);
         dctcoef u[8] = { 0 }; u[0] = t[0];        idct(u, size);
