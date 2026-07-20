@@ -3494,11 +3494,8 @@ static void home_draw(int bsel, long long rpos) {
     ui_text(UI_W - 6 - ui_text_w(1, APP_VERSION), 3, 1, UI_DIM, APP_VERSION);
     { const char *bt = BUILD_TAG;   /* build stamp under the version -> "which v1.0 is this?" */
       ui_text(UI_W - 6 - ui_text_w(1, bt), 14, 1, UI_DIM, bt); }
-    if (s_upd[0]) {   /* a newer build was published (checked in the background at startup) */
-        u16 oc = UI_RGB(255, 170, 60);
-        ui_text(UI_W - 6 - ui_text_w(1, "UPDATE"), 25, 1, oc, "UPDATE");
-        ui_text(UI_W - 6 - ui_text_w(1, "AVAIL."), 36, 1, oc, "AVAIL.");
-    }
+    if (s_upd[0])   /* a newer build was published (checked in the background at startup) */
+        ui_text(UI_W - 6 - ui_text_w(1, "UPDATE"), 25, 1, UI_RGB(255, 170, 60), "UPDATE");
 
     /* theme swatch button (tap or press Y) */
     {
