@@ -1678,7 +1678,7 @@ static void lib_scan_dir(const char *dir, int depth) {
     closedir(d);
 }
 
-static int lib_normalize_shows(int deep) {   /* returns nonzero when it healed something */
+static int lib_normalize_shows(void) {   /* returns nonzero when it healed something (cheap, in-RAM) */
     int chg = 0;
     /* canonicalize urls (collapse '//') so the same file can't hide behind two spellings */
     for (int i = 0; i < g_lib_n; i++) {
@@ -1690,26 +1690,8 @@ static int lib_normalize_shows(int deep) {   /* returns nonzero when it healed s
         }
         *w = 0;
     }
-    /* heal ".srt.moflex"-style names the old download sniffer created: restore the real
-     * extension on the SD and drop the bogus library entry */
-    static const char *junk[] = { ".srt", ".txt", ".nfo", ".jpg", ".png" };
-    for (int i = 0; i < g_lib_n; i++) {
-        size_t L = strlen(g_lib[i].fname);
-        if (!(L > 7 && !strcasecmp(g_lib[i].fname + L - 7, ".moflex"))) continue;
-        int bad = 0;
-        for (unsigned j = 0; j < sizeof junk / sizeof *junk && !bad; j++) {
-            size_t jl = strlen(junk[j]);
-            if (L - 7 > jl && !strncasecmp(g_lib[i].fname + L - 7 - jl, junk[j], jl)) bad = 1;
-        }
-        if (!bad) continue;
-        size_t UL = strlen(g_lib[i].url);
-        if (UL > 7) {
-            char nu[CAT_URLLEN]; snprintf(nu, sizeof nu, "%.*s", (int)(UL - 7), g_lib[i].url);
-            rename(g_lib[i].url, nu);
-        }
-        memmove(&g_lib[i], &g_lib[i + 1], (size_t)(g_lib_n - i - 1) * sizeof(CatEntry));
-        g_lib_n--; i--; chg = 1;
-    }
+    /* (the ".srt.moflex" migration heal was removed -- the download sniffer no longer creates those
+     * names, so there's nothing left to fix and no reason to walk the list for it.) */
     /* belt-and-braces: whatever code path touched the entries, a FOLDER url must always be a show
      * (is_zip 2, folder-derived name). Cheap: only non-media-named entries get the stat. */
     for (int i = 0; i < g_lib_n; i++) {
@@ -1745,19 +1727,10 @@ static int lib_normalize_shows(int deep) {   /* returns nonzero when it healed s
             g_lib_n--; chg = 1;
         }
     }
-    if (deep) {   /* on load: drop entries whose file vanished (renamed/deleted outside the app) */
-        for (int i = 0; i < g_lib_n; i++) {
-            if (g_lib[i].is_zip == 2) continue;
-            struct stat st;
-            if (!stat(g_lib[i].url, &st)) continue;
-            memmove(&g_lib[i], &g_lib[i + 1], (size_t)(g_lib_n - i - 1) * sizeof(CatEntry));
-            g_lib_n--; i--; chg = 1;
-        }
-    }
     return chg;
 }
 static void lib_save_cache(void) {
-    lib_normalize_shows(0);                                   /* never persist a demoted show entry */
+    lib_normalize_shows();                                   /* never persist a demoted show entry */
     mkdir("sdmc:/moflex_player", 0777);                       /* cache so later opens are instant */
     FILE *f = fopen(LIB_CACHE, "wb");
     if (f) { int magic = LIB_MAGIC; fwrite(&magic, sizeof magic, 1, f);
@@ -1823,7 +1796,7 @@ static int lib_load_cache(void) {   /* cache-only: movie count, 0 if no valid ca
             fread(&n, sizeof n, 1, f) == 1 && n > 0 && n <= LIB_MAX &&
             (int)fread(g_lib, sizeof(CatEntry), n, f) == n) g_lib_n = n;
         fclose(f); }
-    if (lib_normalize_shows(1)) lib_save_cache();   /* deep heal (dups, dangling, stray files) + persist */
+    if (lib_normalize_shows()) lib_save_cache();   /* cheap in-RAM heal (dups/canonicalize) + persist */
     return g_lib_n;
 }
 static int lib_load(void) {   /* returns the movie count; loads the cache, else scans once */
@@ -1945,7 +1918,7 @@ static int lib_load_cache_only(void) {
             fread(&n, sizeof n, 1, f) == 1 && n > 0 && n <= LIB_MAX &&
             (int)fread(g_lib, sizeof(CatEntry), n, f) == n) g_lib_n = n;
         fclose(f); }
-    if (lib_normalize_shows(1)) lib_save_cache();   /* same deep heal -- this loader can fill RAM first */
+    if (lib_normalize_shows()) lib_save_cache();   /* same cheap heal -- this loader can fill RAM first */
     return g_lib_n;
 }
 
