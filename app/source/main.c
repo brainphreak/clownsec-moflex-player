@@ -1857,7 +1857,7 @@ static int dt_covered(const char *full) {
     for (int i = 0; i < s_dt_nh; i++) if (s_dt_hash[i] == h) return 1;
     return 0;
 }
-static void lib_detect_dir(const char *dir, int depth) {
+__attribute__((unused)) static void lib_detect_dir(const char *dir, int depth) {
     if (depth > 8 || s_dt_abort) return;
     DIR *d = opendir(dir);
     if (!d) return;
@@ -2848,27 +2848,43 @@ static int startup_detect_poll(void);
 #define LATEST_URL "https://github.com/brainphreak/clownsec-moflex-player/releases/download/v1.0/latest.txt"
 static char s_upd[24] = ""; static int s_upd_shown = 0;
 static volatile int s_dtw_exit = 1;   /* worker thread fully finished (fetch included) */
-static void update_check(void) {   /* runs on the worker thread; ~10 byte fetch */
+/* Parse a leading "MAJOR.MINOR" out of s WITHOUT scanf (no newlib locale involvement). */
+static void ver_parse(const char *s, int *a, int *b) {
+    int *cur = a; *a = *b = 0;
+    for (; *s; s++) {
+        if (*s >= '0' && *s <= '9') *cur = *cur * 10 + (*s - '0');
+        else if (*s == '.' && cur == a) cur = b;
+        else break;
+    }
+}
+static void update_check(void) {   /* worker thread; printf-free so it can't hit the locale fault */
     for (int try = 0; try < 8 && !s_dt_abort; try++) {
         if (try) for (int w = 0; w < 50 && !s_dt_abort; w++) svcSleepThread(100 * 1000 * 1000LL);   /* 5s, abortable */
-        while (s_dt_pause && !s_dt_abort) svcSleepThread(50 * 1000 * 1000LL);   /* don't fetch while a movie plays */
         if (osGetWifiStrength() == 0) continue;   /* offline or still associating -> retry, never block */
         char *buf = NULL; size_t len = 0;
-        if (!download_to_mem(LATEST_URL, &buf, &len, 256) || !buf) continue;   /* busy/queue contention -> retry */
+        if (!download_to_mem(LATEST_URL, &buf, &len, 256) || !buf) continue;   /* busy -> retry */
         buf[len < 255 ? len : 255] = 0;
         int ld = 0, ln = 0, cd = 0, cn = 0;
-        if (sscanf(buf, "%d.%d", &ld, &ln) == 2 && sscanf(BUILD_TAG, "%d.%d", &cd, &cn) == 2 &&
-            (ld > cd || (ld == cd && ln > cn)))
-            snprintf(s_upd, sizeof s_upd, "%d.%d", ld, ln);
+        ver_parse(buf, &ld, &ln);
+        ver_parse(BUILD_TAG, &cd, &cn);
+        if (ld > cd || (ld == cd && ln > cn)) {   /* copy "MAJOR.MINOR" verbatim, no snprintf */
+            int j = 0;
+            for (const char *pp = buf; *pp && j < (int)sizeof s_upd - 1; pp++) {
+                if ((*pp >= '0' && *pp <= '9') || *pp == '.') s_upd[j++] = *pp; else break;
+            }
+            s_upd[j] = 0;
+        }
         free(buf);
         return;
     }
 }
 static void detect_worker(void *arg) {
     (void)arg;
-    lib_detect_dir("sdmc:/", 0);
-    s_dt_done = 1;             /* new-video results land now -- the fetch must not delay them */
+    /* No automatic SD walk on boot anymore: it contended the card during resume (20s+ starts) and
+     * formatting non-ASCII filenames on this libctru thread crashed. Files added from a computer are
+     * picked up by the manual "Rescan Library". This worker now only runs the tiny update check. */
     if (!s_dt_abort) update_check();
+    s_dt_done = 1;
     s_dtw_exit = 1;
 }
 
@@ -2890,21 +2906,15 @@ static void startup_new_movie_check(void) {
         return;
     }
 
-    /* Library exists: the SD walk takes ~30s+ on big cards, so it runs on a BACKGROUND thread.
-     * Snapshot the library urls as hashes first (the walk never touches g_lib, so the user can
-     * browse/rescan freely meanwhile); the home screen polls and prompts when the walk finishes. */
-    free(s_dt_hash);
-    s_dt_hash = (u64 *)malloc(sizeof(u64) * (g_lib_n ? g_lib_n : 1));
-    s_dt_nh = 0;
-    if (!s_dt_hash) return;
-    for (int i = 0; i < g_lib_n; i++) s_dt_hash[s_dt_nh++] = dt_fnv(g_lib[i].url);
-    s_newlist = malloc(sizeof *s_newlist * NEWLIST_MAX);
-    if (!s_newlist) { free(s_dt_hash); s_dt_hash = NULL; return; }
-    s_new_n = 0; s_dt_done = 0; s_dt_abort = 0; s_dt_consumed = 0;
+    /* Library exists: do NOT auto-scan the SD on boot. Walking a 256GB card on a background thread
+     * made resume slow (card contention) and was fragile; the manual "Rescan Library" covers files
+     * added from a computer. We still kick off the tiny printf-free update check in the background. */
+    s_new_n = 0; s_newlist = NULL; s_dt_hash = NULL;
+    s_dt_done = 0; s_dt_abort = 0; s_dt_consumed = 0; s_dtw_exit = 0;
     s32 prio = 0x30; svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
-    s_dtw_exit = 0;
-    if (!threadCreate(detect_worker, NULL, 32 * 1024, prio + 1, -2, true))
-        detect_worker(NULL);   /* couldn't thread -> fall back to the old synchronous walk */
+    if (!threadCreate(detect_worker, NULL, 32 * 1024, prio + 1, -2, true)) {
+        s_dt_done = 1; s_dtw_exit = 1;   /* couldn't thread -> skip (never fetch on the main thread) */
+    }
 }
 
 /* Home screen polls this once per frame; runs the prompts when the background walk lands. */
