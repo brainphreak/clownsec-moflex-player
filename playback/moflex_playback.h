@@ -29,11 +29,17 @@ MoflexResult moflex_play(const char *path);
 /* Saved resume position (microseconds) for a movie, or 0 if none. */
 long long moflex_resume_get(const char *path);
 
+/* Same, but for a specific embedded video inside a CIA (by its byte offset). */
+long long moflex_resume_at(const char *path, long long off);
+
 /* Forget the saved position (used by the "start from beginning" choice). */
 void moflex_resume_clear(const char *path);
 
 /* Watched registry: videos finished to the end. */
 int  moflex_watched(const char *path);
 void moflex_watched_set(const char *path, int on);
+/* Per-embedded-video (CIA) variants, keyed by the video's byte offset. */
+int  moflex_watched_at(const char *path, long long off);
+void moflex_watched_set_at(const char *path, long long off, int on);
 
 #endif

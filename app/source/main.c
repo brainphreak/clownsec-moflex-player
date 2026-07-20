@@ -2018,11 +2018,27 @@ static int lib_idxbuf[LIB_MAX];
 /* watch status per entry: 0 new, 1 in progress, 2 watched, -1 none (shows). Cached per list
  * visit -- the resume check opens a file, so it runs once per entry, not per redraw. */
 static u8 s_vs[LIB_MAX];
+/* Aggregate watched status of a CIA's embedded videos: all watched -> watched;
+ * any watched/started -> in progress; none -> new. -1 if it has no playable video. */
+static int cia_status(const char *path) {
+    CiaMoflex list[64];
+    int nc = cia_list_moflex(path, list, 64);
+    if (nc <= 0) return -1;
+    int w = 0, touched = 0;
+    for (int i = 0; i < nc; i++) {
+        int st = moflex_watched_at(path, list[i].off) ? 2
+               : moflex_resume_at(path, list[i].off) > 0 ? 1 : 0;
+        if (st == 2) w++;
+        if (st) touched = 1;
+    }
+    return (w == nc) ? 2 : touched ? 1 : 0;
+}
 static int vid_status(int li) {
     if (s_vs[li] != 0xFF) return (int)s_vs[li] - 1;
     const CatEntry *e = &g_lib[li];
     int st;
     if (e->is_zip == 2) st = show_status(e->name, e->url);   /* aggregate of the episodes */
+    else if (cia_is_cia(e->fname)) st = cia_status(e->url);  /* aggregate of the embedded videos */
     else if (moflex_watched(e->url)) st = 2;
     else if (moflex_resume_get(e->url) > 0) st = 1;
     else st = 0;
@@ -2961,20 +2977,33 @@ static void lib_edit_menu(int li) {
     }
 }
 
+/* Mark every embedded video in a CIA watched/unwatched in one shot. */
+static void cia_watched_set_all(const char *path, int on) {
+    CiaMoflex list[64];
+    int nc = cia_list_moflex(path, list, 64);
+    for (int i = 0; i < nc; i++) moflex_watched_set_at(path, list[i].off, on);
+}
+
 static void lib_getinfo_menu(int *idx, int ni, int csel) {
     (void)ni;   /* batch fetch lives in the rescan flow now */
-    int watched = g_lib[idx[csel]].is_zip != 2 && moflex_watched(g_lib[idx[csel]].url);
+    const CatEntry *ce = &g_lib[idx[csel]];
+    int is_cia = cia_is_cia(ce->fname);
+    int watched = ce->is_zip != 2 && (is_cia ? cia_status(ce->url) == 2 : moflex_watched(ce->url));
     const char *items[3] = { "Download Info", "Edit Info", watched ? "Mark Unwatched" : "Mark Watched" };
-    int nit = g_lib[idx[csel]].is_zip == 2 ? 2 : 3;   /* shows: no single watched flag */
-    int c = ui_menu("VIDEO INFO", g_lib[idx[csel]].name, items, nit);   /* B backs out */
+    int nit = ce->is_zip == 2 ? 2 : 3;   /* shows: no single watched flag */
+    int c = ui_menu("VIDEO INFO", ce->name, items, nit);   /* B backs out */
     if (c == 0) {
         /* never silently overwrite hand edits: confirm before re-downloading existing info */
-        if (movieinfo_have(g_lib[idx[csel]].url) &&
+        if (movieinfo_have(ce->url) &&
             prompt2("DOWNLOAD INFO", "Info already exists for this video.\nUpdating replaces any edits.",
                     "UPDATE", "KEEP") != 0) return;
         lib_scrape_one(idx[csel]);
     } else if (c == 1) lib_edit_menu(idx[csel]);
-    else if (c == 2) { moflex_watched_set(g_lib[idx[csel]].url, !watched); s_vs[idx[csel]] = 0xFF; }
+    else if (c == 2) {
+        if (is_cia) cia_watched_set_all(ce->url, !watched);
+        else moflex_watched_set(ce->url, !watched);
+        s_vs[idx[csel]] = 0xFF;
+    }
 }
 
 /* GET INFO chooser (X in Open Video): fetch metadata for just this movie, or every movie in
@@ -3041,7 +3070,7 @@ static void do_paste(void) {
 
 /* play a movie file, then restore the menu screens. returns the play result. */
 /* Choose which embedded moflex to play when a CIA holds several. Returns index, or -1 = back. */
-static int pick_moflex(const CiaMoflex *list, int n) {
+static int pick_moflex(const char *ciapath, const CiaMoflex *list, int n) {
     int sel = 0, top = 0, redraw = 1, tdown = 0, tx0 = 0, ty0 = 0, tsc0 = 0, tmoved = 0;
     const int VIS = 5, ry0 = 54, rh = 30, gap = 4;
     while (aptMainLoop()) {
@@ -3076,6 +3105,9 @@ static int pick_moflex(const CiaMoflex *list, int n) {
                     ui_vgrad_round(8, by, rw, rh, 7, TH_SEL, TH_SELLO);
                     ui_frame_round(8, by, rw, rh, 7, UI_NEON, 1); }
                 icon_movie(18, by + (rh - 16) / 2, UI_NEONC);
+                { int st = moflex_watched_at(ciapath, list[i].off) ? 2
+                        : moflex_resume_at(ciapath, list[i].off) > 0 ? 1 : 0;
+                  draw_status(6, by + (rh - 9) / 2, st); }   /* watched badge, like the library rows */
                 char nm[64]; snprintf(nm, sizeof nm, "%s", list[i].name); strip_ext(nm);
                 char sz[16]; snprintf(sz, sizeof sz, "%lldMB", (long long)(list[i].size / 1000000));
                 int nmax = (rw - 46 - (int)strlen(sz) * 8 - 16) / 8;
@@ -3107,7 +3139,7 @@ static MoflexResult play_movie(const char *path) {
         }
         int sel = 0;
         if (nc > 1) {                                   /* several videos -> let the user choose */
-            sel = pick_moflex(list, nc);
+            sel = pick_moflex(path, list, nc);
             if (sel < 0) { branding_show(); return MOFLEX_QUIT_BACK; }
         }
         /* title = the embedded movie's real name (from movie_title.csv); only fall back to the CIA's own

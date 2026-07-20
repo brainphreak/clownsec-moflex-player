@@ -63,7 +63,9 @@ static void vol_save(void) {
 }
 
 /* ---- per-movie resume position, persisted to sdmc ---- */
-static void resume_path(const char *movie, char *out, size_t cap) {
+/* sanitized basename + CIA embed suffix. off>=0 forces a specific embedded video;
+ * off<0 uses the active selection (empty for a plain moflex). */
+static void movie_key_off(const char *movie, long long off, char *out, size_t cap) {
     const char *base = strrchr(movie, '/'); base = base ? base + 1 : movie;
     char key[160]; size_t j = 0;
     for (const char *p = base; *p && j + 1 < sizeof(key); p++) {
@@ -73,8 +75,14 @@ static void resume_path(const char *movie, char *out, size_t cap) {
         key[j++] = ok ? c : '_';
     }
     key[j] = 0;
-    char suf[24]; cia_selection_suffix(movie, suf, sizeof suf);   /* per-embedded-video for multi-moflex CIAs */
-    snprintf(out, cap, "sdmc:/moflex_player/resume/%s%s.pos", key, suf);
+    char suf[24];
+    if (off >= 0) snprintf(suf, sizeof suf, "_%llx", (unsigned long long)off);
+    else cia_selection_suffix(movie, suf, sizeof suf);   /* per-embedded-video for multi-moflex CIAs */
+    snprintf(out, cap, "%s%s", key, suf);
+}
+static void resume_path(const char *movie, char *out, size_t cap) {
+    char kb[192]; movie_key_off(movie, -1, kb, sizeof kb);
+    snprintf(out, cap, "sdmc:/moflex_player/resume/%s.pos", kb);
 }
 static int64_t resume_load(const char *movie) {
     char p[256]; resume_path(movie, p, sizeof(p));
@@ -114,25 +122,34 @@ static void watch_load(void) {
     }
     fclose(f);
 }
-int moflex_watched(const char *path) {
+/* watched key = full path + CIA embed suffix. A plain moflex gets no suffix, so the
+ * on-disk key is identical to older builds (existing watched.txt entries still match);
+ * embedded CIA videos are now tracked independently per offset. */
+static void watched_key(const char *path, long long off, char *out, size_t cap) {
+    char suf[24];
+    if (off >= 0) snprintf(suf, sizeof suf, "_%llx", (unsigned long long)off);
+    else cia_selection_suffix(path, suf, sizeof suf);
+    snprintf(out, cap, "%s%s", path, suf);
+}
+static int watched_has_key(const char *key) {
     watch_load();
-    u64 h = watch_hash(path);
+    u64 h = watch_hash(key);
     for (int i = 0; i < g_watch_n; i++) if (g_watch[i] == h) return 1;
     return 0;
 }
-void moflex_watched_set(const char *path, int on) {
+static void watched_set_key(const char *key, int on) {
     watch_load();
-    u64 h = watch_hash(path);
+    u64 h = watch_hash(key);
     int at = -1;
     for (int i = 0; i < g_watch_n; i++) if (g_watch[i] == h) { at = i; break; }
     if (on && at < 0) {
         if (g_watch_n < WATCH_MAX) g_watch[g_watch_n++] = h;
         mkdir("sdmc:/moflex_player", 0777);
         FILE *f = fopen(WATCH_FILE, "ab");
-        if (f) { fprintf(f, "%s\n", path); fclose(f); }
+        if (f) { fprintf(f, "%s\n", key); fclose(f); }
     } else if (!on && at >= 0) {
         g_watch[at] = g_watch[--g_watch_n];
-        FILE *f = fopen(WATCH_FILE, "rb");   /* rewrite the file without this path */
+        FILE *f = fopen(WATCH_FILE, "rb");   /* rewrite the file without this key */
         if (f) {
             fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
             char *buf = sz > 0 ? malloc(sz + 1) : NULL;
@@ -145,7 +162,7 @@ void moflex_watched_set(const char *path, int on) {
                     char *line = buf;
                     while (line && *line) {
                         char *nl = strchr(line, '\n'); if (nl) *nl = 0;
-                        if (line[0] && strcmp(line, path)) fprintf(o, "%s\n", line);
+                        if (line[0] && strcmp(line, key)) fprintf(o, "%s\n", line);
                         line = nl ? nl + 1 : NULL;
                     }
                     fclose(o);
@@ -155,6 +172,10 @@ void moflex_watched_set(const char *path, int on) {
         }
     }
 }
+int  moflex_watched(const char *path) { char k[600]; watched_key(path, -1, k, sizeof k); return watched_has_key(k); }
+int  moflex_watched_at(const char *path, long long off) { char k[600]; watched_key(path, off, k, sizeof k); return watched_has_key(k); }
+void moflex_watched_set(const char *path, int on) { char k[600]; watched_key(path, -1, k, sizeof k); watched_set_key(k, on); }
+void moflex_watched_set_at(const char *path, long long off, int on) { char k[600]; watched_key(path, off, k, sizeof k); watched_set_key(k, on); }
 
 /* ---- per-movie subtitle encoding, persisted next to the resume file ---- */
 static void subenc_path(const char *movie, char *out, size_t cap) {
@@ -171,6 +192,13 @@ static int subenc_load(const char *movie) {             /* 0..4, or -1 if none s
 /* (subenc_save is gone -- the encoding is now written with the rest of the settings by subcfg_save;
  *  subenc_load stays as the read-side fallback for .enc files written by older builds.) */
 long long moflex_resume_get(const char *path) { return (long long)resume_load(path); }
+long long moflex_resume_at(const char *path, long long off) {   /* specific embedded video */
+    char kb[192]; movie_key_off(path, off, kb, sizeof kb);
+    char pp[256]; snprintf(pp, sizeof pp, "sdmc:/moflex_player/resume/%s.pos", kb);
+    FILE *f = fopen(pp, "rb"); if (!f) return 0;
+    long long us = 0; int ok = (fscanf(f, "%lld", &us) == 1); fclose(f);
+    return (ok && us > 0) ? us : 0;
+}
 void moflex_resume_clear(const char *path) { resume_clear(path); }
 
 /* ---- YUV->RGB565 LUTs ---- */
