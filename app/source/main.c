@@ -23,7 +23,7 @@
 #include "ui_gfx.h"
 #include "branding.h"
 
-#define APP_VERSION "v1.1.0b"
+#define APP_VERSION "v1.0"
 #ifndef BUILD_TAG
 #define BUILD_TAG "dev"      /* set by the Makefile: date +%y%m%d.%H%M of the build */
 #endif
@@ -2818,11 +2818,8 @@ static void startup_new_movie_check(void) {
 
 /* Home screen polls this once per frame; runs the prompts when the background walk lands. */
 static int startup_detect_poll(void) {
-    if (s_dt_done && s_upd[0] && !s_upd_shown) {   /* newer build published */
-        s_upd_shown = 1;
-        char um[96];
-        snprintf(um, sizeof um, "A newer build is available:\nb%s (you have b%s).\nRedownload via the QR / FBI.", s_upd, BUILD_TAG);
-        msg_screen("UPDATE AVAILABLE", um);
+    if (s_dt_done && s_upd[0] && !s_upd_shown) {   /* newer build published -> repaint so the */
+        s_upd_shown = 1;                           /* UPDATE AVAIL tag under the build shows up */
         return 1;
     }
     if (s_dt_consumed || !s_dt_done) return 0;
@@ -3482,9 +3479,13 @@ static void home_draw(int bsel, long long rpos) {
 
     /* title + neon divider */
     ui_text_center(UI_W / 2, 12, 2, UI_NEON, "CLOWNSEC");
-    ui_text(UI_W - 52, 3, 1, UI_DIM, APP_VERSION);
-    { const char *bt = "b" BUILD_TAG;   /* build stamp under the version -> "which 1.0.0 is this?" */
+    ui_text(UI_W - 6 - ui_text_w(1, APP_VERSION), 3, 1, UI_DIM, APP_VERSION);
+    { const char *bt = BUILD_TAG;   /* build stamp under the version -> "which v1.0 is this?" */
       ui_text(UI_W - 6 - ui_text_w(1, bt), 14, 1, UI_DIM, bt); }
+    if (s_upd[0]) {   /* a newer build was published (checked in the background at startup) */
+        const char *ua = "UPDATE AVAIL";
+        ui_text(UI_W - 6 - ui_text_w(1, ua), 25, 1, UI_RGB(255, 170, 60), ua);
+    }
 
     /* theme swatch button (tap or press Y) */
     {
