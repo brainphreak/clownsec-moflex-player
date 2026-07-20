@@ -2765,22 +2765,28 @@ static void lib_rescan_interactive(void) {
 static int startup_detect_poll(void);
 #define LATEST_URL "https://github.com/brainphreak/clownsec-moflex-player/releases/download/v1.1.0-beta/latest.txt"
 static char s_upd[24] = ""; static int s_upd_shown = 0;
+static volatile int s_dtw_exit = 1;   /* worker thread fully finished (fetch included) */
 static void update_check(void) {   /* runs on the worker thread; ~10 byte fetch */
-    if (osGetWifiStrength() == 0) return;   /* offline console: skip silently, never wait on a timeout */
-    char *buf = NULL; size_t len = 0;
-    if (!download_to_mem(LATEST_URL, &buf, &len, 256) || !buf) return;
-    buf[len < 255 ? len : 255] = 0;
-    int ld = 0, ln = 0, cd = 0, cn = 0;
-    if (sscanf(buf, "%d.%d", &ld, &ln) == 2 && sscanf(BUILD_TAG, "%d.%d", &cd, &cn) == 2 &&
-        (ld > cd || (ld == cd && ln > cn)))
-        snprintf(s_upd, sizeof s_upd, "%d.%d", ld, ln);
-    free(buf);
+    for (int try = 0; try < 8 && !s_dt_abort; try++) {
+        if (try) for (int w = 0; w < 50 && !s_dt_abort; w++) svcSleepThread(100 * 1000 * 1000LL);   /* 5s, abortable */
+        if (osGetWifiStrength() == 0) continue;   /* offline or still associating -> retry, never block */
+        char *buf = NULL; size_t len = 0;
+        if (!download_to_mem(LATEST_URL, &buf, &len, 256) || !buf) continue;   /* busy/queue contention -> retry */
+        buf[len < 255 ? len : 255] = 0;
+        int ld = 0, ln = 0, cd = 0, cn = 0;
+        if (sscanf(buf, "%d.%d", &ld, &ln) == 2 && sscanf(BUILD_TAG, "%d.%d", &cd, &cn) == 2 &&
+            (ld > cd || (ld == cd && ln > cn)))
+            snprintf(s_upd, sizeof s_upd, "%d.%d", ld, ln);
+        free(buf);
+        return;
+    }
 }
 static void detect_worker(void *arg) {
     (void)arg;
     lib_detect_dir("sdmc:/", 0);
+    s_dt_done = 1;             /* new-video results land now -- the fetch must not delay them */
     if (!s_dt_abort) update_check();
-    s_dt_done = 1;
+    s_dtw_exit = 1;
 }
 
 static void startup_new_movie_check(void) {
@@ -2813,13 +2819,14 @@ static void startup_new_movie_check(void) {
     if (!s_newlist) { free(s_dt_hash); s_dt_hash = NULL; return; }
     s_new_n = 0; s_dt_done = 0; s_dt_abort = 0; s_dt_consumed = 0;
     s32 prio = 0x30; svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
+    s_dtw_exit = 0;
     if (!threadCreate(detect_worker, NULL, 32 * 1024, prio + 1, -2, true))
         detect_worker(NULL);   /* couldn't thread -> fall back to the old synchronous walk */
 }
 
 /* Home screen polls this once per frame; runs the prompts when the background walk lands. */
 static int startup_detect_poll(void) {
-    if (s_dt_done && s_upd[0] && !s_upd_shown) {   /* newer build published */
+    if (s_upd[0] && !s_upd_shown) {   /* newer build published */
         s_upd_shown = 1;
         char um[96];
         snprintf(um, sizeof um, "A newer build is available:\n%s (you have %s).\nRedownload via the QR / FBI.", s_upd, BUILD_TAG);
@@ -3487,8 +3494,9 @@ static void home_draw(int bsel, long long rpos) {
     { const char *bt = BUILD_TAG;   /* build stamp under the version -> "which v1.0 is this?" */
       ui_text(UI_W - 6 - ui_text_w(1, bt), 14, 1, UI_DIM, bt); }
     if (s_upd[0]) {   /* a newer build was published (checked in the background at startup) */
-        const char *ua = "UPDATE AVAIL";
-        ui_text(UI_W - 6 - ui_text_w(1, ua), 25, 1, UI_RGB(255, 170, 60), ua);
+        u16 oc = UI_RGB(255, 170, 60);
+        ui_text(UI_W - 6 - ui_text_w(1, "UPDATE"), 25, 1, oc, "UPDATE");
+        ui_text(UI_W - 6 - ui_text_w(1, "AVAIL."), 36, 1, oc, "AVAIL.");
     }
 
     /* theme swatch button (tap or press Y) */
@@ -3722,6 +3730,7 @@ int main(void) {
     /* sockets: init once, shared by the web server (UPLOAD) and curl (DOWNLOAD) */
     u32 *soc_buf = (u32 *)memalign(0x1000, SOC_BUF_SZ);
     if (soc_buf) socInit(soc_buf, SOC_BUF_SZ);
+    downloader_init();   /* curl_global_init is NOT thread-safe: run it here, before any download thread exists */
 
     gfxSetScreenFormat(GFX_BOTTOM, GSP_RGB565_OES);   /* match ui_gfx (u16) */
     consoleInit(GFX_BOTTOM, NULL);
@@ -3755,6 +3764,7 @@ int main(void) {
     }
     s_dt_abort = 1;   /* stop the background SD walk before teardown */
     for (int w = 0; w < 20 && !s_dt_done && !s_dt_consumed; w++) svcSleepThread(25 * 1000 * 1000LL);
+    for (int w = 0; w < 30 && !s_dtw_exit; w++) svcSleepThread(100 * 1000 * 1000LL);   /* update fetch too */
 
     dlw_stop_wait();   /* abort any in-flight background download (partial kept) */
     downloader_exit();
