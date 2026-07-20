@@ -2019,7 +2019,7 @@ ll_rebuild:;   /* X-search inside the list jumps back here with s_lib_search set
                     ui_vgrad_round(8, ry, rw, rh, 7, TH_SEL, TH_SELLO);
                     ui_frame_round(8, ry, rw, rh, 7, UI_NEON, 1); }
                 icon_movie(18, ry + 3, UI_NEONC);
-                { int st = vid_status(idx[i]); if (st >= 0) draw_status(34, ry + (rh - 9) / 2, st); }
+                { int st = vid_status(idx[i]); if (st >= 0) draw_status(9, ry + (rh - 9) / 2, st); }   /* first in the row */
                 int tx = 46, txr = UI_W - 16, ty = ry + (rh - 8) / 2;
                 char yr[8] = "";
                 if (ce->year > 0) { snprintf(yr, sizeof yr, "%d", ce->year); txr -= 40; }   /* reserve room for the year */
