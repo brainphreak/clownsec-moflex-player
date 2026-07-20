@@ -93,6 +93,69 @@ static void resume_clear(const char *movie) {
     remove(p);
 }
 
+/* ---- watched registry: videos finished to the end (moflex_player/watched.txt) ---- */
+#define WATCH_FILE "sdmc:/moflex_player/watched.txt"
+#define WATCH_MAX  2048
+static u64 g_watch[WATCH_MAX]; static int g_watch_n = -1;   /* -1 = not loaded yet */
+static u64 watch_hash(const char *s) {
+    u64 h = 1469598103934665603ull;
+    while (*s) { h ^= (u8)*s++; h *= 1099511628211ull; }
+    return h;
+}
+static void watch_load(void) {
+    if (g_watch_n >= 0) return;
+    g_watch_n = 0;
+    FILE *f = fopen(WATCH_FILE, "rb");
+    if (!f) return;
+    char ln[600];
+    while (g_watch_n < WATCH_MAX && fgets(ln, sizeof ln, f)) {
+        char *nl = strchr(ln, '\n'); if (nl) *nl = 0;
+        if (ln[0]) g_watch[g_watch_n++] = watch_hash(ln);
+    }
+    fclose(f);
+}
+int moflex_watched(const char *path) {
+    watch_load();
+    u64 h = watch_hash(path);
+    for (int i = 0; i < g_watch_n; i++) if (g_watch[i] == h) return 1;
+    return 0;
+}
+void moflex_watched_set(const char *path, int on) {
+    watch_load();
+    u64 h = watch_hash(path);
+    int at = -1;
+    for (int i = 0; i < g_watch_n; i++) if (g_watch[i] == h) { at = i; break; }
+    if (on && at < 0) {
+        if (g_watch_n < WATCH_MAX) g_watch[g_watch_n++] = h;
+        mkdir("sdmc:/moflex_player", 0777);
+        FILE *f = fopen(WATCH_FILE, "ab");
+        if (f) { fprintf(f, "%s\n", path); fclose(f); }
+    } else if (!on && at >= 0) {
+        g_watch[at] = g_watch[--g_watch_n];
+        FILE *f = fopen(WATCH_FILE, "rb");   /* rewrite the file without this path */
+        if (f) {
+            fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+            char *buf = sz > 0 ? malloc(sz + 1) : NULL;
+            long rd = buf ? (long)fread(buf, 1, sz, f) : 0;
+            fclose(f);
+            if (buf) {
+                buf[rd] = 0;
+                FILE *o = fopen(WATCH_FILE, "wb");
+                if (o) {
+                    char *line = buf;
+                    while (line && *line) {
+                        char *nl = strchr(line, '\n'); if (nl) *nl = 0;
+                        if (line[0] && strcmp(line, path)) fprintf(o, "%s\n", line);
+                        line = nl ? nl + 1 : NULL;
+                    }
+                    fclose(o);
+                }
+                free(buf);
+            }
+        }
+    }
+}
+
 /* ---- per-movie subtitle encoding, persisted next to the resume file ---- */
 static void subenc_path(const char *movie, char *out, size_t cap) {
     resume_path(movie, out, cap);                       /* .../<key>.pos */
@@ -1531,7 +1594,7 @@ static MoflexResult moflex_play_gpu(const char *path) {
     }
     if (!aptMainLoop() && result == MOFLEX_QUIT_BACK) result = MOFLEX_QUIT_EXIT;
 gdone:
-    if (dur_us > 0 && cur_us >= dur_us - 10000000) resume_clear(path);
+    if (dur_us > 0 && cur_us >= dur_us - 10000000) { resume_clear(path); moflex_watched_set(path, 1); }
     else if (cur_us > 3000000) resume_save_us(path, cur_us);
     if (awt) { g_aw_stop = 1; threadJoin(awt, 2000000000LL); threadFree(awt); }   /* stop audio worker */
     C2D_TextBufDelete(sbuf); C2D_TextBufDelete(tmbuf);
@@ -2467,7 +2530,7 @@ static MoflexResult moflex_play_ring(const char *path) {
         if (s.done && (s.wr - rd) == 0 && playing) {
             playing = 0; s.paused = 1;
             if (have_audio) ndspChnSetPaused(0, true);
-            resume_clear(path);                      /* finished -> no resume point */
+            resume_clear(path); moflex_watched_set(path, 1);   /* finished -> watched */
             if (dur_us > 0) cur_us = dur_us;
             dirty = 1;
         }
@@ -2497,7 +2560,7 @@ static MoflexResult moflex_play_ring(const char *path) {
     }
     g_ring_lock = NULL; g_ring_wake = NULL;   /* s.lock/s.wake go out of scope after this */
 
-    if (dur_us > 0 && cur_us >= dur_us - 10000000) resume_clear(path);
+    if (dur_us > 0 && cur_us >= dur_us - 10000000) { resume_clear(path); moflex_watched_set(path, 1); }
     else if (cur_us > 3000000) resume_save_us(path, cur_us);
     if (vol_dirty) vol_save();
     /* release panel services (restore backlight first so we never leave the screen dark) */
@@ -2882,7 +2945,7 @@ done:
     g_old3d_warn = 0;
     if (vol_dirty) { vol_save(); vol_dirty = 0; }   /* persist any volume change made during playback */
     /* remember where we stopped (clear it if we watched to the end) */
-    if (dur_us > 0 && cur_us >= dur_us - 10000000) resume_clear(path);
+    if (dur_us > 0 && cur_us >= dur_us - 10000000) { resume_clear(path); moflex_watched_set(path, 1); }
     else if (cur_us > 3000000) resume_save_us(path, cur_us);
     if (have_audio) { ndspChnWaveBufClear(0); ndspChnSetPaused(0, false);
         for (int i = 0; i < NWB; i++) if (abuf[i]) linearFree(abuf[i]); }
@@ -3162,7 +3225,7 @@ static MoflexResult moflex_play_soft(const char *path) {
         if (done && r3_vqc == 0 && (wr - rd) == 0 && playing) {
             playing = 0;
             if (have_audio) ndspChnSetPaused(0, true);
-            resume_clear(path);
+            resume_clear(path); moflex_watched_set(path, 1);
             if (dur_us > 0) cur_us = dur_us;
             dirty = 1;
         }
@@ -3176,7 +3239,7 @@ static MoflexResult moflex_play_soft(const char *path) {
     if (g_mcu_ok) { mcuHwcExit(); g_mcu_ok = 0; }
     ptmuExit(); g_old3d_warn = 0; g_sw_bank = -1;
     if (vol_dirty) vol_save();
-    if (dur_us > 0 && cur_us >= dur_us - 10000000) resume_clear(path);
+    if (dur_us > 0 && cur_us >= dur_us - 10000000) { resume_clear(path); moflex_watched_set(path, 1); }
     else if (cur_us > 3000000) resume_save_us(path, cur_us);
     r3_audio_close();   /* unconditional: also frees a partial bank when setup failed */
     r3_vq_clear();

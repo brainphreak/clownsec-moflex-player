@@ -32,4 +32,8 @@ long long moflex_resume_get(const char *path);
 /* Forget the saved position (used by the "start from beginning" choice). */
 void moflex_resume_clear(const char *path);
 
+/* Watched registry: videos finished to the end. */
+int  moflex_watched(const char *path);
+void moflex_watched_set(const char *path, int on);
+
 #endif

@@ -1443,7 +1443,10 @@ static int show_pick_episode(const char *showname, const char *url, char *out, s
         const char *tag = ep_tag_at(b);
         char nm[64]; snprintf(nm, sizeof nm, "%s", tag ? tag : b);
         strip_ext(nm); strip_3d_tags(nm);
-        snprintf(eps[i], 32, "%.31s", nm);
+        /* watch markers: * = watched, > = in progress */
+        const char *mk = moflex_watched(s_epfile[i]) ? "* "
+                       : moflex_resume_get(s_epfile[i]) > 0 ? "> " : "";
+        snprintf(eps[i], 32, "%s%.29s", mk, nm);
     }
     int c = catalog_pick("EPISODES", showname, eps, n, 0, NULL);
     if (c < 0) return 0;
@@ -1780,11 +1783,41 @@ static char s_lib_search[64] = "";   /* active library search query ("" = off) *
 static char s_lib_last_cat[32] = "", s_lib_last_genre[32] = "";   /* filters of the last list shown */
 static char s_lib_presel[PATHLEN + NAMELEN] = "";                 /* highlight this url on next list open */
 static int lib_idxbuf[LIB_MAX];
+
+/* watch status per entry: 0 new, 1 in progress, 2 watched, -1 none (shows). Cached per list
+ * visit -- the resume check opens a file, so it runs once per entry, not per redraw. */
+static u8 s_vs[LIB_MAX];
+static int vid_status(int li) {
+    if (s_vs[li] != 0xFF) return (int)s_vs[li] - 1;
+    const CatEntry *e = &g_lib[li];
+    int st;
+    if (e->is_zip == 2) st = -1;                       /* shows: per-episode marks live in the picker */
+    else if (moflex_watched(e->url)) st = 2;
+    else if (moflex_resume_get(e->url) > 0) st = 1;
+    else st = 0;
+    s_vs[li] = (u8)(st + 1);
+    return st;
+}
+static void draw_status(int x, int y, int st) {
+    if (st == 2) {          /* watched: green check */
+        u16 g = UI_RGB(70, 220, 110);
+        for (int i = 0; i < 3; i++) ui_px(x + i, y + 4 + i, g), ui_px(x + i, y + 5 + i, g);
+        for (int i = 0; i < 5; i++) ui_px(x + 3 + i, y + 6 - i, g), ui_px(x + 3 + i, y + 7 - i, g);
+    } else if (st == 1) {   /* in progress: orange half-filled box */
+        u16 o = UI_RGB(255, 170, 60);
+        ui_frame_round(x, y, 9, 9, 2, o, 1);
+        ui_fill(x + 1, y + 1, 4, 7, o);
+    } else if (st == 0) {   /* new: small cyan dot */
+        ui_fill_round(x + 2, y + 2, 5, 5, 2, UI_RGB(80, 200, 255));
+    }
+}
+
 static int library_list(const char *filt_cat, const char *filt_genre, u16 *poster, int *sortmode, char *out, size_t cap) {
     /* remember where we are so BACK from the player can reopen this exact list */
     snprintf(s_lib_last_cat, sizeof s_lib_last_cat, "%s", filt_cat);
     snprintf(s_lib_last_genre, sizeof s_lib_last_genre, "%s", filt_genre);
 ll_rebuild:;   /* X-search inside the list jumps back here with s_lib_search set */
+    memset(s_vs, 0xFF, sizeof s_vs);
     int *idx = lib_idxbuf, ni = 0;
     for (int i = 0; i < g_lib_n; i++) {
         if (filt_cat[0] && strcasecmp(lib_disp_cat(&g_lib[i]), filt_cat)) continue;
@@ -1903,6 +1936,7 @@ ll_rebuild:;   /* X-search inside the list jumps back here with s_lib_search set
                     ui_vgrad_round(8, ry, rw, rh, 7, TH_SEL, TH_SELLO);
                     ui_frame_round(8, ry, rw, rh, 7, UI_NEON, 1); }
                 icon_movie(18, ry + 3, UI_NEONC);
+                { int st = vid_status(idx[i]); if (st >= 0) draw_status(34, ry + (rh - 9) / 2, st); }
                 int tx = 46, txr = UI_W - 16, ty = ry + (rh - 8) / 2;
                 char yr[8] = "";
                 if (ce->year > 0) { snprintf(yr, sizeof yr, "%d", ce->year); txr -= 40; }   /* reserve room for the year */
@@ -2558,8 +2592,10 @@ static void lib_edit_menu(int li) {
 
 static void lib_getinfo_menu(int *idx, int ni, int csel) {
     (void)ni;   /* batch fetch lives in the rescan flow now */
-    const char *items[2] = { "Download Info", "Edit Info" };
-    int c = ui_menu("VIDEO INFO", g_lib[idx[csel]].name, items, 2);   /* B backs out */
+    int watched = g_lib[idx[csel]].is_zip != 2 && moflex_watched(g_lib[idx[csel]].url);
+    const char *items[3] = { "Download Info", "Edit Info", watched ? "Mark Unwatched" : "Mark Watched" };
+    int nit = g_lib[idx[csel]].is_zip == 2 ? 2 : 3;   /* shows: no single watched flag */
+    int c = ui_menu("VIDEO INFO", g_lib[idx[csel]].name, items, nit);   /* B backs out */
     if (c == 0) {
         /* never silently overwrite hand edits: confirm before re-downloading existing info */
         if (movieinfo_have(g_lib[idx[csel]].url) &&
@@ -2567,6 +2603,7 @@ static void lib_getinfo_menu(int *idx, int ni, int csel) {
                     "UPDATE", "KEEP") != 0) return;
         lib_scrape_one(idx[csel]);
     } else if (c == 1) lib_edit_menu(idx[csel]);
+    else if (c == 2) { moflex_watched_set(g_lib[idx[csel]].url, !watched); s_vs[idx[csel]] = 0xFF; }
 }
 
 /* GET INFO chooser (X in Open Video): fetch metadata for just this movie, or every movie in
