@@ -1634,8 +1634,18 @@ static void lib_scan_dir(const char *dir, int depth) {
     closedir(d);
 }
 
-static int lib_normalize_shows(void) {   /* returns nonzero when it healed something */
+static int lib_normalize_shows(int deep) {   /* returns nonzero when it healed something */
     int chg = 0;
+    /* canonicalize urls (collapse '//') so the same file can't hide behind two spellings */
+    for (int i = 0; i < g_lib_n; i++) {
+        char *u = g_lib[i].url, *w = u; int prev = 0;
+        for (char *r = u; *r; r++) {
+            if (*r == '/' && prev) { chg = 1; continue; }
+            prev = (*r == '/');
+            *w++ = *r;
+        }
+        *w = 0;
+    }
     /* heal ".srt.moflex"-style names the old download sniffer created: restore the real
      * extension on the SD and drop the bogus library entry */
     static const char *junk[] = { ".srt", ".txt", ".nfo", ".jpg", ".png" };
@@ -1682,10 +1692,28 @@ static int lib_normalize_shows(void) {   /* returns nonzero when it healed somet
             g_lib_n--; chg = 1;
         }
     }
+    /* drop duplicate file entries that point at the same path */
+    for (int i = 0; i < g_lib_n; i++) {
+        if (g_lib[i].is_zip == 2) continue;
+        for (int j = g_lib_n - 1; j > i; j--) {
+            if (g_lib[j].is_zip == 2 || strcasecmp(g_lib[j].url, g_lib[i].url)) continue;
+            memmove(&g_lib[j], &g_lib[j + 1], (size_t)(g_lib_n - j - 1) * sizeof(CatEntry));
+            g_lib_n--; chg = 1;
+        }
+    }
+    if (deep) {   /* on load: drop entries whose file vanished (renamed/deleted outside the app) */
+        for (int i = 0; i < g_lib_n; i++) {
+            if (g_lib[i].is_zip == 2) continue;
+            struct stat st;
+            if (!stat(g_lib[i].url, &st)) continue;
+            memmove(&g_lib[i], &g_lib[i + 1], (size_t)(g_lib_n - i - 1) * sizeof(CatEntry));
+            g_lib_n--; i--; chg = 1;
+        }
+    }
     return chg;
 }
 static void lib_save_cache(void) {
-    lib_normalize_shows();                                    /* never persist a demoted show entry */
+    lib_normalize_shows(0);                                   /* never persist a demoted show entry */
     mkdir("sdmc:/moflex_player", 0777);                       /* cache so later opens are instant */
     FILE *f = fopen(LIB_CACHE, "wb");
     if (f) { int magic = LIB_MAGIC; fwrite(&magic, sizeof magic, 1, f);
@@ -1751,7 +1779,7 @@ static int lib_load_cache(void) {   /* cache-only: movie count, 0 if no valid ca
             fread(&n, sizeof n, 1, f) == 1 && n > 0 && n <= LIB_MAX &&
             (int)fread(g_lib, sizeof(CatEntry), n, f) == n) g_lib_n = n;
         fclose(f); }
-    if (lib_normalize_shows()) lib_save_cache();   /* heal (demoted shows, stray files) + persist it */
+    if (lib_normalize_shows(1)) lib_save_cache();   /* deep heal (dups, dangling, stray files) + persist */
     return g_lib_n;
 }
 static int lib_load(void) {   /* returns the movie count; loads the cache, else scans once */
@@ -1869,7 +1897,7 @@ static int lib_load_cache_only(void) {
             fread(&n, sizeof n, 1, f) == 1 && n > 0 && n <= LIB_MAX &&
             (int)fread(g_lib, sizeof(CatEntry), n, f) == n) g_lib_n = n;
         fclose(f); }
-    if (lib_normalize_shows()) lib_save_cache();   /* same heal as lib_load_cache -- this loader can fill RAM first */
+    if (lib_normalize_shows(1)) lib_save_cache();   /* same deep heal -- this loader can fill RAM first */
     return g_lib_n;
 }
 
