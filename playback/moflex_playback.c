@@ -2007,7 +2007,8 @@ static MoflexResult moflex_play_ring(const char *path) {
     AVCodecContext ctx; memset(&ctx, 0, sizeof ctx);
     ctx.width = W; ctx.height = H; ctx.priv_data = calloc(1, mobi_ctx_size());
     if (!ctx.priv_data || mobi_init(&ctx) != 0) { free(ctx.priv_data); mfx_close(&m); fclose(f); return MOFLEX_ERROR; }
-    mobi_opt = 0x1BDA5E;   /* shipped fast path + missing-ref tolerance + SIMD residual add (0x40). NOTE: no pipeline --
+    mobi_opt = 0x1BDA5E | 0x08000000;   /* shipped fast path + missing-ref tolerance + SIMD residual (0x40) + FUSED
+                             * transpose-free IDCT (0x08000000, bit-exact, ~3% faster decode -- binary-guided). NOTE: no pipeline --
                             * the decode THREAD gives the headroom the New-3DS pipeline used to, and the
                             * threaded producer decodes plain sequential frames (no L/R lag bookkeeping). */
     bool r3_isnew = false; APT_CheckNew3DS(&r3_isnew);
