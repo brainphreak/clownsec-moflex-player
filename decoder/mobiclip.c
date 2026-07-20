@@ -668,6 +668,23 @@ static inline void idct_job(ReconSet *rs, const ReconJob *j) {
 #define MOBI_SIMD_IDCT 0x04000000   /* packed 2-row IDCT (experiment) */
 static void idct_writeback(dctcoef *mat, uint8_t *dst, int linesize, int size, int ac, unsigned rowmask)
 {
+#define MOBI_FUSED_IDCT 0x08000000   /* fused column pass: no transpose, no mat[] 2nd-write (official-style) */
+    if (mobi_opt & MOBI_FUSED_IDCT) {
+        /* pass 1: rows (as normal). */
+        for (int y = 0; y < size; y++) idct(&mat[y * size], size);
+        /* pass 2: for output ROW y, transform COLUMN y of the row-pass result and write it -- no
+         * transpose, sequential row write (packable). Bit-exact: matches the scalar path's
+         * transpose+idct orientation, same >>6 + clip. */
+        for (int y = 0; y < size; y++) {
+            dctcoef col[8];
+            for (int k = 0; k < size; k++) col[k] = mat[k * size + y];   /* column y (strided gather) */
+            idct(col, size);
+            for (int x = 0; x < size; x += 4)                           /* row y: packed 4-px write */
+                st4(dst + x, simd_add_clip4(ld4(dst + x), col[x] >> 6, col[x+1] >> 6, col[x+2] >> 6, col[x+3] >> 6));
+            dst += linesize;
+        }
+        return;
+    }
     if (mobi_opt & MOBI_SIMD_IDCT) {                 /* packed 2-row transform (both passes) */
         for (int y = 0; y < size; y += 2) idct_pair_rows(&mat[y * size], &mat[(y + 1) * size], size);
         for (int y = 0; y < size; y++)               /* transpose (scalar) */

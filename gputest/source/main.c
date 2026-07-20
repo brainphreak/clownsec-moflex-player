@@ -82,13 +82,15 @@ int main(void) {
     /* SIMD-IDCT A/B: scalar full-transform vs packed 2-row full-transform (0x04000000), like-for-like
      * (both WITHOUT the DC-only/rowmask shortcuts, so we isolate the transform). 3 pairs interleaved
      * to expose thermal drift -- compare each SIMD to the scalar right above it, not across runs. */
+    /* FUSED transpose-free IDCT (0x08000000) vs scalar full transform, both with packed residual
+     * write (0x40). Only difference = the transpose + separate 2nd-pass. 3 interleaved pairs. */
     static const struct { const char *name; int opt; } C[6] = {
         { "scalarFULL A ", 0x1BDA58 },
-        { "SIMD-IDCT  A ", 0x1BDA58 | 0x04000000 },
+        { "FUSED-IDCT A ", 0x1BDA58 | 0x08000000 },
         { "scalarFULL B ", 0x1BDA58 },
-        { "SIMD-IDCT  B ", 0x1BDA58 | 0x04000000 },
+        { "FUSED-IDCT B ", 0x1BDA58 | 0x08000000 },
         { "scalarFULL C ", 0x1BDA58 },
-        { "SIMD-IDCT  C ", 0x1BDA58 | 0x04000000 },
+        { "FUSED-IDCT C ", 0x1BDA58 | 0x08000000 },
     };
     int NC = sizeof(C) / sizeof(C[0]);
     Res res[16];
