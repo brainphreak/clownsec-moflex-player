@@ -11,6 +11,7 @@
 #include <malloc.h>
 #include <ctype.h>
 #include <time.h>
+#include <locale.h>
 
 #include "moflex_playback.h"
 #include "httpd.h"
@@ -3822,6 +3823,11 @@ static int play_and_handle(const char *path, int origin) {
 
 #define SOC_BUF_SZ 0x100000
 int main(void) {
+    /* Initialize newlib's global locale ON THE MAIN THREAD before any worker spawns. The
+     * background SD scan snprintf()s every filename on a libctru thread, and __global_locale's
+     * wctomb pointer is NULL until locale is touched -- so formatting a filename with a non-ASCII
+     * byte on that thread called through NULL (prefetch abort, PC=0). This makes it valid. */
+    setlocale(LC_ALL, "C");
     osSetSpeedupEnable(true);   /* unlock New 3DS 804MHz clock (no-op on old 3DS) */
     gfxInitDefault();
     ndspInit();
