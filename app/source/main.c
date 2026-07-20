@@ -889,6 +889,82 @@ static void pw_request(int id, const char *url, const char *key) {
 
 /* Google Drive (and similar) serve files with no extension in the name; give the saved file the
  * right extension by sniffing its magic bytes so the browser recognizes and plays it. */
+/* ---------- DOWNLOAD QUEUE: queue several catalog downloads, run back to back ---------- */
+#define QUEUE_FILE "sdmc:/moflex_player/queue.txt"
+#define QUEUE_MAX  24
+typedef struct { char name[64]; char fname[160]; char url[512]; char art[512]; char category[32]; char dest[512]; int is_zip; } QItem;
+static QItem s_q[QUEUE_MAX]; static int s_qn = -1;      /* -1 = not loaded */
+static char s_q_dest[512] = "";                         /* remembered destination folder */
+static char s_qtoast[40] = ""; static int s_qtoast_t = 0;   /* "Queued (n)" overlay in the list */
+
+static void queue_save(void) {
+    mkdir("sdmc:/moflex_player", 0777);
+    FILE *f = fopen(QUEUE_FILE, "wb");
+    if (!f) return;
+    for (int i = 0; i < s_qn; i++)
+        fprintf(f, "%s\t%s\t%s\t%s\t%s\t%s\t%d\n",
+                s_q[i].name, s_q[i].fname, s_q[i].url, s_q[i].art, s_q[i].category, s_q[i].dest, s_q[i].is_zip);
+    fclose(f);
+}
+static void queue_load(void) {
+    if (s_qn >= 0) return;
+    s_qn = 0;
+    FILE *f = fopen(QUEUE_FILE, "rb");
+    if (!f) return;
+    static char ln[2048];
+    while (s_qn < QUEUE_MAX && fgets(ln, sizeof ln, f)) {
+        char *nl = strchr(ln, '\n'); if (nl) *nl = 0;
+        QItem *q = &s_q[s_qn]; memset(q, 0, sizeof *q);
+        char *pp = ln; int fi = 0;
+        while (fi < 7 && pp) {
+            char *t = strchr(pp, '\t'); if (t) *t = 0;
+            switch (fi) {
+                case 0: snprintf(q->name, sizeof q->name, "%s", pp); break;
+                case 1: snprintf(q->fname, sizeof q->fname, "%s", pp); break;
+                case 2: snprintf(q->url, sizeof q->url, "%s", pp); break;
+                case 3: snprintf(q->art, sizeof q->art, "%s", pp); break;
+                case 4: snprintf(q->category, sizeof q->category, "%s", pp); break;
+                case 5: snprintf(q->dest, sizeof q->dest, "%s", pp); break;
+                case 6: q->is_zip = atoi(pp); break;
+            }
+            pp = t ? t + 1 : NULL; fi++;
+        }
+        if (q->url[0] && q->fname[0]) s_qn++;
+    }
+    fclose(f);
+}
+static int queue_count(void) { queue_load(); return s_qn; }
+static void queue_remove(int i) {
+    queue_load();
+    if (i < 0 || i >= s_qn) return;
+    memmove(&s_q[i], &s_q[i + 1], (size_t)(s_qn - i - 1) * sizeof(QItem));
+    s_qn--; queue_save();
+}
+static void queue_move_top(int i) {
+    queue_load();
+    if (i <= 0 || i >= s_qn) return;
+    QItem t = s_q[i];
+    memmove(&s_q[1], &s_q[0], (size_t)i * sizeof(QItem));
+    s_q[0] = t; queue_save();
+}
+static void queue_add_ui(const CatEntry *e) {
+    queue_load();
+    if (s_qn >= QUEUE_MAX) { snprintf(s_qtoast, sizeof s_qtoast, "Queue full (%d)", QUEUE_MAX); s_qtoast_t = 75; return; }
+    for (int i = 0; i < s_qn; i++)
+        if (!strcmp(s_q[i].url, e->url)) { snprintf(s_qtoast, sizeof s_qtoast, "Already queued"); s_qtoast_t = 75; return; }
+    if (!s_q_dest[0] && !pick_folder(s_q_dest, sizeof s_q_dest)) return;   /* choose the folder once */
+    QItem *q = &s_q[s_qn]; memset(q, 0, sizeof *q);
+    snprintf(q->name, sizeof q->name, "%s", e->name);
+    snprintf(q->fname, sizeof q->fname, "%s", e->fname);
+    snprintf(q->url, sizeof q->url, "%s", e->url);
+    snprintf(q->art, sizeof q->art, "%s", e->art);
+    snprintf(q->category, sizeof q->category, "%s", e->category);
+    snprintf(q->dest, sizeof q->dest, "%s", s_q_dest);
+    q->is_zip = e->is_zip;
+    s_qn++; queue_save();
+    snprintf(s_qtoast, sizeof s_qtoast, "Queued (%d)", s_qn); s_qtoast_t = 75;
+}
+
 static void fix_download_ext(char *dest, size_t cap) {
     size_t L = strlen(dest);
     if ((L > 7 && !strcasecmp(dest + L - 7, ".moflex")) ||
@@ -1126,6 +1202,7 @@ cb_rebuild:;   /* X-search inside the list jumps back here with filt_search set 
             csel = i; redraw = 1;
         }
         if (k & KEY_A) want_dl = 1;
+        if (k & KEY_SELECT) { queue_add_ui(&cat[idx[csel]]); redraw = 1; }   /* add to download queue */
         if (k & KEY_Y) { sortmode = (sortmode + 1) % 3; g_smode = sortmode;   /* cycle sort */
             qsort(idx, ni, sizeof(int), idx_cmp); csel = 0; cscroll = 0; shown = -1; redraw = 1; }
         if (csel < cscroll) cscroll = csel;
@@ -1143,11 +1220,11 @@ cb_rebuild:;   /* X-search inside the list jumps back here with filt_search set 
                     if (ns != cscroll) { cscroll = ns; redraw = 1; } } }
         } else if ((ku & KEY_TOUCH) && td) { td = 0;
             if (!tmv) {
-                if (ty0 >= 210 && ty0 < 236) {           /* DOWNLOAD / SORT / Back */
+                if (ty0 >= 210 && ty0 < 236) {           /* DOWNLOAD / SORT / QUEUE */
                     if (tx0 < 104) want_dl = 1;
                     else if (tx0 < 208) { sortmode = (sortmode + 1) % 3; g_smode = sortmode;
                         qsort(idx, ni, sizeof(int), idx_cmp); csel = 0; cscroll = 0; shown = -1; redraw = 1; }
-                    else leave = (ncat > 1) ? 1 : 2;
+                    else { queue_add_ui(&cat[idx[csel]]); redraw = 1; }
                 } else if (ty0 >= BR_LIST_Y) { int i = cscroll + (ty0 - BR_LIST_Y) / BR_ROWH;
                     if (i >= 0 && i < ni && i < cscroll + BR_ROWS) { csel = i; redraw = 1; } }
             }
@@ -1199,6 +1276,7 @@ cb_rebuild:;   /* X-search inside the list jumps back here with filt_search set 
             redraw = 1;
         }
     cont:
+        if (s_qtoast_t > 0 && --s_qtoast_t == 0) redraw = 1;   /* toast expired -> repaint without it */
         if (csel != shown) { redraw = 1; phave = 0; settle = 0; requested = 0; }   /* moved -> drop poster */
         /* debounced request to the background loader, then poll -- scrolling never blocks on a poster */
         if (!phave && !requested && cat[idx[csel]].art[0] && ++settle >= 6) { pw_request(idx[csel], cat[idx[csel]].art, cat[idx[csel]].fname); requested = 1; }
@@ -1242,7 +1320,12 @@ cb_rebuild:;   /* X-search inside the list jumps back here with filt_search set 
             const char *sm = sortmode == 0 ? "Sort: Title" : sortmode == 1 ? "Sort: Year" : "Sort: Date";
             ui_button(8, 210, 96, 26, "DOWNLOAD", 0, UI_NEON);
             ui_button(108, 210, 100, 26, sm, 0, UI_NEONC);
-            ui_button(212, 210, 100, 26, "Back", 0, UI_NEONP);
+            ui_button(212, 210, 100, 26, "QUEUE", 0, UI_NEONP);
+            if (s_qtoast_t > 0) {   /* "Queued (n)" toast on top of the list */
+                ui_fill_round(70, 96, 180, 26, 8, UI_BG2);
+                ui_frame_round(70, 96, 180, 26, 8, UI_NEON, 1);
+                ui_text_center(UI_W / 2, 105, 1, UI_NEON, s_qtoast);
+            }
             ui_present();
             draw_info_top(&cat[idx[csel]], phave ? poster : NULL);
             shown = csel; redraw = 0;
@@ -2199,12 +2282,76 @@ static int ui_menu(const char *title, const char *subtitle, const char *const *i
     return -1;
 }
 
+/* Run the queue front to back. B during a download pauses the queue (partial kept for resume). */
+static void queue_run(void) {
+    queue_load();
+    while (s_qn > 0 && aptMainLoop()) {
+        QItem q = s_q[0];
+        char dest[PATHLEN + NAMELEN];
+        size_t dl = strlen(q.dest);
+        snprintf(dest, sizeof dest, "%s%s%s", q.dest, (dl && q.dest[dl - 1] == '/') ? "" : "/", q.fname);
+        snprintf(g_dl_name, sizeof g_dl_name, "%s (%d left)", q.fname, s_qn);
+        g_last_prog = 0;
+        bool ok = download_to_file(q.url, dest, dl_progress, NULL);
+        if (!ok) {   /* cancelled/failed: keep the item + partial data */
+            if (prompt2("DOWNLOAD QUEUE", "Queue paused.\nProgress is saved for resume.", "RESUME", "STOP") == 0) continue;
+            return;
+        }
+        /* post-process like a normal download */
+        CatEntry e; memset(&e, 0, sizeof e);
+        snprintf(e.name, sizeof e.name, "%s", q.name);
+        snprintf(e.title, sizeof e.title, "%s", q.name);
+        snprintf(e.fname, sizeof e.fname, "%s", q.fname);
+        snprintf(e.url, sizeof e.url, "%s", q.url);
+        snprintf(e.art, sizeof e.art, "%s", q.art);
+        snprintf(e.category, sizeof e.category, "%s", q.category);
+        e.is3d = -1; e.is_zip = q.is_zip;
+        size_t fl = strlen(dest);
+        if (q.is_zip && fl > 4 && !strcasecmp(dest + fl - 4, ".zip") && file_is_zip(dest)) {
+            char folder[PATHLEN + NAMELEN];
+            snprintf(folder, sizeof folder, "%.*s", (int)(fl - 4), dest);
+            int tot = 0;
+            int nf = unzip_to_dir_cb(dest, folder, &tot, unzip_prog);
+            if (nf > 0) { remove(dest); lib_add_extracted(folder, &e); }
+        } else {
+            fix_download_ext(dest, sizeof dest);
+            u16 *pb = (u16 *)malloc((size_t)POSTER_W * POSTER_H * sizeof(u16));
+            int phave = pb && e.art[0] && poster_get(e.art, e.fname, pb, POSTER_W, POSTER_H);
+            movieinfo_save(dest, &e, phave ? pb : NULL, POSTER_W, POSTER_H);
+            free(pb);
+            lib_add_downloaded(dest, &e);
+        }
+        queue_remove(0);
+    }
+    if (s_qn == 0) msg_screen("DOWNLOAD QUEUE", "All downloads complete.");
+}
+
+/* Queue screen: list of pending items; A on an item -> Move to Top / Remove; Start runs it. */
+static void queue_screen(void) {
+    for (;;) {
+        queue_load();
+        if (s_qn == 0) { msg_screen("DOWNLOAD QUEUE", "The queue is empty.\nPress SELECT (or tap QUEUE)\non a catalog entry to queue it."); return; }
+        static char names[QUEUE_MAX][32];
+        for (int i = 0; i < s_qn; i++) snprintf(names[i], 32, "%d. %.27s", i + 1, s_q[i].name);
+        char sub[24]; snprintf(sub, sizeof sub, "%d item%s", s_qn, s_qn == 1 ? "" : "s");
+        int c = catalog_pick("DOWNLOAD QUEUE", sub, names, s_qn, 0, "* Start Downloads");
+        if (c == -1) return;
+        if (c == -3) { queue_run(); continue; }
+        if (c < 0) continue;
+        const char *items[2] = { "Move to Top", "Remove" };
+        int a = ui_menu("QUEUE ITEM", s_q[c].name, items, 2);
+        if (a == 0) queue_move_top(c);
+        else if (a == 1) queue_remove(c);
+    }
+}
+
 static void add_movies_menu(void) {
     for (;;) {
-        const char *items[] = { "DOWNLOAD  (catalog / URL)", "UPLOAD  (over Wi-Fi)" };
-        int c = ui_menu("ADD VIDEO", NULL, items, 2);
+        char qlab[40]; snprintf(qlab, sizeof qlab, "DOWNLOAD QUEUE  (%d)", queue_count());
+        const char *items[3] = { "DOWNLOAD  (catalog / URL)", "UPLOAD  (over Wi-Fi)", qlab };
+        int c = ui_menu("ADD VIDEO", NULL, items, 3);
         if (c < 0) break;
-        if (c == 0) download_screen(); else upload_screen();
+        if (c == 0) download_screen(); else if (c == 1) upload_screen(); else queue_screen();
     }
 }
 
@@ -2460,9 +2607,22 @@ static void lib_rescan_interactive(void) {
 /* ---- startup: detect movies added outside the app (browser download, PC copy, upload) and offer
  * a rescan; after rescanning, offer art + info download for the new arrivals. ---- */
 static int startup_detect_poll(void);
+#define LATEST_URL "https://github.com/brainphreak/clownsec-moflex-player/releases/download/v1.1.0-beta/latest.txt"
+static char s_upd[24] = ""; static int s_upd_shown = 0;
+static void update_check(void) {   /* runs on the worker thread; ~10 byte fetch */
+    char *buf = NULL; size_t len = 0;
+    if (!download_to_mem(LATEST_URL, &buf, &len, 256) || !buf) return;
+    buf[len < 255 ? len : 255] = 0;
+    int ld = 0, ln = 0, cd = 0, cn = 0;
+    if (sscanf(buf, "%d.%d", &ld, &ln) == 2 && sscanf(BUILD_TAG, "%d.%d", &cd, &cn) == 2 &&
+        (ld > cd || (ld == cd && ln > cn)))
+        snprintf(s_upd, sizeof s_upd, "%d.%d", ld, ln);
+    free(buf);
+}
 static void detect_worker(void *arg) {
     (void)arg;
     lib_detect_dir("sdmc:/", 0);
+    if (!s_dt_abort) update_check();
     s_dt_done = 1;
 }
 
@@ -2502,6 +2662,13 @@ static void startup_new_movie_check(void) {
 
 /* Home screen polls this once per frame; runs the prompts when the background walk lands. */
 static int startup_detect_poll(void) {
+    if (s_dt_done && s_upd[0] && !s_upd_shown) {   /* newer build published */
+        s_upd_shown = 1;
+        char um[96];
+        snprintf(um, sizeof um, "A newer build is available:\nb%s (you have b%s).\nRedownload via the QR / FBI.", s_upd, BUILD_TAG);
+        msg_screen("UPDATE AVAILABLE", um);
+        return 1;
+    }
     if (s_dt_consumed || !s_dt_done) return 0;
     s_dt_consumed = 1;
     free(s_dt_hash); s_dt_hash = NULL;
@@ -3388,6 +3555,12 @@ int main(void) {
 
     startup_new_movie_check();   /* movies added outside the app -> offer rescan (+ art/info) */
     lastplay_restore();          /* home boots with the last-played movie ready on PLAY */
+    if (queue_count() > 0) {
+        char qm[64];
+        snprintf(qm, sizeof qm, "%d queued download%s waiting.\nContinue downloading now?",
+                 queue_count(), queue_count() == 1 ? "" : "s");
+        if (prompt2("DOWNLOAD QUEUE", qm, "DOWNLOAD", "LATER") == 0) queue_run();
+    }
 
     int running = 1;
     while (running && aptMainLoop()) {
