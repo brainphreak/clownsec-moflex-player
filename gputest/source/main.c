@@ -79,13 +79,16 @@ int main(void) {
     AVFrame *fr = av_frame_alloc();
     printf("%.30s  %dx%d\n%d frames x configs...\n\n", strrchr(path, '/') + 1, gW, gH, SEG_FRAMES);
 
+    /* SIMD-IDCT A/B: scalar full-transform vs packed 2-row full-transform (0x04000000), like-for-like
+     * (both WITHOUT the DC-only/rowmask shortcuts, so we isolate the transform). 3 pairs interleaved
+     * to expose thermal drift -- compare each SIMD to the scalar right above it, not across runs. */
     static const struct { const char *name; int opt; } C[6] = {
-        { "0 base        ", 0 },
-        { "1 ASM-mc      ", 0x100 },              /* hand-written assembly motion comp */
-        { "2 ASM+pf+sk+dc", 0x100 | 8 | 2 | 4 },  /* asm mc + the decode wins */
-        { "3 pf+sk+dc    ", 0x0E },               /* current best (no asm) for comparison */
-        { "4 dir-mc(C)   ", 0x80 },               /* the C aligned-read attempt (was a wash) */
-        { "5 uhadd-mc(C) ", 16 },                 /* the C UHADD8 attempt (was a wash) */
+        { "scalarFULL A ", 0x1BDA58 },
+        { "SIMD-IDCT  A ", 0x1BDA58 | 0x04000000 },
+        { "scalarFULL B ", 0x1BDA58 },
+        { "SIMD-IDCT  B ", 0x1BDA58 | 0x04000000 },
+        { "scalarFULL C ", 0x1BDA58 },
+        { "SIMD-IDCT  C ", 0x1BDA58 | 0x04000000 },
     };
     int NC = sizeof(C) / sizeof(C[0]);
     Res res[16];
@@ -95,7 +98,7 @@ int main(void) {
     for (int i = 0; i < NC; i++)
         printf("%s  %6.2f    %s\n", C[i].name, res[i].tot,
                i == 0 ? "base" : (res[i].csum == res[0].csum ? "YES" : "DIFF"));
-    printf("\nall motion-comp attempts, one run.\n");
+    printf("\nSIMD-IDCT (0x04000000) vs scalar, full transform.\n");
     printf("ok=YES = bit-identical. lower=faster.\n");
     printf("\nSTART to exit.\n");
 
