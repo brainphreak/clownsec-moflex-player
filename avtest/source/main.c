@@ -225,7 +225,7 @@ int main(void) {
         imgL[NB] = (C2D_Image){ &texL[NB], &sub }; imgR[NB] = (C2D_Image){ &texR[NB], &sub };
     }
     y2r_setup();
-    mobi_opt = 0x1BDA1E;  /* +DC closed form +intra memcpy/memset (16.54 vs 18.01 ms/f) */
+    mobi_opt = 0x1BDA5E;  /* shipped fast path: +DC closed form +intra memcpy/memset +SIMD residual add (0x40) */
 
     printf("linear %uK -> ring NB=%d pairs (~%.1fs cushion)\n",
            (unsigned)(lin0 >> 10), NB, NB / 23.976);
