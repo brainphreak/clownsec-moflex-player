@@ -897,6 +897,7 @@ typedef struct { char name[64]; char fname[160]; char url[512]; char art[512]; c
 static QItem s_q[QUEUE_MAX]; static int s_qn = -1;      /* -1 = not loaded */
 static char s_q_dest[512] = "";                         /* remembered destination folder */
 static char s_qtoast[40] = ""; static int s_qtoast_t = 0;   /* "Queued (n)" overlay in the list */
+static int lib_has_file(const char *fname);   /* "is this already downloaded?" (defined with the library) */
 
 static void queue_save(void) {
     mkdir("sdmc:/moflex_player", 0777);
@@ -953,6 +954,7 @@ static void queue_add_ui(const CatEntry *e) {
     if (s_qn >= QUEUE_MAX) { snprintf(s_qtoast, sizeof s_qtoast, "Queue full (%d)", QUEUE_MAX); s_qtoast_t = 75; return; }
     for (int i = 0; i < s_qn; i++)
         if (!strcmp(s_q[i].url, e->url)) { snprintf(s_qtoast, sizeof s_qtoast, "Already queued"); s_qtoast_t = 75; return; }
+    if (lib_has_file(e->fname)) { snprintf(s_qtoast, sizeof s_qtoast, "Already in library"); s_qtoast_t = 75; return; }
     if (!s_q_dest[0] && !pick_folder(s_q_dest, sizeof s_q_dest)) return;   /* choose the folder once */
     QItem *q = &s_q[s_qn]; memset(q, 0, sizeof *q);
     snprintf(q->name, sizeof q->name, "%s", e->name);
@@ -1333,6 +1335,7 @@ cb_rebuild:;   /* X-search inside the list jumps back here with filt_search set 
         if (leave) break;
         if (want_dl) {   /* background download: becomes next in line, list stays usable */
             CatEntry *e = &cat[idx[csel]];
+            if (lib_has_file(e->fname)) { qtoast("Already in library"); redraw = 1; goto cont; }
             if (!s_q_dest[0] && !pick_folder(s_q_dest, sizeof s_q_dest)) { redraw = 1; goto cont; }
             queue_add_front(e);
             dlw_start();
@@ -1939,6 +1942,17 @@ static int lib_load_cache_only(void) {
         fclose(f); }
     if (lib_normalize_shows(1)) lib_save_cache();   /* same deep heal -- this loader can fill RAM first */
     return g_lib_n;
+}
+
+/* Is a file with this name already in the library? (guards against re-downloading.) */
+static int lib_has_file(const char *fname) {
+    if (!fname || !fname[0]) return 0;
+    if (g_lib_n == 0) lib_load_cache_only();
+    for (int i = 0; i < g_lib_n; i++) {
+        if (g_lib[i].is_zip == 2) continue;   /* shows are folders, not single files */
+        if (!strcasecmp(g_lib[i].fname, fname)) return 1;
+    }
+    return 0;
 }
 
 /* Add (or update) a just-downloaded catalog movie in the library so it shows immediately
@@ -2552,7 +2566,14 @@ static void queue_screen(void) {
             const char *items[2] = { "Move to Top", "Remove" };
             int a = ui_menu("QUEUE ITEM", s_q[c].name, items, 2);
             if (a == 0) queue_move_top(c);
-            else if (a == 1) queue_remove(c);
+            else if (a == 1) {
+                char rurl[512]; snprintf(rurl, sizeof rurl, "%s", s_q[c].url);
+                long long part = download_partial_bytes(rurl);   /* leftover .part bytes, if any */
+                queue_remove(c);
+                if (part > 0 && prompt2("REMOVE", "Delete the partial download too?\n(KEEP saves it to resume later.)",
+                                        "DELETE", "KEEP") == 0)
+                    download_discard_partial(rurl);
+            }
         }
     }
 }
