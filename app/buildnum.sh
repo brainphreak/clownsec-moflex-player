@@ -1,6 +1,7 @@
 #!/bin/sh
-# Build tag: YYMMDD.N -- N restarts at 1 each day and bumps per build (stored in .buildnum).
-d=$(date +%y%m%d)
+# Build tag: YMMDD.N -- N restarts at 1 each day and bumps per build (stored in .buildnum).
+# Single year digit ("6" for 2026) keeps the tag short enough for the home header.
+d=$(date +%y%m%d | cut -c2-)
 f="$(dirname "$0")/.buildnum"
 pd=""; pn=0
 [ -f "$f" ] && read -r pd pn < "$f"

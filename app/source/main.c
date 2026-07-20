@@ -2819,8 +2819,11 @@ static void startup_new_movie_check(void) {
 
 /* Home screen polls this once per frame; runs the prompts when the background walk lands. */
 static int startup_detect_poll(void) {
-    if (s_dt_done && s_upd[0] && !s_upd_shown) {   /* newer build published -> repaint so the */
-        s_upd_shown = 1;                           /* UPDATE AVAIL tag under the build shows up */
+    if (s_dt_done && s_upd[0] && !s_upd_shown) {   /* newer build published */
+        s_upd_shown = 1;
+        char um[96];
+        snprintf(um, sizeof um, "A newer build is available:\n%s (you have %s).\nRedownload via the QR / FBI.", s_upd, BUILD_TAG);
+        msg_screen("UPDATE AVAILABLE", um);   /* once per session; the UPDATE AVAIL tag stays after */
         return 1;
     }
     if (s_dt_consumed || !s_dt_done) return 0;
