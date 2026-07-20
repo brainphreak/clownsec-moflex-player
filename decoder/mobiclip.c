@@ -1406,6 +1406,9 @@ static void mc_copy(uint8_t *dst, const uint8_t *src, int width, int height,
           }
 }
 
+#ifdef MOBI_REFDIAG
+unsigned long g_mobi_refdist[8];   /* [d&7] = motion blocks referencing d frames back; ODD d = cross-eye in 3D */
+#endif
 static int predict_motion_impl(AVCodecContext *avctx,
                           int width, int height, int index,
                           int offsetm, int offsetx, int offsety)
@@ -1418,6 +1421,9 @@ static int predict_motion_impl(AVCodecContext *avctx,
 
     if (index <= 5) {
         int sidx = -FFMAX(1, index) + s->current_pic;
+#ifdef MOBI_REFDIAG
+        g_mobi_refdist[FFMAX(1, index) & 7]++;   /* reference-distance histogram (odd = cross-eye) */
+#endif
         MotionXY mv = s->motion[0];
 
         if (sidx < 0)
