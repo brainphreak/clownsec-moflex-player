@@ -1151,6 +1151,12 @@ static int catalog_pick(const char *title, const char *subtitle, char items[][32
                 ui_fill_round(UI_W - 6, ty, 3, th, 1, TH_TRACK);
                 ui_fill_round(UI_W - 6, hy, 3, hh, 1, UI_NEON); }
             ui_text(8, 226, 1, UI_DIM, "X - search");   /* left-aligned so it can't read as a row */
+            if (s_dlw_active) {   /* live size + percent of the background download */
+                char st[48]; u32 dd = s_dlw_done, tt = s_dlw_total;
+                if (tt) snprintf(st, sizeof st, "DL %lu/%lu MB  %d%%", (unsigned long)(dd >> 20), (unsigned long)(tt >> 20), (int)((u64)dd * 100 / tt));
+                else    snprintf(st, sizeof st, "DL %lu KB", (unsigned long)(dd >> 10));
+                ui_text(UI_W - (int)strlen(st) * 8 - 8, 226, 1, UI_NEONP, st);
+            }
             ui_present(); redraw = 0;
         }
         gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
@@ -2368,8 +2374,45 @@ static int dlw_poll(void) {
     return 1;
 }
 
-/* Queue screen: pending items in order; the active download shows live progress
- * and can only be cancelled here. Others: Move to Top / Remove. */
+/* Live view of the active background download: the classic progress screen
+ * (bar, size downloaded vs file size, percent) with CANCEL underneath.
+ * B backs out and the download keeps running. */
+static void dlw_detail_screen(void) {
+    while (aptMainLoop() && s_dlw_active) {
+        if (dlw_poll()) return;   /* finished while we were watching */
+        hidScanInput();
+        u32 k = hidKeysDown();
+        if (k & KEY_B) return;
+        int cancel = (k & KEY_A) ? 1 : 0;
+        if (k & KEY_TOUCH) { touchPosition tp; hidTouchRead(&tp);
+            if (tp.py >= 206 && tp.py < 234 && tp.px >= 110 && tp.px < 210) cancel = 1; }
+        if (cancel) { dlw_stop_wait(); return; }
+        u32 d = s_dlw_done, t = s_dlw_total;
+        ui_begin(GFX_BOTTOM);
+        ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
+        ui_text_center(UI_W / 2, 12, 2, UI_NEON, "DOWNLOADING");
+        ui_glow_round(28, 40, UI_W - 56, 2, 1, UI_NEON, 3, 30);
+        ui_fill_round(28, 40, UI_W - 56, 2, 1, UI_NEON);
+        ui_text_fit(UI_W / 2, 68, 1, UI_NEONC, s_dlw_item.name, UI_W - 16);
+        int bx = 20, bw = UI_W - 40, by = 104, bh = 16;
+        ui_fill_round(bx, by, bw, bh, bh / 2, TH_TRACK);
+        char pl[48];
+        if (t) {
+            int fw = (int)((long long)bw * d / t); if (fw > 0) ui_fill_round(bx, by, fw, bh, bh / 2, UI_NEON);
+            int pct = (int)((u64)d * 100 / t);
+            if (t >= 1048576) snprintf(pl, sizeof pl, "%lu / %lu MB   %d%%", (unsigned long)(d / 1048576), (unsigned long)(t / 1048576), pct);
+            else              snprintf(pl, sizeof pl, "%lu / %lu KB   %d%%", (unsigned long)(d / 1024), (unsigned long)(t / 1024), pct);
+        } else snprintf(pl, sizeof pl, "%lu KB", (unsigned long)(d / 1024));
+        ui_text_center(UI_W / 2, by + bh + 8, 1, UI_INK, pl);
+        ui_text_center(UI_W / 2, by + bh + 30, 1, UI_DIM, "B - back (keeps downloading)");
+        ui_button(110, 206, 100, 28, "CANCEL", 0, UI_RED);
+        ui_present();
+        gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
+    }
+}
+
+/* Queue screen: pending items in order; A on the active download opens the live
+ * progress view (with Cancel). Others: Move to Top / Remove. */
 static void queue_screen(void) {
     for (;;) {
         dlw_poll();
@@ -2383,14 +2426,13 @@ static void queue_screen(void) {
             } else snprintf(names[i], 32, "%d. %.27s", i + 1, s_q[i].name);
         }
         char sub[40];
-        snprintf(sub, sizeof sub, "%d item%s%s", s_qn, s_qn == 1 ? "" : "s", s_dlw_active ? "  -  downloading" : "");
+        snprintf(sub, sizeof sub, "%d item%s%s", s_qn, s_qn == 1 ? "" : "s", s_dlw_active ? "  -  downloading" : "  -  not downloading");
         int c = catalog_pick("DOWNLOAD QUEUE", sub, names, s_qn, 0, s_dlw_active ? NULL : "* Start Downloads");
         if (c == -1) return;
         if (c == -3) { dlw_start(); continue; }
         if (c < 0) continue;
         if (s_dlw_active && !strcmp(s_q[c].url, (const char *)s_dlw_item.url)) {
-            const char *items[1] = { "Cancel Download" };
-            if (ui_menu("QUEUE ITEM", s_q[c].name, items, 1) == 0) dlw_stop_wait();
+            dlw_detail_screen();   /* live bar + sizes, CANCEL button, B = back */
         } else {
             const char *items[2] = { "Move to Top", "Remove" };
             int a = ui_menu("QUEUE ITEM", s_q[c].name, items, 2);
