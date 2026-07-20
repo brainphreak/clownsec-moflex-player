@@ -965,6 +965,78 @@ static void queue_add_ui(const CatEntry *e) {
     snprintf(s_qtoast, sizeof s_qtoast, "Queued (%d)", s_qn); s_qtoast_t = 75;
 }
 
+static void qtoast(const char *m) { snprintf(s_qtoast, sizeof s_qtoast, "%s", m); s_qtoast_t = 75; }
+
+/* ---- background download worker ----
+ * One detached thread downloads the front queue item into its own private copy;
+ * it touches ONLY these volatiles. All queue mutation and post-processing stays
+ * on the main thread via dlw_poll(), so no locking is needed anywhere. */
+static QItem s_dlw_item;                             /* private copy the worker downloads */
+static volatile int s_dlw_active = 0;                /* worker thread running */
+static volatile int s_dlw_finished = 0;              /* worker done, waiting for dlw_poll() */
+static volatile int s_dlw_ok = 0;                    /* download result */
+static volatile int s_dlw_stop = 0;                  /* main thread asks the worker to abort */
+static volatile u32 s_dlw_done = 0, s_dlw_total = 0; /* live progress for the UI strip */
+static int s_dlw_resume_ask = 0;                     /* paused for playback -> offer to resume */
+static int dlw_poll(void);                           /* defined after the post-processing helpers */
+
+static bool dlw_progress(void *u, u32 d, u32 t) {    /* worker thread: no UI, no hid */
+    (void)u; s_dlw_done = d; s_dlw_total = t;
+    return !s_dlw_stop;
+}
+static void dlw_thread(void *arg) {
+    (void)arg;
+    char dest[PATHLEN + NAMELEN];
+    size_t dl = strlen(s_dlw_item.dest);
+    snprintf(dest, sizeof dest, "%s%s%s", s_dlw_item.dest,
+             (dl && s_dlw_item.dest[dl - 1] == '/') ? "" : "/", s_dlw_item.fname);
+    s_dlw_ok = download_to_file(s_dlw_item.url, dest, dlw_progress, NULL);
+    s_dlw_finished = 1;
+}
+static int dlw_start(void) {   /* main thread: launch the front queue item */
+    if (s_dlw_active) return 1;
+    queue_load();
+    if (s_qn <= 0) return 0;
+    s_dlw_item = s_q[0];
+    s_dlw_stop = 0; s_dlw_finished = 0; s_dlw_ok = 0; s_dlw_done = s_dlw_total = 0;
+    s32 prio = 0; svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
+    if (!threadCreate(dlw_thread, NULL, 32 * 1024, prio + 1, -2, true)) return 0;
+    s_dlw_active = 1;
+    return 1;
+}
+static void dlw_stop_wait(void) {   /* abort the in-flight download; partial + queue item kept */
+    if (!s_dlw_active) return;
+    s_dlw_stop = 1;
+    while (!s_dlw_finished) svcSleepThread(50 * 1000 * 1000LL);
+    s_dlw_active = 0; s_dlw_finished = 0;
+}
+static void queue_remove_url(const char *url) {   /* the active item may have been reordered */
+    queue_load();
+    for (int i = 0; i < s_qn; i++) if (!strcmp(s_q[i].url, url)) { queue_remove(i); return; }
+}
+/* A on a catalog entry: put it NEXT in line (right after the active download, if any). */
+static void queue_add_front(const CatEntry *e) {
+    queue_load();
+    int pos = s_dlw_active ? 1 : 0;
+    if (pos > s_qn) pos = s_qn;
+    for (int i = 0; i < s_qn; i++)
+        if (!strcmp(s_q[i].url, e->url)) {   /* already queued -> just bump it up */
+            if (i > pos) { QItem t = s_q[i]; memmove(&s_q[pos + 1], &s_q[pos], (size_t)(i - pos) * sizeof(QItem)); s_q[pos] = t; queue_save(); }
+            return;
+        }
+    if (s_qn >= QUEUE_MAX) { qtoast("Queue full"); return; }
+    memmove(&s_q[pos + 1], &s_q[pos], (size_t)(s_qn - pos) * sizeof(QItem));
+    QItem *q = &s_q[pos]; memset(q, 0, sizeof *q);
+    snprintf(q->name, sizeof q->name, "%s", e->name);
+    snprintf(q->fname, sizeof q->fname, "%s", e->fname);
+    snprintf(q->url, sizeof q->url, "%s", e->url);
+    snprintf(q->art, sizeof q->art, "%s", e->art);
+    snprintf(q->category, sizeof q->category, "%s", e->category);
+    snprintf(q->dest, sizeof q->dest, "%s", s_q_dest);
+    q->is_zip = e->is_zip;
+    s_qn++; queue_save();
+}
+
 static void fix_download_ext(char *dest, size_t cap) {
     size_t L = strlen(dest);
     if ((L > 7 && !strcasecmp(dest + L - 7, ".moflex")) ||
@@ -1055,9 +1127,13 @@ static int catalog_pick(const char *title, const char *subtitle, char items[][32
             return act - (show_all ? 1 : 0);
         }
         if (sel < top) top = sel; if (sel >= top + VIS) top = sel - VIS + 1;
+        if (dlw_poll()) redraw = 1;   /* a background download finished while we were here */
+        { static int qt; if (s_dlw_active && ++qt >= 20) { qt = 0; redraw = 1; } }   /* keep the strip live */
         if (redraw) {
             ui_begin(GFX_BOTTOM);
             ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
+            if (s_dlw_active && s_dlw_total)   /* thin download-progress strip along the top edge */
+                ui_fill_round(0, 0, (int)((u64)UI_W * s_dlw_done / s_dlw_total), 3, 0, UI_NEONP);
             ui_text_center(UI_W / 2, 12, 2, UI_NEON, title);
             if (subtitle && subtitle[0]) ui_text_fit(UI_W / 2, 34, 1, UI_NEONP, subtitle, UI_W - 16);
             ui_glow_round(28, 48, UI_W - 56, 2, 1, UI_NEON, 3, 30); ui_fill_round(28, 48, UI_W - 56, 2, 1, UI_NEON);
@@ -1230,52 +1306,17 @@ cb_rebuild:;   /* X-search inside the list jumps back here with filt_search set 
             }
         }
         if (leave) break;
-        if (want_dl) {
+        if (want_dl) {   /* background download: becomes next in line, list stays usable */
             CatEntry *e = &cat[idx[csel]];
-            char destdir[PATHLEN];
-            if (!pick_folder(destdir, sizeof(destdir))) { redraw = 1; goto cont; }   /* cancelled */
-            char dest[PATHLEN + NAMELEN];
-            snprintf(dest, sizeof(dest), "%s%s", destdir, e->fname);
-            snprintf(g_dl_name, sizeof(g_dl_name), "%s", e->fname);
-            g_last_prog = 0;
-            if (!download_resume_check(e->url)) { redraw = 1; goto cont; }   /* B on the prompt -> back */
-            bool ok = download_to_file(e->url, dest, dl_progress, NULL);
-            if (ok && !e->is_zip) {   /* persist metadata + poster so the info panel shows for the local file */
-                fix_download_ext(dest, sizeof dest);   /* Drive items have no extension -> sniff + add it */
-                if (!phave && e->art[0] && poster) phave = poster_get(e->art, e->fname, poster, POSTER_W, POSTER_H);
-                movieinfo_save(dest, e, phave ? poster : NULL, POSTER_W, POSTER_H);
-                lib_add_downloaded(dest, e);   /* show it in the library right away (info + poster already saved) */
-            }
-            if (ok && e->is_zip && !file_is_zip(dest)) {
-                remove(dest);   /* not a real zip (likely a 404 page) */
-                msg_screen("DOWNLOAD", "Download failed: the server did\nnot return a zip (not found).");
-            } else if (ok && e->is_zip) {
-                if (confirm("Extract the zip now?\n(No = keep the .zip file)")) {
-                    char stem[NAMELEN]; snprintf(stem, sizeof(stem), "%s", e->fname);
-                    size_t sl = strlen(stem); if (sl > 4) stem[sl - 4] = 0;   /* drop .zip */
-                    char folder[PATHLEN + NAMELEN];
-                    snprintf(folder, sizeof(folder), "%s%s", destdir, stem);
-                    int tot = 0;
-                    int nf = unzip_to_dir_cb(dest, folder, &tot, unzip_prog);
-                    if (nf > 0) remove(dest);   /* delete the .zip only after something extracted */
-                    char m[160];
-                    if (nf > 0 && nf == tot) snprintf(m, sizeof m, "Extracted %d file%s into:\n%s", nf, nf == 1 ? "" : "s", stem);
-                    else if (nf > 0)         snprintf(m, sizeof m, "Extracted %d of %d files into:\n%s", nf, tot, stem);
-                    else if (tot == 0)       snprintf(m, sizeof m, "Could not open the zip.\n%s", stem);
-                    else                     snprintf(m, sizeof m, "Extract FAILED (0 of %d).\n%s", tot, stem);
-                    if (nf > 0) lib_add_extracted(folder, e);   /* shows/movies inside -> straight into the library */
-                    msg_screen("DOWNLOAD", m);
-                } else {
-                    char m[128]; snprintf(m, sizeof m, "Zip saved (not extracted):\n%s", e->fname);
-                    msg_screen("DOWNLOAD", m);
-                }
-            } else if (ok) {
-                char m[160]; snprintf(m, sizeof m, "%s\nDownload complete.", g_dl_name);
-                msg_screen("DOWNLOAD", m);
-            } else download_cancel_msg(e->url);   /* progress saved; offers DELETE FILE, B keeps it */
+            if (!s_q_dest[0] && !pick_folder(s_q_dest, sizeof s_q_dest)) { redraw = 1; goto cont; }
+            queue_add_front(e);
+            dlw_start();
+            qtoast((s_dlw_active && !strcmp((const char *)s_dlw_item.url, e->url)) ? "Downloading..." : "Queued next");
             redraw = 1;
         }
     cont:
+        if (dlw_poll()) redraw = 1;   /* finalize finished background downloads */
+        { static int qt2; if (s_dlw_active && ++qt2 >= 20) { qt2 = 0; redraw = 1; } }
         if (s_qtoast_t > 0 && --s_qtoast_t == 0) redraw = 1;   /* toast expired -> repaint without it */
         if (csel != shown) { redraw = 1; phave = 0; settle = 0; requested = 0; }   /* moved -> drop poster */
         /* debounced request to the background loader, then poll -- scrolling never blocks on a poster */
@@ -1293,6 +1334,8 @@ cb_rebuild:;   /* X-search inside the list jumps back here with filt_search set 
         if (redraw) {
             ui_begin(GFX_BOTTOM);
             ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
+            if (s_dlw_active && s_dlw_total)   /* thin download-progress strip along the top edge */
+                ui_fill_round(0, 0, (int)((u64)UI_W * s_dlw_done / s_dlw_total), 3, 0, UI_NEONP);
             ui_text(10, 8, 2, UI_NEON, "CATALOG");
             char hdr[24]; snprintf(hdr, sizeof hdr, "%d / %d", csel + 1, ni);
             ui_text(UI_W - (int)strlen(hdr) * 8 - 10, 12, 1, UI_NEONP, hdr);
@@ -2283,65 +2326,77 @@ static int ui_menu(const char *title, const char *subtitle, const char *const *i
 }
 
 /* Run the queue front to back. B during a download pauses the queue (partial kept for resume). */
-static void queue_run(void) {
-    queue_load();
-    while (s_qn > 0 && aptMainLoop()) {
-        QItem q = s_q[0];
-        char dest[PATHLEN + NAMELEN];
-        size_t dl = strlen(q.dest);
-        snprintf(dest, sizeof dest, "%s%s%s", q.dest, (dl && q.dest[dl - 1] == '/') ? "" : "/", q.fname);
-        snprintf(g_dl_name, sizeof g_dl_name, "%s (%d left)", q.fname, s_qn);
-        g_last_prog = 0;
-        bool ok = download_to_file(q.url, dest, dl_progress, NULL);
-        if (!ok) {   /* cancelled/failed: keep the item + partial data */
-            if (prompt2("DOWNLOAD QUEUE", "Queue paused.\nProgress is saved for resume.", "RESUME", "STOP") == 0) continue;
-            return;
-        }
-        /* post-process like a normal download */
-        CatEntry e; memset(&e, 0, sizeof e);
-        snprintf(e.name, sizeof e.name, "%s", q.name);
-        snprintf(e.title, sizeof e.title, "%s", q.name);
-        snprintf(e.fname, sizeof e.fname, "%s", q.fname);
-        snprintf(e.url, sizeof e.url, "%s", q.url);
-        snprintf(e.art, sizeof e.art, "%s", q.art);
-        snprintf(e.category, sizeof e.category, "%s", q.category);
-        e.is3d = -1; e.is_zip = q.is_zip;
-        size_t fl = strlen(dest);
-        if (q.is_zip && fl > 4 && !strcasecmp(dest + fl - 4, ".zip") && file_is_zip(dest)) {
-            char folder[PATHLEN + NAMELEN];
-            snprintf(folder, sizeof folder, "%.*s", (int)(fl - 4), dest);
-            int tot = 0;
-            int nf = unzip_to_dir_cb(dest, folder, &tot, unzip_prog);
-            if (nf > 0) { remove(dest); lib_add_extracted(folder, &e); }
-        } else {
-            fix_download_ext(dest, sizeof dest);
-            u16 *pb = (u16 *)malloc((size_t)POSTER_W * POSTER_H * sizeof(u16));
-            int phave = pb && e.art[0] && poster_get(e.art, e.fname, pb, POSTER_W, POSTER_H);
-            movieinfo_save(dest, &e, phave ? pb : NULL, POSTER_W, POSTER_H);
-            free(pb);
-            lib_add_downloaded(dest, &e);
-        }
-        queue_remove(0);
+/* Main-thread finalizer: post-process a finished background download, then chain
+ * the next queue item. Returns 1 when something changed (caller should redraw). */
+static int dlw_poll(void) {
+    if (!s_dlw_active || !s_dlw_finished) return 0;
+    s_dlw_active = 0; s_dlw_finished = 0;
+    if (!s_dlw_ok) {   /* cancelled or failed: keep the item + partial data for resume */
+        qtoast(s_dlw_stop ? "Download paused" : "Download failed");
+        return 1;
     }
-    if (s_qn == 0) msg_screen("DOWNLOAD QUEUE", "All downloads complete.");
+    QItem q = s_dlw_item;
+    char dest[PATHLEN + NAMELEN];
+    size_t dl = strlen(q.dest);
+    snprintf(dest, sizeof dest, "%s%s%s", q.dest, (dl && q.dest[dl - 1] == '/') ? "" : "/", q.fname);
+    CatEntry e; memset(&e, 0, sizeof e);
+    snprintf(e.name, sizeof e.name, "%s", q.name);
+    snprintf(e.title, sizeof e.title, "%s", q.name);
+    snprintf(e.fname, sizeof e.fname, "%s", q.fname);
+    snprintf(e.url, sizeof e.url, "%s", q.url);
+    snprintf(e.art, sizeof e.art, "%s", q.art);
+    snprintf(e.category, sizeof e.category, "%s", q.category);
+    e.is3d = -1; e.is_zip = q.is_zip;
+    size_t fl = strlen(dest);
+    if (q.is_zip && fl > 4 && !strcasecmp(dest + fl - 4, ".zip") && file_is_zip(dest)) {
+        char folder[PATHLEN + NAMELEN];
+        snprintf(folder, sizeof folder, "%.*s", (int)(fl - 4), dest);
+        int tot = 0;
+        int nf = unzip_to_dir_cb(dest, folder, &tot, unzip_prog);   /* brief modal extract screen */
+        if (nf > 0) { remove(dest); lib_add_extracted(folder, &e); }
+    } else {
+        fix_download_ext(dest, sizeof dest);
+        u16 *pb = (u16 *)malloc((size_t)POSTER_W * POSTER_H * sizeof(u16));
+        int phave = pb && e.art[0] && poster_get(e.art, e.fname, pb, POSTER_W, POSTER_H);
+        movieinfo_save(dest, &e, phave ? pb : NULL, POSTER_W, POSTER_H);
+        free(pb);
+        lib_add_downloaded(dest, &e);
+    }
+    queue_remove_url(q.url);
+    if (queue_count() > 0) dlw_start();   /* chain the next item */
+    else qtoast("Queue complete");
+    return 1;
 }
 
-/* Queue screen: list of pending items; A on an item -> Move to Top / Remove; Start runs it. */
+/* Queue screen: pending items in order; the active download shows live progress
+ * and can only be cancelled here. Others: Move to Top / Remove. */
 static void queue_screen(void) {
     for (;;) {
+        dlw_poll();
         queue_load();
-        if (s_qn == 0) { msg_screen("DOWNLOAD QUEUE", "The queue is empty.\nPress SELECT (or tap QUEUE)\non a catalog entry to queue it."); return; }
+        if (s_qn == 0) { msg_screen("DOWNLOAD QUEUE", "The queue is empty.\nA downloads now (in background);\nSELECT queues for later."); return; }
         static char names[QUEUE_MAX][32];
-        for (int i = 0; i < s_qn; i++) snprintf(names[i], 32, "%d. %.27s", i + 1, s_q[i].name);
-        char sub[24]; snprintf(sub, sizeof sub, "%d item%s", s_qn, s_qn == 1 ? "" : "s");
-        int c = catalog_pick("DOWNLOAD QUEUE", sub, names, s_qn, 0, "* Start Downloads");
+        for (int i = 0; i < s_qn; i++) {
+            if (s_dlw_active && !strcmp(s_q[i].url, (const char *)s_dlw_item.url)) {
+                if (s_dlw_total) snprintf(names[i], 32, "> %.20s  %d%%", s_q[i].name, (int)((u64)100 * s_dlw_done / s_dlw_total));
+                else             snprintf(names[i], 32, "> %.24s ...", s_q[i].name);
+            } else snprintf(names[i], 32, "%d. %.27s", i + 1, s_q[i].name);
+        }
+        char sub[40];
+        snprintf(sub, sizeof sub, "%d item%s%s", s_qn, s_qn == 1 ? "" : "s", s_dlw_active ? "  -  downloading" : "");
+        int c = catalog_pick("DOWNLOAD QUEUE", sub, names, s_qn, 0, s_dlw_active ? NULL : "* Start Downloads");
         if (c == -1) return;
-        if (c == -3) { queue_run(); continue; }
+        if (c == -3) { dlw_start(); continue; }
         if (c < 0) continue;
-        const char *items[2] = { "Move to Top", "Remove" };
-        int a = ui_menu("QUEUE ITEM", s_q[c].name, items, 2);
-        if (a == 0) queue_move_top(c);
-        else if (a == 1) queue_remove(c);
+        if (s_dlw_active && !strcmp(s_q[c].url, (const char *)s_dlw_item.url)) {
+            const char *items[1] = { "Cancel Download" };
+            if (ui_menu("QUEUE ITEM", s_q[c].name, items, 1) == 0) dlw_stop_wait();
+        } else {
+            const char *items[2] = { "Move to Top", "Remove" };
+            int a = ui_menu("QUEUE ITEM", s_q[c].name, items, 2);
+            if (a == 0) queue_move_top(c);
+            else if (a == 1) queue_remove(c);
+        }
     }
 }
 
@@ -2922,6 +2977,13 @@ static MoflexResult play_movie(const char *path) {
       if (L > 7 && !strcasecmp(g_now_playing + L - 7, ".moflex")) g_now_playing[L - 7] = 0;
       else if (L > 4 && !strcasecmp(g_now_playing + L - 4, ".zip")) g_now_playing[L - 4] = 0;
       else if (L > 4 && !strcasecmp(g_now_playing + L - 4, ".cia")) g_now_playing[L - 4] = 0; }
+    if (s_dlw_active) {   /* playback and downloads fight over the SD card + CPU: pause first */
+        if (prompt2("DOWNLOAD ACTIVE", "Playing pauses the current\ndownload (progress is kept).", "PLAY", "BACK") != 0) {
+            cia_clear_selection(); branding_show(); return MOFLEX_QUIT_BACK;
+        }
+        dlw_stop_wait();
+        s_dlw_resume_ask = 1;   /* offer to resume once we are back on the home screen */
+    }
     { long long rp = moflex_resume_get(path);   /* pre-played -> resume, start fresh, or back out */
       if (rp > 3000000) {
           int rc = resume_prompt(g_now_playing, rp);
@@ -3379,6 +3441,12 @@ static int home_gui(void) {
     long long rpos = g_now_playing_path[0] ? moflex_resume_get(g_now_playing_path) : 0;
     while (aptMainLoop()) {
         if (startup_detect_poll()) redraw = 1;
+        if (dlw_poll()) redraw = 1;   /* finalize background downloads while on home */
+        if (s_dlw_resume_ask) {
+            s_dlw_resume_ask = 0;
+            if (queue_count() > 0 && prompt2("DOWNLOAD QUEUE", "Resume the paused downloads?", "RESUME", "LATER") == 0) dlw_start();
+            redraw = 1;
+        }
         hidScanInput();
         u32 k = hidKeysDown();
         if (k & KEY_START) return -1;
@@ -3559,7 +3627,7 @@ int main(void) {
         char qm[64];
         snprintf(qm, sizeof qm, "%d queued download%s waiting.\nContinue downloading now?",
                  queue_count(), queue_count() == 1 ? "" : "s");
-        if (prompt2("DOWNLOAD QUEUE", qm, "DOWNLOAD", "LATER") == 0) queue_run();
+        if (prompt2("DOWNLOAD QUEUE", qm, "DOWNLOAD", "LATER") == 0) dlw_start();   /* runs in background */
     }
 
     int running = 1;
@@ -3581,6 +3649,7 @@ int main(void) {
     s_dt_abort = 1;   /* stop the background SD walk before teardown */
     for (int w = 0; w < 20 && !s_dt_done && !s_dt_consumed; w++) svcSleepThread(25 * 1000 * 1000LL);
 
+    dlw_stop_wait();   /* abort any in-flight background download (partial kept) */
     downloader_exit();
     socExit();
     ndspExit();
