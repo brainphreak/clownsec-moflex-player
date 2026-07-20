@@ -987,7 +987,15 @@ static void g_y2r_init(int W, int H, int bpp) {
     p.standard_coefficient = COEFFICIENT_ITU_R_BT_601_SCALING; p.alpha = 0xFF;   /* TV range (content is 16..235) */
     Y2RU_SetConversionParams(&p);
     Y2RU_SetTransferEndInterrupt(true);
+    if (g_y2r_done) { svcCloseHandle(g_y2r_done); g_y2r_done = 0; }   /* never leak a previous event handle */
     Y2RU_GetTransferEndEvent(&g_y2r_done);
+}
+/* Release Y2R AND the transfer-end event handle. Plain y2rExit() only closes the service
+ * session -- the event grabbed by Y2RU_GetTransferEndEvent must be closed too, or every
+ * video open leaks a kernel handle until the table fills (black video, audio still plays). */
+static void g_y2r_exit(void) {
+    if (g_y2r_done) { svcCloseHandle(g_y2r_done); g_y2r_done = 0; }
+    y2rExit();
 }
 static void g_y2r_start(AVFrame *o, C3D_Tex *tex, int W, int H) {
     int cw = W / 2, ch = H / 2, bpp = g_y2r_bpp;
@@ -1628,7 +1636,7 @@ gdone:
     C2D_TextBufDelete(sbuf); C2D_TextBufDelete(tmbuf);
     for (int i = 0; i < NTB; i++) { C3D_TexDelete(&texL[i]); C3D_TexDelete(&texR[i]); }
     gspWaitForVBlank(); gspWaitForVBlank();
-    C2D_Fini(); C3D_Fini(); y2rExit();
+    C2D_Fini(); C3D_Fini(); g_y2r_exit();
     /* restore the software-UI framebuffer format for the home/browser screens */
     gfxSetScreenFormat(GFX_TOP, GSP_BGR8_OES);      /* 24-bit: RGB565 gave blue only 5 bits -> banding */
     gfxSetScreenFormat(GFX_BOTTOM, GSP_RGB565_OES);   /* UI panel stays 16-bit */
@@ -1833,7 +1841,7 @@ static void mp_ring_apt_hook(APT_HookType hook, void *param) {
             if (g_ring_lock) { LightLock_Lock(g_ring_lock); LightLock_Unlock(g_ring_lock); }  /* ...and drain any in flight */
             if (g_screen_off) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; } g_backlight_on = 1;
             if (g_lcd_ok) gspLcdExit();                 /* release gsp::Lcd (else HOME hard-locks) */
-            if (g_ring_apt_w) y2rExit();                /* release Y2R (only if it's up yet) */
+            if (g_ring_apt_w) g_y2r_exit();             /* release Y2R + its event (only if it's up yet) */
             gfxSet3D(false);
             break;
         case APTHOOK_ONRESTORE:
@@ -2602,7 +2610,7 @@ static MoflexResult moflex_play_ring(const char *path) {
     for (int i = 0; i < NB; i++) { C3D_TexDelete(&r3_texL[i]); C3D_TexDelete(&r3_texR[i]); }
     ui_tex_free();   /* release the software-UI panel texture before C3D shuts down */
     gspWaitForVBlank(); gspWaitForVBlank();
-    C2D_Fini(); C3D_Fini(); y2rExit();
+    C2D_Fini(); C3D_Fini(); g_y2r_exit();
     gfxSet3D(false);
     /* Hand a CLEAN gfx state back to the app ONLY when returning to it (BACK/OPEN). On EXIT the app is
      * closing -- doing gfxExit()+gfxInitDefault() during the applet close hangs on "closing software",
