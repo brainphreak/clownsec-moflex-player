@@ -2766,6 +2766,7 @@ static int startup_detect_poll(void);
 #define LATEST_URL "https://github.com/brainphreak/clownsec-moflex-player/releases/download/v1.1.0-beta/latest.txt"
 static char s_upd[24] = ""; static int s_upd_shown = 0;
 static void update_check(void) {   /* runs on the worker thread; ~10 byte fetch */
+    if (osGetWifiStrength() == 0) return;   /* offline console: skip silently, never wait on a timeout */
     char *buf = NULL; size_t len = 0;
     if (!download_to_mem(LATEST_URL, &buf, &len, 256) || !buf) return;
     buf[len < 255 ? len : 255] = 0;
