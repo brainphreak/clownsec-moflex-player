@@ -241,7 +241,7 @@ static void ui_text_center_fit(int cx, int y, int maxscale, u16 c, const char *s
     ui_text_center(cx, y, sc, c, s);
 }
 /* neon message popup with a Back button (replaces the old console result screens) */
-static void msg_screen(const char *title, const char *body) {
+static void msg_screen_btn(const char *title, const char *body, const char *btn) {
     int redraw = 1, tdown = 0, tx0 = 0, ty0 = 0;
     while (aptMainLoop()) {
         hidScanInput();
@@ -260,12 +260,13 @@ static void msg_screen(const char *title, const char *body) {
             while (*p) { int j = 0; while (*p && *p != '\n' && j < 79) line[j++] = *p++;
                 line[j] = 0; if (*p == '\n') p++;
                 ui_text_fit(UI_W / 2, ly, 1, UI_INK, line, UI_W - 16); ly += 16; }
-            ui_button(110, 206, 100, 28, "Back", 0, UI_NEONP);
+            ui_button(110, 206, 100, 28, btn, 0, UI_NEONP);
             ui_present(); redraw = 0;
         }
         gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
     }
 }
+static void msg_screen(const char *title, const char *body) { msg_screen_btn(title, body, "Back"); }
 
 static int confirm(const char *prompt) {
     int redraw = 1, tdown = 0, tx0 = 0, ty0 = 0;
@@ -2763,7 +2764,7 @@ static void lib_rescan_interactive(void) {
 /* ---- startup: detect movies added outside the app (browser download, PC copy, upload) and offer
  * a rescan; after rescanning, offer art + info download for the new arrivals. ---- */
 static int startup_detect_poll(void);
-#define LATEST_URL "https://github.com/brainphreak/clownsec-moflex-player/releases/download/v1.1.0-beta/latest.txt"
+#define LATEST_URL "https://github.com/brainphreak/clownsec-moflex-player/releases/download/v1.0/latest.txt"
 static char s_upd[24] = ""; static int s_upd_shown = 0;
 static volatile int s_dtw_exit = 1;   /* worker thread fully finished (fetch included) */
 static void update_check(void) {   /* runs on the worker thread; ~10 byte fetch */
@@ -2830,7 +2831,7 @@ static int startup_detect_poll(void) {
         s_upd_shown = 1;
         char um[96];
         snprintf(um, sizeof um, "A newer build is available:\n%s (you have %s).\nRedownload via the QR / FBI.", s_upd, BUILD_TAG);
-        msg_screen("UPDATE AVAILABLE", um);   /* once per session; the UPDATE AVAIL tag stays after */
+        msg_screen_btn("UPDATE AVAILABLE", um, "OKAY");   /* once per session; the tag stays after */
         return 1;
     }
     if (s_dt_consumed || !s_dt_done) return 0;
