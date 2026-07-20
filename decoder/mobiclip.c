@@ -670,8 +670,16 @@ static void idct_writeback(dctcoef *mat, uint8_t *dst, int linesize, int size, i
 {
 #define MOBI_FUSED_IDCT 0x08000000   /* fused column pass: no transpose, no mat[] 2nd-write (official-style) */
     if (mobi_opt & MOBI_FUSED_IDCT) {
-        /* pass 1: rows (as normal). */
-        for (int y = 0; y < size; y++) idct(&mat[y * size], size);
+        if ((mobi_opt & 4) && ac == 0) {          /* DC-only shortcut (same as scalar path) */
+            dctcoef t[8] = { 0 }; t[0] = mat[0]; idct(t, size);
+            dctcoef u[8] = { 0 }; u[0] = t[0];    idct(u, size);
+            int d = u[0] >> 6;
+            for (int y = 0; y < size; y++) { for (int x = 0; x < size; x++) dst[x] = av_clip_uint8(dst[x] + d); dst += linesize; }
+            return;
+        }
+        /* pass 1: rows (honor the rowmask zero-row skip, like the scalar path). */
+        if (mobi_opt & 2) { for (int y = 0; y < size; y++) if (rowmask & (1u << y)) idct(&mat[y * size], size); }
+        else                for (int y = 0; y < size; y++) idct(&mat[y * size], size);
         /* pass 2: for output ROW y, transform COLUMN y of the row-pass result and write it -- no
          * transpose, sequential row write (packable). Bit-exact: matches the scalar path's
          * transpose+idct orientation, same >>6 + clip. */

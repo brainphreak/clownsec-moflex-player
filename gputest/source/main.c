@@ -84,13 +84,15 @@ int main(void) {
      * to expose thermal drift -- compare each SIMD to the scalar right above it, not across runs. */
     /* FUSED transpose-free IDCT (0x08000000) vs scalar full transform, both with packed residual
      * write (0x40). Only difference = the transpose + separate 2nd-pass. 3 interleaved pairs. */
+    /* REAL-WORLD: shipped path (0x1BDA5E, DC/rowmask shortcuts + packed residual) vs the same
+     * PLUS fused transpose-free IDCT (0x08000000). This is what playback actually runs. */
     static const struct { const char *name; int opt; } C[6] = {
-        { "scalarFULL A ", 0x1BDA58 },
-        { "FUSED-IDCT A ", 0x1BDA58 | 0x08000000 },
-        { "scalarFULL B ", 0x1BDA58 },
-        { "FUSED-IDCT B ", 0x1BDA58 | 0x08000000 },
-        { "scalarFULL C ", 0x1BDA58 },
-        { "FUSED-IDCT C ", 0x1BDA58 | 0x08000000 },
+        { "SHIPPED    A ", 0x1BDA5E },
+        { "SHIP+FUSED A ", 0x1BDA5E | 0x08000000 },
+        { "SHIPPED    B ", 0x1BDA5E },
+        { "SHIP+FUSED B ", 0x1BDA5E | 0x08000000 },
+        { "SHIPPED    C ", 0x1BDA5E },
+        { "SHIP+FUSED C ", 0x1BDA5E | 0x08000000 },
     };
     int NC = sizeof(C) / sizeof(C[0]);
     Res res[16];
