@@ -1634,7 +1634,8 @@ static void lib_scan_dir(const char *dir, int depth) {
     closedir(d);
 }
 
-static void lib_normalize_shows(void) {
+static int lib_normalize_shows(void) {   /* returns nonzero when it healed something */
+    int chg = 0;
     /* heal ".srt.moflex"-style names the old download sniffer created: restore the real
      * extension on the SD and drop the bogus library entry */
     static const char *junk[] = { ".srt", ".txt", ".nfo", ".jpg", ".png" };
@@ -1653,7 +1654,7 @@ static void lib_normalize_shows(void) {
             rename(g_lib[i].url, nu);
         }
         memmove(&g_lib[i], &g_lib[i + 1], (size_t)(g_lib_n - i - 1) * sizeof(CatEntry));
-        g_lib_n--; i--;
+        g_lib_n--; i--; chg = 1;
     }
     /* belt-and-braces: whatever code path touched the entries, a FOLDER url must always be a show
      * (is_zip 2, folder-derived name). Cheap: only non-media-named entries get the stat. */
@@ -1662,14 +1663,14 @@ static void lib_normalize_shows(void) {
         struct stat st;
         if (stat(g_lib[i].url, &st)) continue;
         if (S_ISDIR(st.st_mode)) {
-            g_lib[i].is_zip = 2;
+            g_lib[i].is_zip = 2; chg = 1;
             show_name_from_dir(g_lib[i].url, g_lib[i].name, sizeof g_lib[i].name);
             if (!strcasecmp(g_lib[i].category, "Uncategorized"))
                 snprintf(g_lib[i].category, sizeof g_lib[i].category, "TV Shows");
         } else {
             /* a plain file that is not a playable video (e.g. a subtitle) -> not an entry */
             memmove(&g_lib[i], &g_lib[i + 1], (size_t)(g_lib_n - i - 1) * sizeof(CatEntry));
-            g_lib_n--; i--;
+            g_lib_n--; i--; chg = 1;
         }
     }
     /* collapse duplicate show entries (one per show name; season folders combine in the picker) */
@@ -1678,9 +1679,10 @@ static void lib_normalize_shows(void) {
         for (int j = g_lib_n - 1; j > i; j--) {
             if (g_lib[j].is_zip != 2 || strcasecmp(g_lib[j].name, g_lib[i].name)) continue;
             memmove(&g_lib[j], &g_lib[j + 1], (size_t)(g_lib_n - j - 1) * sizeof(CatEntry));
-            g_lib_n--;
+            g_lib_n--; chg = 1;
         }
     }
+    return chg;
 }
 static void lib_save_cache(void) {
     lib_normalize_shows();                                    /* never persist a demoted show entry */
@@ -1749,7 +1751,7 @@ static int lib_load_cache(void) {   /* cache-only: movie count, 0 if no valid ca
             fread(&n, sizeof n, 1, f) == 1 && n > 0 && n <= LIB_MAX &&
             (int)fread(g_lib, sizeof(CatEntry), n, f) == n) g_lib_n = n;
         fclose(f); }
-    lib_normalize_shows();   /* heal caches written while the refresh bug demoted shows */
+    if (lib_normalize_shows()) lib_save_cache();   /* heal (demoted shows, stray files) + persist it */
     return g_lib_n;
 }
 static int lib_load(void) {   /* returns the movie count; loads the cache, else scans once */
@@ -1867,6 +1869,7 @@ static int lib_load_cache_only(void) {
             fread(&n, sizeof n, 1, f) == 1 && n > 0 && n <= LIB_MAX &&
             (int)fread(g_lib, sizeof(CatEntry), n, f) == n) g_lib_n = n;
         fclose(f); }
+    if (lib_normalize_shows()) lib_save_cache();   /* same heal as lib_load_cache -- this loader can fill RAM first */
     return g_lib_n;
 }
 
