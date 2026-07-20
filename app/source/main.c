@@ -1099,7 +1099,10 @@ static int distinct_genres(const CatEntry *cat, int nc, const char *category, ch
     return n;
 }
 /* neon scrolling picker for a list of short strings. Returns index, -2 (Show All), or -1 (back). */
-static int catalog_pick(const char *title, const char *subtitle, char items[][32], int n, int show_all, const char *extra) {
+static void draw_status(int x, int y, int st);          /* watched badges (defined with the library code) */
+static const signed char *s_pick_status = NULL;         /* optional per-item badge for the NEXT catalog_pick */
+static int catalog_pick(const char *title, const char *subtitle, char items[][64], int n, int show_all, const char *extra) {
+    const signed char *pst = s_pick_status; s_pick_status = NULL;   /* consumed by this call only */
     int has_extra = (extra && extra[0]) ? 1 : 0;
     int total = n + (show_all ? 1 : 0) + has_extra;
     int sel = 0, top = 0, redraw = 1, td = 0, tx0 = 0, ty0 = 0, tsc0 = 0, tmv = 0;
@@ -1130,6 +1133,12 @@ static int catalog_pick(const char *title, const char *subtitle, char items[][32
             return act - (show_all ? 1 : 0);
         }
         if (sel < top) top = sel; if (sel >= top + VIS) top = sel - VIS + 1;
+        int mq = 0;   /* reveal-then-reset marquee of the selected row's full label */
+        { int nr = 0, isitem = !(show_all && sel == 0) && !(has_extra && sel == total - 1);
+          if (isitem && sel >= top && sel < top + VIS)
+              mq = marquee_off(3000000 + sel, ui_text_w(1, items[sel - (show_all ? 1 : 0)]), UI_W - 52, &nr);
+          else marquee_off(-4, 0, 0, &nr);
+          if (nr) redraw = 1; }
         if (dlw_poll()) redraw = 1;   /* a background download finished while we were here */
         { static int qt; if (s_dlw_active && ++qt >= 20) { qt = 0; redraw = 1; } }   /* keep the strip live */
         if (redraw) {
@@ -1147,7 +1156,14 @@ static int catalog_pick(const char *title, const char *subtitle, char items[][32
                     ui_frame_round(8, by, rw, rh, 7, UI_NEON, 1); }
                 int all = (show_all && i == 0), ex = (has_extra && i == total - 1);
                 const char *lbl = all ? "* Show All" : ex ? extra : items[i - (show_all ? 1 : 0)];
-                ui_text_fit(UI_W / 2, by + (rh - 8) / 2, 1, selrow ? UI_WHITE : (all || ex ? UI_NEON : UI_INK), lbl, rw - 16);
+                u16 lc = selrow ? UI_WHITE : (all || ex ? UI_NEON : UI_INK);
+                int ty2 = by + (rh - 8) / 2;
+                if (pst && !all && !ex) { int st = pst[i - (show_all ? 1 : 0)];
+                    if (st >= 0) draw_status(14, by + (rh - 9) / 2, st); }
+                int tx0 = 8 + 24, txr2 = 8 + rw - 12, tw2 = ui_text_w(1, lbl);
+                if (tw2 <= txr2 - tx0) ui_text_fit(UI_W / 2, ty2, 1, lc, lbl, rw - (pst ? 60 : 16));
+                else if (selrow) ui_text_clipped(tx0 - mq, ty2, 1, lc, lbl, tx0, txr2);
+                else ui_text_fit(UI_W / 2, ty2, 1, lc, lbl, rw - (pst ? 60 : 16));
             }
             if (total > VIS) { int th = VIS * (rh + gap) - gap, ty = ry0, maxs = total - VIS;
                 int hh = th * VIS / total; if (hh < 12) hh = 12; int hy = ty + (th - hh) * top / maxs;
@@ -1214,11 +1230,11 @@ static void catalog_browse(const Source *src) {
         /* ---- navigation: pick a category (+ optional genre), Show All, or X = search ---- */
         char filt_cat[32] = "", filt_genre[32] = "", filt_search[64] = "";
         if (ncat > 1) {
-            static char cdisp[24][32];   /* category rows with counts (selection uses cats[]) */
+            static char cdisp[24][64];   /* category rows with counts (selection uses cats[]) */
             for (int k = 0; k < ncat; k++) {
                 int n = 0;
                 for (int i = 0; i < nc; i++) if (!strcasecmp(cat[i].category, cats[k])) n++;
-                snprintf(cdisp[k], 32, "%.24s (%d)", cats[k], n);
+                snprintf(cdisp[k], 64, "%.48s (%d)", cats[k], n);
             }
             int c = catalog_pick("CATEGORY", src->name, cdisp, ncat, 1, NULL);
             if (c == -1) break;
@@ -1228,12 +1244,12 @@ static void catalog_browse(const Source *src) {
                 static char gens[64][32]; int ng = distinct_genres(cat, nc, filt_cat, gens, 64);
                 qsort(gens, ng, 32, strrow_cmp);   /* genres alphabetical */
                 if (ng > 0) {
-                    static char gdisp[64][32];   /* genre rows with counts (within this category) */
+                    static char gdisp[64][64];   /* genre rows with counts (within this category) */
                     for (int k = 0; k < ng; k++) {
                         int n = 0;
                         for (int i = 0; i < nc; i++)
                             if (!strcasecmp(cat[i].category, filt_cat) && genre_match(cat[i].genres, gens[k])) n++;
-                        snprintf(gdisp[k], 32, "%.24s (%d)", gens[k], n);
+                        snprintf(gdisp[k], 64, "%.48s (%d)", gens[k], n);
                     }
                     const char *mi[2] = { "View All", "Pick a Genre" };
                     int mm = ui_menu(filt_cat, NULL, mi, 2);
@@ -1538,8 +1554,9 @@ static void ep_collect_dir_named(const char *dirpath, const char *showname, int 
 /* Episode picker for a show: lists episodes from EVERY sibling season folder whose derived show
  * name matches (so "…Season 1…" and "…Season 2…" combine into one show).
  * 1 = picked (out set), 0 = backed out, -1 = no episodes found. */
-static int show_pick_episode(const char *showname, const char *url, char *out, size_t cap) {
-    static char eps[EP_MAX][32]; int n = 0;
+/* Collect + sort all episode paths of a show into s_epfile. Returns the count. */
+static int show_collect_eps(const char *showname, const char *url) {
+    int n = 0;
     struct stat st;
     int real = (stat(url, &st) == 0 && S_ISDIR(st.st_mode));
     const char *sl = strrchr(url, '/');
@@ -1571,18 +1588,40 @@ static int show_pick_episode(const char *showname, const char *url, char *out, s
         size_t L = strlen(pdir); while (L > 1 && pdir[L - 1] == '/') pdir[--L] = 0;
         ep_collect_dir_named(pdir, showname, &n);
     }
+    if (n) qsort(s_epfile, n, sizeof s_epfile[0], epname_cmp);   /* SxxEyy sorts into watch order */
+    return n;
+}
+
+/* One episode's watch status: 2 watched, 1 in progress, 0 new. */
+static int ep_status(const char *path) {
+    if (moflex_watched(path)) return 2;
+    return moflex_resume_get(path) > 0 ? 1 : 0;
+}
+
+/* Aggregate status for a whole show: all watched -> watched; anything touched -> in
+ * progress; untouched -> new. -1 when the folder has no episodes. */
+static int show_status(const char *showname, const char *url) {
+    int n = show_collect_eps(showname, url);
+    if (n <= 0) return -1;
+    int w = 0, touched = 0;
+    for (int i = 0; i < n; i++) { int st = ep_status(s_epfile[i]); if (st == 2) w++; if (st) touched = 1; }
+    return (w == n) ? 2 : touched ? 1 : 0;
+}
+
+static int show_pick_episode(const char *showname, const char *url, char *out, size_t cap) {
+    static char eps[EP_MAX][64];
+    static signed char epst[EP_MAX];
+    int n = show_collect_eps(showname, url);
     if (n == 0) return -1;
-    qsort(s_epfile, n, sizeof s_epfile[0], epname_cmp);   /* SxxEyy sorts into watch order */
     for (int i = 0; i < n; i++) {
         const char *b = strrchr(s_epfile[i], '/'); b = b ? b + 1 : s_epfile[i];
         const char *tag = ep_tag_at(b);
         char nm[64]; snprintf(nm, sizeof nm, "%s", tag ? tag : b);
         strip_ext(nm); strip_3d_tags(nm);
-        /* watch markers: * = watched, > = in progress */
-        const char *mk = moflex_watched(s_epfile[i]) ? "* "
-                       : moflex_resume_get(s_epfile[i]) > 0 ? "> " : "";
-        snprintf(eps[i], 32, "%s%.29s", mk, nm);
+        snprintf(eps[i], 64, "%.63s", nm);
+        epst[i] = (signed char)ep_status(s_epfile[i]);
     }
+    s_pick_status = epst;   /* same watched badges as the library list */
     int c = catalog_pick("EPISODES", showname, eps, n, 0, NULL);
     if (c < 0) return 0;
     snprintf(out, cap, "%s", s_epfile[c]);
@@ -1983,7 +2022,7 @@ static int vid_status(int li) {
     if (s_vs[li] != 0xFF) return (int)s_vs[li] - 1;
     const CatEntry *e = &g_lib[li];
     int st;
-    if (e->is_zip == 2) st = -1;                       /* shows: per-episode marks live in the picker */
+    if (e->is_zip == 2) st = show_status(e->name, e->url);   /* aggregate of the episodes */
     else if (moflex_watched(e->url)) st = 2;
     else if (moflex_resume_get(e->url) > 0) st = 1;
     else st = 0;
@@ -2173,11 +2212,11 @@ static int library_view(char *out, size_t cap) {
     while (aptMainLoop() && !chose) {
         static char cats[24][32]; int ncat = lib_distinct_categories(cats, 24);
         qsort(cats, ncat, 32, strrow_cmp);
-        static char cdisp[24][32];   /* display rows with per-category counts (selection uses cats[]) */
+        static char cdisp[24][64];   /* display rows with per-category counts (selection uses cats[]) */
         for (int k = 0; k < ncat; k++) {
             int n = 0;
             for (int i = 0; i < g_lib_n; i++) if (!strcasecmp(lib_disp_cat(&g_lib[i]), cats[k])) n++;
-            snprintf(cdisp[k], 32, "%.24s (%d)", cats[k], n);
+            snprintf(cdisp[k], 64, "%.48s (%d)", cats[k], n);
         }
         char sub[24]; snprintf(sub, sizeof sub, "%d videos", g_lib_n);
         int c = catalog_pick("LIBRARY", sub, cdisp, ncat, 1, "* Rescan Library");
@@ -2219,12 +2258,12 @@ static int library_view(char *out, size_t cap) {
                         int r = library_list(fc, "", poster, &sortmode, out, cap);
                         if (r == LL_PLAY) chose = 1; else if (r == LL_RESCAN) rescan = 1;
                     } else {                                   /* Pick a Genre */
-                        static char gdisp[64][32];   /* genre rows with counts (within this category) */
+                        static char gdisp[64][64];   /* genre rows with counts (within this category) */
                         for (int k = 0; k < ng; k++) {
                             int n = 0;
                             for (int i = 0; i < g_lib_n; i++)
                                 if (!strcasecmp(lib_disp_cat(&g_lib[i]), fc) && genre_match(g_lib[i].genres, gens[k])) n++;
-                            snprintf(gdisp[k], 32, "%.24s (%d)", gens[k], n);
+                            snprintf(gdisp[k], 64, "%.48s (%d)", gens[k], n);
                         }
                         int gen_back = 0;
                         while (!gen_back && !chose && !rescan && aptMainLoop()) {
@@ -2478,12 +2517,12 @@ static void queue_screen(void) {
         dlw_poll();
         queue_load();
         if (s_qn == 0) { msg_screen("DOWNLOAD QUEUE", "The queue is empty.\nA downloads now (in background);\nSELECT queues for later."); return; }
-        static char names[QUEUE_MAX][32];
+        static char names[QUEUE_MAX][64];
         for (int i = 0; i < s_qn; i++) {
             if (s_dlw_active && !strcmp(s_q[i].url, (const char *)s_dlw_item.url)) {
-                if (s_dlw_total) snprintf(names[i], 32, "> %.20s  %d%%", s_q[i].name, (int)((u64)100 * s_dlw_done / s_dlw_total));
-                else             snprintf(names[i], 32, "> %.24s ...", s_q[i].name);
-            } else snprintf(names[i], 32, "%d. %.27s", i + 1, s_q[i].name);
+                if (s_dlw_total) snprintf(names[i], 64, "> %.40s  %d%%", s_q[i].name, (int)((u64)100 * s_dlw_done / s_dlw_total));
+                else             snprintf(names[i], 64, "> %.48s ...", s_q[i].name);
+            } else snprintf(names[i], 64, "%d. %.58s", i + 1, s_q[i].name);
         }
         char sub[40];
         snprintf(sub, sizeof sub, "%d item%s%s", s_qn, s_qn == 1 ? "" : "s", s_dlw_active ? "  -  downloading" : "  -  not downloading");
@@ -3597,7 +3636,7 @@ static int home_gui(void) {
 /* pick from the recently-played list (most recent first; missing files pruned). 1 = picked. */
 static int recent_pick(char *out, size_t cap) {
     static char paths[RECENT_MAX][PATHLEN + NAMELEN];
-    static char names[RECENT_MAX][32]; int n = 0;
+    static char names[RECENT_MAX][64]; int n = 0;
     FILE *f = fopen(RECENT_FILE, "rb");
     if (f) {
         char ln[PATHLEN + NAMELEN];
@@ -3608,7 +3647,7 @@ static int recent_pick(char *out, size_t cap) {
             snprintf(paths[n], sizeof paths[0], "%s", ln);
             const char *b = strrchr(ln, '/'); b = b ? b + 1 : ln;
             char nm[64]; snprintf(nm, sizeof nm, "%s", b); strip_ext(nm);
-            snprintf(names[n], 32, "%.31s", nm); n++;
+            snprintf(names[n], 64, "%.62s", nm); n++;
         }
         fclose(f);
     }
