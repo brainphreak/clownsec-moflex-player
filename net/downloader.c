@@ -119,8 +119,9 @@ bool download_to_file(const char *url, const char *dest, dl_progress_cb cb, void
         curl_off_t off = (stat(part, &st) == 0) ? (curl_off_t)st.st_size : 0;
         FILE *f = fopen(part, off > 0 ? "ab" : "wb");
         if (!f) return false;
-        static char dlwbuf[256 * 1024];   /* large stdio buffer: bigger SD writes = better SD throughput */
-        setvbuf(f, dlwbuf, _IOFBF, sizeof dlwbuf);
+        /* NOTE: deliberately NOT a big stdio buffer -- a large SD write holds the FAT lock long enough
+         * to freeze the UI's SD reads on Old-3DS (menus hung for 1-2 min behind the download). Default
+         * (small, frequent) writes let the main thread's reads interleave. */
         CURL *e = curl_easy_init();
         if (!e) { fclose(f); return false; }
 
