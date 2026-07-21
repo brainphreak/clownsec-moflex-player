@@ -445,6 +445,14 @@ static bool dl_progress(void *u, u32 d, u32 t) {
     if (hidKeysHeld() & KEY_TOUCH) { touchPosition tp; hidTouchRead(&tp);   /* tap CANCEL */
         if (tp.py >= 206 && tp.py < 234 && tp.px >= 110 && tp.px < 210) return false; }
     u64 now = osGetTime();
+    /* live speed: bytes since the last redraw over the elapsed ms (smoothed a little) */
+    static u64 sp_t = 0; static u32 sp_b = 0; static double sp_mbps = 0;
+    if (sp_t == 0) { sp_t = now; sp_b = d; }
+    else if (now - sp_t >= 250) {
+        double inst = (double)(d - sp_b) * 8.0 / 1000.0 / (double)(now - sp_t);   /* bits/ms = Mbps */
+        sp_mbps = sp_mbps > 0 ? sp_mbps * 0.5 + inst * 0.5 : inst;                /* EMA smoothing */
+        sp_t = now; sp_b = d;
+    }
     if (now - g_last_prog >= 100) {
         g_last_prog = now;
         ui_begin(GFX_BOTTOM);
@@ -463,6 +471,9 @@ static bool dl_progress(void *u, u32 d, u32 t) {
             else              snprintf(pl, sizeof pl, "%lu / %lu KB   %d%%", (unsigned long)(d / 1024), (unsigned long)(t / 1024), pct);
         } else snprintf(pl, sizeof pl, "%lu KB", (unsigned long)(d / 1024));
         ui_text_center(UI_W / 2, by + bh + 8, 1, UI_INK, pl);
+        char sp[40];
+        snprintf(sp, sizeof sp, "%.2f Mbps   (%.0f KB/s)", sp_mbps, sp_mbps * 1000.0 / 8.0);
+        ui_text_center(UI_W / 2, by + bh + 26, 1, UI_NEON, sp);
         ui_button(110, 206, 100, 28, "CANCEL", 0, UI_RED);
         ui_present();
         gfxFlushBuffers(); gfxSwapBuffers();
