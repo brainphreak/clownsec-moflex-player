@@ -1024,8 +1024,15 @@ static int dlw_start(void) {   /* main thread: launch the front queue item */
     if (s_qn <= 0) return 0;
     s_dlw_item = s_q[0];
     s_dlw_stop = 0; s_dlw_finished = 0; s_dlw_ok = 0; s_dlw_done = s_dlw_total = 0;
+    /* Run the download on the SYSCORE (core 1) like the fast upload server does -- not on the app core
+     * where it contends with the UI. The ring only enables the syscore on Old-3DS, so on New-3DS the
+     * worker was starved on core 0 -> downloads far slower than Old-3DS despite better WiFi. Enable it
+     * here for both consoles. Fall back to the app core if core 1 can't be used. */
+    APT_SetAppCpuTimeLimit(30);
     s32 prio = 0; svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
-    if (!threadCreate(dlw_thread, NULL, 32 * 1024, prio + 1, -2, true)) return 0;
+    Thread th = threadCreate(dlw_thread, NULL, 32 * 1024, 0x3F, 1, true);        /* core 1 (syscore) */
+    if (!th) th = threadCreate(dlw_thread, NULL, 32 * 1024, prio + 1, -2, true); /* fallback: any core */
+    if (!th) return 0;
     s_dlw_active = 1;
     return 1;
 }
