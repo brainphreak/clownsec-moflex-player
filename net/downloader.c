@@ -37,7 +37,14 @@ static void setup(CURL *e, const char *url) {
     curl_easy_setopt(e, CURLOPT_SSL_VERIFYHOST, 0L);
     curl_easy_setopt(e, CURLOPT_USERAGENT, "moflex-player/1.0");
     curl_easy_setopt(e, CURLOPT_ACCEPT_ENCODING, "");  /* allow gzip etc. */
-    curl_easy_setopt(e, CURLOPT_BUFFERSIZE, 64L * 1024L);
+    curl_easy_setopt(e, CURLOPT_BUFFERSIZE, 256L * 1024L);   /* bigger receive buffer -> fewer syscalls */
+    curl_easy_setopt(e, CURLOPT_TCP_NODELAY, 1L);
+    /* The 3DS decrypts TLS in software with no AES hardware; ChaCha20-Poly1305 is far faster there than
+     * AES-GCM. Prefer it (server picks the best mutual cipher, so this safely falls back to AES). */
+    curl_easy_setopt(e, CURLOPT_SSL_CIPHER_LIST,
+        "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:"
+        "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:AES128-GCM-SHA256");
+    curl_easy_setopt(e, CURLOPT_TLS13_CIPHERS, "TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256");
     curl_easy_setopt(e, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(e, CURLOPT_CONNECTTIMEOUT, 20L);
 }
@@ -110,6 +117,8 @@ bool download_to_file(const char *url, const char *dest, dl_progress_cb cb, void
         curl_off_t off = (stat(part, &st) == 0) ? (curl_off_t)st.st_size : 0;
         FILE *f = fopen(part, off > 0 ? "ab" : "wb");
         if (!f) return false;
+        static char dlwbuf[256 * 1024];   /* large stdio buffer: bigger SD writes = better SD throughput */
+        setvbuf(f, dlwbuf, _IOFBF, sizeof dlwbuf);
         CURL *e = curl_easy_init();
         if (!e) { fclose(f); return false; }
 
