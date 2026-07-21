@@ -117,8 +117,12 @@ bool download_to_file(const char *url, const char *dest, dl_progress_cb cb, void
     for (int attempt = 0; attempt < MAX_TRIES; attempt++) {
         struct stat st;
         curl_off_t off = (stat(part, &st) == 0) ? (curl_off_t)st.st_size : 0;
-        FILE *f = fopen(part, off > 0 ? "ab" : "wb");
+        /* RESUME: open read+write and seek to the end ONCE, NOT append mode ("ab"). On the 3DS FAT
+         * driver, append does an lseek(END) before every write -- O(file-size) per write -- so a resumed
+         * download crawls and slows further as the .part grows. r+b seeks once, then writes sequentially. */
+        FILE *f = fopen(part, off > 0 ? "r+b" : "wb");
         if (!f) return false;
+        if (off > 0) fseeko(f, 0, SEEK_END);
         /* NOTE: deliberately NOT a big stdio buffer -- a large SD write holds the FAT lock long enough
          * to freeze the UI's SD reads on Old-3DS (menus hung for 1-2 min behind the download). Default
          * (small, frequent) writes let the main thread's reads interleave. */
