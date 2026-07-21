@@ -9,12 +9,30 @@ IMA-ADPCM audio) files **natively** — decoded in portable C, no on-device FFmp
 synchronized audio. It auto-detects **stereoscopic 3D** vs flat **2D** and plays each
 correctly, including movies embedded inside `.cia` files.
 
-Full speed on **New 3DS** (2D and 3D). On **Old 3DS**, 2D plays smoothly; 3D delivers twice
-the frames and the decode can't sustain that in real time, so it isn't smooth there (the
-player shows a note during Old-3DS 3D playback).
+Full speed on **New 3DS** (2D and 3D). On **Old 3DS**, 2D plays smoothly and **3D has been
+substantially sped up** — see **[3DS performance](#3ds-performance)** below for the HQ toggle
+and the one tip that makes the biggest difference on the older hardware.
 
 The decoder is a standalone port of FFmpeg's MobiClip/moflex path, verified **bit-exact
 against FFmpeg on PC** before ever touching hardware.
+
+## 3DS performance
+
+A lot of recent work went into playback speed, especially **3D on the Old 3DS**, where every
+frame is decoded twice (once per eye):
+
+- **Faster decode + a decode-ahead engine.** The MobiClip decoder was hand-optimized and the
+  3D player now decodes frames ahead of time and banks them, so it can absorb heavy scenes
+  instead of stuttering on them. Most clips play smoothly on the Old 3DS now.
+- **HQ button (Old 3DS only).** To stay smooth by default, the Old 3DS plays in a lighter
+  **16-bit color** mode. Tap the on-screen **HQ** button — bottom-left of the player, opposite
+  the moon — to switch to **24-bit color** for cleaner gradients on a movie that can afford it.
+  Your choice is remembered across launches. (The New 3DS is always 24-bit, so it has no HQ
+  button.)
+- **Best performance: turn off the bottom screen.** Tap the **moon** button during playback to
+  power off the bottom backlight — the movie keeps playing on top. This hands the console more
+  time to spend on decoding and is the single biggest thing you can do to smooth out a demanding
+  3D movie on the Old 3DS (it also saves battery). Any button press wakes the screen back up.
 
 ## Download
 
@@ -64,6 +82,8 @@ If the timer won't advance past `0:00` in Citra, give the emulator the 3DS **DSP
   After a seek the landing frame is shown immediately and audio resumes synced to it.
 - **Resume** — playback position is saved per movie (and per episode inside a multi-movie CIA)
   and auto-resumes where you left off.
+- **Watched / Unwatched indicators** — movies you finish are marked as watched in the browser,
+  so you can see at a glance what you've already seen; the rest keep their resume point.
 - **Software volume boost** up to 400% for quiet sources.
 - **Subtitles (closed captions)** — drop a `.srt` next to a movie (works on **2D and 3D**) and it
   loads automatically. The in-player **CC** button toggles them and adjusts position, size,
@@ -73,6 +93,10 @@ If the timer won't advance past `0:00` in Citra, give the emulator the 3DS **DSP
   3D/2D badge).
 - **Downloader** — pull movies and TV seasons straight to the SD card (zips are extracted into
   their own folder), or grab any file by direct URL, with a destination-folder picker.
+- **Download queue** — line up several movies or whole seasons and they download one after
+  another in the background, with a live speed readout (Mbps / KB/s) showing real throughput.
+  The **QUEUE** button jumps to the queue; downloads keep running while you browse or watch, and
+  interrupted transfers resume where they left off.
 - **Built-in web server** — upload any files to the console from a browser over Wi-Fi.
 - **File manager** — browse, move, delete, and create folders on the SD card (all files, with a
   movies-only toggle).
