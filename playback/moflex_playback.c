@@ -2036,8 +2036,9 @@ static MoflexResult moflex_play_ring(const char *path) {
     bool r3_isnew = false; APT_CheckNew3DS(&r3_isnew);
     /* 24-bit color (RGBA8) on New-3DS to kill gradient banding; 16-bit (RGB565) on Old-3DS where the
      * doubled texture size would halve the decode-ahead cushion. */
-    int r3_bpp = r3_isnew ? 4 : 2;
-    GPU_TEXCOLOR r3_tf = r3_isnew ? GPU_RGBA8 : GPU_RGB565;
+    int r3_bpp = 4;                       /* 24-bit RGBA8 on BOTH consoles now -- Old-3DS was RGB565 (banding).
+                                           * Trade: ~half the decode-ahead cushion + slightly slower Y2R. */
+    GPU_TEXCOLOR r3_tf = GPU_RGBA8;
     g_ring_apt_bpp = r3_bpp;
     AVFrame *fL = av_frame_alloc(), *fR = av_frame_alloc();
 
