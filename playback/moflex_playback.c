@@ -1951,7 +1951,28 @@ static void r3_produce(R3S *s) {
     }
     if (r3_vqc < 2) return;   /* not enough for a pair yet */
 
-    /* CATCH-UP: if video has fallen > DRIFT_MAX pairs behind the audio clock, skip GOPs to the nearest
+    /* ================= CATCH-UP MODE (current: SKIP+FLUSH = avtest "mode 2") =================
+     * Documented so it can be changed deliberately later. The mode ONLY matters when the video has
+     * fallen behind the audio clock (drift > DRIFT_MAX); when decode keeps up, none of it runs.
+     * Per-frame decode cost is identical across all three -- they differ only in how a fall-behind
+     * recovers, and in how much decode work is discarded to do it:
+     *
+     *   0 NOSKIP  : never skip. Decode EVERY pair, elide only the DISPLAY of stale ones. No freeze,
+     *               no artifacts, but audio drifts ahead during sustained-heavy scenes (sync slip).
+     *               MOST decode-intensive under load (never drops decode work; can't out-run the
+     *               decoder). Select by never setting s->skipping (delete the drift test below).
+     *   1 SKIP    : drop undecoded packets to the next keyframe, NO flush. LESS decode work when
+     *               behind (resyncs to real time) and no freeze -- but the skipped refs are stale, so
+     *               ghosting persists until the next NATURAL keyframe (rare here -> looks bad on this
+     *               content). Select by removing the mobi_flush() call below (keep the skip logic).
+     *   2 SKIP+FL : (CURRENT) drop undecoded packets to the keyframe, THEN flush -> clean picture at
+     *               the cost of a brief freeze per resync. Best-looking on keyframe-sparse content.
+     *
+     * avtest (avtest/source/main.c, `int mode`) cycles all three LIVE with Y for on-hardware A/B.
+     * NOTE: no mode speeds up steady-state decode. The real per-frame levers are elsewhere -- 16-bit
+     * color (HQ off) + bottom-screen-off cut the Y2R/present cost every mode pays on every shown frame.
+     * ==========================================================================================
+     * CATCH-UP: if video has fallen > DRIFT_MAX pairs behind the audio clock, skip GOPs to the nearest
      * buffered keyframe at/before the audio position (never past it -> no freeze). */
     long long dpair = s->dpair;
     int apos_pair = (r3_apos >= 0) ? (int)(r3_apos / s->pair_dur) : -1;
