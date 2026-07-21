@@ -47,6 +47,8 @@ static void setup(CURL *e, const char *url) {
     curl_easy_setopt(e, CURLOPT_TLS13_CIPHERS, "TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256");
     curl_easy_setopt(e, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(e, CURLOPT_CONNECTTIMEOUT, 20L);
+    curl_easy_setopt(e, CURLOPT_LOW_SPEED_LIMIT, 512L);   /* < 512 B/s for 30s -> abort, never hang */
+    curl_easy_setopt(e, CURLOPT_LOW_SPEED_TIME, 30L);
 }
 
 /* ---- progress bridge ---- */

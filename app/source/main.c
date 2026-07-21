@@ -961,6 +961,7 @@ static void queue_move_top(int i) {
     memmove(&s_q[1], &s_q[0], (size_t)i * sizeof(QItem));
     s_q[0] = t; queue_save();
 }
+static void queue_screen(void);   /* the DOWNLOAD QUEUE screen (defined later) */
 static void queue_add_ui(const CatEntry *e) {
     queue_load();
     if (s_qn >= QUEUE_MAX) { snprintf(s_qtoast, sizeof s_qtoast, "Queue full (%d)", QUEUE_MAX); s_qtoast_t = 75; return; }
@@ -995,8 +996,17 @@ static volatile u32 s_dlw_done = 0, s_dlw_total = 0; /* live progress for the UI
 static int s_dlw_resume_ask = 0;                     /* paused for playback -> offer to resume */
 static int dlw_poll(void);                           /* defined after the post-processing helpers */
 
+static volatile int s_dlw_mbps_x100 = 0;             /* live download speed *100 (Mbps), for the UI */
 static bool dlw_progress(void *u, u32 d, u32 t) {    /* worker thread: no UI, no hid */
     (void)u; s_dlw_done = d; s_dlw_total = t;
+    static u64 spt = 0; static u32 spb = 0; static double ema = 0;
+    u64 now = osGetTime();
+    if (spt == 0 || d < spb) { spt = now; spb = d; ema = 0; }
+    else if (now - spt >= 300) {
+        double inst = (double)(d - spb) * 8.0 / 1000.0 / (double)(now - spt);   /* bits/ms = Mbps */
+        ema = ema > 0 ? ema * 0.5 + inst * 0.5 : inst;
+        s_dlw_mbps_x100 = (int)(ema * 100 + 0.5); spt = now; spb = d;
+    }
     return !s_dlw_stop;
 }
 static void dlw_thread(void *arg) {
@@ -1339,7 +1349,7 @@ cb_rebuild:;   /* X-search inside the list jumps back here with filt_search set 
                     if (tx0 < 104) want_dl = 1;
                     else if (tx0 < 208) { sortmode = (sortmode + 1) % 3; g_smode = sortmode;
                         qsort(idx, ni, sizeof(int), idx_cmp); csel = 0; cscroll = 0; shown = -1; redraw = 1; }
-                    else { queue_add_ui(&cat[idx[csel]]); redraw = 1; }
+                    else { queue_screen(); redraw = 1; }   /* QUEUE button -> the queue (A adds/downloads) */
                 } else if (ty0 >= BR_LIST_Y) { int i = cscroll + (ty0 - BR_LIST_Y) / BR_ROWH;
                     if (i >= 0 && i < ni && i < cscroll + BR_ROWS) { csel = i; redraw = 1; } }
             }
@@ -2522,7 +2532,9 @@ static void dlw_detail_screen(void) {
             else              snprintf(pl, sizeof pl, "%lu / %lu KB   %d%%", (unsigned long)(d / 1024), (unsigned long)(t / 1024), pct);
         } else snprintf(pl, sizeof pl, "%lu KB", (unsigned long)(d / 1024));
         ui_text_center(UI_W / 2, by + bh + 8, 1, UI_INK, pl);
-        ui_text_center(UI_W / 2, by + bh + 30, 1, UI_DIM, "B - back (keeps downloading)");
+        char spd[40]; snprintf(spd, sizeof spd, "%d.%02d Mbps  (%d KB/s)", s_dlw_mbps_x100 / 100, s_dlw_mbps_x100 % 100, s_dlw_mbps_x100 * 10 / 8);
+        ui_text_center(UI_W / 2, by + bh + 26, 1, UI_NEON, spd);
+        ui_text_center(UI_W / 2, by + bh + 46, 1, UI_DIM, "B - back (keeps downloading)");
         ui_button(110, 206, 100, 28, "CANCEL", 0, UI_RED);
         ui_present();
         gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
