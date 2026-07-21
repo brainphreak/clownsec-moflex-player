@@ -2441,7 +2441,11 @@ static MoflexResult moflex_play_ring(const char *path) {
                 resume_exact = 0;
                 if (s.wr == 1 && cur_us < seek_to_us && seek_to_us - cur_us <= 30000000) {
                     MfxPacket pk2; int64_t cts = cur_us, last_paint = cur_us; int aborted = 0;
+                    u64 rf_start = osGetTime();   /* bound resume decode by REAL time: Old-3DS ~25ms/frame,
+                                                   * so 30s of content = 30s+ of black-screen wait. Cap it. */
                     while (cts + pair_dur <= seek_to_us && !aborted) {
+                        if (osGetTime() - rf_start > 3000) break;   /* ~3s cap: land close (exact on New-3DS),
+                                                                     * a few seconds short on Old-3DS, never hang */
                         int need = is3d ? 2 : 1;
                         for (int e = 0; e < need && !aborted; e++) {
                             for (;;) {
