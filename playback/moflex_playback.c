@@ -1920,8 +1920,9 @@ static void r3_produce(R3S *s) {
          * that corrupts the whole GOP and the blockiness bleeds into the following calm scenes. The
          * cost is a brief freeze on the last clean frame, resolved the instant a keyframe lands. */
         if (r3_vqc == 0) { s->dpair = dpair + 1; return; }                 /* nothing buffered yet -> hold */
-        if (r3_vq_head_is_kf()) { s->skipping = 0; if (!s->old3ds) mobi_flush(s->ctx); }   /* Old-3DS: NO flush,
-                             * keep stale-but-valid refs (ghost that decays) vs NULL refs (the flush freeze). */
+        if (r3_vq_head_is_kf()) { s->skipping = 0; mobi_flush(s->ctx); }   /* FLUSH on resync (avtest mode 2,
+                             * "looked best": clean picture + rare freezes, vs no-flush's persistent ghosting on
+                             * this keyframe-sparse content). Matches the avtest degradation the user prefers. */
         else {
             int n, kf; int64_t ts; free(r3_vq_pop(&n, &ts, &kf)); if (r3_vqc > 0) free(r3_vq_pop(&n, &ts, &kf));
             s->dpair = dpair + 1;
