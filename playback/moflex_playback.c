@@ -1130,8 +1130,8 @@ static int ui_tex_init(void) {
 }
 static void ui_tex_free(void) { if (g_uitex_ok) { C3D_TexDelete(&g_uitex); g_uitex_ok = 0; } }
 
-/* lift the offscreen UI buffer (already drawn) into the texture and draw it on the bottom screen */
-static void ui_tex_present(C3D_RenderTarget *bot) {
+/* copy the offscreen UI buffer into the texture (the CPU-heavy 76800-pixel tiled copy) */
+static void ui_tex_upload(void) {
     ui_capture(0);
     const u16 *src = ui_pixels();                /* pixel (x,y) at [x*UI_H + (UI_H-1-y)] (rotated fb) */
     u16 *dst = (u16 *)g_uitex.data;
@@ -1139,17 +1139,34 @@ static void ui_tex_present(C3D_RenderTarget *bot) {
         for (int x = 0; x < UI_W; x++)
             dst[r3_tile_off(x, y)] = src[x * UI_H + (UI_H - 1 - y)];
     C3D_TexFlush(&g_uitex);
+}
+/* blit the (already-uploaded) UI texture onto the bottom screen -- cheap GPU only */
+static void ui_tex_blit(C3D_RenderTarget *bot) {
     C2D_TargetClear(bot, C2D_Color32(0, 0, 0, 255));
     C2D_SceneBegin(bot);
     C2D_DrawImageAt(g_uiimg, 0, 0, 0, NULL, 1, 1);
 }
+static void ui_tex_present(C3D_RenderTarget *bot) { ui_tex_upload(); ui_tex_blit(bot); }
 
-/* Drop-in for g_panel(): render the release panel to the offscreen buffer, then texture it. */
+/* Drop-in for g_panel(): render the release panel to the offscreen buffer, then texture it.
+ * The CPU-heavy work (panel_draw + the 76800-pixel tiled upload) only runs when a VISIBLE element
+ * changed -- second tick, bar pixel, play state, volume, battery, or a forced event. The blit runs
+ * every frame so the panel stays on screen with no flicker. This keeps the panel off the decode
+ * critical path on Old-3DS (it was re-rendering + re-uploading every frame). */
+static int g_panel_force = 1;   /* force a re-render next time (first frame, wake from dark, submenu exit) */
 static void g_panel_sw(C3D_RenderTarget *bot, const char *title, int64_t cur, int64_t dur, int playing) {
     if (!ui_tex_init()) return;
-    ui_capture(1);
-    panel_draw(title, cur, dur, playing);       /* fills g_buf; ui_present() is a no-op under capture */
-    ui_tex_present(bot);
+    static int64_t l_sec = -1; static int l_bar = -1, l_play = -1, l_vol = -1, l_batt = -2;
+    int sec = (int)(cur / 1000000);
+    int bar = dur > 0 ? (int)((double)BAR_W * (double)cur / (double)dur) : 0;
+    int vol = (int)(g_vol * 100 + 0.5f);
+    if (g_panel_force || sec != l_sec || bar != l_bar || playing != l_play || vol != l_vol || g_batt_pct != l_batt) {
+        g_panel_force = 0; l_sec = sec; l_bar = bar; l_play = playing; l_vol = vol; l_batt = g_batt_pct;
+        ui_capture(1);
+        panel_draw(title, cur, dur, playing);   /* fills g_buf; ui_present() is a no-op under capture */
+        ui_tex_upload();
+    }
+    ui_tex_blit(bot);
 }
 
 /* ==================== NON-BLOCKING SUBTITLE MENU (ring engine, live preview) ====================
@@ -2564,9 +2581,10 @@ static MoflexResult moflex_play_ring(const char *path) {
             C2D_TargetClear(topR, black); C2D_SceneBegin(topR);
             C2D_DrawImageAt(is3d ? r3_imgR[b] : r3_imgL[b], 0, 0, 0, NULL, 1, 1);
             if (sub_valid) r3_draw_sub(&tsub, is3d ? g_sub_depth : 0, subcol, subout);
-            if (g_screen_off) g_dark_sw(bot);                    /* dark: black + toast only, never the panel */
-            else if (g_submenu) g_submenu_sw(bot, is3d);         /* subtitle options (movie keeps playing) */
-            else g_panel_sw(bot, title, disp_us, dur_us, playing);   /* panel (lock toast on top) */
+            if (g_screen_off) { g_dark_sw(bot); g_panel_force = 1; }      /* dark: panel stale -> force on wake */
+            else if (g_submenu) { g_submenu_sw(bot, is3d); g_panel_force = 1; }  /* submenu: panel stale on exit */
+            else { if (dirty) g_panel_force = 1;                          /* UI changed -> re-render the panel */
+                   g_panel_sw(bot, title, disp_us, dur_us, playing); }   /* panel (lock toast on top) */
             u64 _tg = svcGetSystemTick(); C3D_FrameEnd(0); pf_gpu += svcGetSystemTick() - _tg;
             dirty = 0;
             if (show >= 0) {
