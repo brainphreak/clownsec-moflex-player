@@ -37,6 +37,9 @@ static int   g_screen_off = 0;   /* bottom backlight is currently off (movie kee
 static int   g_touch_locked = 0; /* touch lock: L toggles it; buttons still work; touch shows a toast */
 static int   g_lock_toast = 0;   /* frames left to show the "touch locked" toast after a locked touch */
 static int   g_backlight_on = 1; /* actual bottom backlight state (reconciled from g_screen_off + toast) */
+static int   g_hq = 0;           /* Old-3DS: 24-bit HQ color on? default OFF (fast 16-bit); HQ button toggles */
+static int   g_hq_avail = 0;     /* HQ button shown this playback? (Old-3DS only -- New-3DS is always 24-bit) */
+static int   g_hq_loaded = 0;    /* g_hq loaded from disk once */
 
 /* ---- battery indicator (player panel) ---- */
 static int   g_mcu_ok = 0;       /* mcu::HWC available -> exact 0-100% */
@@ -99,6 +102,21 @@ static void resume_save_us(const char *movie, int64_t us) {
 static void resume_clear(const char *movie) {
     char p[256]; resume_path(movie, p, sizeof(p));
     remove(p);
+}
+
+/* ---- HQ (24-bit color) preference: one global flag, remembered across launches. Only meaningful on
+ * Old-3DS (New-3DS always runs 24-bit). Off by default -> the smooth 16-bit path out of the box; the
+ * viewer opts into 24-bit with the on-screen HQ button when a movie can afford it. ---- */
+#define HQ_FILE "sdmc:/moflex_player/hq.cfg"
+static void hq_load(void) {
+    FILE *f = fopen(HQ_FILE, "rb"); if (!f) return;
+    int v = 0; if (fscanf(f, "%d", &v) == 1) g_hq = !!v;
+    fclose(f);
+}
+static void hq_save(void) {
+    mkdir("sdmc:/moflex_player", 0777);
+    FILE *f = fopen(HQ_FILE, "wb"); if (!f) return;
+    fprintf(f, "%d\n", g_hq); fclose(f);
 }
 
 /* ---- watched registry: videos finished to the end (moflex_player/watched.txt) ---- */
@@ -336,6 +354,11 @@ static void bw_exit(void) {
 #define DIM_Y 138
 #define DIM_W 48
 #define DIM_H 28
+/* HQ (24-bit color) toggle -- mirrors the DIM button on the LEFT, same row (Old-3DS only) */
+#define HQ_X 8
+#define HQ_Y 138
+#define HQ_W 48
+#define HQ_H 28
 
 static void fmt_time(int64_t us, char *o, int cap) {
     if (us < 0) us = 0;
@@ -743,6 +766,9 @@ static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing)
         ui_fill_round(mx - mr, my - mr, 2 * mr, 2 * mr, mr, UI_NEONC);                 /* full disc */
         ui_fill_round(mx - mr + 6, my - mr - 2, 2 * mr, 2 * mr, mr, UI_BG2); /* carve -> crescent */
     }
+    /* HQ (24-bit color) toggle -- Old-3DS only; glows when 24-bit is on, else dim (=fast 16-bit) */
+    if (g_hq_avail)
+        ui_button(HQ_X, HQ_Y, HQ_W, HQ_H, "HQ", g_hq, g_hq ? UI_NEON : UI_DIM);
     panel_lock_toast();   /* drawn LAST -> always on top of every control */
     ui_present();
 }
@@ -1687,6 +1713,7 @@ gdone:
 
 /* internal sentinel: the ring couldn't allocate on this console -> caller runs the classic path */
 #define MOFLEX_FALLBACK ((MoflexResult)100)
+#define MOFLEX_REPLAY   ((MoflexResult)101)   /* HQ toggled mid-playback -> dispatcher re-opens (new color depth) */
 
 /* --- single-demux audio bank for the ring player (r3_ = ring-3d, kept separate from the classic
  *     inline wbuf[] and the gpu-path audio_worker so nothing clashes). Sized SMALL: on the Old 3DS
@@ -2034,11 +2061,14 @@ static MoflexResult moflex_play_ring(const char *path) {
                             * the decode THREAD gives the headroom the New-3DS pipeline used to, and the
                             * threaded producer decodes plain sequential frames (no L/R lag bookkeeping). */
     bool r3_isnew = false; APT_CheckNew3DS(&r3_isnew);
-    /* 24-bit color (RGBA8) on New-3DS to kill gradient banding; 16-bit (RGB565) on Old-3DS where the
-     * doubled texture size would halve the decode-ahead cushion. */
-    int r3_bpp = 4;                       /* 24-bit RGBA8 on BOTH consoles now -- Old-3DS was RGB565 (banding).
-                                           * Trade: ~half the decode-ahead cushion + slightly slower Y2R. */
-    GPU_TEXCOLOR r3_tf = GPU_RGBA8;
+    if (!g_hq_loaded) { hq_load(); g_hq_loaded = 1; }   /* remember the viewer's HQ choice across launches */
+    g_hq_avail = !r3_isnew;               /* the HQ button appears on Old-3DS only (New-3DS is always 24-bit) */
+    /* Color depth. New-3DS: always 24-bit RGBA8 (kills gradient banding, decode has the headroom).
+     * Old-3DS: 16-bit RGB565 by default -- half the texture size keeps the decode-ahead cushion deep and
+     * Y2R fast, so strugglers stay smooth. The on-screen HQ button flips it to 24-bit RGBA8 when the
+     * viewer wants the cleaner gradients on a movie that can afford it. */
+    int r3_bpp = 4; GPU_TEXCOLOR r3_tf = GPU_RGBA8;
+    if (!r3_isnew && !g_hq) { r3_bpp = 2; r3_tf = GPU_RGB565; }
     g_ring_apt_bpp = r3_bpp;
     AVFrame *fL = av_frame_alloc(), *fR = av_frame_alloc();
 
@@ -2306,6 +2336,10 @@ static MoflexResult moflex_play_ring(const char *path) {
                 g_submenu = 1; g_sub_sel = 0; dirty = 1;   /* CC: open the subtitle options menu */
             } else if (g_lcd_ok && px >= DIM_X && px < DIM_X + DIM_W && py >= DIM_Y && py < DIM_Y + DIM_H) {
                 g_screen_off = 1; dirty = 1;   /* moon: darken (a button or touch wakes it; reconcile handles backlight) */
+            } else if (g_hq_avail && px >= HQ_X && px < HQ_X + HQ_W && py >= HQ_Y && py < HQ_Y + HQ_H) {
+                /* HQ: flip color depth. The texture format is fixed at ring init, so re-open the movie
+                 * (resume restores the exact spot) to rebuild the ring in the new format. */
+                g_hq = !g_hq; hq_save(); result = MOFLEX_REPLAY; break;
             } else if (py >= BTN_Y && py < BTN_Y + BTN_H) {
                 if      (px >= BKB_X && px < BKB_X + BKB_W) { result = MOFLEX_QUIT_OPEN; break; }   /* OPEN VIDEO */
                 else if (px >= OPB_X && px < OPB_X + OPB_W) { result = MOFLEX_QUIT_MANAGE; break; }   /* MANAGE VIDEOS */
@@ -2715,6 +2749,7 @@ static void mp_apt_hook(APT_HookType hook, void *param) {
 static MoflexResult moflex_play_classic(const char *path) {
     init_luts();
     vol_load();
+    g_hq_avail = 0;   /* the HQ (color-depth) toggle is a ring-only feature; classic is always 24-bit */
 
     FILE *f = fopen(path, "rb");
     if (!f) { printf("\x1b[2J\x1b[Hfopen failed\npress A\n"); mp_wait_key(); return MOFLEX_ERROR; }
@@ -3360,8 +3395,12 @@ MoflexResult moflex_play(const char *path) {
                                                            * Old-3DS inline (banking + avtest's no-flush catch-up
                                                            * + display elision). Falls back to classic if the
                                                            * ring can't allocate its buffers. */
-        MoflexResult r = moflex_play_ring(path);
-        if (r != MOFLEX_FALLBACK) return r;
+        for (;;) {
+            MoflexResult r = moflex_play_ring(path);
+            if (r == MOFLEX_REPLAY) continue;   /* HQ toggled -> re-open in the new color depth (resumes in place) */
+            if (r != MOFLEX_FALLBACK) return r;
+            break;                              /* couldn't allocate -> fall through to the classic path */
+        }
     }
 #else
     (void)is3d;
