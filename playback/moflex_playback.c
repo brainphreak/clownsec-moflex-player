@@ -2529,25 +2529,28 @@ static MoflexResult moflex_play_ring(const char *path) {
         int64_t disp_us = (show >= 0) ? bts[show] : (last_shown >= 0 ? last_bts : cur_us);
         if (want_seek && (kh & (KEY_LEFT | KEY_RIGHT))) { disp_us = seek_to_us < 0 ? 0 : seek_to_us; dirty = 1; }  /* preview the accumulating seek target */
         if (scrubbing) { disp_us = scrub_us; dirty = 1; }   /* preview the dragged position while the finger is down */
-        const char *cue = subs_active(disp_us);   /* NULL if subs off or no cue now */
-        char tc[16], td[16], ts[64];
-        fmt_time(disp_us, tc, sizeof tc);
-        fmt_time(dur_us, td, sizeof td);
-        snprintf(ts, sizeof ts, "%s / %s", tc, td);   /* clean current / duration (debug HUD removed) */
         (void)pf_str;
-        if (strcmp(ts, last_ts)) { snprintf(last_ts, sizeof last_ts, "%s", ts);
-                                   C2D_TextBufClear(tmbuf); C2D_TextParse(&ttime, tmbuf, ts); C2D_TextOptimize(&ttime); }
-        if (cue && *cue) {                          /* (re)parse only when the cue text changes */
-            if (!sub_valid || strcmp(cue, last_sub)) {
-                snprintf(last_sub, sizeof last_sub, "%s", cue);
-                C2D_TextBufClear(subbuf); C2D_TextParse(&tsub, subbuf, cue); C2D_TextOptimize(&tsub); sub_valid = 1;
-            }
-        } else { sub_valid = 0; last_sub[0] = 0; }
 
         /* Draw ONLY when a new pair is due (show>=0) or the UI changed (dirty). Between presents the
          * loop keeps decoding at full speed to BANK ahead -- drawing every iteration would peg the loop
-         * to the ~60Hz GPU pace and kill the calm-scene surplus that lets busy scenes coast. */
+         * to the ~60Hz GPU pace and kill the calm-scene surplus that lets busy scenes coast.
+         * The subtitle/time-string PREP now lives inside this block too: it used to run every loop
+         * iteration (wasted CPU while banking), so calm scenes now spend that time decoding ahead -> a
+         * bigger cushion -> heavy scenes coast longer before they get choppy. */
         if ((show >= 0 || dirty) && (show >= 0 || last_shown >= 0)) {
+            const char *cue = subs_active(disp_us);   /* NULL if subs off or no cue now */
+            char tc[16], td[16], ts[64];
+            fmt_time(disp_us, tc, sizeof tc);
+            fmt_time(dur_us, td, sizeof td);
+            snprintf(ts, sizeof ts, "%s / %s", tc, td);   /* clean current / duration */
+            if (strcmp(ts, last_ts)) { snprintf(last_ts, sizeof last_ts, "%s", ts);
+                                       C2D_TextBufClear(tmbuf); C2D_TextParse(&ttime, tmbuf, ts); C2D_TextOptimize(&ttime); }
+            if (cue && *cue) {                          /* (re)parse only when the cue text changes */
+                if (!sub_valid || strcmp(cue, last_sub)) {
+                    snprintf(last_sub, sizeof last_sub, "%s", cue);
+                    C2D_TextBufClear(subbuf); C2D_TextParse(&tsub, subbuf, cue); C2D_TextOptimize(&tsub); sub_valid = 1;
+                }
+            } else { sub_valid = 0; last_sub[0] = 0; }
             int b = (show >= 0) ? show : last_shown;
             C3D_FrameBegin(0);
             C2D_TargetClear(topL, black); C2D_SceneBegin(topL);
