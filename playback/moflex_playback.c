@@ -662,9 +662,12 @@ static void panel_lock_toast(void) {
     ui_text_center(UI_W / 2, by + 24, 1, UI_INK, "Press L + R to unlock");
 }
 
+static int g_panel_cheap = 0;   /* Old-3DS: skip the CPU-heavy full-screen gradient + glow blurs in the
+                                 * software-rendered panel -- they steal decode time on the single core. */
 static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing) {
     ui_begin(GFX_BOTTOM);
-    ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
+    if (g_panel_cheap) ui_fill_round(0, 0, UI_W, UI_H, 0, UI_BG);          /* flat bg (cheap) */
+    else               ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
 
     ui_text_clipped(10, 8, 1, UI_NEON, title, 10, VOL_X - 12);   /* clipped so it can't run into volume */
 
@@ -702,15 +705,16 @@ static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing)
     int fw = (int)(BAR_W * frac);
     if (fw > 0) ui_fill_round(BAR_X, BAR_Y, fw, BAR_H, BAR_H / 2, UI_NEON);
     int kx = BAR_X + fw, ky = BAR_Y + BAR_H / 2, kr = 8;
-    ui_glow_round(kx - kr, ky - kr, 2 * kr, 2 * kr, kr, UI_NEON, 4, 26);
+    if (!g_panel_cheap) ui_glow_round(kx - kr, ky - kr, 2 * kr, 2 * kr, kr, UI_NEON, 4, 26);
     ui_fill_round(kx - kr, ky - kr, 2 * kr, 2 * kr, kr, UI_WHITE);
 
     /* transport: RW (<<)   glowing play/pause   FF (>>) */
     ui_play_l(RW_CX - 5, PLAY_CY, 14, UI_NEONC); ui_play_l(RW_CX + 6, PLAY_CY, 14, UI_NEONC);
     ui_play(FF_CX - 6, PLAY_CY, 14, UI_NEONC);   ui_play(FF_CX + 5, PLAY_CY, 14, UI_NEONC);
     int R = 24;
-    ui_glow_round(PLAY_CX - R, PLAY_CY - R, 2 * R, 2 * R, R, UI_NEON, 6, 22);
-    ui_vgrad_round(PLAY_CX - R, PLAY_CY - R, 2 * R, 2 * R, R, UI_BG2, TH_BG1);
+    if (!g_panel_cheap) ui_glow_round(PLAY_CX - R, PLAY_CY - R, 2 * R, 2 * R, R, UI_NEON, 6, 22);
+    if (g_panel_cheap) ui_fill_round(PLAY_CX - R, PLAY_CY - R, 2 * R, 2 * R, R, UI_BG2);
+    else               ui_vgrad_round(PLAY_CX - R, PLAY_CY - R, 2 * R, 2 * R, R, UI_BG2, TH_BG1);
     ui_frame_round(PLAY_CX - R, PLAY_CY - R, 2 * R, 2 * R, R, UI_NEON, 2);
     if (playing) ui_pause(PLAY_CX, PLAY_CY, 22, UI_NEON);
     else         ui_play(PLAY_CX + 2, PLAY_CY, 22, UI_NEON);
@@ -2158,6 +2162,7 @@ static MoflexResult moflex_play_ring(const char *path) {
     R3S s; memset(&s, 0, sizeof s);
     s.m = &m; s.ctx = &ctx; s.fL = fL; s.fR = fR;
     s.W = W; s.H = H; s.is3d = is3d; s.NB = NB; s.have_audio = have_audio; s.old3ds = !r3_isnew;
+    g_panel_cheap = !r3_isnew;   /* lighten the software panel on Old-3DS to free decode CPU */
     s.pair_dur = pair_dur; s.dur_us = dur_us; s.run = 1;
     s.paused = want_seek ? 1 : 0;   /* if resuming, stay paused until the seek/prime below sets us up */
     LightLock_Init(&s.lock); LightEvent_Init(&s.wake, RESET_ONESHOT);
