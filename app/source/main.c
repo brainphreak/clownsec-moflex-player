@@ -996,6 +996,36 @@ static volatile u32 s_dlw_done = 0, s_dlw_total = 0; /* live progress for the UI
 static int s_dlw_resume_ask = 0;                     /* paused for playback -> offer to resume */
 static int dlw_poll(void);                           /* defined after the post-processing helpers */
 
+/* ---- lid-close-proof downloads: while the queue runs we DENY sleep, so closing the lid only
+ * switches the LCDs off (hardware does that) and WiFi + the transfer keep going. When the queue
+ * empties we re-allow sleep -- with the lid closed the console then falls asleep on its own --
+ * and light the notification LED (green = done, red = failed; it keeps blinking through sleep,
+ * StreetPass-style). Optional: power the console off instead when the user asked for it. */
+static int s_dlw_after = 0;             /* queue done with the LID CLOSED: 0 = sleep, 1 = power off
+                                         * (lid open = user is present -> neither; just toast + LED) */
+static void dl_led(int r, int g) {      /* breathing notification LED; (0,0) = off */
+    if (R_FAILED(mcuHwcInit())) return;
+    InfoLedPattern p; memset(&p, 0, sizeof p);
+    if (r || g) {
+        p.delay = 2; p.smoothing = 0x40; p.loopDelay = 0x08;   /* ~4s breath, loops until cleared */
+        for (int i = 0; i < 32; i++) {
+            u8 v = (u8)((i < 16 ? i : 31 - i) * 11);
+            if (r) p.redPattern[i] = v;
+            if (g) p.greenPattern[i] = v;
+        }
+    }
+    MCUHWC_SetInfoLedPattern(&p);
+    mcuHwcExit();
+}
+static void dl_power_off(void) {
+    if (R_SUCCEEDED(ptmSysmInit())) { PTMSYSM_ShutdownAsync(0); ptmSysmExit(); }
+}
+static int dl_lid_closed(void) {
+    u8 shell = 1;   /* 1 = open */
+    if (R_SUCCEEDED(ptmuInit())) { PTMU_GetShellState(&shell); ptmuExit(); }
+    return shell == 0;
+}
+
 static volatile int s_dlw_mbps_x100 = 0;             /* live download speed *100 (Mbps), for the UI */
 static bool dlw_progress(void *u, u32 d, u32 t) {    /* worker thread: no UI, no hid */
     (void)u; s_dlw_done = d; s_dlw_total = t;
@@ -1041,8 +1071,10 @@ static int dlw_start(void) {   /* main thread: launch the front queue item */
         }
     }
     if (!th) th = threadCreate(dlw_thread, NULL, 32 * 1024, prio - 1, -2, true); /* app core, above UI */
-    if (!th) return 0;
+    if (!th) { aptSetSleepAllowed(true); return 0; }   /* chain-start failed -> lid is normal again */
     s_dlw_active = 1;
+    aptSetSleepAllowed(false);   /* lid close now only darkens the LCDs; the transfer keeps going */
+    dl_led(0, 0);                /* a fresh queue clears any leftover done/failed light */
     return 1;
 }
 static void dlw_stop_wait(void) {   /* abort the in-flight download; partial + queue item kept */
@@ -1050,6 +1082,7 @@ static void dlw_stop_wait(void) {   /* abort the in-flight download; partial + q
     s_dlw_stop = 1;
     while (!s_dlw_finished) svcSleepThread(50 * 1000 * 1000LL);
     s_dlw_active = 0; s_dlw_finished = 0;
+    aptSetSleepAllowed(true);
 }
 static void queue_remove_url(const char *url) {   /* the active item may have been reordered */
     queue_load();
@@ -2354,7 +2387,9 @@ static void download_url_direct(void) {
     snprintf(g_dl_name, sizeof(g_dl_name), "%s", fname);
     g_last_prog = 0;
     if (!download_resume_check(url)) return;   /* B on the prompt -> back */
+    aptSetSleepAllowed(false);                 /* direct downloads survive a closed lid too */
     bool ok = download_to_file(url, dest, dl_progress, NULL);
+    aptSetSleepAllowed(true);
     if (!ok) { download_cancel_msg(url); return; }   /* progress saved; offers DELETE FILE, B keeps it */
     size_t fl = strlen(fname);
     if (fl > 4 && !strcasecmp(fname + fl - 4, ".zip") && file_is_zip(dest) &&
@@ -2482,6 +2517,8 @@ static int dlw_poll(void) {
     if (!s_dlw_active || !s_dlw_finished) return 0;
     s_dlw_active = 0; s_dlw_finished = 0;
     if (!s_dlw_ok) {   /* cancelled or failed: keep the item + partial data for resume */
+        aptSetSleepAllowed(true);            /* lid closed -> the console can nap now */
+        if (!s_dlw_stop) dl_led(1, 0);       /* real failure: red light so a closed lid still tells you */
         qtoast(s_dlw_stop ? "Download paused" : "Download failed");
         return 1;
     }
@@ -2513,8 +2550,13 @@ static int dlw_poll(void) {
         lib_add_downloaded(dest, &e);
     }
     queue_remove_url(q.url);
-    if (queue_count() > 0) dlw_start();   /* chain the next item */
-    else qtoast("Queue complete");
+    if (queue_count() > 0) dlw_start();   /* chain the next item (sleep stays denied) */
+    else {
+        qtoast("Queue complete");
+        dl_led(0, 1);                     /* green: all done (keeps blinking through sleep) */
+        if (dl_lid_closed() && s_dlw_after == 1) dl_power_off();
+        else aptSetSleepAllowed(true);    /* lid closed -> drifts into sleep; open -> user is here */
+    }
     return 1;
 }
 
@@ -2522,6 +2564,7 @@ static int dlw_poll(void) {
  * (bar, size downloaded vs file size, percent) with CANCEL underneath.
  * B backs out and the download keeps running. */
 static void dlw_detail_screen(void) {
+    dl_led(0, 0);
     while (aptMainLoop() && s_dlw_active) {
         if (dlw_poll()) return;   /* finished while we were watching */
         hidScanInput();
@@ -2560,6 +2603,7 @@ static void dlw_detail_screen(void) {
 /* Queue screen: pending items in order; A on the active download opens the live
  * progress view (with Cancel). Others: Move to Top / Remove. */
 static void queue_screen(void) {
+    dl_led(0, 0);   /* the user came to look -> the done/failed notification light served its purpose */
     for (;;) {
         dlw_poll();
         queue_load();
@@ -2573,9 +2617,12 @@ static void queue_screen(void) {
         }
         char sub[40];
         snprintf(sub, sizeof sub, "%d item%s%s", s_qn, s_qn == 1 ? "" : "s", s_dlw_active ? "  -  downloading" : "  -  not downloading");
-        int c = catalog_pick("DOWNLOAD QUEUE", sub, names, s_qn, 0, s_dlw_active ? NULL : "* Start Downloads");
+        /* while downloading you can close the lid and walk away -- the transfer keeps running; the
+         * extra row picks what a CLOSED lid does once the queue empties (open lid: you're there) */
+        static const char *after_lbl[2] = { "* Done + lid closed: sleep", "* Done + lid closed: POWER OFF" };
+        int c = catalog_pick("DOWNLOAD QUEUE", sub, names, s_qn, 0, s_dlw_active ? after_lbl[s_dlw_after] : "* Start Downloads");
         if (c == -1) return;
-        if (c == -3) { dlw_start(); continue; }
+        if (c == -3) { if (s_dlw_active) s_dlw_after ^= 1; else dlw_start(); continue; }
         if (c < 0) continue;
         if (s_dlw_active && !strcmp(s_q[c].url, (const char *)s_dlw_item.url)) {
             dlw_detail_screen();   /* live bar + sizes, CANCEL button, B = back */
