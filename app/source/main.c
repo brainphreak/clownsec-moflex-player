@@ -1779,13 +1779,20 @@ static int show_pick_episode(const char *showname, const char *url, char *out, s
     return 1;
 }
 
+static int s_scan_stop;   /* lid closed mid-scan -> abort cleanly (checked ~2x/s) */
+static int scan_should_stop(void) {
+    static u64 last;
+    u64 now = osGetTime();
+    if (now - last >= 500) { last = now; if (dl_lid_closed()) s_scan_stop = 1; }
+    return s_scan_stop;
+}
 static void lib_scan_dir(const char *dir, int depth) {
     if (g_lib_n >= LIB_MAX || depth > 8) return;
     DIR *d = opendir(dir);
     if (!d) return;
     int shows_done = 0;   /* episode grouping runs once per directory */
     struct dirent *e;
-    while ((e = readdir(d)) && g_lib_n < LIB_MAX) {
+    while ((e = readdir(d)) && g_lib_n < LIB_MAX && !scan_should_stop()) {
         if (e->d_name[0] == '.') continue;
         char full[PATHLEN + NAMELEN];
         snprintf(full, sizeof full, "%s%s", dir, e->d_name);
@@ -1884,16 +1891,24 @@ static void lib_save_cache(void) {
         fwrite(&g_lib_n, sizeof g_lib_n, 1, f); fwrite(g_lib, sizeof(CatEntry), g_lib_n, f); fclose(f); }
 }
 
+static int lib_load_cache_only(void);   /* defined with the library code below */
 static void lib_rescan(void) {
     if (!g_lib) g_lib = (CatEntry *)malloc(sizeof(CatEntry) * LIB_MAX);
     if (!g_lib) return;
+    int dl_was = s_dlw_active;   /* the scan and a download fight over the SD card: pause first
+                                  * (same rule as playback), resume automatically after */
+    if (dl_was) dlw_stop_wait();
+    s_scan_stop = 0;
     g_lib_n = 0;
     ui_begin(GFX_BOTTOM); ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
     ui_text_center(UI_W / 2, 96, 2, UI_NEON, "Scanning...");
     ui_text_center(UI_W / 2, 128, 1, UI_DIM, "searching the SD card for movies"); ui_present();
     gfxFlushBuffers(); gfxSwapBuffers();
     lib_scan_dir("sdmc:/", 0);
-    lib_save_cache();
+    if (s_scan_stop) { g_lib_n = 0; lib_load_cache_only(); }   /* aborted -> keep the OLD library,
+                                                                * never save a truncated cache */
+    else lib_save_cache();
+    if (dl_was) dlw_start();     /* resume the queue (progress was kept) */
 }
 
 /* reload a library entry's metadata from its .nfo, preserving the path + file date */
