@@ -50,19 +50,26 @@ static void idle_apt_hook(APT_HookType t, void *u) {
     (void)u;   /* HOME / lid sleep: the system restored the backlight behind our back */
     if (t == APTHOOK_ONRESTORE || t == APTHOOK_ONWAKEUP) { s_idle_off = 0; s_idle_last = osGetTime(); }
 }
+/* Analog direction bits (circle pad / C-stick) are EXCLUDED from the presence test: a slightly
+ * drifting stick sits past the threshold and reports "held" (or flickers edges) every single
+ * frame -- the timer would reset forever and the screen would never go dark. Only real
+ * button / d-pad / touch EDGES count, both for staying awake and for waking. */
+#define IDLE_ANALOG (KEY_CPAD_UP | KEY_CPAD_DOWN | KEY_CPAD_LEFT | KEY_CPAD_RIGHT | \
+                     KEY_CSTICK_UP | KEY_CSTICK_DOWN | KEY_CSTICK_LEFT | KEY_CSTICK_RIGHT)
 static void idle_scan(void) {
     if (!s_idle_hooked) { aptHook(&s_idle_cookie, idle_apt_hook, NULL); s_idle_hooked = 1; }
     hidScanInput();
     u64 now = osGetTime();
     if (now - s_idle_prevscan > 2000) s_idle_last = now;   /* back from playback/extract/applet */
     s_idle_prevscan = now;
-    if (hidKeysDown() | hidKeysHeld()) {
+    u32 edge = (hidKeysDown() | hidKeysUp()) & ~IDLE_ANALOG;
+    if (edge) {
         s_idle_last = now;
         if (s_idle_off) { idle_backlight(1); s_idle_swallow = 1; }  /* wake press must not act */
-    } else {
-        s_idle_swallow = 0;                                         /* everything released */
-        if (!s_idle_off && now - s_idle_last >= IDLE_OFF_MS) idle_backlight(0);
     }
+    if (s_idle_swallow && !((hidKeysHeld() | hidKeysDown()) & ~IDLE_ANALOG))
+        s_idle_swallow = 0;                                         /* real keys released -> live */
+    if (!s_idle_off && now - s_idle_last >= IDLE_OFF_MS) idle_backlight(0);
 }
 static u32 idle_kdown(void) { return s_idle_swallow ? 0 : hidKeysDown(); }
 static u32 idle_kheld(void) { return s_idle_swallow ? 0 : hidKeysHeld(); }
