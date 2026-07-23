@@ -30,7 +30,7 @@
 ## Downloads
 
 * Catalog browser to download direct from Clownsec, Zackk's, and the 3DS Movie archive
-* Fast downloads optimized to reach over 400kbps on New 3DS
+* Fast downloads optimized to reach up to 5 Mbps (625 KB/s) on New 3DS
 * Download queue for automating multiple downloads
 * Resumable transfers for continuing download later
 * TV Season zips extract themselves
