@@ -210,14 +210,7 @@ static bool httpc_ready(void) {
     static bool tried;
     if (!tried) {
         if (g_lock_ready) LightLock_Lock(&g_init_lock);
-        if (!tried) {
-            /* escape hatch: drop this file on the SD card to force the old curl engine
-             * (for A/B-ing download problems in the field, like sw_convert.txt) */
-            struct stat st;
-            if (stat("sdmc:/moflex_player/no_httpc.txt", &st) == 0) g_httpc_ready = false;
-            else g_httpc_ready = R_SUCCEEDED(httpcInit(0));
-            tried = true;
-        }
+        if (!tried) { g_httpc_ready = R_SUCCEEDED(httpcInit(0)); tried = true; }
         if (g_lock_ready) LightLock_Unlock(&g_init_lock);
     }
     return g_httpc_ready;
