@@ -2716,7 +2716,15 @@ static void dlw_detail_screen(void) {
         ui_text_center(UI_W / 2, by + bh + 8, 1, UI_INK, pl);
         char spd[40]; snprintf(spd, sizeof spd, "%d.%02d Mbps  (%d KB/s)", s_dlw_mbps_x100 / 100, s_dlw_mbps_x100 % 100, s_dlw_mbps_x100 * 10 / 8);
         ui_text_center(UI_W / 2, by + bh + 26, 1, UI_NEON, spd);
-        ui_text_center(UI_W / 2, by + bh + 46, 1, UI_DIM, "B - back (keeps downloading)");
+        if (t > d && s_dlw_mbps_x100 > 0) {   /* remaining bytes / smoothed speed */
+            u32 bps = (u32)s_dlw_mbps_x100 * 1250u;   /* Mbps*100 -> bytes/s */
+            u32 es = (t - d) / (bps ? bps : 1);
+            char eta[32];
+            if (es >= 3600) snprintf(eta, sizeof eta, "ETA %luh %02lum", (unsigned long)(es / 3600), (unsigned long)(es % 3600 / 60));
+            else            snprintf(eta, sizeof eta, "ETA %lu:%02lu", (unsigned long)(es / 60), (unsigned long)(es % 60));
+            ui_text_center(UI_W / 2, by + bh + 46, 1, UI_NEONC, eta);
+        }
+        ui_text_center(UI_W / 2, by + bh + 64, 1, UI_DIM, "B - back (keeps downloading)");
         ui_button(110, 206, 100, 28, "CANCEL", 0, UI_RED);
         ui_present();
         gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
