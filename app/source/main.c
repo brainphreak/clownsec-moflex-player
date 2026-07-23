@@ -233,13 +233,20 @@ static void go_up(void) {
     if (at_root()) return;
     size_t L = strlen(cwd);
     if (L && cwd[L-1] == '/') cwd[--L] = 0;
+    char leaving[NAMELEN];   /* remember the folder we're exiting so B lands back ON it */
+    { char *b = strrchr(cwd, '/'); snprintf(leaving, sizeof leaving, "%s", b ? b + 1 : cwd); }
     char *s = strrchr(cwd, '/');
     if (s) s[1] = 0;
     scan();
+    for (int i = 0; i < nentries; i++)
+        if (entries[i].is_dir && !strcmp(entries[i].name, leaving)) { sel = i; break; }
+    if (sel < scroll) scroll = sel;
+    else if (sel >= scroll + 6) scroll = sel - 6 + 1;   /* 6 = BR_ROWS (defined below) */
 }
 static void enter_dir(const char *name) {
     size_t L = strlen(cwd);
     snprintf(cwd + L, PATHLEN - L, "%s/", name);
+    sel = 0;   /* a fresh folder starts at its top (scan only clamps) */
     scan();
 }
 
@@ -676,6 +683,7 @@ static int pick_folder(char *out, size_t cap) {
     static char list[256][NAMELEN];
     snprintf(dir, sizeof(dir), "%s", cwd);
     int nd = 0, psel = 0, pscroll = 0, redraw = 1, rescan = 1, hu = 0, hd = 0;
+    char backto[NAMELEN] = "";   /* after [..], land on the folder we just left */
     while (aptMainLoop()) {
         if (rescan) {
             nd = 0;
@@ -686,6 +694,12 @@ static int pick_folder(char *out, size_t cap) {
                     if (de->d_type == DT_DIR && strcmp(de->d_name, ".") && strcmp(de->d_name, ".."))
                         snprintf(list[nd++], NAMELEN, "%s", de->d_name);
                 closedir(d);
+            }
+            if (backto[0]) {   /* just went up: highlight the folder we exited */
+                int b2 = 1 + (strcmp(dir, "sdmc:/") == 0 ? 0 : 1);
+                for (int i = 0; i < nd; i++)
+                    if (!strcmp(list[i], backto)) { psel = b2 + i; break; }
+                backto[0] = 0;
             }
             rescan = 0; redraw = 1;
         }
@@ -728,6 +742,7 @@ static int pick_folder(char *out, size_t cap) {
             if (act == 0) { snprintf(out, cap, "%s", dir); return 1; }    /* save here */
             else if (!is_root && act == 1) {                             /* go up */
                 size_t L = strlen(dir); if (L && dir[L - 1] == '/') dir[L - 1] = 0;
+                { char *b = strrchr(dir, '/'); snprintf(backto, sizeof backto, "%s", b ? b + 1 : dir); }
                 char *sl = strrchr(dir, '/'); if (sl) sl[1] = 0;
                 psel = 0; rescan = 1;
             } else {                                                     /* enter folder */
@@ -1205,11 +1220,16 @@ static void fix_download_ext(char *dest, size_t cap) {
 }
 
 /* ---- catalog category / genre / sort helpers ---- */
-static const CatEntry *g_scat; static int g_smode;   /* 0 = title, 1 = year, 2 = date added */
+static const CatEntry *g_scat; static int g_smode;   /* 0 = title, 1 = year, 2 = date added, 3 = watched */
+static int vid_status(int li);   /* watched sort (library list only -- indexes into g_lib) */
 static int idx_cmp(const void *a, const void *b) {
     const CatEntry *x = &g_scat[*(const int *)a], *y = &g_scat[*(const int *)b];
     if (g_smode == 1) { if (x->year != y->year) return y->year - x->year; }       /* newest year first */
     else if (g_smode == 2) { int c = strcmp(y->date, x->date); if (c) return c; }  /* newest date first */
+    else if (g_smode == 3) {   /* watched first, then in progress, then new -> easy bulk delete */
+        int c = vid_status(*(const int *)b) - vid_status(*(const int *)a);
+        if (c) return c;
+    }
     return strcasecmp(x->name, y->name);                                           /* title A-Z (+ tiebreak) */
 }
 static int strrow_cmp(const void *a, const void *b) { return strcasecmp((const char *)a, (const char *)b); }
@@ -1250,11 +1270,15 @@ static int distinct_genres(const CatEntry *cat, int nc, const char *category, ch
 /* neon scrolling picker for a list of short strings. Returns index, -2 (Show All), or -1 (back). */
 static void draw_status(int x, int y, int st);          /* watched badges (defined with the library code) */
 static const signed char *s_pick_status = NULL;         /* optional per-item badge for the NEXT catalog_pick */
+static int s_pick_init = 0;   /* initial highlight ROW for the NEXT catalog_pick (one-shot):
+                               * callers set it when re-showing a list so B-back lands where you were */
 static int catalog_pick(const char *title, const char *subtitle, char items[][64], int n, int show_all, const char *extra) {
     const signed char *pst = s_pick_status; s_pick_status = NULL;   /* consumed by this call only */
     int has_extra = (extra && extra[0]) ? 1 : 0;
     int total = n + (show_all ? 1 : 0) + has_extra;
     int sel = 0, top = 0, redraw = 1, td = 0, tx0 = 0, ty0 = 0, tsc0 = 0, tmv = 0;
+    if (s_pick_init > 0) sel = s_pick_init < total ? s_pick_init : (total ? total - 1 : 0);
+    s_pick_init = 0;   /* one-shot (the follow logic below scrolls it into view) */
     int hfu = 0, hfd = 0;
     const int VIS = 5, ry0 = 54, rh = 30, gap = 4;
     while (aptMainLoop()) {
@@ -1406,6 +1430,7 @@ static void catalog_browse(const Source *src) {
                     if (mm == 1) { int g = catalog_pick("GENRE", filt_cat, gdisp, ng, 0, NULL);
                                    if (g < 0) continue; snprintf(filt_genre, sizeof filt_genre, "%s", gens[g]); }
                 }
+                s_pick_init = c + 1;   /* B-back re-highlights this category (+1: Show All row) */
             }
         }
         /* ---- build the filtered + sorted index over cat[] ---- */
@@ -2267,7 +2292,7 @@ ll_rebuild:;   /* X-search inside the list jumps back here with s_lib_search set
             if (kbd_text("Search", q, sizeof q)) { snprintf(s_lib_search, sizeof s_lib_search, "%s", q); goto ll_rebuild; }
             redraw = 1;
         }
-        if (k & KEY_Y) { *sortmode = (*sortmode + 1) % 3; g_smode = *sortmode;
+        if (k & KEY_Y) { *sortmode = (*sortmode + 1) % 4; g_smode = *sortmode;
             qsort(idx, ni, sizeof(int), idx_cmp); csel = 0; cscroll = 0; shown = -1; redraw = 1; }
         if (csel < cscroll) cscroll = csel;
         if (csel >= cscroll + BR_ROWS) cscroll = csel - BR_ROWS + 1;
@@ -2285,7 +2310,7 @@ ll_rebuild:;   /* X-search inside the list jumps back here with s_lib_search set
                 if (ty0 >= 210 && ty0 < 236) {               /* PLAY / INFO / SORT */
                     if (tx0 < 104) play = 1;
                     else if (tx0 < 208) info = 1;
-                    else { *sortmode = (*sortmode + 1) % 3; g_smode = *sortmode;
+                    else { *sortmode = (*sortmode + 1) % 4; g_smode = *sortmode;
                         qsort(idx, ni, sizeof(int), idx_cmp); csel = 0; cscroll = 0; shown = -1; redraw = 1; }
                 } else if (ty0 >= BR_LIST_Y) { int i = cscroll + (ty0 - BR_LIST_Y) / BR_ROWH;
                     if (i >= 0 && i < ni && i < cscroll + BR_ROWS) {
@@ -2353,7 +2378,8 @@ ll_rebuild:;   /* X-search inside the list jumps back here with s_lib_search set
                 int hh = th * BR_ROWS / ni; if (hh < 12) hh = 12; int hy = ty + (th - hh) * cscroll / maxs;
                 ui_fill_round(UI_W - 6, ty, 3, th, 1, TH_TRACK);
                 ui_fill_round(UI_W - 6, hy, 3, hh, 1, UI_NEON); }
-            const char *sm = *sortmode == 0 ? "Sort: Title" : *sortmode == 1 ? "Sort: Year" : "Sort: Date";
+            const char *sm = *sortmode == 0 ? "Sort: Title" : *sortmode == 1 ? "Sort: Year"
+                           : *sortmode == 2 ? "Sort: Date" : "Sort: Watched";
             ui_button(8, 210, 96, 26, "PLAY", 0, UI_NEON);
             ui_button(108, 210, 100, 26, "INFO", 0, UI_NEONC);
             ui_button(212, 210, 100, 26, sm, 0, UI_NEONP);
@@ -2441,12 +2467,13 @@ static int library_view(char *out, size_t cap) {
                             if (g < 0) { gen_back = 1; break; }         /* back -> View All / Pick a Genre */
                             int r = library_list(fc, gens[g], poster, &sortmode, out, cap);
                             if (r == LL_PLAY) chose = 1; else if (r == LL_RESCAN) rescan = 1;
-                            /* back from the list -> re-show the GENRE picker */
+                            s_pick_init = g;   /* back from the list -> re-show the GENRE picker HERE */
                         }
                     }
                 }
             }
         }
+        if (c >= 0) s_pick_init = c + 1;   /* B-back re-highlights this category (+1: Show All row) */
         if (rescan) lib_rescan();                             /* categories may change -> rebuild at the top */
     }
     branding_show();
@@ -2720,6 +2747,7 @@ static void queue_screen(void) {
         if (c == -1) return;
         if (c == -3) { if (s_dlw_active) s_dlw_after ^= 1; else dlw_start(); continue; }
         if (c < 0) continue;
+        s_pick_init = c;   /* after the action, come back to the same row (clamped if it was removed) */
         if (s_dlw_active && !strcmp(s_q[c].url, (const char *)s_dlw_item.url)) {
             dlw_detail_screen();   /* live bar + sizes, CANCEL button, B = back */
         } else {
