@@ -71,6 +71,9 @@ If the timer won't advance past `0:00` in Citra, give the emulator the 3DS **DSP
 
 ## Features
 
+This is the short tour — the complete list of everything the player does lives in
+[**FEATURES.md**](FEATURES.md).
+
 - **2D & 3D with auto-detection** — each file is detected as frame-interleaved 3D or flat 2D
   and played correctly. For 3D, the left/right eyes are paired and presented atomically so the
   two views are always the same moment (no eye desync).
@@ -95,8 +98,17 @@ If the timer won't advance past `0:00` in Citra, give the emulator the 3DS **DSP
   their own folder), or grab any file by direct URL, with a destination-folder picker.
 - **Download queue** — line up several movies or whole seasons and they download one after
   another in the background, with a live speed readout (Mbps / KB/s) showing real throughput.
-  The **QUEUE** button jumps to the queue; downloads keep running while you browse or watch, and
-  interrupted transfers resume where they left off.
+  Every file you add picks its own destination folder. The **QUEUE** button jumps to the queue;
+  downloads keep running while you browse, and interrupted transfers resume where they left off.
+  Downloads run through the 3DS system HTTP module (TLS decrypted in hardware) with SD writes
+  overlapped in parallel — the same techniques the fastest 3DS downloaders use.
+- **Close the lid and walk away** — an active queue keeps downloading with the lid shut (the
+  screens just turn off). When everything finishes, the **notification LED breathes green**
+  (red if something failed) and the console **goes to sleep** — or **powers off**, your choice
+  on the queue screen. See [Background downloads](#background-downloads-close-the-lid-and-walk-away).
+- **Idle screen-off** — sitting in the menus untouched for 5 minutes (downloads or not) turns
+  both backlights off to save battery; any button or touch wakes them, and the waking press
+  isn't acted on. Video playback is never interrupted.
 - **Built-in web server** — upload any files to the console from a browser over Wi-Fi.
 - **File manager** — browse, move, delete, and create folders on the SD card (all files, with a
   movies-only toggle).
@@ -155,6 +167,26 @@ If the timer won't advance past `0:00` in Citra, give the emulator the 3DS **DSP
 <td align="center" colspan="2"><img src="screenshots/11-player-upload-to-3ds.png" width="340"><br><sub>Live upload progress on the 3DS as the file arrives</sub></td>
 </tr>
 </table>
+
+## Background downloads (close the lid and walk away)
+
+Queue up a batch of movies, shut the lid, and come back later — the player takes care of the
+rest:
+
+- **The queue survives a closed lid.** While anything is downloading, closing the lid only
+  turns the screens off: the Wi-Fi stays up and the queue keeps working through its items.
+  (Normally the 3DS would sleep and kill the connection; the player holds the console awake
+  and the wireless alive only while a transfer is running.)
+- **The notification LED tells you how it went.** When the whole queue finishes, the LED
+  breathes **green** — visible with the lid closed, StreetPass-style. If a download failed,
+  it breathes **red** instead (the partial file is kept, so starting it again resumes).
+- **Sleep or power off when done.** While a queue is downloading, the bottom row of the
+  **QUEUE** screen cycles what a closed lid does once the queue empties: **sleep** (default)
+  or **POWER OFF**. With the lid open, neither happens — you're there.
+- **Every file picks its destination.** Each add opens the folder picker, and items in one
+  queue can go to different folders.
+- **Nothing downloading?** The lid behaves completely normally, and the menus themselves go
+  dark after 5 idle minutes to save battery (any button wakes them).
 
 ## Movie info & artwork
 
