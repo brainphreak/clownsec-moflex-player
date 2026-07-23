@@ -1172,6 +1172,8 @@ static void queue_add_front(const CatEntry *e) {
             return;
         }
     if (s_qn >= QUEUE_MAX) { qtoast("Queue full"); return; }
+    if (!s_q_dest[0] && !pick_folder(s_q_dest, sizeof s_q_dest)) return;   /* choose the folder once
+                                       * (this path never asked -> items silently went to SD root) */
     memmove(&s_q[pos + 1], &s_q[pos], (size_t)(s_qn - pos) * sizeof(QItem));
     QItem *q = &s_q[pos]; memset(q, 0, sizeof *q);
     snprintf(q->name, sizeof q->name, "%s", e->name);
