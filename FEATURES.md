@@ -58,8 +58,8 @@ screenshots, and setup instructions; this is the full inventory.
   `moflex_player/moviedata/` for movies no catalog knows.
 - **Forgiving filename matching** — bracketed tags, separators, and case are ignored, so
   `A_Goofy_Movie_(1995)_x264` and `A Goofy Movie (1995)` match the same entry.
-- **Startup detection of new videos** — newly copied files are noticed and offered
-  art + info download; interactive library rescan.
+- **Interactive library rescan** — Rescan Library sweeps the SD card for new videos on
+  demand, with live progress.
 - **Hidden system folders** — `3DS`, `DCIM`, `Nintendo 3DS`, etc. stay out of the way
   (Y reveals them).
 
