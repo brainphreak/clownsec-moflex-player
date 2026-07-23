@@ -216,8 +216,22 @@ static bool httpc_ready(void) {
     return g_httpc_ready;
 }
 
+/* The http sysmodule REJECTS URLs with raw spaces / non-ASCII (curl passes them through and
+ * the servers tolerate it) -- and our movie URLs are full of "Name (2025) (3D).moflex". Encode
+ * anything unsafe; '%' is left alone so an already-encoded URL isn't double-encoded. */
+static void url_enc(const char *in, char *out, size_t cap) {
+    static const char hex[] = "0123456789ABCDEF";
+    size_t o = 0;
+    for (const unsigned char *p = (const unsigned char *)in; *p && o + 4 < cap; p++) {
+        if (*p <= 0x20 || *p >= 0x7f || strchr("\"<>\\^`{|}", *p)) {
+            out[o++] = '%'; out[o++] = hex[*p >> 4]; out[o++] = hex[*p & 15];
+        } else out[o++] = (char)*p;
+    }
+    out[o] = 0;
+}
+
 static int httpc_fetch(const char *url, DlFile *df, Prog *pr) {
-    char cur[1024]; snprintf(cur, sizeof cur, "%s", url);
+    char cur[1024]; url_enc(url, cur, sizeof cur);
     for (int redir = 0; redir < 8; redir++) {
         httpcContext c;
         if (R_FAILED(httpcOpenContext(&c, HTTPC_METHOD_GET, cur, 1))) return HF_USE_CURL;
@@ -227,10 +241,12 @@ static int httpc_fetch(const char *url, DlFile *df, Prog *pr) {
             char rg[48]; snprintf(rg, sizeof rg, "bytes=%lld-", (long long)df->resume_off);
             httpcAddRequestHeaderField(&c, "Range", rg);
         }
-        if (R_FAILED(httpcBeginRequest(&c))) { httpcCloseContext(&c); return HF_FAIL; }
+        /* ANY failure before body bytes hit the sink falls back to curl for this attempt --
+         * httpc must never make a download fail that curl could have completed. */
+        if (R_FAILED(httpcBeginRequest(&c))) { httpcCloseContext(&c); return HF_USE_CURL; }
         u32 status = 0;
         if (R_FAILED(httpcGetResponseStatusCodeTimeout(&c, &status, HF_STALL_NS))) {
-            httpcCloseContext(&c); return HF_FAIL;
+            httpcCloseContext(&c); return HF_USE_CURL;
         }
         if (status >= 300 && status < 400) {
             char loc[1024] = "";
@@ -238,14 +254,14 @@ static int httpc_fetch(const char *url, DlFile *df, Prog *pr) {
             if (R_FAILED(lr)) lr = httpcGetResponseHeader(&c, "location", loc, sizeof loc);
             httpcCloseContext(&c);
             if (R_FAILED(lr) || !strstr(loc, "://")) return HF_USE_CURL;   /* odd redirect -> curl */
-            snprintf(cur, sizeof cur, "%s", loc);
+            url_enc(loc, cur, sizeof cur);
             continue;
         }
         df->status = (long)status;
         if (df->resume_off > 0 && status == 200) {   /* Range ignored: full body incoming */
             httpcCloseContext(&c); df->range_ignored = 1; return HF_RANGE;
         }
-        if (status != 200 && status != 206) { httpcCloseContext(&c); return HF_FAIL; }
+        if (status != 200 && status != 206) { httpcCloseContext(&c); return HF_USE_CURL; }
 
         u32 want = 0; httpcGetDownloadSizeState(&c, NULL, &want);   /* bytes THIS response will send */
         u8 *buf = (u8 *)malloc(HF_CHUNK);
@@ -268,7 +284,8 @@ static int httpc_fetch(const char *url, DlFile *df, Prog *pr) {
         } while (1);
         free(buf);
         httpcCloseContext(&c);
-        if (ret == HF_OK && want && got_total < want) ret = HF_FAIL;   /* connection died mid-body */
+        if (ret == HF_OK && want && got_total < want) ret = HF_FAIL;      /* connection died mid-body */
+        if (ret == HF_FAIL && got_total == 0) ret = HF_USE_CURL;          /* got nothing -> let curl try */
         return ret;
     }
     return HF_FAIL;   /* redirect loop */
