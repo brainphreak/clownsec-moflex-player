@@ -1021,7 +1021,7 @@ static void queue_add_ui(const CatEntry *e) {
     for (int i = 0; i < s_qn; i++)
         if (!strcmp(s_q[i].url, e->url)) { snprintf(s_qtoast, sizeof s_qtoast, "Already queued"); s_qtoast_t = 75; return; }
     if (lib_has_file(e->fname)) { snprintf(s_qtoast, sizeof s_qtoast, "Already in library"); s_qtoast_t = 75; return; }
-    if (!s_q_dest[0] && !pick_folder(s_q_dest, sizeof s_q_dest)) return;   /* choose the folder once */
+    if (!pick_folder(s_q_dest, sizeof s_q_dest)) return;   /* every file picks its own folder */
     QItem *q = &s_q[s_qn]; memset(q, 0, sizeof *q);
     snprintf(q->name, sizeof q->name, "%s", e->name);
     snprintf(q->fname, sizeof q->fname, "%s", e->fname);
@@ -1162,18 +1162,17 @@ static void queue_remove_url(const char *url) {   /* the active item may have be
     for (int i = 0; i < s_qn; i++) if (!strcmp(s_q[i].url, url)) { queue_remove(i); return; }
 }
 /* A on a catalog entry: put it NEXT in line (right after the active download, if any). */
-static void queue_add_front(const CatEntry *e) {
+static int queue_add_front(const CatEntry *e) {   /* 1 = queued/bumped, 0 = user backed out */
     queue_load();
     int pos = s_dlw_active ? 1 : 0;
     if (pos > s_qn) pos = s_qn;
     for (int i = 0; i < s_qn; i++)
         if (!strcmp(s_q[i].url, e->url)) {   /* already queued -> just bump it up */
             if (i > pos) { QItem t = s_q[i]; memmove(&s_q[pos + 1], &s_q[pos], (size_t)(i - pos) * sizeof(QItem)); s_q[pos] = t; queue_save(); }
-            return;
+            return 1;
         }
-    if (s_qn >= QUEUE_MAX) { qtoast("Queue full"); return; }
-    if (!s_q_dest[0] && !pick_folder(s_q_dest, sizeof s_q_dest)) return;   /* choose the folder once
-                                       * (this path never asked -> items silently went to SD root) */
+    if (s_qn >= QUEUE_MAX) { qtoast("Queue full"); return 0; }
+    if (!pick_folder(s_q_dest, sizeof s_q_dest)) return 0;   /* every file picks its own folder */
     memmove(&s_q[pos + 1], &s_q[pos], (size_t)(s_qn - pos) * sizeof(QItem));
     QItem *q = &s_q[pos]; memset(q, 0, sizeof *q);
     snprintf(q->name, sizeof q->name, "%s", e->name);
@@ -1184,6 +1183,7 @@ static void queue_add_front(const CatEntry *e) {
     snprintf(q->dest, sizeof q->dest, "%s", s_q_dest);
     q->is_zip = e->is_zip;
     s_qn++; queue_save();
+    return 1;
 }
 
 static void fix_download_ext(char *dest, size_t cap) {
@@ -1482,8 +1482,7 @@ cb_rebuild:;   /* X-search inside the list jumps back here with filt_search set 
         if (want_dl) {   /* background download: becomes next in line, list stays usable */
             CatEntry *e = &cat[idx[csel]];
             if (lib_has_file(e->fname)) { qtoast("Already in library"); redraw = 1; goto cont; }
-            if (!s_q_dest[0] && !pick_folder(s_q_dest, sizeof s_q_dest)) { redraw = 1; goto cont; }
-            queue_add_front(e);
+            if (!queue_add_front(e)) { redraw = 1; goto cont; }   /* asks for this file's folder */
             dlw_start();
             qtoast((s_dlw_active && !strcmp((const char *)s_dlw_item.url, e->url)) ? "Downloading..." : "Queued next");
             redraw = 1;
