@@ -47,8 +47,9 @@ static void setup(CURL *e, const char *url) {
     curl_easy_setopt(e, CURLOPT_TLS13_CIPHERS, "TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256");
     curl_easy_setopt(e, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(e, CURLOPT_CONNECTTIMEOUT, 20L);
-    curl_easy_setopt(e, CURLOPT_LOW_SPEED_LIMIT, 512L);   /* < 512 B/s for 30s -> abort, never hang */
-    curl_easy_setopt(e, CURLOPT_LOW_SPEED_TIME, 30L);
+    curl_easy_setopt(e, CURLOPT_LOW_SPEED_LIMIT, 512L);   /* < 512 B/s for 10s -> abort + retry/resume
+                                                           * (short so stalls recover fast, never hang) */
+    curl_easy_setopt(e, CURLOPT_LOW_SPEED_TIME, 10L);
 }
 
 /* ---- progress bridge ---- */
@@ -64,6 +65,16 @@ static int xfer_cb(void *p, curl_off_t dltotal, curl_off_t dlnow, curl_off_t ul,
     curl_off_t tot = (dltotal > 0) ? off + dltotal : 0;
     if (pr && pr->cb && !pr->cb(pr->user, (uint32_t)now, (uint32_t)tot)) return 1; /* abort */
     return 0;
+}
+
+/* Sliced retry backoff so CANCEL reacts within ~100ms even between attempts (a stalled
+ * transfer used to grind through minutes of timeouts+sleeps looking completely hung). */
+static bool dl_backoff(int attempt) {   /* false = user aborted */
+    for (int t = (attempt + 1) * 5; t > 0; t--) {
+        if (g_abort_cb && g_abort_cb()) return false;
+        svcSleepThread(100 * 1000 * 1000LL);
+    }
+    return true;
 }
 
 /* ---- double-buffered SD committer (Universal-Updater's technique): the transfer thread only
@@ -203,7 +214,8 @@ void download_discard_partial(const char *url) {
 #define HF_RANGE    -2     /* server ignored Range -> caller starts clean */
 #define HF_USE_CURL -3     /* httpc can't handle this transfer -> curl this attempt */
 #define HF_CHUNK   (64 * 1024)
-#define HF_STALL_NS (30LL * 1000 * 1000 * 1000)   /* 30s no-progress abort, like curl LOW_SPEED */
+#define HF_STALL_NS (10LL * 1000 * 1000 * 1000)   /* 10s no-progress abort, like curl LOW_SPEED --
+                                                   * a failed attempt resumes, so short is safe */
 
 static bool g_httpc_ready;
 static bool httpc_ready(void) {
@@ -327,8 +339,8 @@ bool download_to_file(const char *url, const char *dest, dl_progress_cb cb, void
             }
             if (hr == HF_ABORT) return false;            /* user cancelled -> keep .part */
             if (df.range_ignored) remove(part);          /* server can't resume -> start clean */
-            svcSleepThread((s64)(attempt + 1) * 500000000LL);
-            continue;                                    /* backoff, then resume/retry */
+            if (!dl_backoff(attempt)) return false;      /* cancel-responsive backoff */
+            continue;                                    /* then resume/retry */
         }
 
         CURL *e = curl_easy_init();
@@ -358,7 +370,7 @@ bool download_to_file(const char *url, const char *dest, dl_progress_cb cb, void
         }
         if (r == CURLE_ABORTED_BY_CALLBACK) return false;   /* user cancelled -> keep .part */
         if (df.range_ignored) remove(part);                 /* server can't resume -> start clean */
-        svcSleepThread((s64)(attempt + 1) * 500000000LL);   /* backoff, then resume/retry */
+        if (!dl_backoff(attempt)) return false;             /* cancel-responsive backoff, then retry */
     }
     return false;   /* give up for now; .part stays for a later Resume / Start-over */
 }
