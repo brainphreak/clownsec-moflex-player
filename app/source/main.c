@@ -1162,14 +1162,15 @@ static void queue_remove_url(const char *url) {   /* the active item may have be
     for (int i = 0; i < s_qn; i++) if (!strcmp(s_q[i].url, url)) { queue_remove(i); return; }
 }
 /* A on a catalog entry: put it NEXT in line (right after the active download, if any). */
-static int queue_add_front(const CatEntry *e) {   /* 1 = queued/bumped, 0 = user backed out */
+static int queue_add_front(const CatEntry *e) {   /* 1 = queued, 2 = was already queued, 0 = backed out */
     queue_load();
     int pos = s_dlw_active ? 1 : 0;
     if (pos > s_qn) pos = s_qn;
     for (int i = 0; i < s_qn; i++)
-        if (!strcmp(s_q[i].url, e->url)) {   /* already queued -> just bump it up */
+        if (!strcmp(s_q[i].url, e->url)) {   /* already queued (e.g. a kept failed/paused item) ->
+                                              * bump it up; it KEEPS its originally chosen folder */
             if (i > pos) { QItem t = s_q[i]; memmove(&s_q[pos + 1], &s_q[pos], (size_t)(i - pos) * sizeof(QItem)); s_q[pos] = t; queue_save(); }
-            return 1;
+            return 2;
         }
     if (s_qn >= QUEUE_MAX) { qtoast("Queue full"); return 0; }
     if (!pick_folder(s_q_dest, sizeof s_q_dest)) return 0;   /* every file picks its own folder */
@@ -1482,9 +1483,11 @@ cb_rebuild:;   /* X-search inside the list jumps back here with filt_search set 
         if (want_dl) {   /* background download: becomes next in line, list stays usable */
             CatEntry *e = &cat[idx[csel]];
             if (lib_has_file(e->fname)) { qtoast("Already in library"); redraw = 1; goto cont; }
-            if (!queue_add_front(e)) { redraw = 1; goto cont; }   /* asks for this file's folder */
+            int qa = queue_add_front(e);                          /* asks for this file's folder */
+            if (!qa) { redraw = 1; goto cont; }
             dlw_start();
-            qtoast((s_dlw_active && !strcmp((const char *)s_dlw_item.url, e->url)) ? "Downloading..." : "Queued next");
+            qtoast(qa == 2 ? "Already queued - resuming" :
+                   (s_dlw_active && !strcmp((const char *)s_dlw_item.url, e->url)) ? "Downloading..." : "Queued next");
             redraw = 1;
         }
     cont:
