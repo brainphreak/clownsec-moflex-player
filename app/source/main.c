@@ -1024,14 +1024,23 @@ static int dlw_start(void) {   /* main thread: launch the front queue item */
     if (s_qn <= 0) return 0;
     s_dlw_item = s_q[0];
     s_dlw_stop = 0; s_dlw_finished = 0; s_dlw_ok = 0; s_dlw_done = s_dlw_total = 0;
-    /* Run the download on the SYSCORE (core 1) like the fast upload server does -- not on the app core
-     * where it contends with the UI. The ring only enables the syscore on Old-3DS, so on New-3DS the
-     * worker was starved on core 0 -> downloads far slower than Old-3DS despite better WiFi. Enable it
-     * here for both consoles. Fall back to the app core if core 1 can't be used. */
-    APT_SetAppCpuTimeLimit(30);
+    /* Worker core is per-model. New-3DS: the extra core (core 2, same as the ring's blit worker) --
+     * a dedicated full-speed core with no syscore time-slicing (the 30% core-1 slice stalled socket
+     * reads mid-transfer on some consoles: fast on one New-3DS, a crawl on another). Old-3DS/2DS has
+     * no core 2 and 30% of its 268MHz syscore starves curl+TLS, so it stays on the app core; that
+     * fallback runs ABOVE the UI priority -- curl blocks on the socket most of the time, and a
+     * below-UI worker starves whenever a screen redraws every frame. */
+    bool dlw_isnew = false; APT_CheckNew3DS(&dlw_isnew);
     s32 prio = 0; svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
-    Thread th = threadCreate(dlw_thread, NULL, 32 * 1024, 0x3F, 1, true);        /* core 1 (syscore) */
-    if (!th) th = threadCreate(dlw_thread, NULL, 32 * 1024, prio + 1, -2, true); /* fallback: any core */
+    Thread th = NULL;
+    if (dlw_isnew) {
+        th = threadCreate(dlw_thread, NULL, 32 * 1024, 0x3F, 2, true);           /* core 2 (N3DS extra) */
+        if (!th) {
+            APT_SetAppCpuTimeLimit(30);
+            th = threadCreate(dlw_thread, NULL, 32 * 1024, 0x3F, 1, true);       /* core 1 (syscore) */
+        }
+    }
+    if (!th) th = threadCreate(dlw_thread, NULL, 32 * 1024, prio - 1, -2, true); /* app core, above UI */
     if (!th) return 0;
     s_dlw_active = 1;
     return 1;
