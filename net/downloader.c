@@ -234,7 +234,9 @@ static int httpc_fetch(const char *url, DlFile *df, Prog *pr) {
     char cur[1024]; url_enc(url, cur, sizeof cur);
     for (int redir = 0; redir < 8; redir++) {
         httpcContext c;
-        if (R_FAILED(httpcOpenContext(&c, HTTPC_METHOD_GET, cur, 1))) return HF_USE_CURL;
+        /* use_defaultproxy=0: the curl engine never used the console's proxy setting, so the
+         * httpc engine must not either (a configured proxy = choppy/stalling downloads) */
+        if (R_FAILED(httpcOpenContext(&c, HTTPC_METHOD_GET, cur, 0))) return HF_USE_CURL;
         httpcSetSSLOpt(&c, SSLCOPT_DisableVerify);   /* 3DS has no cert store (same as curl setup) */
         httpcAddRequestHeaderField(&c, "User-Agent", "moflex-player/1.0");
         if (df->resume_off > 0) {
