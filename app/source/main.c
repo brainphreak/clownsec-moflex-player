@@ -1071,6 +1071,24 @@ static int dl_lid_closed(void) {
     if (R_SUCCEEDED(ptmuInit())) { PTMU_GetShellState(&shell); ptmuExit(); }
     return shell == 0;
 }
+/* Denying sleep keeps the CPU alive with the lid shut, but the NDM daemon still powers the
+ * wireless down -- the transfer stalls out anyway. An exclusive-state lock keeps the
+ * infrastructure WiFi up until we release it. */
+static int s_dlw_ndm = 0;
+static void dl_wifi_hold(int on) {
+    if (on == s_dlw_ndm) return;
+    if (on) {
+        if (R_FAILED(ndmuInit())) return;
+        NDMU_EnterExclusiveState(NDM_EXCLUSIVE_STATE_INFRASTRUCTURE);
+        NDMU_LockState();
+        s_dlw_ndm = 1;
+    } else {
+        NDMU_UnlockState();
+        NDMU_LeaveExclusiveState();
+        ndmuExit();
+        s_dlw_ndm = 0;
+    }
+}
 
 static volatile int s_dlw_mbps_x100 = 0;             /* live download speed *100 (Mbps), for the UI */
 static bool dlw_progress(void *u, u32 d, u32 t) {    /* worker thread: no UI, no hid */
@@ -1117,9 +1135,10 @@ static int dlw_start(void) {   /* main thread: launch the front queue item */
         }
     }
     if (!th) th = threadCreate(dlw_thread, NULL, 32 * 1024, prio - 1, -2, true); /* app core, above UI */
-    if (!th) { aptSetSleepAllowed(true); return 0; }   /* chain-start failed -> lid is normal again */
+    if (!th) { aptSetSleepAllowed(true); dl_wifi_hold(0); return 0; }   /* chain-start failed -> normal lid */
     s_dlw_active = 1;
     aptSetSleepAllowed(false);   /* lid close now only darkens the LCDs; the transfer keeps going */
+    dl_wifi_hold(1);             /* ...and NDM must not power the wireless down meanwhile */
     dl_led(0, 0);                /* a fresh queue clears any leftover done/failed light */
     return 1;
 }
@@ -1129,6 +1148,7 @@ static void dlw_stop_wait(void) {   /* abort the in-flight download; partial + q
     while (!s_dlw_finished) svcSleepThread(50 * 1000 * 1000LL);
     s_dlw_active = 0; s_dlw_finished = 0;
     aptSetSleepAllowed(true);
+    dl_wifi_hold(0);
 }
 static void queue_remove_url(const char *url) {   /* the active item may have been reordered */
     queue_load();
@@ -2434,8 +2454,10 @@ static void download_url_direct(void) {
     g_last_prog = 0;
     if (!download_resume_check(url)) return;   /* B on the prompt -> back */
     aptSetSleepAllowed(false);                 /* direct downloads survive a closed lid too */
+    dl_wifi_hold(1);
     bool ok = download_to_file(url, dest, dl_progress, NULL);
     aptSetSleepAllowed(true);
+    dl_wifi_hold(0);
     if (!ok) { download_cancel_msg(url); return; }   /* progress saved; offers DELETE FILE, B keeps it */
     size_t fl = strlen(fname);
     if (fl > 4 && !strcasecmp(fname + fl - 4, ".zip") && file_is_zip(dest) &&
@@ -2564,6 +2586,7 @@ static int dlw_poll(void) {
     s_dlw_active = 0; s_dlw_finished = 0;
     if (!s_dlw_ok) {   /* cancelled or failed: keep the item + partial data for resume */
         aptSetSleepAllowed(true);            /* lid closed -> the console can nap now */
+        dl_wifi_hold(0);
         if (!s_dlw_stop) dl_led(1, 0);       /* real failure: red light so a closed lid still tells you */
         qtoast(s_dlw_stop ? "Download paused" : "Download failed");
         return 1;
@@ -2599,6 +2622,7 @@ static int dlw_poll(void) {
     if (queue_count() > 0) dlw_start();   /* chain the next item (sleep stays denied) */
     else {
         qtoast("Queue complete");
+        dl_wifi_hold(0);
         dl_led(0, 1);                     /* green: all done (keeps blinking through sleep) */
         if (dl_lid_closed() && s_dlw_after == 1) dl_power_off();
         else aptSetSleepAllowed(true);    /* lid closed -> drifts into sleep; open -> user is here */
