@@ -28,6 +28,52 @@
 #ifndef BUILD_TAG
 #define BUILD_TAG "dev"      /* set by the Makefile: date +%y%m%d.%H%M of the build */
 #endif
+
+/* ---- MENU IDLE SCREEN-OFF: 5 minutes with no input on any menu screen turns both backlights
+ * off (the console keeps running -- e.g. the download queue); any button/touch wakes them, and
+ * the waking press is swallowed until released so it can't invisibly activate something.
+ * Playback never runs these loops (it manages its own screens in moflex_playback.c). gsp::Lcd
+ * is held only for the instant of the toggle -- holding it across a HOME suspend locks the GSP.
+ * Cost: one osGetTime + a few compares per frame; nothing on the hot paths. */
+#define IDLE_OFF_MS (5 * 60 * 1000)
+static u64 s_idle_last, s_idle_prevscan;
+static int s_idle_off, s_idle_swallow, s_idle_hooked;
+static aptHookCookie s_idle_cookie;
+static void idle_backlight(int on) {
+    if (R_FAILED(gspLcdInit())) return;              /* transient hold -> HOME/suspend safe */
+    if (on) GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTH);
+    else    GSPLCD_PowerOffBacklight(GSPLCD_SCREEN_BOTH);
+    gspLcdExit();
+    s_idle_off = !on;
+}
+static void idle_apt_hook(APT_HookType t, void *u) {
+    (void)u;   /* HOME / lid sleep: the system restored the backlight behind our back */
+    if (t == APTHOOK_ONRESTORE || t == APTHOOK_ONWAKEUP) { s_idle_off = 0; s_idle_last = osGetTime(); }
+}
+static void idle_scan(void) {
+    if (!s_idle_hooked) { aptHook(&s_idle_cookie, idle_apt_hook, NULL); s_idle_hooked = 1; }
+    hidScanInput();
+    u64 now = osGetTime();
+    if (now - s_idle_prevscan > 2000) s_idle_last = now;   /* back from playback/extract/applet */
+    s_idle_prevscan = now;
+    if (hidKeysDown() | hidKeysHeld()) {
+        s_idle_last = now;
+        if (s_idle_off) { idle_backlight(1); s_idle_swallow = 1; }  /* wake press must not act */
+    } else {
+        s_idle_swallow = 0;                                         /* everything released */
+        if (!s_idle_off && now - s_idle_last >= IDLE_OFF_MS) idle_backlight(0);
+    }
+}
+static u32 idle_kdown(void) { return s_idle_swallow ? 0 : hidKeysDown(); }
+static u32 idle_kheld(void) { return s_idle_swallow ? 0 : hidKeysHeld(); }
+static u32 idle_kup(void)   { return s_idle_swallow ? 0 : hidKeysUp(); }
+static void idle_tread(touchPosition *t) { if (s_idle_swallow) memset(t, 0, sizeof *t); else hidTouchRead(t); }
+/* every menu loop below scans/reads through these (moflex_playback.c is unaffected) */
+#define hidScanInput idle_scan
+#define hidKeysDown  idle_kdown
+#define hidKeysHeld  idle_kheld
+#define hidKeysUp    idle_kup
+#define hidTouchRead idle_tread
 #define MAXE     1024
 #define NAMELEN  256
 #define PATHLEN  1024
