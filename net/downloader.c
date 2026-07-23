@@ -66,8 +66,91 @@ static int xfer_cb(void *p, curl_off_t dltotal, curl_off_t dlnow, curl_off_t ul,
     return 0;
 }
 
+/* ---- double-buffered SD committer (Universal-Updater's technique): the transfer thread only
+ * appends into a RAM buffer while this thread flushes the OTHER buffer to SD, so the network
+ * never idles waiting on an SD write (every fwrite is a blocking FS IPC -- serial write-then-read
+ * was costing ~half the achievable throughput). Unlike UU we commit in 64KB slices, so the FAT
+ * lock is never held long enough to freeze the UI's SD reads (the 256KB single-write lesson). */
+#define WB_SZ    (256 * 1024)
+#define WB_SLICE (64 * 1024)
+typedef struct {
+    FILE *f;
+    u8 *buf[2];
+    u32 len;                  /* fill of buf[widx] (transfer thread only) */
+    int widx;                 /* buffer being filled */
+    volatile int cidx;        /* buffer being committed, -1 = none */
+    volatile u32 clen;
+    volatile int err, quit;
+    LightEvent ready, done;
+    Thread th;
+} WBuf;
+
+static void wb_thread(void *arg) {
+    WBuf *w = (WBuf *)arg;
+    for (;;) {
+        LightEvent_Wait(&w->ready);
+        if (w->cidx >= 0) {
+            const u8 *p = w->buf[w->cidx];
+            for (u32 o = 0; o < w->clen && !w->err; o += WB_SLICE) {
+                u32 n = w->clen - o; if (n > WB_SLICE) n = WB_SLICE;
+                if (fwrite(p + o, 1, n, w->f) != n) w->err = 1;
+            }
+            w->cidx = -1;
+            LightEvent_Signal(&w->done);
+        }
+        if (w->quit) break;
+    }
+}
+static int wb_flip(WBuf *w) {          /* hand the filled buffer to the committer */
+    while (w->cidx >= 0) LightEvent_Wait(&w->done);
+    if (w->err) return 0;
+    w->clen = w->len; w->cidx = w->widx;
+    w->widx ^= 1; w->len = 0;
+    LightEvent_Signal(&w->ready);
+    return 1;
+}
+static size_t wb_write(WBuf *w, const void *p, size_t n) {
+    if (w->err) return 0;
+    const u8 *s = (const u8 *)p; size_t left = n;
+    while (left) {
+        size_t room = WB_SZ - w->len, take = left < room ? left : room;
+        memcpy(w->buf[w->widx] + w->len, s, take);
+        w->len += (u32)take; s += take; left -= take;
+        if (w->len == WB_SZ && !wb_flip(w)) return 0;
+    }
+    return n;
+}
+static WBuf *wb_open(FILE *f) {
+    WBuf *w = (WBuf *)calloc(1, sizeof *w);
+    if (!w) return NULL;
+    w->f = f; w->cidx = -1;
+    w->buf[0] = (u8 *)malloc(WB_SZ); w->buf[1] = (u8 *)malloc(WB_SZ);
+    LightEvent_Init(&w->ready, RESET_ONESHOT);
+    LightEvent_Init(&w->done, RESET_ONESHOT);
+    if (w->buf[0] && w->buf[1])
+        /* 0x2E = just above the main thread (0x30): commits preempt UI redraw for the microseconds
+         * between FS IPCs, so a busy screen can never back the buffers up and stall the transfer */
+        w->th = threadCreate(wb_thread, w, 8 * 1024, 0x2E, -2, false);
+    if (!w->th) { free(w->buf[0]); free(w->buf[1]); free(w); return NULL; }   /* -> direct writes */
+    return w;
+}
+static int wb_close(WBuf *w) {         /* drain remaining bytes, stop the thread; 0 = write error */
+    if (!w) return 1;
+    if (w->len && !w->err) wb_flip(w);
+    while (w->cidx >= 0) LightEvent_Wait(&w->done);
+    w->quit = 1;
+    LightEvent_Signal(&w->ready);
+    threadJoin(w->th, U64_MAX); threadFree(w->th);
+    int ok = !w->err;
+    free(w->buf[0]); free(w->buf[1]); free(w);
+    return ok;
+}
+
 /* ---- to file (resumable) ---- */
-typedef struct { FILE *f; curl_off_t resume_off; long status; int range_ignored; } DlFile;
+typedef struct { FILE *f; WBuf *wb; curl_off_t resume_off; long status; int range_ignored; } DlFile;
+static size_t dl_sink(DlFile *d, const void *p, size_t n) {
+    return d->wb ? wb_write(d->wb, p, n) : fwrite(p, 1, n, d->f);
+}
 
 /* Sniff the HTTP status so we can tell a real resume (206) from a server that ignored our
  * Range and is re-sending the whole file (200) -- appending that would corrupt the .part. */
@@ -84,7 +167,7 @@ static size_t hdr_cb(char *buf, size_t sz, size_t nm, void *ud) {
 static size_t file_cb(void *ptr, size_t sz, size_t nm, void *ud) {
     DlFile *d = (DlFile *)ud;
     if (d->range_ignored) return 0;   /* abort now rather than append a full body onto the partial */
-    return fwrite(ptr, sz, nm, d->f);
+    return dl_sink(d, ptr, sz * nm) / (sz ? sz : 1);
 }
 
 /* Partial downloads live in ONE central dir, keyed by a hash of the URL (not the destination)
@@ -109,6 +192,88 @@ void download_discard_partial(const char *url) {
     remove(part);
 }
 
+/* ---- httpc path: HTTP(S) through the http:C sysmodule. TLS runs inside the system module
+ * (hardware-assisted), NOT in-app mbedTLS burning our worker core -- this is how FBI and the
+ * fast downloaders get their speed. We read in 64KB chunks (vs curl's 16KB TLS records), which
+ * also means fewer, larger SD writes without approaching the 256KB size that froze the Old-3DS
+ * UI behind the FAT lock. curl remains the fallback for anything httpc can't do. */
+#define HF_OK        1     /* body complete */
+#define HF_FAIL      0     /* transient failure -> retry (resume picks up) */
+#define HF_ABORT    -1     /* user cancelled */
+#define HF_RANGE    -2     /* server ignored Range -> caller starts clean */
+#define HF_USE_CURL -3     /* httpc can't handle this transfer -> curl this attempt */
+#define HF_CHUNK   (64 * 1024)
+#define HF_STALL_NS (30LL * 1000 * 1000 * 1000)   /* 30s no-progress abort, like curl LOW_SPEED */
+
+static bool g_httpc_ready;
+static bool httpc_ready(void) {
+    static bool tried;
+    if (!tried) {
+        if (g_lock_ready) LightLock_Lock(&g_init_lock);
+        if (!tried) { g_httpc_ready = R_SUCCEEDED(httpcInit(0)); tried = true; }
+        if (g_lock_ready) LightLock_Unlock(&g_init_lock);
+    }
+    return g_httpc_ready;
+}
+
+static int httpc_fetch(const char *url, DlFile *df, Prog *pr) {
+    char cur[1024]; snprintf(cur, sizeof cur, "%s", url);
+    for (int redir = 0; redir < 8; redir++) {
+        httpcContext c;
+        if (R_FAILED(httpcOpenContext(&c, HTTPC_METHOD_GET, cur, 1))) return HF_USE_CURL;
+        httpcSetSSLOpt(&c, SSLCOPT_DisableVerify);   /* 3DS has no cert store (same as curl setup) */
+        httpcAddRequestHeaderField(&c, "User-Agent", "moflex-player/1.0");
+        if (df->resume_off > 0) {
+            char rg[48]; snprintf(rg, sizeof rg, "bytes=%lld-", (long long)df->resume_off);
+            httpcAddRequestHeaderField(&c, "Range", rg);
+        }
+        if (R_FAILED(httpcBeginRequest(&c))) { httpcCloseContext(&c); return HF_FAIL; }
+        u32 status = 0;
+        if (R_FAILED(httpcGetResponseStatusCodeTimeout(&c, &status, HF_STALL_NS))) {
+            httpcCloseContext(&c); return HF_FAIL;
+        }
+        if (status >= 300 && status < 400) {
+            char loc[1024] = "";
+            Result lr = httpcGetResponseHeader(&c, "Location", loc, sizeof loc);
+            if (R_FAILED(lr)) lr = httpcGetResponseHeader(&c, "location", loc, sizeof loc);
+            httpcCloseContext(&c);
+            if (R_FAILED(lr) || !strstr(loc, "://")) return HF_USE_CURL;   /* odd redirect -> curl */
+            snprintf(cur, sizeof cur, "%s", loc);
+            continue;
+        }
+        df->status = (long)status;
+        if (df->resume_off > 0 && status == 200) {   /* Range ignored: full body incoming */
+            httpcCloseContext(&c); df->range_ignored = 1; return HF_RANGE;
+        }
+        if (status != 200 && status != 206) { httpcCloseContext(&c); return HF_FAIL; }
+
+        u32 want = 0; httpcGetDownloadSizeState(&c, NULL, &want);   /* bytes THIS response will send */
+        u8 *buf = (u8 *)malloc(HF_CHUNK);
+        if (!buf) { httpcCloseContext(&c); return HF_USE_CURL; }
+        u32 got_total = 0;
+        int ret = HF_OK;
+        Result r;
+        do {
+            r = httpcReceiveDataTimeout(&c, buf, HF_CHUNK, HF_STALL_NS);
+            int pending = (r == (Result)HTTPC_RESULTCODE_DOWNLOADPENDING);
+            if (R_FAILED(r) && !pending) { ret = HF_FAIL; break; }
+            u32 now = 0; httpcGetDownloadSizeState(&c, &now, NULL);
+            u32 chunk = now - got_total;                       /* bytes valid in buf this round */
+            if (chunk && dl_sink(df, buf, chunk) != chunk) { ret = HF_FAIL; break; }
+            got_total = now;
+            if (g_abort_cb && g_abort_cb()) { ret = HF_ABORT; break; }
+            if (pr && pr->cb && !pr->cb(pr->user, (uint32_t)(pr->resume_off + got_total),
+                                        (uint32_t)(want ? pr->resume_off + want : 0))) { ret = HF_ABORT; break; }
+            if (!pending) break;
+        } while (1);
+        free(buf);
+        httpcCloseContext(&c);
+        if (ret == HF_OK && want && got_total < want) ret = HF_FAIL;   /* connection died mid-body */
+        return ret;
+    }
+    return HF_FAIL;   /* redirect loop */
+}
+
 bool download_to_file(const char *url, const char *dest, dl_progress_cb cb, void *user) {
     if (!downloader_init()) return false;
     char part[512]; part_path_for_url(url, part, sizeof part);
@@ -123,14 +288,33 @@ bool download_to_file(const char *url, const char *dest, dl_progress_cb cb, void
         FILE *f = fopen(part, off > 0 ? "r+b" : "wb");
         if (!f) return false;
         if (off > 0) fseeko(f, 0, SEEK_END);
-        /* NOTE: deliberately NOT a big stdio buffer -- a large SD write holds the FAT lock long enough
-         * to freeze the UI's SD reads on Old-3DS (menus hung for 1-2 min behind the download). Default
-         * (small, frequent) writes let the main thread's reads interleave. */
-        CURL *e = curl_easy_init();
-        if (!e) { fclose(f); return false; }
-
-        DlFile df = { f, off, 0, 0 };
+        /* NOTE: no big stdio buffer here -- writes go through the double-buffered committer (wb),
+         * which flushes in 64KB slices so the FAT lock never freezes the UI's SD reads on Old-3DS
+         * (menus hung 1-2 min behind the download when a single write was 256KB). */
+        WBuf *wb = wb_open(f);        /* NULL (alloc/thread fail) -> plain direct writes */
+        DlFile df = { f, wb, off, 0, 0 };
         Prog pr = { cb, user, off };
+
+        /* Fast path: the http:C sysmodule (TLS off our core). Falls through to curl if it can't. */
+        int hr = HF_USE_CURL;
+        if (httpc_ready()) hr = httpc_fetch(url, &df, &pr);
+        if (hr != HF_USE_CURL) {
+            int wok = wb_close(wb);
+            fclose(f);
+            if (hr == HF_OK && wok) {
+                remove(dest);
+                rename(part, dest);
+                return true;
+            }
+            if (hr == HF_ABORT) return false;            /* user cancelled -> keep .part */
+            if (df.range_ignored) remove(part);          /* server can't resume -> start clean */
+            svcSleepThread((s64)(attempt + 1) * 500000000LL);
+            continue;                                    /* backoff, then resume/retry */
+        }
+
+        CURL *e = curl_easy_init();
+        if (!e) { wb_close(wb); fclose(f); return false; }
+
         setup(e, url);
         curl_easy_setopt(e, CURLOPT_WRITEFUNCTION, file_cb);
         curl_easy_setopt(e, CURLOPT_WRITEDATA, &df);
@@ -145,9 +329,10 @@ bool download_to_file(const char *url, const char *dest, dl_progress_cb cb, void
         CURLcode r = curl_easy_perform(e);
         long code = 0; curl_easy_getinfo(e, CURLINFO_RESPONSE_CODE, &code);
         curl_easy_cleanup(e);
+        int wok = wb_close(wb);
         fclose(f);
 
-        if (r == CURLE_OK && (code == 200 || code == 206)) {
+        if (r == CURLE_OK && wok && (code == 200 || code == 206)) {
             remove(dest);                 /* replace any stale final */
             rename(part, dest);           /* .part -> dest only when complete */
             return true;
