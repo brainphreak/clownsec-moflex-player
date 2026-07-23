@@ -210,7 +210,14 @@ static bool httpc_ready(void) {
     static bool tried;
     if (!tried) {
         if (g_lock_ready) LightLock_Lock(&g_init_lock);
-        if (!tried) { g_httpc_ready = R_SUCCEEDED(httpcInit(0)); tried = true; }
+        if (!tried) {
+            /* escape hatch: drop this file on the SD card to force the old curl engine
+             * (for A/B-ing download problems in the field, like sw_convert.txt) */
+            struct stat st;
+            if (stat("sdmc:/moflex_player/no_httpc.txt", &st) == 0) g_httpc_ready = false;
+            else g_httpc_ready = R_SUCCEEDED(httpcInit(0));
+            tried = true;
+        }
         if (g_lock_ready) LightLock_Unlock(&g_init_lock);
     }
     return g_httpc_ready;
@@ -234,7 +241,9 @@ static int httpc_fetch(const char *url, DlFile *df, Prog *pr) {
     char cur[1024]; url_enc(url, cur, sizeof cur);
     for (int redir = 0; redir < 8; redir++) {
         httpcContext c;
-        if (R_FAILED(httpcOpenContext(&c, HTTPC_METHOD_GET, cur, 1))) return HF_USE_CURL;
+        /* use_defaultproxy=0: the old curl engine never used the console's proxy setting; going
+         * through a configured proxy made downloads choppy/stalling for those users */
+        if (R_FAILED(httpcOpenContext(&c, HTTPC_METHOD_GET, cur, 0))) return HF_USE_CURL;
         httpcSetSSLOpt(&c, SSLCOPT_DisableVerify);   /* 3DS has no cert store (same as curl setup) */
         httpcAddRequestHeaderField(&c, "User-Agent", "moflex-player/1.0");
         if (df->resume_off > 0) {
