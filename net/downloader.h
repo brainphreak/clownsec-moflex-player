@@ -26,6 +26,10 @@ bool download_to_file(const char *url, const char *dest, dl_progress_cb cb, void
  * Keyed by URL, so it finds the partial regardless of destination folder. */
 long long download_partial_bytes(const char *url);
 
+/* nonzero when the LAST download_to_file failure was a WRITE error (SD full / card trouble),
+ * so the UI can say "SD full?" instead of blaming the network */
+int download_write_failed(void);
+
 /* Delete the leftover partial for `url` (for "start over"). */
 void download_discard_partial(const char *url);
 
