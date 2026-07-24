@@ -2664,21 +2664,24 @@ static int srt_is_html(const char *path) {
 }
 /* Fetch a catalog-listed subtitle and save it as <movie>.srt so it auto-loads at playback.
  * Keeps a good existing .srt; REPLACES one that turns out to be an HTML catch-all page.
- * Used when a download finishes and by Get Info (grab subs without redownloading the movie). */
-static void fetch_sub(const char *moviepath, const char *suburl) {
-    if (!suburl || !suburl[0]) return;
+ * Used when a download finishes and by Get Info (grab subs without redownloading the movie).
+ * Returns: 1 downloaded, 2 already had real subtitles, 0 none available / failed. */
+static int fetch_sub(const char *moviepath, const char *suburl) {
+    if (!suburl || !suburl[0]) return 0;
     char sdest[PATHLEN + NAMELEN]; snprintf(sdest, sizeof sdest, "%s", moviepath);
     char *dot = strrchr(sdest, '.');
-    if (!dot || (size_t)(dot - sdest) + 5 >= sizeof sdest) return;
+    if (!dot || (size_t)(dot - sdest) + 5 >= sizeof sdest) return 0;
     memcpy(dot, ".srt", 5);
     struct stat st;
     if (stat(sdest, &st) == 0) {
-        if (st.st_size > 0 && !srt_is_html(sdest)) return;   /* real subtitles already there */
-        remove(sdest);                                       /* junk -> refetch */
+        if (st.st_size > 0 && !srt_is_html(sdest)) return 2;   /* real subtitles already there */
+        remove(sdest);                                         /* junk -> refetch */
     }
-    if (download_to_file(suburl, sdest, NULL, NULL) && srt_is_html(sdest))
-        remove(sdest);   /* the server sent its site page: no subtitles exist for this file */
+    if (!download_to_file(suburl, sdest, NULL, NULL)) return 0;
+    if (srt_is_html(sdest)) { remove(sdest); return 0; }   /* server sent its site page */
+    return 1;
 }
+static int s_scrape_sub = 0;   /* what the last scrape_one did about subtitles (fetch_sub code) */
 
 /* Run the queue front to back. B during a download pauses the queue (partial kept for resume). */
 /* Main-thread finalizer: post-process a finished background download, then chain
@@ -2930,6 +2933,7 @@ static int fetch_poster(const CatEntry *e, u16 *pb) {
 /* Try to find + save catalog metadata for ONE movie (forces a refresh; used by X:Get info).
  * Returns 0 = no match, 1 = saved with poster, 2 = saved but the poster wouldn't download. */
 static int scrape_one(const char *moviepath) {
+    s_scrape_sub = 0;
     load_sources();
     char lstem[192]; local_stem(moviepath, lstem, sizeof lstem);
     int cap = 4096; CatEntry *cat = (CatEntry *)malloc(sizeof(CatEntry) * cap);
@@ -2946,7 +2950,7 @@ static int scrape_one(const char *moviepath) {
         for (int i = 0; i < nc; i++) if (scr_match(lstem, &cat[i])) {
             int poster_ok = fetch_poster(&cat[i], pb);
             movieinfo_save(moviepath, &cat[i], poster_ok ? pb : NULL, POSTER_W, POSTER_H);
-            fetch_sub(moviepath, cat[i].sub);   /* subs without redownloading the movie */
+            s_scrape_sub = fetch_sub(moviepath, cat[i].sub);   /* subs without redownloading */
             found = poster_ok ? 1 : 2;
             break;
         }
@@ -3017,9 +3021,14 @@ static void lib_scrape_one(int i) {
     char path[CAT_URLLEN]; snprintf(path, sizeof path, "%s", g_lib[i].url);
     int r = scrape_one(path);
     if (r) { lib_refresh_entry(i); lib_save_cache(); }
-    msg_screen("GET INFO", r == 1 ? "Info + artwork saved."
-                         : r == 2 ? "Info saved, but the poster\ndidn't download. Try again for the art."
-                                  : "No catalog had this title.");
+    char m[160];
+    snprintf(m, sizeof m, "%s%s",
+             r == 1 ? "Info + artwork saved."
+           : r == 2 ? "Info saved, but the poster\ndidn't download. Try again for the art."
+                    : "No catalog had this title.",
+             !r ? "" : s_scrape_sub == 1 ? "\nSubtitles downloaded."
+                     : s_scrape_sub == 2 ? "\nSubtitles already present." : "\nNo subtitles in the catalog.");
+    msg_screen("GET INFO", m);
 }
 
 /* Library GET INFO (batch): fill in every movie in the current list that's MISSING info. */
@@ -3310,10 +3319,14 @@ static void getinfo_menu(void) {
             prompt2("DOWNLOAD INFO", "Info already exists for this video.\nUpdating replaces any edits.",
                     "UPDATE", "KEEP") != 0) return;
         int r = scrape_one(full);
-        const char *msg = r == 1 ? "Info + artwork saved."
-                        : r == 2 ? "Info saved, but the poster\ndidn't download. Try again for the art."
-                                 : "No catalog had this title.";
-        msg_screen("DOWNLOAD INFO", msg);
+        char m[160];
+        snprintf(m, sizeof m, "%s%s",
+                 r == 1 ? "Info + artwork saved."
+               : r == 2 ? "Info saved, but the poster\ndidn't download. Try again for the art."
+                        : "No catalog had this title.",
+                 !r ? "" : s_scrape_sub == 1 ? "\nSubtitles downloaded."
+                         : s_scrape_sub == 2 ? "\nSubtitles already present." : "\nNo subtitles in the catalog.");
+        msg_screen("DOWNLOAD INFO", m);
     } else if (a == 1) {
         scrape_folder();
     }
