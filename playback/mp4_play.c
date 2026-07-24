@@ -399,6 +399,10 @@ MoflexResult mp4_play(const char *path) {
 
     int vi = 0;
     int64_t cur_us = 0;
+    g_pq_n = 0;        /* the reorder queue is static: entries from a PREVIOUS session (B-exit
+                        * leaves up to 4 queued) would present as phantom frames with stale
+                        * timestamps -- the frozen-bar + fast-forward-catch-up bug */
+    g_present_log = 12;
 
     /* auto-resume (like moflex): jump to the saved position if any */
     int64_t resume_us = (int64_t)moflex_resume_get(path);
