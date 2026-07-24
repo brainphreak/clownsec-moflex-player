@@ -73,9 +73,10 @@ static int xfer_cb(void *p, curl_off_t dltotal, curl_off_t dlnow, curl_off_t ul,
 static int dl_wifi_up(void) {
     u32 st = 0;
     if (R_FAILED(acInit())) return 1;   /* can't tell -> assume up and let timeouts handle it */
-    Result r = ACU_GetWifiStatus(&st);
+    Result r = ACU_GetStatus(&st);      /* 1 = not connected, 3 = connected (NOT GetWifiStatus,
+                                         * which returns AP-type flags and can be 0 while online) */
     acExit();
-    return R_FAILED(r) ? 1 : (st != 0);
+    return R_FAILED(r) ? 1 : (st == 3);
 }
 
 /* Sliced retry backoff so CANCEL reacts within ~100ms even between attempts (a stalled
