@@ -59,7 +59,10 @@ static void feed_annexb(const uint8_t *nal, int len) {
     memcpy(g_pkt + 3, nal, len);
     GSPGPU_FlushDataCache(g_pkt, len + 3);
     mvd_log("STEP prime: feeding %d-byte NAL (type %d)", len, nal[0] & 0x1F);
-    Result pr = mvdstdProcessVideoFrame(g_pkt, len + 3, 0, NULL);
+    /* the MVD module only understands the NEW linear range (0x30000000+); this app's linear heap
+     * lives in the OLD range (0x14000000) and libctru passes the vaddr through UNCONVERTED --
+     * feeding the raw pointer data-aborts the mvd sysmodule itself (full system crash) */
+    Result pr = mvdstdProcessVideoFrame(osConvertOldLINEARMemToNew(g_pkt), len + 3, 0, NULL);
     mvd_log("STEP prime: fed, result=%08lX", (unsigned long)pr);
 }
 
@@ -186,10 +189,11 @@ int mp4_mvd_decode(const uint8_t *sample, int size) {
     GSPGPU_FlushDataCache(g_out, (u32)g_cw * g_ch * sizeof(u16));
     GSPGPU_FlushDataCache(g_pkt, off);
 
+    void *pkt_mvd = osConvertOldLINEARMemToNew(g_pkt);   /* mvd needs NEW-range linear addresses */
     if (lg) mvd_log("STEP 7: frame %d process (annexb %d bytes, first NAL type %d)", logframes, off, g_pkt[3] & 0x1F);
-    Result r = mvdstdProcessVideoFrame(g_pkt, off, 0, NULL);
+    Result r = mvdstdProcessVideoFrame(pkt_mvd, off, 0, NULL);
     if (lg) mvd_log("STEP 8: frame %d processed r=%08lX first=%d", logframes, (unsigned long)r, g_first);
-    if (g_first) { mvdstdProcessVideoFrame(g_pkt, off, 0, NULL); g_first = 0;
+    if (g_first) { mvdstdProcessVideoFrame(pkt_mvd, off, 0, NULL); g_first = 0;
                    if (lg) mvd_log("STEP 8b: first-frame-twice done"); }   /* MVD needs the first frame twice */
     if (!MVD_CHECKNALUPROC_SUCCESS(r)) return 0;
 
