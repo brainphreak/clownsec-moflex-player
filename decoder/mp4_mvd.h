@@ -17,6 +17,9 @@ void mp4_mvd_exit(void);
  * Frames survive in their slot until ~4 further decodes -- enough for B-frame reordering. */
 int  mp4_mvd_decode(const uint8_t *sample, int size);
 
+/* Pop a FURTHER held picture (B-frame streams). Returns slot+1, or 0 when none pending. */
+int  mp4_mvd_render_extra(void);
+
 /* Re-prime the decoder after a seek so it resyncs on the next keyframe. Decode the keyframe and
  * any following frames up to the seek target (discarding output) before presenting again. */
 void mp4_mvd_reset(void);

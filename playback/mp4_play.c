@@ -538,6 +538,13 @@ MoflexResult mp4_play(const char *path) {
             }
             if (g_ftn < 16) g_ft[g_ftn++] = v_cts_us(&m, vi);   /* pool this frame's display time */
             if (r) { g_pq[g_pq_n].cts = ft_pop_min(); g_pq[g_pq_n].slot = r - 1; g_pq_n++; }
+            /* drain any FURTHER pictures the decoder is holding (B-frames surface in bursts);
+             * capped so a decoder that re-renders the same picture can't spin us */
+            for (int x = 0; x < 2 && g_pq_n < PQ_DEPTH && g_ftn > 0; x++) {
+                int e = mp4_mvd_render_extra();
+                if (!e) break;
+                g_pq[g_pq_n].cts = ft_pop_min(); g_pq[g_pq_n].slot = e - 1; g_pq_n++;
+            }
             vi++;
         }
         if (g_pq_n == 0) continue;   /* nothing display-ready yet (decoder still priming) */

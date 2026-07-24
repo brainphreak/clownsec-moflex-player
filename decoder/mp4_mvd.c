@@ -219,3 +219,20 @@ int mp4_mvd_decode(const uint8_t *sample, int size) {
     g_slot = (g_slot + 1) % MVD_SLOTS;        /* next decode writes the next slot */
     return produced + 1;                      /* slot+1 so 0 keeps meaning "no frame" */
 }
+
+/* Pull ANOTHER display-ready picture out of the decoder without feeding more data. B-frame
+ * streams surface pictures late, and the module can hold several -- popping only one per
+ * feed lost 2 of 3 frames. Returns slot+1 when a picture appeared, 0 when the decoder had
+ * nothing more (sentinel corners untouched). */
+int mp4_mvd_render_extra(void) {
+    if (!g_ready) return 0;
+    g_config.physaddr_outdata0 = osConvertVirtToPhys(g_out);
+    set_corners();
+    GSPGPU_FlushDataCache(g_out, (u32)g_cw * g_ch * sizeof(u16));
+    mvdstdRenderVideoFrame(&g_config, true);
+    GSPGPU_InvalidateDataCache(g_out, (u32)g_cw * g_ch * sizeof(u16));
+    if (!corners_changed()) return 0;
+    int produced = g_slot;
+    g_slot = (g_slot + 1) % MVD_SLOTS;
+    return produced + 1;
+}
