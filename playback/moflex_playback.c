@@ -3428,3 +3428,17 @@ MoflexResult moflex_play(const char *path) {
 #endif
     return moflex_play_classic(path);
 }
+
+/* ---- shared with the MP4 player (mp4_play.c): one resume store, one volume, one subtitle
+ * system across both formats, so switching between .moflex and .mp4 feels identical. ---- */
+void moflex_resume_save(const char *path, long long us) { resume_save_us(path, (int64_t)us); }
+float moflex_vol_get(void) { vol_load(); return g_vol; }
+void moflex_vol_set(float v) {
+    if (v < 0.25f) v = 0.25f;
+    if (v > 4.0f)  v = 4.0f;
+    g_vol = v; vol_save();
+}
+void moflex_subs_autoload(const char *moviepath) { subs_autoload(moviepath); }
+void moflex_sub_menu(const char *moviepath, int is3d) { sub_menu(moviepath, is3d); }
+void moflex_sub_overlay(int is3d, long long us) { sub_overlay(is3d, (int64_t)us); }
+int  moflex_subs_on(void) { return g_sub_on; }

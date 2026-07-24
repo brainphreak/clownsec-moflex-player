@@ -14,6 +14,7 @@
 #include <locale.h>
 
 #include "moflex_playback.h"
+#include "mp4_play.h"
 #include "httpd.h"
 #include "downloader.h"
 #include "catalog.h"
@@ -177,8 +178,10 @@ static char move_name[NAMELEN];
 
 static int is_moflex(const char *n) {
     size_t L = strlen(n);
-    /* playable = a plain .moflex OR a .cia with an embedded moflex (played in place) */
+    /* playable = a plain .moflex, an .mp4 (New-3DS hardware H.264), OR a .cia with an
+     * embedded moflex (played in place) */
     return (L > 7 && strcasecmp(n + L - 7, ".moflex") == 0)
+        || (L > 4 && strcasecmp(n + L - 4, ".mp4") == 0)
         || (L > 4 && strcasecmp(n + L - 4, ".cia") == 0);
 }
 static int cmp_entry(const void *a, const void *b) {
@@ -1226,15 +1229,17 @@ static int queue_add_front(const CatEntry *e) {   /* 1 = queued, 2 = was already
 static void fix_download_ext(char *dest, size_t cap) {
     size_t L = strlen(dest);
     if ((L > 7 && !strcasecmp(dest + L - 7, ".moflex")) ||
+        (L > 4 && !strcasecmp(dest + L - 4, ".mp4"))    ||
         (L > 4 && !strcasecmp(dest + L - 4, ".cia"))    ||
         (L > 4 && !strcasecmp(dest + L - 4, ".zip"))) return;   /* already typed */
     FILE *f = fopen(dest, "rb"); if (!f) return;
-    unsigned char b[4] = {0}; size_t r = fread(b, 1, 4, f); fclose(f);
+    unsigned char b[8] = {0}; size_t r = fread(b, 1, 8, f); fclose(f);
     if (r < 4) return;
     const char *ext = NULL;   /* rename only on a POSITIVE match -- an .srt must stay an .srt */
     if (b[0] == 0x4C && b[1] == 0x32) ext = ".moflex";                            /* moflex sync */
     else if (b[0] == 0x20 && b[1] == 0x20 && b[2] == 0 && b[3] == 0) ext = ".cia";
     else if (b[0] == 'P' && b[1] == 'K' && b[2] == 3 && b[3] == 4) ext = ".zip";
+    else if (r >= 8 && b[4] == 'f' && b[5] == 't' && b[6] == 'y' && b[7] == 'p') ext = ".mp4";  /* ISO-BMFF */
     if (!ext) return;
     char nd[PATHLEN + NAMELEN]; snprintf(nd, sizeof nd, "%s%s", dest, ext);
     if (rename(dest, nd) == 0) snprintf(dest, cap, "%s", nd);
@@ -3456,6 +3461,7 @@ static MoflexResult play_movie(const char *path) {
       size_t L = strlen(g_now_playing);   /* hide extension in the title */
       if (L > 7 && !strcasecmp(g_now_playing + L - 7, ".moflex")) g_now_playing[L - 7] = 0;
       else if (L > 4 && !strcasecmp(g_now_playing + L - 4, ".zip")) g_now_playing[L - 4] = 0;
+      else if (L > 4 && !strcasecmp(g_now_playing + L - 4, ".mp4")) g_now_playing[L - 4] = 0;
       else if (L > 4 && !strcasecmp(g_now_playing + L - 4, ".cia")) g_now_playing[L - 4] = 0; }
     if (s_dlw_active) {   /* playback and downloads fight over the SD card + CPU: pause first */
         if (prompt2("DOWNLOAD ACTIVE", "Playing pauses the current\ndownload (progress is kept).", "PLAY", "BACK") != 0) {
@@ -3474,7 +3480,10 @@ static MoflexResult play_movie(const char *path) {
     int was_scanning = !s_dt_done && !s_dt_consumed;
     if (was_scanning) { s_dt_pause = 1;
         for (int w = 0; w < 6 && !s_dt_paused && !s_dt_done; w++) svcSleepThread(30 * 1000 * 1000LL); }  /* let it park (<=180ms) */
-    MoflexResult r = moflex_play(path);
+    MoflexResult r;
+    { size_t L = strlen(path);   /* .mp4 -> the New-3DS hardware H.264 path; everything else -> moflex */
+      if (L > 4 && !strcasecmp(path + L - 4, ".mp4")) r = mp4_play(path);
+      else r = moflex_play(path); }
     if (was_scanning) s_dt_pause = 0;   /* resume the walk now that we are back on the menu */
     if (r == MOFLEX_ERROR) msg_screen("PLAY", "Could not play this file.\nIt does not look like a\nvalid moflex video.");
     cia_clear_selection();

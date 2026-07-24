@@ -79,6 +79,7 @@ AccessControlInfo:
    - http:C
    - ldr:ro
    - mcu::HWC
+   - mvd:STD
    - ndm:u
    - nim:s
    - ptm:sysm
@@ -178,6 +179,8 @@ SystemControlInfo:
     ir: 0x0004013000003302L
     mcu: 0x0004013000001f02L
     mic: 0x0004013000002002L
+    # MVD = the New-3DS hardware H.264 decoder used by the MP4 path (New-3DS-only module).
+    mvd: 0x0004013020004102L
     ndm: 0x0004013000002b02L
     news: 0x0004013000003502L
     nim: 0x0004013000002c02L
