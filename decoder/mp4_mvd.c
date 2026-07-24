@@ -90,9 +90,12 @@ void mp4_mvd_exit(void) {
 
 /* Blit one eye -- source columns [sx, sx+sw) of the decoded frame -- into a top-screen
  * framebuffer, aspect-fit (nearest-scaled, centered, letter/pillar-boxed) into 400x240 and
- * rotate-transposed into the column-major framebuffer. */
+ * rotate-transposed into the column-major framebuffer.
+ * The top screen runs 24-bit BGR8 (same as the moflex path -- required so the SHARED subtitle
+ * overlay, which writes 3-byte pixels, can never overrun a 16-bit buffer; also kills banding).
+ * MVD can only output 16-bit, so each 565 pixel is expanded to 888 here. */
 static void blit_eye(gfx3dSide_t side, int sx, int sw) {
-    u16 *fb = (u16 *)gfxGetFramebuffer(GFX_TOP, side, NULL, NULL);
+    u8 *fb = gfxGetFramebuffer(GFX_TOP, side, NULL, NULL);
     int sh = g_h, dw, dh;
     /* fit sw x sh into TOP_W x TOP_H preserving aspect */
     if (sw * TOP_H <= sh * TOP_W) { dh = TOP_H; dw = sw ? sw * TOP_H / sh : TOP_W; }  /* height-limited */
@@ -106,15 +109,21 @@ static void blit_eye(gfx3dSide_t side, int sx, int sw) {
     for (int dy = 0; dy < dh; dy++) srcrow[dy] = (dy * sh / dh) * g_w;
 
     for (int dx = 0; dx < TOP_W; dx++) {
-        u16 *col = fb + dx * TOP_H;
+        u8 *col = fb + (size_t)dx * TOP_H * 3;
         if (dx < dxoff || dx >= dxoff + dw) {            /* pillarbox column */
-            for (int dy = 0; dy < TOP_H; dy++) col[dy] = 0;
+            memset(col, 0, TOP_H * 3);
             continue;
         }
         int srcx = sx + (dx - dxoff) * sw / dw;
-        for (int dy = 0; dy < dyoff; dy++)               col[TOP_H - 1 - dy] = 0;                    /* top bar */
-        for (int dy = 0; dy < dh; dy++)                  col[TOP_H - 1 - (dy + dyoff)] = g_out[srcrow[dy] + srcx];
-        for (int dy = dyoff + dh; dy < TOP_H; dy++)      col[TOP_H - 1 - dy] = 0;                    /* bottom bar */
+        if (dyoff)                memset(col + (TOP_H - dyoff) * 3, 0, dyoff * 3);            /* top bar */
+        for (int dy = 0; dy < dh; dy++) {
+            u16 v = g_out[srcrow[dy] + srcx];
+            u8 *p = col + (TOP_H - 1 - (dy + dyoff)) * 3;
+            p[0] = (u8)((v << 3) | ((v >> 2) & 7));                    /* B: 5 -> 8 bits */
+            p[1] = (u8)(((v >> 3) & 0xFC) | ((v >> 9) & 3));           /* G: 6 -> 8 bits */
+            p[2] = (u8)(((v >> 8) & 0xF8) | (v >> 13));                /* R: 5 -> 8 bits */
+        }
+        if (dyoff + dh < TOP_H)   memset(col, 0, (TOP_H - dyoff - dh) * 3);                   /* bottom bar */
     }
 }
 

@@ -257,7 +257,8 @@ MoflexResult mp4_play(const char *path) {
      * resolution works: two 16:9 halves = 3.55:1, two 400x240 halves = 3.33:1, while normal 2D
      * films top out around 2.4:1. Threshold 2.7:1 splits them cleanly. */
     int sbs = (m.height > 0 && m.width * 10 > m.height * 27);
-    gfxSetScreenFormat(GFX_TOP, GSP_RGB565_OES);
+    gfxSetScreenFormat(GFX_TOP, GSP_BGR8_OES);   /* 24-bit like moflex: no banding, and the shared
+                                                  * subtitle overlay writes 3-byte pixels */
     gfxSet3D(sbs);
     gfxSetDoubleBuffering(GFX_TOP, true);
     gfxSetScreenFormat(GFX_BOTTOM, GSP_RGB565_OES);
