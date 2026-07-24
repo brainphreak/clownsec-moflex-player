@@ -227,6 +227,10 @@ int mp4_open(Mp4 *m, const char *path) {
     memset(m, 0, sizeof *m);
     m->f = fopen(path, "rb");
     if (!m->f) return 0;
+    setvbuf(m->f, NULL, _IOFBF, 128 * 1024);   /* SD reads are the frame budget: buffer big */
+    m->fa = fopen(path, "rb");                 /* audio's own handle -> two sequential streams
+                                                * instead of one seek-thrashing between them */
+    if (m->fa) setvbuf(m->fa, NULL, _IOFBF, 64 * 1024);
     fseeko(m->f, 0, SEEK_END);
     int64_t fsz = ftello(m->f);
     if (fsz <= 8) { mp4_close(m); return 0; }
@@ -257,6 +261,7 @@ int mp4_open(Mp4 *m, const char *path) {
 
 void mp4_close(Mp4 *m) {
     if (m->f) fclose(m->f);
+    if (m->fa) fclose(m->fa);
     free(m->vsamples); free(m->asamples);
     memset(m, 0, sizeof *m);
 }
@@ -264,6 +269,11 @@ void mp4_close(Mp4 *m) {
 int mp4_read_sample(Mp4 *m, const Mp4Sample *s, uint8_t *buf) {
     if (fseeko(m->f, s->offset, SEEK_SET)) return 0;
     return (int)fread(buf, 1, s->size, m->f);
+}
+int mp4_read_sample_audio(Mp4 *m, const Mp4Sample *s, uint8_t *buf) {
+    FILE *f = m->fa ? m->fa : m->f;
+    if (fseeko(f, s->offset, SEEK_SET)) return 0;
+    return (int)fread(buf, 1, s->size, f);
 }
 
 int mp4_keyframe_before(const Mp4 *m, int64_t dts) {

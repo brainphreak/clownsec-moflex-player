@@ -119,7 +119,7 @@ static void pump_audio(Mp4 *m, uint8_t *atmp) {
         if (wb->status == NDSP_WBUF_DONE) { g_a_played += g_slot_ns[i]; g_slot_ns[i] = 0; }
         if (g_a_next >= m->a_count) continue;
         Mp4Sample *as = &m->asamples[g_a_next];
-        int n  = mp4_read_sample(m, as, atmp);
+        int n  = mp4_read_sample_audio(m, as, atmp);
         int sp = (n == (int)as->size) ? mp4_aac_decode(&g_aac, atmp, n, g_abuf[i]) : 0;
         g_a_next++;
         if (sp <= 0) continue;
@@ -461,9 +461,21 @@ MoflexResult mp4_play(const char *path) {
 
         /* ---- decode next video frame ---- */
         Mp4Sample *s = &m.vsamples[vi];
+        u64 t0 = osGetTime();
         int n = mp4_read_sample(&m, s, buf);
+        u64 t1 = osGetTime();
         int got = (n == (int)s->size && mp4_mvd_decode(buf, n));
+        u64 t2 = osGetTime();
         pump_audio(&m, atmp);
+        u64 t3 = osGetTime();
+        {   /* stall forensics: any frame spending >50ms before its wait is a hiccup -- log it */
+            extern void mvd_log(const char *fmt, ...);
+            u32 rd = (u32)(t1 - t0), dec = (u32)(t2 - t1), aud = (u32)(t3 - t2);
+            if (rd + dec + aud > 50)
+                mvd_log("SPIKE f=%d size=%lu read=%lums decode=%lums audio=%lums kf=%d",
+                        vi, (unsigned long)s->size, (unsigned long)rd, (unsigned long)dec,
+                        (unsigned long)aud, s->keyframe);
+        }
         cur_us = v_time_us(&m, vi);
 
         /* ---- wait until this frame is due (audio-master), staying responsive ---- */

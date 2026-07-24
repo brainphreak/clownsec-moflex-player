@@ -27,7 +27,8 @@ typedef struct {
 } Mp4Sample;
 
 typedef struct {
-    FILE *f;
+    FILE *f;    /* video sample reads */
+    FILE *fa;   /* audio sample reads: OWN handle+buffer, so a/v never seek-thrash each other */
 
     /* ---- video (H.264 / avc1) ---- */
     int      has_video;
@@ -56,6 +57,7 @@ void mp4_close(Mp4 *m);
 
 /* Read a sample's bytes into buf (must be >= sample->size). Returns bytes read, 0 on error. */
 int  mp4_read_sample(Mp4 *m, const Mp4Sample *s, uint8_t *buf);
+int  mp4_read_sample_audio(Mp4 *m, const Mp4Sample *s, uint8_t *buf);
 
 /* Index of the last video keyframe at or before dts (for seeking). */
 int  mp4_keyframe_before(const Mp4 *m, int64_t dts);
