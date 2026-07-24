@@ -33,6 +33,7 @@
 * Fast downloads optimized to reach up to 5 Mbps (625 KB/s) on New 3DS
 * Download queue for automating multiple downloads
 * Resumable transfers for continuing download later
+* Subtitles download automatically with the movie when the catalog has them
 * TV Season zips extract themselves
 * Direct URL download
 * Download auto-retry on failure
