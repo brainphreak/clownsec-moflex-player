@@ -26,6 +26,7 @@ typedef struct {
     uint32_t *stsz; int stsz_cnt; uint32_t stsz_uniform;
     uint64_t *stco; int stco_cnt;
     uint32_t *stss; int stss_cnt;
+    uint32_t *ctts_n; int32_t *ctts_d; int ctts_cnt;   /* composition offsets (B-frames) */
 } Trak;
 
 /* ---- memory box iterator: fills type/body/bend for one child box in b[pos,end) ---- */
@@ -142,6 +143,11 @@ static void parse_stbl_leaf_mem(const uint8_t *b, uint32_t type, int64_t body, i
         uint32_t n = clamp_cnt(mu32(p + 4), avail, 4);
         t->stss = malloc((size_t)n * 4 + 4); t->stss_cnt = n;
         for (uint32_t i = 0; i < n; i++) t->stss[i] = mu32(p + 8 + i*4);
+    } else if (type == BOX('c','t','t','s')) {
+        uint32_t n = clamp_cnt(mu32(p + 4), avail, 8);
+        t->ctts_n = malloc((size_t)n * 4 + 4); t->ctts_d = malloc((size_t)n * 4 + 4); t->ctts_cnt = n;
+        /* version 0 stores unsigned offsets, version 1 signed -- reading as s32 handles both */
+        for (uint32_t i = 0; i < n; i++) { t->ctts_n[i] = mu32(p + 8 + i*8); t->ctts_d[i] = (int32_t)mu32(p + 8 + i*8 + 4); }
     }
 }
 
@@ -162,6 +168,11 @@ static Mp4Sample *assemble(Trak *t, int *count) {
     for (int e = 0; e < t->stts_cnt && idx < n; e++)
         for (uint32_t k = 0; k < t->stts_n[e] && idx < n; k++) { s[idx].dts = dts; dts += t->stts_d[e]; idx++; }
     for (; idx < n; idx++) s[idx].dts = dts;
+    /* composition times: dts + ctts run-length offsets (no ctts box = no B-frames = cts == dts) */
+    idx = 0;
+    for (int e = 0; e < t->ctts_cnt && idx < n; e++)
+        for (uint32_t k = 0; k < t->ctts_n[e] && idx < n; k++) { s[idx].cts = s[idx].dts + t->ctts_d[e]; idx++; }
+    for (; idx < n; idx++) s[idx].cts = s[idx].dts;
     if (t->stss_cnt > 0) {
         for (int i = 0; i < n; i++) s[i].keyframe = 0;
         for (int i = 0; i < t->stss_cnt; i++) { int k = (int)t->stss[i] - 1; if (k >= 0 && k < n) s[k].keyframe = 1; }
@@ -173,6 +184,7 @@ static Mp4Sample *assemble(Trak *t, int *count) {
 static void trak_free_tables(Trak *t) {
     free(t->stts_n); free(t->stts_d); free(t->stsc_first); free(t->stsc_spc);
     free(t->stsz); free(t->stco); free(t->stss);
+    free(t->ctts_n); free(t->ctts_d);
 }
 static void finalize_trak(Mp4 *m, Trak *t) {
     if (t->is_video && !m->has_video) {

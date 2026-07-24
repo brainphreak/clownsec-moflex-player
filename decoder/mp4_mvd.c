@@ -32,7 +32,12 @@ static int            g_ready = 0, g_first = 1;
 static MVDSTD_Config  g_config;
 static uint8_t       *g_pkt = NULL;       /* Annex-B packet for a frame */
 static size_t         g_pkt_cap = 0;
-static u16           *g_out = NULL;        /* MVD writes the decoded frame here (linear BGR565) */
+#define MVD_SLOTS 5   /* rotating decoded-frame buffers: B-frame reordering presents frames
+                       * OUT of decode order, so a decoded frame must survive until its display
+                       * time while later frames keep decoding (queue depth 4 + 1 in flight) */
+static u16           *g_outs[MVD_SLOTS];
+static int            g_slot = 0;
+#define g_out (g_outs[g_slot])
 static int            g_w = 0, g_h = 0, g_nal_len = 4;   /* DISPLAY dims (from the stsd box) */
 static int            g_cw = 0, g_ch = 0;   /* CODED dims: 16-aligned macroblock size. H.264 codes
                                              * whole MBs (e.g. 800x166 display = 800x176 coded);
@@ -89,9 +94,11 @@ int mp4_mvd_init(int w, int h, const uint8_t *avcc, int avcc_len, int nal_len_si
     mvd_log("STEP 2: linearSpaceFree=%lu", (unsigned long)linearSpaceFree());
     g_pkt_cap = 2 * 1024 * 1024;
     g_pkt = (uint8_t *)linearAlloc(g_pkt_cap);
-    g_out = (u16 *)linearAlloc((size_t)g_cw * g_ch * sizeof(u16));
-    mvd_log("STEP 3: pkt=%p out=%p", g_pkt, g_out);
-    if (!g_pkt || !g_out) { mp4_mvd_exit(); return 0; }
+    int allock = 1;
+    for (int i = 0; i < MVD_SLOTS; i++) { g_outs[i] = (u16 *)linearAlloc((size_t)g_cw * g_ch * sizeof(u16)); if (!g_outs[i]) allock = 0; }
+    g_slot = 0;
+    mvd_log("STEP 3: pkt=%p out0=%p", g_pkt, g_outs[0]);
+    if (!g_pkt || !allock) { mp4_mvd_exit(); return 0; }
 
     Result ir = mvdstdInit(MVDMODE_VIDEOPROCESSING, MVD_INPUT_H264, MVD_OUTPUT_BGR565,
                            MVD_DEFAULT_WORKBUF_SIZE, NULL);
@@ -118,7 +125,7 @@ void mp4_mvd_reset(void) {
 void mp4_mvd_exit(void) {
     if (g_ready) mvdstdExit();
     if (g_pkt) { linearFree(g_pkt); g_pkt = NULL; }
-    if (g_out) { linearFree(g_out); g_out = NULL; }
+    for (int i = 0; i < MVD_SLOTS; i++) if (g_outs[i]) { linearFree(g_outs[i]); g_outs[i] = NULL; }
     g_ready = 0;
 }
 
@@ -161,9 +168,12 @@ static void blit_eye(gfx3dSide_t side, int sx, int sw) {
     }
 }
 
-void mp4_mvd_present(int sbs) {
+void mp4_mvd_present(int slot, int sbs) {
+    int save = g_slot;
+    if (slot >= 0 && slot < MVD_SLOTS) g_slot = slot;   /* blit reads g_out == g_outs[g_slot] */
     if (sbs) { int hw = g_w / 2; blit_eye(GFX_LEFT, 0, hw); blit_eye(GFX_RIGHT, hw, hw); }
     else     { blit_eye(GFX_LEFT, 0, g_w); }
+    g_slot = save;
 }
 
 int mp4_mvd_decode(const uint8_t *sample, int size) {
@@ -204,5 +214,7 @@ int mp4_mvd_decode(const uint8_t *sample, int size) {
     GSPGPU_InvalidateDataCache(g_out, (u32)g_cw * g_ch * sizeof(u16));
     if (!corners_changed()) return 0;   /* MVD didn't actually write a frame yet */
 
-    return 1;
+    int produced = g_slot;                    /* this slot now holds a display-ready frame */
+    g_slot = (g_slot + 1) % MVD_SLOTS;        /* next decode writes the next slot */
+    return produced + 1;                      /* slot+1 so 0 keeps meaning "no frame" */
 }

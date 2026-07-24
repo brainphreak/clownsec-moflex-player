@@ -71,6 +71,26 @@ static void clk_set(int64_t us, int running) { g_clk_base_us = us; g_clk_t0 = os
 static void clk_pause(void)  { if (g_clk_running) { g_clk_base_us += (int64_t)(osGetTime() - g_clk_t0) * 1000; g_clk_running = 0; } }
 static void clk_resume(void) { if (!g_clk_running) { g_clk_t0 = osGetTime(); g_clk_running = 1; } }
 
+/* ---- HOME/sleep safety: holding gsp::Lcd across an APT suspend hard-locks the GSP (the
+ * moflex engines learned this the hard way) -- release it when HOME opens, re-acquire on
+ * return; pause/resume audio alongside. ---- */
+static aptHookCookie g_mp4_apt_cookie;
+static void mp4_apt_hook(APT_HookType t, void *u) {
+    (void)u;
+    switch (t) {
+        case APTHOOK_ONSUSPEND: case APTHOOK_ONSLEEP:
+            if (g_screen_off) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; }
+            if (g_lcd_ok) { gspLcdExit(); g_lcd_ok = 0; }
+            if (g_have_audio) ndspChnSetPaused(0, true);
+            break;
+        case APTHOOK_ONRESTORE: case APTHOOK_ONWAKEUP:
+            if (!g_lcd_ok) g_lcd_ok = R_SUCCEEDED(gspLcdInit());
+            if (g_have_audio && g_playing) ndspChnSetPaused(0, false);
+            break;
+        default: break;
+    }
+}
+
 /* ---- battery (local; New-3DS panel) ---- */
 static int  g_batt = -1, g_batt_chg = 0, g_mcu_ok = 0;
 static u64  g_batt_next = 0;
@@ -96,6 +116,16 @@ static int64_t v_time_us(Mp4 *m, int i) {
     if (m->v_timescale <= 0) return 0;
     return (int64_t)(m->vsamples[i].dts * 1000000LL / (int64_t)m->v_timescale);
 }
+static int64_t v_cts_us(Mp4 *m, int i) {   /* DISPLAY time: with B-frames this != decode time */
+    if (m->v_timescale <= 0) return 0;
+    return (int64_t)(m->vsamples[i].cts * 1000000LL / (int64_t)m->v_timescale);
+}
+/* B-frame reorder queue: decoded frames wait here (by slot) until their DISPLAY time comes up.
+ * Depth 4 covers x264's default reorder distance with margin; adds ~4 frames of start latency. */
+#define PQ_DEPTH 4
+static struct { int64_t cts; int slot; } g_pq[PQ_DEPTH];
+static int g_pq_n = 0;
+
 static int64_t a_time_us(Mp4 *m, int i) {
     if (m->a_timescale <= 0) return 0;
     return (int64_t)(m->asamples[i].dts * 1000000LL / (int64_t)m->a_timescale);
@@ -210,12 +240,14 @@ static void do_seek(Mp4 *m, uint8_t *vbuf, uint8_t *atmp, int sbs, int64_t dur_u
     int tvi = kf; while (tvi + 1 < m->v_count && v_time_us(m, tvi + 1) <= target_us) tvi++;
 
     mp4_mvd_reset();
+    g_pq_n = 0;   /* seek invalidates queued frames */
     int got = 0;
     for (int j = kf; j <= tvi; j++) {
         int nn = mp4_read_sample(m, &m->vsamples[j], vbuf);
-        got = (nn == (int)m->vsamples[j].size && mp4_mvd_decode(vbuf, nn));
+        int r = (nn == (int)m->vsamples[j].size) ? mp4_mvd_decode(vbuf, nn) : 0;
+        if (r) got = r;
     }
-    if (got) { mp4_mvd_present(sbs); moflex_sub_overlay(sbs, target_us); gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank(); }
+    if (got) { mp4_mvd_present(got - 1, sbs); moflex_sub_overlay(sbs, target_us); gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank(); }
     *vi = tvi + 1;
 
     if (g_have_audio) {
@@ -341,6 +373,7 @@ MoflexResult mp4_play(const char *path) {
 
     g_mcu_ok = R_SUCCEEDED(mcuHwcInit());
     g_lcd_ok = R_SUCCEEDED(gspLcdInit()); g_screen_off = 0;   /* bottom-screen-off button */
+    aptHook(&g_mp4_apt_cookie, mp4_apt_hook, NULL);   /* HOME/sleep must release gsp::Lcd */
     g_pvol = moflex_vol_get();
     g_playing = 1;
 
@@ -452,31 +485,39 @@ MoflexResult mp4_play(const char *path) {
         }
         if (was_paused) { if (g_have_audio) ndspChnSetPaused(0, false); clk_resume(); was_paused = 0; }
 
-        /* ---- EOF ---- */
-        if (vi >= m.v_count) {   /* finished: clear resume + mark watched (library badges/sort) */
+        /* ---- EOF: only after the reorder queue has fully drained ---- */
+        if (vi >= m.v_count && g_pq_n == 0) {   /* finished: clear resume + mark watched */
             moflex_resume_clear(path);
             moflex_watched_set(path, 1);
             result = MOFLEX_EOF; break;
         }
 
-        /* ---- decode next video frame ---- */
-        Mp4Sample *s = &m.vsamples[vi];
-        u64 t0 = osGetTime();
-        int n = mp4_read_sample(&m, s, buf);
-        u64 t1 = osGetTime();
-        int got = (n == (int)s->size && mp4_mvd_decode(buf, n));
-        u64 t2 = osGetTime();
-        pump_audio(&m, atmp);
-        u64 t3 = osGetTime();
-        {   /* stall forensics: any frame spending >50ms before its wait is a hiccup -- log it */
-            extern void mvd_log(const char *fmt, ...);
-            u32 rd = (u32)(t1 - t0), dec = (u32)(t2 - t1), aud = (u32)(t3 - t2);
-            if (rd + dec + aud > 50)
-                mvd_log("SPIKE f=%d size=%lu read=%lums decode=%lums audio=%lums kf=%d",
-                        vi, (unsigned long)s->size, (unsigned long)rd, (unsigned long)dec,
-                        (unsigned long)aud, s->keyframe);
+        /* ---- decode ahead: keep the reorder queue full so frames can present in DISPLAY
+         * order (B-frames arrive out of order; presenting by decode order judders motion) ---- */
+        while (vi < m.v_count && g_pq_n < PQ_DEPTH) {
+            Mp4Sample *s = &m.vsamples[vi];
+            u64 t0 = osGetTime();
+            int n = mp4_read_sample(&m, s, buf);
+            u64 t1 = osGetTime();
+            int r = (n == (int)s->size) ? mp4_mvd_decode(buf, n) : 0;
+            u64 t2 = osGetTime();
+            pump_audio(&m, atmp);
+            u64 t3 = osGetTime();
+            {   /* stall forensics: any frame spending >50ms here is a hiccup -- log it */
+                extern void mvd_log(const char *fmt, ...);
+                u32 rd = (u32)(t1 - t0), dec = (u32)(t2 - t1), aud = (u32)(t3 - t2);
+                if (rd + dec + aud > 50)
+                    mvd_log("SPIKE f=%d size=%lu read=%lums decode=%lums audio=%lums kf=%d",
+                            vi, (unsigned long)s->size, (unsigned long)rd, (unsigned long)dec,
+                            (unsigned long)aud, s->keyframe);
+            }
+            if (r) { g_pq[g_pq_n].cts = v_cts_us(&m, vi); g_pq[g_pq_n].slot = r - 1; g_pq_n++; }
+            vi++;
         }
-        cur_us = v_time_us(&m, vi);
+        if (g_pq_n == 0) continue;   /* nothing display-ready yet (decoder still priming) */
+        int mi = 0;
+        for (int i = 1; i < g_pq_n; i++) if (g_pq[i].cts < g_pq[mi].cts) mi = i;
+        cur_us = g_pq[mi].cts;
 
         /* ---- wait until this frame is due (audio-master), staying responsive ---- */
         for (;;) {
@@ -497,9 +538,11 @@ MoflexResult mp4_play(const char *path) {
         if (quit) break;
         if (!g_playing) continue;   /* got paused mid-wait -> re-handle */
 
-        if (got) { mp4_mvd_present(sbs); moflex_sub_overlay(sbs, cur_us); gfxFlushBuffers(); gfxSwapBuffers(); }
+        mp4_mvd_present(g_pq[mi].slot, sbs);
+        moflex_sub_overlay(sbs, cur_us);
+        gfxFlushBuffers(); gfxSwapBuffers();
+        g_pq[mi] = g_pq[--g_pq_n];   /* consumed */
         gspWaitForVBlank();
-        vi++;
     }
 
     /* ---- save state on exit ---- */
@@ -514,6 +557,7 @@ MoflexResult mp4_play(const char *path) {
         for (int i = 0; i < NWB; i++) if (g_abuf[i]) { linearFree(g_abuf[i]); g_abuf[i] = NULL; }
         mp4_aac_close(&g_aac);
     }
+    aptUnhook(&g_mp4_apt_cookie);
     if (g_screen_off) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; }
     if (g_lcd_ok) { gspLcdExit(); g_lcd_ok = 0; }
     if (g_mcu_ok) { mcuHwcExit(); g_mcu_ok = 0; }

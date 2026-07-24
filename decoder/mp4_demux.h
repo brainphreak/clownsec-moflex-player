@@ -23,6 +23,8 @@ typedef struct {
     int64_t offset;    /* absolute file offset of the sample */
     uint32_t size;     /* sample size in bytes */
     int64_t dts;       /* decode timestamp, in the track's timescale units */
+    int64_t cts;       /* COMPOSITION (display) timestamp: dts + ctts offset. With B-frames
+                        * decode order != display order -- present frames sorted by THIS. */
     int keyframe;      /* 1 = sync sample (IDR); seek targets */
 } Mp4Sample;
 
