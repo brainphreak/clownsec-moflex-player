@@ -19,16 +19,22 @@ static MVDSTD_Config  g_config;
 static uint8_t       *g_pkt = NULL;       /* Annex-B packet for a frame */
 static size_t         g_pkt_cap = 0;
 static u16           *g_out = NULL;        /* MVD writes the decoded frame here (linear BGR565) */
-static int            g_w = 0, g_h = 0, g_nal_len = 4;
+static int            g_w = 0, g_h = 0, g_nal_len = 4;   /* DISPLAY dims (from the stsd box) */
+static int            g_cw = 0, g_ch = 0;   /* CODED dims: 16-aligned macroblock size. H.264 codes
+                                             * whole MBs (e.g. 800x166 display = 800x176 coded);
+                                             * MVD must be configured -- and the output buffer
+                                             * sized -- for the CODED frame, or the sysmodule
+                                             * itself data-aborts (hard system crash). The blit
+                                             * crops back to the display size. */
 static uint8_t        g_avcc[512];         /* saved SPS/PPS, for re-priming after a seek */
 static int            g_avcc_len = 0;
 
 static void set_corners(void) {
-    uint8_t *d = (uint8_t *)g_out; int w = g_w, h = g_h;
+    uint8_t *d = (uint8_t *)g_out; int w = g_cw, h = g_ch;
     d[0] = 0x11; d[w*2 - 1] = 0x11; d[(w*h*2) - (w*2)] = 0x11; d[w*h*2 - 1] = 0x11;
 }
 static int corners_changed(void) {
-    const uint8_t *d = (const uint8_t *)g_out; int w = g_w, h = g_h;
+    const uint8_t *d = (const uint8_t *)g_out; int w = g_cw, h = g_ch;
     return d[0] != 0x11 || d[w*2 - 1] != 0x11 || d[(w*h*2) - (w*2)] != 0x11 || d[w*h*2 - 1] != 0x11;
 }
 
@@ -55,17 +61,18 @@ int mp4_mvd_init(int w, int h, const uint8_t *avcc, int avcc_len, int nal_len_si
     g_first = 1;
     g_nal_len = (nal_len_size == 1 || nal_len_size == 2 || nal_len_size == 4) ? nal_len_size : 4;
     g_w = w; g_h = h;
+    g_cw = (w + 15) & ~15; g_ch = (h + 15) & ~15;
     g_avcc_len = (avcc && avcc_len > 0 && avcc_len <= (int)sizeof g_avcc) ? avcc_len : 0;
     if (g_avcc_len) memcpy(g_avcc, avcc, g_avcc_len);
 
     g_pkt_cap = 2 * 1024 * 1024;
     g_pkt = (uint8_t *)linearAlloc(g_pkt_cap);
-    g_out = (u16 *)linearAlloc((size_t)w * h * sizeof(u16));
+    g_out = (u16 *)linearAlloc((size_t)g_cw * g_ch * sizeof(u16));
     if (!g_pkt || !g_out) { mp4_mvd_exit(); return 0; }
 
     if (R_FAILED(mvdstdInit(MVDMODE_VIDEOPROCESSING, MVD_INPUT_H264, MVD_OUTPUT_BGR565,
                             MVD_DEFAULT_WORKBUF_SIZE, NULL))) { mp4_mvd_exit(); return 0; }
-    mvdstdGenerateDefaultConfig(&g_config, (u32)w, (u32)h, (u32)w, (u32)h, NULL, NULL, NULL);
+    mvdstdGenerateDefaultConfig(&g_config, (u32)g_cw, (u32)g_ch, (u32)g_cw, (u32)g_ch, NULL, NULL, NULL);
     g_config.output_type = MVD_OUTPUT_BGR565;
 
     prime_sps_pps();
@@ -106,7 +113,7 @@ static void blit_eye(gfx3dSide_t side, int sx, int sw) {
 
     /* precompute the source row for each destination row (avoids a divide per pixel) */
     static int srcrow[TOP_H];
-    for (int dy = 0; dy < dh; dy++) srcrow[dy] = (dy * sh / dh) * g_w;
+    for (int dy = 0; dy < dh; dy++) srcrow[dy] = (dy * sh / dh) * g_cw;   /* stride = CODED width */
 
     for (int dx = 0; dx < TOP_W; dx++) {
         u8 *col = fb + (size_t)dx * TOP_H * 3;
@@ -150,7 +157,7 @@ int mp4_mvd_decode(const uint8_t *sample, int size) {
 
     g_config.physaddr_outdata0 = osConvertVirtToPhys(g_out);
     set_corners();
-    GSPGPU_FlushDataCache(g_out, (u32)g_w * g_h * sizeof(u16));
+    GSPGPU_FlushDataCache(g_out, (u32)g_cw * g_ch * sizeof(u16));
     GSPGPU_FlushDataCache(g_pkt, off);
 
     Result r = mvdstdProcessVideoFrame(g_pkt, off, 0, NULL);
@@ -159,7 +166,7 @@ int mp4_mvd_decode(const uint8_t *sample, int size) {
 
     /* render the decoded frame into g_out (the config points there) */
     mvdstdRenderVideoFrame(&g_config, true);
-    GSPGPU_InvalidateDataCache(g_out, (u32)g_w * g_h * sizeof(u16));
+    GSPGPU_InvalidateDataCache(g_out, (u32)g_cw * g_ch * sizeof(u16));
     if (!corners_changed()) return 0;   /* MVD didn't actually write a frame yet */
 
     return 1;

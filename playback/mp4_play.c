@@ -284,6 +284,13 @@ MoflexResult mp4_play(const char *path) {
         mp4_msg("MP4 video track is missing its H.264 config (avcC).");
         mp4_close(&m); return MOFLEX_QUIT_BACK;
     }
+    /* The container can LIE about the codec (an HEVC stream remuxed under an 'avc1' label
+     * hard-crashes the MVD sysmodule = full system crash). A real H.264 avcC starts with
+     * version 1 and its first SPS NAL has type 7 -- HEVC bits fail both. */
+    if (m.avcc[0] != 1 || (m.avcc_len > 8 && (m.avcc[8] & 0x1F) != 7)) {
+        mp4_msg("Video stream is not valid H.264\n(mislabeled file?). Re-encode\nwith x264 (H.264/AVC).");
+        mp4_close(&m); return MOFLEX_QUIT_BACK;
+    }
     /* ANY resolution the hardware can decode is accepted -- the present step aspect-fits each
      * frame (or each SBS half) into the 400x240 screen, so 480p/720p/1080p files just work.
      * Only refuse what MVD itself cannot do (H.264 level 4.x frame limit). */
