@@ -11,6 +11,7 @@ typedef struct {
     char fname[CAT_NAMELEN];  /* filename to save as */
     char url[CAT_URLLEN];     /* download URL (fully encoded) */
     char art[CAT_URLLEN];     /* artwork/poster URL */
+    char sub[CAT_URLLEN];     /* subtitle (.srt) URL from the catalog, "" if none */
     char genres[96];          /* "Genre1, Genre2, ..." */
     char category[32];        /* "Movies" / "TV Shows" / "Music" / ... (normalized across catalogs) */
     char desc[400];           /* description */
