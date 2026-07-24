@@ -2662,8 +2662,12 @@ static int dlw_poll(void) {
         aptSetSleepAllowed(true);            /* lid closed -> the console can nap now */
         dl_wifi_hold(0);
         if (!s_dlw_stop) dl_led(1, 0);       /* real failure: red light so a closed lid still tells you */
-        qtoast(s_dlw_stop ? "Download paused"
-               : download_write_failed() ? "Download failed - SD full?" : "Download failed");
+        if (s_dlw_stop) qtoast("Download paused");
+        else if (download_write_failed()) qtoast("Download failed - SD full?");
+        else if (download_last_http() >= 400) {   /* e.g. 404 = the file is missing on the server */
+            char m[40]; snprintf(m, sizeof m, "Download failed: HTTP %ld", download_last_http());
+            qtoast(m);
+        } else qtoast("Download failed");
         return 1;
     }
     QItem q = s_dlw_item;
