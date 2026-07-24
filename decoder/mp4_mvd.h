@@ -12,13 +12,13 @@
 int  mp4_mvd_init(int w, int h, const uint8_t *avcc, int avcc_len, int nal_len_size);
 void mp4_mvd_exit(void);
 
-/* Decode one MP4 video sample (AVCC: length-prefixed NAL units) into the next rotating frame
- * buffer. Returns SLOT+1 if a frame was produced (pass slot to mp4_mvd_present), 0 otherwise.
- * Frames survive in their slot until ~4 further decodes -- enough for B-frame reordering. */
-int  mp4_mvd_decode(const uint8_t *sample, int size);
+/* One decode-pump step (reference-player state machine). If pictures are pending inside the
+ * decoder, drains one (sample ignored); otherwise feeds `sample` (*consumed set to 1).
+ * Returns SLOT+1 when a picture was obtained (pass slot to mp4_mvd_present), 0 otherwise. */
+int  mp4_mvd_pump(const uint8_t *sample, int size, int *consumed);
 
-/* Pop a FURTHER held picture (B-frame streams). Returns slot+1, or 0 when none pending. */
-int  mp4_mvd_render_extra(void);
+/* Nonzero while the decoder holds pictures that must be drained before feeding more. */
+int  mp4_mvd_pending(void);
 
 /* Re-prime the decoder after a seek so it resyncs on the next keyframe. Decode the keyframe and
  * any following frames up to the seek target (discarding output) before presenting again. */

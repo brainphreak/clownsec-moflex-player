@@ -28,7 +28,17 @@ void mvd_log(const char *fmt, ...) {
 #define TOP_W 400
 #define TOP_H 240
 
+/* MVD result codes (documented by the Video_player_for_3DS project) */
+#define MVD_ST_OK         0x17000
+#define MVD_ST_PARAMSET   0x17001
+#define MVD_ST_BUSY       0x17002
+#define MVD_ST_FRAMEREADY 0x17003
+#define MVD_ST_INCOMPLETE 0x17004
+
 static int            g_ready = 0, g_first = 1;
+static int            g_skip_feed = 0;   /* a picture surfaced during ProcessVideoFrame: MORE may
+                                          * be held -- drain via render before feeding again
+                                          * (feeding while pictures pend loses them) */
 static MVDSTD_Config  g_config;
 static uint8_t       *g_pkt = NULL;       /* Annex-B packet for a frame */
 static size_t         g_pkt_cap = 0;
@@ -121,6 +131,7 @@ void mp4_mvd_reset(void) {
     if (!g_ready) return;
     prime_sps_pps();
     g_first = 1;
+    g_skip_feed = 0;
     g_logframes = 0;   /* re-log the first frames after every seek */
 }
 
@@ -178,61 +189,69 @@ void mp4_mvd_present(int slot, int sbs) {
     g_slot = save;
 }
 
-int mp4_mvd_decode(const uint8_t *sample, int size) {
-    if (!g_ready) return 0;
+/* ---- reference-player decode state machine (modeled on Video_player_for_3DS) ----
+ * KEY facts learned from their source + our logs:
+ *  1. the output buffer must be CONFIGURED (MVDSTD_SetConfig) BEFORE ProcessVideoFrame --
+ *     pictures are often written DURING processing, into whatever buffer was last configured;
+ *  2. when a picture surfaces during processing, STOP feeding and drain via render until dry;
+ *  3. render is asynchronous: retry while it returns MVD_ST_BUSY. */
 
-    /* build one Annex-B packet from all of this frame's length-prefixed NALs */
-    int off = 0, sp = 0;
-    while (sp + g_nal_len <= size) {
-        uint32_t nlen = 0;
-        for (int b = 0; b < g_nal_len; b++) nlen = (nlen << 8) | sample[sp + b];
-        sp += g_nal_len;
-        if (nlen == 0 || sp + (int)nlen > size) break;
-        if ((size_t)(off + 3 + nlen) > g_pkt_cap) break;
-        g_pkt[off] = 0; g_pkt[off+1] = 0; g_pkt[off+2] = 1; off += 3;
-        memcpy(g_pkt + off, sample + sp, nlen); off += (int)nlen; sp += (int)nlen;
-    }
-    if (off == 0) return 0;
-
-    int lg = (g_logframes < 6); if (lg) g_logframes++;
+static void slot_arm(void) {   /* point MVD at the CURRENT slot + set sentinels, BEFORE decoding */
     g_config.physaddr_outdata0 = osConvertVirtToPhys(g_out);
+    MVDSTD_SetConfig(&g_config);
     set_corners();
     GSPGPU_FlushDataCache(g_out, (u32)g_cw * g_ch * sizeof(u16));
-    GSPGPU_FlushDataCache(g_pkt, off);
-
-    void *pkt_mvd = osConvertOldLINEARMemToNew(g_pkt);   /* mvd needs NEW-range linear addresses */
-    if (lg) mvd_log("STEP 7: frame %d process (annexb %d bytes, first NAL type %d)", g_logframes, off, g_pkt[3] & 0x1F);
-    Result r = mvdstdProcessVideoFrame(pkt_mvd, off, 0, NULL);
-    if (lg) mvd_log("STEP 8: frame %d processed r=%08lX first=%d", g_logframes, (unsigned long)r, g_first);
-    if (g_first) { mvdstdProcessVideoFrame(pkt_mvd, off, 0, NULL); g_first = 0;
-                   if (lg) mvd_log("STEP 8b: first-frame-twice done"); }   /* MVD needs the first frame twice */
-    if (!MVD_CHECKNALUPROC_SUCCESS(r)) return 0;
-
-    /* render the decoded frame into g_out (the config points there) */
-    if (lg) mvd_log("STEP 9: frame %d render", g_logframes);
-    mvdstdRenderVideoFrame(&g_config, true);
-    if (lg) mvd_log("STEP 10: frame %d rendered", g_logframes);
-    GSPGPU_InvalidateDataCache(g_out, (u32)g_cw * g_ch * sizeof(u16));
-    if (!corners_changed()) return 0;   /* MVD didn't actually write a frame yet */
-
-    int produced = g_slot;                    /* this slot now holds a display-ready frame */
-    g_slot = (g_slot + 1) % MVD_SLOTS;        /* next decode writes the next slot */
-    return produced + 1;                      /* slot+1 so 0 keeps meaning "no frame" */
 }
-
-/* Pull ANOTHER display-ready picture out of the decoder without feeding more data. B-frame
- * streams surface pictures late, and the module can hold several -- popping only one per
- * feed lost 2 of 3 frames. Returns slot+1 when a picture appeared, 0 when the decoder had
- * nothing more (sentinel corners untouched). */
-int mp4_mvd_render_extra(void) {
-    if (!g_ready) return 0;
-    g_config.physaddr_outdata0 = osConvertVirtToPhys(g_out);
-    set_corners();
-    GSPGPU_FlushDataCache(g_out, (u32)g_cw * g_ch * sizeof(u16));
-    mvdstdRenderVideoFrame(&g_config, true);
+static int slot_take(void) {   /* did a picture land in the armed slot? claim it if so */
     GSPGPU_InvalidateDataCache(g_out, (u32)g_cw * g_ch * sizeof(u16));
     if (!corners_changed()) return 0;
-    int produced = g_slot;
+    int p = g_slot;
     g_slot = (g_slot + 1) % MVD_SLOTS;
-    return produced + 1;
+    return p + 1;
+}
+
+int mp4_mvd_pending(void) { return g_skip_feed; }
+
+/* One output attempt. If `sample` is non-NULL and no pictures are pending, it is fed
+ * (*consumed = 1). Returns slot+1 when a picture was obtained, 0 otherwise. */
+int mp4_mvd_pump(const uint8_t *sample, int size, int *consumed) {
+    if (consumed) *consumed = 0;
+    if (!g_ready) return 0;
+    slot_arm();
+    int got = 0;
+
+    if (!g_skip_feed && sample && size > 0) {
+        /* build one Annex-B packet from all of this frame's length-prefixed NALs */
+        int off = 0, sp = 0;
+        while (sp + g_nal_len <= size) {
+            uint32_t nlen = 0;
+            for (int b = 0; b < g_nal_len; b++) nlen = (nlen << 8) | sample[sp + b];
+            sp += g_nal_len;
+            if (nlen == 0 || sp + (int)nlen > size) break;
+            if ((size_t)(off + 3 + nlen) > g_pkt_cap) break;
+            g_pkt[off] = 0; g_pkt[off+1] = 0; g_pkt[off+2] = 1; off += 3;
+            memcpy(g_pkt + off, sample + sp, nlen); off += (int)nlen; sp += (int)nlen;
+        }
+        if (off == 0) return 0;
+        if (consumed) *consumed = 1;
+        GSPGPU_FlushDataCache(g_pkt, off);
+        void *pkt_mvd = osConvertOldLINEARMemToNew(g_pkt);   /* mvd needs NEW-range addresses */
+        Result r = mvdstdProcessVideoFrame(pkt_mvd, off, 0, NULL);
+        if (g_first) { mvdstdProcessVideoFrame(pkt_mvd, off, 0, NULL); g_first = 0; }
+        int lg = (g_logframes < 6); if (lg) { g_logframes++;
+            mvd_log("FEED %d bytes r=%08lX", off, (unsigned long)r); }
+        got = slot_take();
+        if (got) g_skip_feed = 1;   /* picture DURING processing -> more may be held */
+    }
+
+    if (!got) {
+        for (int tries = 0; tries < 256; tries++) {
+            Result rr = mvdstdRenderVideoFrame(&g_config, false);
+            got = slot_take();
+            if (got) break;
+            if (rr != (Result)MVD_ST_BUSY) break;
+        }
+        if (!got) g_skip_feed = 0;   /* decoder is dry -> next pump must feed */
+    }
+    return got;
 }

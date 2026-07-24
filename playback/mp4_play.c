@@ -259,8 +259,10 @@ static void do_seek(Mp4 *m, uint8_t *vbuf, uint8_t *atmp, int sbs, int64_t dur_u
     u64 sk0 = osGetTime();
     int got = 0, prod = 0;
     for (int j = kf; j <= tvi; j++) {
+        int c = 0;
+        while (mp4_mvd_pending()) { if (!mp4_mvd_pump(NULL, 0, &c)) break; prod++; }   /* drain */
         int nn = mp4_read_sample(m, &m->vsamples[j], vbuf);
-        int r = (nn == (int)m->vsamples[j].size) ? mp4_mvd_decode(vbuf, nn) : 0;
+        int r = (nn == (int)m->vsamples[j].size) ? mp4_mvd_pump(vbuf, nn, &c) : 0;
         if (r) { got = r; prod++; }
     }
     mvd_log("SEEK to=%llds kf=%d tvi=%d decoded=%d produced=%d took=%lums",
@@ -519,33 +521,31 @@ MoflexResult mp4_play(const char *path) {
 
         /* ---- decode ahead: keep the reorder queue full so frames can present in DISPLAY
          * order (B-frames arrive out of order; presenting by decode order judders motion) ---- */
-        while (vi < m.v_count && g_pq_n < PQ_DEPTH) {
-            Mp4Sample *s = &m.vsamples[vi];
-            u64 t0 = osGetTime();
-            int n = mp4_read_sample(&m, s, buf);
-            u64 t1 = osGetTime();
-            int r = (n == (int)s->size) ? mp4_mvd_decode(buf, n) : 0;
-            u64 t2 = osGetTime();
+        while (g_pq_n < PQ_DEPTH && (vi < m.v_count || mp4_mvd_pending())) {
+            int consumed = 0, r = 0;
+            u64 t0 = osGetTime(), t1 = t0, t2;
+            if (!mp4_mvd_pending() && vi < m.v_count) {
+                Mp4Sample *s = &m.vsamples[vi];
+                int n = mp4_read_sample(&m, s, buf);
+                t1 = osGetTime();
+                if (g_ftn < 16) g_ft[g_ftn++] = v_cts_us(&m, vi);   /* pool the display time */
+                r = (n == (int)s->size) ? mp4_mvd_pump(buf, n, &consumed) : 0;
+                vi++;
+            } else {
+                r = mp4_mvd_pump(NULL, 0, &consumed);   /* drain a held picture */
+                if (!r && vi >= m.v_count) break;       /* tail fully drained */
+            }
+            t2 = osGetTime();
             pump_audio(&m, atmp);
-            u64 t3 = osGetTime();
-            {   /* stall forensics: any frame spending >50ms here is a hiccup -- log it */
+            {   /* stall forensics: any pump spending >50ms is a hiccup -- log it */
                 extern void mvd_log(const char *fmt, ...);
-                u32 rd = (u32)(t1 - t0), dec = (u32)(t2 - t1), aud = (u32)(t3 - t2);
+                u32 rd = (u32)(t1 - t0), dec = (u32)(t2 - t1), aud = (u32)(osGetTime() - t2);
                 if (rd + dec + aud > 50)
-                    mvd_log("SPIKE f=%d size=%lu read=%lums decode=%lums audio=%lums kf=%d",
-                            vi, (unsigned long)s->size, (unsigned long)rd, (unsigned long)dec,
-                            (unsigned long)aud, s->keyframe);
+                    mvd_log("SPIKE f=%d read=%lums pump=%lums audio=%lums",
+                            vi, (unsigned long)rd, (unsigned long)dec, (unsigned long)aud);
             }
-            if (g_ftn < 16) g_ft[g_ftn++] = v_cts_us(&m, vi);   /* pool this frame's display time */
-            if (r) { g_pq[g_pq_n].cts = ft_pop_min(); g_pq[g_pq_n].slot = r - 1; g_pq_n++; }
-            /* drain any FURTHER pictures the decoder is holding (B-frames surface in bursts);
-             * capped so a decoder that re-renders the same picture can't spin us */
-            for (int x = 0; x < 2 && g_pq_n < PQ_DEPTH && g_ftn > 0; x++) {
-                int e = mp4_mvd_render_extra();
-                if (!e) break;
-                g_pq[g_pq_n].cts = ft_pop_min(); g_pq[g_pq_n].slot = e - 1; g_pq_n++;
-            }
-            vi++;
+            if (r && g_ftn > 0) { g_pq[g_pq_n].cts = ft_pop_min(); g_pq[g_pq_n].slot = r - 1; g_pq_n++; }
+            else if (!r && !consumed) break;   /* dry + nothing fed: nothing more this pass */
         }
         if (g_pq_n == 0) continue;   /* nothing display-ready yet (decoder still priming) */
         int mi = 0;
