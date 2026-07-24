@@ -1062,6 +1062,7 @@ static volatile int s_dlw_active = 0;                /* worker thread running */
 static volatile int s_dlw_finished = 0;              /* worker done, waiting for dlw_poll() */
 static volatile int s_dlw_ok = 0;                    /* download result */
 static volatile int s_dlw_stop = 0;                  /* main thread asks the worker to abort */
+static volatile int s_dlw_zombie = 0;                /* worker abandoned after a bounded wait; reaped in dlw_start */
 static volatile u32 s_dlw_done = 0, s_dlw_total = 0; /* live progress for the UI strip */
 static int s_dlw_resume_ask = 0;                     /* paused for playback -> offer to resume */
 static int dlw_poll(void);                           /* defined after the post-processing helpers */
@@ -1138,6 +1139,10 @@ static void dlw_thread(void *arg) {
 }
 static int dlw_start(void) {   /* main thread: launch the front queue item */
     if (s_dlw_active) return 1;
+    if (s_dlw_zombie) {          /* an abandoned worker still owns the download state */
+        if (!s_dlw_finished) { qtoast("Old download still stopping..."); return 0; }
+        s_dlw_zombie = 0; s_dlw_finished = 0;   /* it finally exited -> safe to reuse */
+    }
     queue_load();
     if (s_qn <= 0) return 0;
     s_dlw_item = s_q[0];
@@ -1166,11 +1171,15 @@ static int dlw_start(void) {   /* main thread: launch the front queue item */
     dl_led(0, 0);                /* a fresh queue clears any leftover done/failed light */
     return 1;
 }
-static void dlw_stop_wait(void) {   /* abort the in-flight download; partial + queue item kept */
+static void dlw_stop_wait(void) {   /* abort the in-flight download; partial + queue item kept.
+                                     * BOUNDED: a wedged worker must never hold the UI hostage --
+                                     * after 15s we walk away and let it die on its own. */
     if (!s_dlw_active) return;
     s_dlw_stop = 1;
-    while (!s_dlw_finished) svcSleepThread(50 * 1000 * 1000LL);
-    s_dlw_active = 0; s_dlw_finished = 0;
+    for (int i = 0; i < 300 && !s_dlw_finished; i++) svcSleepThread(50 * 1000 * 1000LL);
+    if (!s_dlw_finished) s_dlw_zombie = 1;   /* it still owns s_dlw_item until it exits */
+    else s_dlw_finished = 0;
+    s_dlw_active = 0;
     aptSetSleepAllowed(true);
     dl_wifi_hold(0);
 }
