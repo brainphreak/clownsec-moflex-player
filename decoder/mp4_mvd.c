@@ -10,6 +10,20 @@
 #include <string.h>
 #include <stdlib.h>
 #include <malloc.h>
+#include <stdio.h>
+#include <stdarg.h>
+
+/* crash forensics: every MVD step appends a line to sdmc:/mvd_log.txt (opened+closed per line
+ * so it survives a sysmodule crash + reboot). The LAST line names the failing call. */
+void mvd_log(const char *fmt, ...) {
+    FILE *f = fopen("sdmc:/mvd_log.txt", "ab");
+    if (!f) return;
+    va_list ap; va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fputc('\n', f);
+    fclose(f);
+}
 
 #define TOP_W 400
 #define TOP_H 240
@@ -44,7 +58,9 @@ static void feed_annexb(const uint8_t *nal, int len) {
     g_pkt[0] = 0; g_pkt[1] = 0; g_pkt[2] = 1;
     memcpy(g_pkt + 3, nal, len);
     GSPGPU_FlushDataCache(g_pkt, len + 3);
-    mvdstdProcessVideoFrame(g_pkt, len + 3, 0, NULL);
+    mvd_log("STEP prime: feeding %d-byte NAL (type %d)", len, nal[0] & 0x1F);
+    Result pr = mvdstdProcessVideoFrame(g_pkt, len + 3, 0, NULL);
+    mvd_log("STEP prime: fed, result=%08lX", (unsigned long)pr);
 }
 
 /* feed the saved SPS/PPS (from avcC) into MVD as Annex-B units */
@@ -65,17 +81,25 @@ int mp4_mvd_init(int w, int h, const uint8_t *avcc, int avcc_len, int nal_len_si
     g_avcc_len = (avcc && avcc_len > 0 && avcc_len <= (int)sizeof g_avcc) ? avcc_len : 0;
     if (g_avcc_len) memcpy(g_avcc, avcc, g_avcc_len);
 
+    remove("sdmc:/mvd_log.txt");   /* fresh log per attempt */
+    mvd_log("STEP 1: init w=%d h=%d coded=%dx%d nal_len=%d avcc=%d", w, h, g_cw, g_ch, g_nal_len, avcc_len);
+    mvd_log("STEP 2: linearSpaceFree=%lu", (unsigned long)linearSpaceFree());
     g_pkt_cap = 2 * 1024 * 1024;
     g_pkt = (uint8_t *)linearAlloc(g_pkt_cap);
     g_out = (u16 *)linearAlloc((size_t)g_cw * g_ch * sizeof(u16));
+    mvd_log("STEP 3: pkt=%p out=%p", g_pkt, g_out);
     if (!g_pkt || !g_out) { mp4_mvd_exit(); return 0; }
 
-    if (R_FAILED(mvdstdInit(MVDMODE_VIDEOPROCESSING, MVD_INPUT_H264, MVD_OUTPUT_BGR565,
-                            MVD_DEFAULT_WORKBUF_SIZE, NULL))) { mp4_mvd_exit(); return 0; }
+    Result ir = mvdstdInit(MVDMODE_VIDEOPROCESSING, MVD_INPUT_H264, MVD_OUTPUT_BGR565,
+                           MVD_DEFAULT_WORKBUF_SIZE, NULL);
+    mvd_log("STEP 4: mvdstdInit result=%08lX linearFreeAfter=%lu", (unsigned long)ir, (unsigned long)linearSpaceFree());
+    if (R_FAILED(ir)) { mp4_mvd_exit(); return 0; }
     mvdstdGenerateDefaultConfig(&g_config, (u32)g_cw, (u32)g_ch, (u32)g_cw, (u32)g_ch, NULL, NULL, NULL);
     g_config.output_type = MVD_OUTPUT_BGR565;
+    mvd_log("STEP 5: config generated");
 
     prime_sps_pps();
+    mvd_log("STEP 6: SPS/PPS primed");
     g_ready = 1;
     return 1;
 }
@@ -155,17 +179,24 @@ int mp4_mvd_decode(const uint8_t *sample, int size) {
     }
     if (off == 0) return 0;
 
+    static int logframes = 0;
+    int lg = (logframes < 4); if (lg) logframes++;
     g_config.physaddr_outdata0 = osConvertVirtToPhys(g_out);
     set_corners();
     GSPGPU_FlushDataCache(g_out, (u32)g_cw * g_ch * sizeof(u16));
     GSPGPU_FlushDataCache(g_pkt, off);
 
+    if (lg) mvd_log("STEP 7: frame %d process (annexb %d bytes, first NAL type %d)", logframes, off, g_pkt[3] & 0x1F);
     Result r = mvdstdProcessVideoFrame(g_pkt, off, 0, NULL);
-    if (g_first) { mvdstdProcessVideoFrame(g_pkt, off, 0, NULL); g_first = 0; }   /* MVD needs the first frame twice */
+    if (lg) mvd_log("STEP 8: frame %d processed r=%08lX first=%d", logframes, (unsigned long)r, g_first);
+    if (g_first) { mvdstdProcessVideoFrame(g_pkt, off, 0, NULL); g_first = 0;
+                   if (lg) mvd_log("STEP 8b: first-frame-twice done"); }   /* MVD needs the first frame twice */
     if (!MVD_CHECKNALUPROC_SUCCESS(r)) return 0;
 
     /* render the decoded frame into g_out (the config points there) */
+    if (lg) mvd_log("STEP 9: frame %d render", logframes);
     mvdstdRenderVideoFrame(&g_config, true);
+    if (lg) mvd_log("STEP 10: frame %d rendered", logframes);
     GSPGPU_InvalidateDataCache(g_out, (u32)g_cw * g_ch * sizeof(u16));
     if (!corners_changed()) return 0;   /* MVD didn't actually write a frame yet */
 
