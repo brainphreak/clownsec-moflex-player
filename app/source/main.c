@@ -973,7 +973,13 @@ static void pw_request(int id, const char *url, const char *key) {
 /* ---------- DOWNLOAD QUEUE: queue several catalog downloads, run back to back ---------- */
 #define QUEUE_FILE "sdmc:/moflex_player/queue.txt"
 #define QUEUE_MAX  24
-typedef struct { char name[64]; char fname[160]; char url[512]; char art[512]; char category[32]; char dest[512]; int is_zip; char sub[512]; } QItem;
+typedef struct { char name[64]; char fname[160]; char url[512]; char art[512]; char category[32]; char dest[512]; int is_zip; char sub[512]; long long size; } QItem;
+
+static long long sd_free_bytes(void) {
+    FS_ArchiveResource r;
+    if (R_FAILED(FSUSER_GetArchiveResource(&r, SYSTEM_MEDIATYPE_SD))) return -1;
+    return (long long)r.clusterSize * r.freeClusters;
+}
 static QItem s_q[QUEUE_MAX]; static int s_qn = -1;      /* -1 = not loaded */
 static char s_q_dest[512] = "";                         /* remembered destination folder */
 static char s_qtoast[40] = ""; static int s_qtoast_t = 0;   /* "Queued (n)" overlay in the list */
@@ -984,8 +990,8 @@ static void queue_save(void) {
     FILE *f = fopen(QUEUE_FILE, "wb");
     if (!f) return;
     for (int i = 0; i < s_qn; i++)
-        fprintf(f, "%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\n",
-                s_q[i].name, s_q[i].fname, s_q[i].url, s_q[i].art, s_q[i].category, s_q[i].dest, s_q[i].is_zip, s_q[i].sub);
+        fprintf(f, "%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%lld\n",
+                s_q[i].name, s_q[i].fname, s_q[i].url, s_q[i].art, s_q[i].category, s_q[i].dest, s_q[i].is_zip, s_q[i].sub, s_q[i].size);
     fclose(f);
 }
 static void queue_load(void) {
@@ -998,7 +1004,7 @@ static void queue_load(void) {
         char *nl = strchr(ln, '\n'); if (nl) *nl = 0;
         QItem *q = &s_q[s_qn]; memset(q, 0, sizeof *q);
         char *pp = ln; int fi = 0;
-        while (fi < 8 && pp) {
+        while (fi < 9 && pp) {
             char *t = strchr(pp, '\t'); if (t) *t = 0;
             switch (fi) {
                 case 0: snprintf(q->name, sizeof q->name, "%s", pp); break;
@@ -1009,6 +1015,7 @@ static void queue_load(void) {
                 case 5: snprintf(q->dest, sizeof q->dest, "%s", pp); break;
                 case 6: q->is_zip = atoi(pp); break;
                 case 7: snprintf(q->sub, sizeof q->sub, "%s", pp); break;   /* absent in old queues */
+                case 8: q->size = atoll(pp); break;                         /* absent in old queues */
             }
             pp = t ? t + 1 : NULL; fi++;
         }
@@ -1046,6 +1053,7 @@ static void queue_add_ui(const CatEntry *e) {
     snprintf(q->category, sizeof q->category, "%s", e->category);
     snprintf(q->dest, sizeof q->dest, "%s", s_q_dest);
     snprintf(q->sub, sizeof q->sub, "%s", e->sub);
+    q->size = e->size;
     q->is_zip = e->is_zip;
     s_qn++; queue_save();
     snprintf(s_qtoast, sizeof s_qtoast, "Queued (%d)", s_qn); s_qtoast_t = 75;
@@ -1145,6 +1153,21 @@ static int dlw_start(void) {   /* main thread: launch the front queue item */
     }
     queue_load();
     if (s_qn <= 0) return 0;
+    /* Refuse to start what can't fit: a nearly-full FAT makes every write crawl and the
+     * download dies a slow confusing death (tonight's lesson). Partial bytes already on
+     * disk count toward the need; +32MB keeps a safety floor for art/metadata/etc. */
+    if (s_q[0].size > 0) {
+        long long freeb = sd_free_bytes();
+        long long need = s_q[0].size - download_partial_bytes(s_q[0].url) + 32LL * 1024 * 1024;
+        if (freeb >= 0 && freeb < need) {
+            char m[40];
+            snprintf(m, sizeof m, "SD full: %lldMB free, need %lldMB",
+                     freeb / 1048576, need / 1048576);
+            qtoast(m);
+            dl_led(1, 0);   /* red: the queue can't proceed */
+            return 0;
+        }
+    }
     s_dlw_item = s_q[0];
     s_dlw_stop = 0; s_dlw_finished = 0; s_dlw_ok = 0; s_dlw_done = s_dlw_total = 0;
     /* Worker core is per-model. New-3DS: the extra core (core 2, same as the ring's blit worker) --
@@ -1209,6 +1232,7 @@ static int queue_add_front(const CatEntry *e) {   /* 1 = queued, 2 = was already
     snprintf(q->category, sizeof q->category, "%s", e->category);
     snprintf(q->dest, sizeof q->dest, "%s", s_q_dest);
     snprintf(q->sub, sizeof q->sub, "%s", e->sub);
+    q->size = e->size;
     q->is_zip = e->is_zip;
     s_qn++; queue_save();
     return 1;
@@ -2653,7 +2677,8 @@ static int dlw_poll(void) {
         aptSetSleepAllowed(true);            /* lid closed -> the console can nap now */
         dl_wifi_hold(0);
         if (!s_dlw_stop) dl_led(1, 0);       /* real failure: red light so a closed lid still tells you */
-        qtoast(s_dlw_stop ? "Download paused" : "Download failed");
+        qtoast(s_dlw_stop ? "Download paused"
+               : download_write_failed() ? "Download failed - SD full?" : "Download failed");
         return 1;
     }
     QItem q = s_dlw_item;

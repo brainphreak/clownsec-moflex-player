@@ -170,8 +170,12 @@ static int wb_close(WBuf *w) {         /* drain remaining bytes, stop the thread
 
 /* ---- to file (resumable) ---- */
 typedef struct { FILE *f; WBuf *wb; curl_off_t resume_off; long status; int range_ignored; } DlFile;
+static volatile int g_write_fail;   /* last failure was the SD (full card?), not the network */
+int download_write_failed(void) { return g_write_fail; }
 static size_t dl_sink(DlFile *d, const void *p, size_t n) {
-    return d->wb ? wb_write(d->wb, p, n) : fwrite(p, 1, n, d->f);
+    size_t w = d->wb ? wb_write(d->wb, p, n) : fwrite(p, 1, n, d->f);
+    if (w != n) g_write_fail = 1;
+    return w;
 }
 
 /* Sniff the HTTP status so we can tell a real resume (206) from a server that ignored our
@@ -321,6 +325,7 @@ static int httpc_fetch(const char *url, DlFile *df, Prog *pr) {
 
 bool download_to_file(const char *url, const char *dest, dl_progress_cb cb, void *user) {
     if (!downloader_init()) return false;
+    g_write_fail = 0;
     char part[512]; part_path_for_url(url, part, sizeof part);
 
     const int MAX_TRIES = 5;
@@ -349,6 +354,7 @@ bool download_to_file(const char *url, const char *dest, dl_progress_cb cb, void
         if (httpc_ready()) hr = httpc_fetch(url, &df, &pr);
         if (hr != HF_USE_CURL) {
             int wok = wb_close(wb);
+            if (!wok) g_write_fail = 1;
             fclose(f);
             if (hr == HF_OK && wok) {
                 remove(dest);
@@ -379,6 +385,7 @@ bool download_to_file(const char *url, const char *dest, dl_progress_cb cb, void
         long code = 0; curl_easy_getinfo(e, CURLINFO_RESPONSE_CODE, &code);
         curl_easy_cleanup(e);
         int wok = wb_close(wb);
+        if (!wok) g_write_fail = 1;
         fclose(f);
 
         if (r == CURLE_OK && wok && (code == 200 || code == 206)) {
