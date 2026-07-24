@@ -2652,6 +2652,34 @@ static int ui_menu(const char *title, const char *subtitle, const char *const *i
     return -1;
 }
 
+/* Does this .srt actually contain a webpage? (the server 200s its site page for missing files) */
+static int srt_is_html(const char *path) {
+    FILE *sf = fopen(path, "rb");
+    if (!sf) return 0;
+    unsigned char hd[8] = {0};
+    fread(hd, 1, sizeof hd, sf); fclose(sf);
+    int i = (hd[0] == 0xEF && hd[1] == 0xBB && hd[2] == 0xBF) ? 3 : 0;
+    while (i < 7 && (hd[i] == ' ' || hd[i] == '\r' || hd[i] == '\n' || hd[i] == '\t')) i++;
+    return hd[i] == '<';
+}
+/* Fetch a catalog-listed subtitle and save it as <movie>.srt so it auto-loads at playback.
+ * Keeps a good existing .srt; REPLACES one that turns out to be an HTML catch-all page.
+ * Used when a download finishes and by Get Info (grab subs without redownloading the movie). */
+static void fetch_sub(const char *moviepath, const char *suburl) {
+    if (!suburl || !suburl[0]) return;
+    char sdest[PATHLEN + NAMELEN]; snprintf(sdest, sizeof sdest, "%s", moviepath);
+    char *dot = strrchr(sdest, '.');
+    if (!dot || (size_t)(dot - sdest) + 5 >= sizeof sdest) return;
+    memcpy(dot, ".srt", 5);
+    struct stat st;
+    if (stat(sdest, &st) == 0) {
+        if (st.st_size > 0 && !srt_is_html(sdest)) return;   /* real subtitles already there */
+        remove(sdest);                                       /* junk -> refetch */
+    }
+    if (download_to_file(suburl, sdest, NULL, NULL) && srt_is_html(sdest))
+        remove(sdest);   /* the server sent its site page: no subtitles exist for this file */
+}
+
 /* Run the queue front to back. B during a download pauses the queue (partial kept for resume). */
 /* Main-thread finalizer: post-process a finished background download, then chain
  * the next queue item. Returns 1 when something changed (caller should redraw). */
@@ -2696,26 +2724,7 @@ static int dlw_poll(void) {
         movieinfo_save(dest, &e, phave ? pb : NULL, POSTER_W, POSTER_H);
         free(pb);
         lib_add_downloaded(dest, &e);
-        if (q.sub[0]) {   /* the catalog lists a matching .srt: save it as <movie>.srt so it
-                           * auto-loads at playback; tiny file, failures are silent */
-            char sdest[PATHLEN + NAMELEN]; snprintf(sdest, sizeof sdest, "%s", dest);
-            char *dot = strrchr(sdest, '.');
-            if (dot && (size_t)(dot - sdest) + 5 < sizeof sdest) {
-                memcpy(dot, ".srt", 5);
-                if (download_to_file(q.sub, sdest, NULL, NULL)) {
-                    /* the server 200s an HTML page for MISSING files (catch-all rewrite) --
-                     * never keep a webpage masquerading as subtitles */
-                    FILE *sf = fopen(sdest, "rb");
-                    if (sf) {
-                        unsigned char hd[8] = {0};
-                        fread(hd, 1, sizeof hd, sf); fclose(sf);
-                        int i = (hd[0] == 0xEF && hd[1] == 0xBB && hd[2] == 0xBF) ? 3 : 0;
-                        while (i < 7 && (hd[i] == ' ' || hd[i] == '\r' || hd[i] == '\n' || hd[i] == '\t')) i++;
-                        if (hd[i] == '<') remove(sdest);
-                    }
-                }
-            }
-        }
+        fetch_sub(dest, q.sub);   /* catalog-listed .srt -> <movie>.srt (silent, tiny) */
     }
     queue_remove_url(q.url);
     if (queue_count() > 0) dlw_start();   /* chain the next item (sleep stays denied) */
@@ -2937,6 +2946,7 @@ static int scrape_one(const char *moviepath) {
         for (int i = 0; i < nc; i++) if (scr_match(lstem, &cat[i])) {
             int poster_ok = fetch_poster(&cat[i], pb);
             movieinfo_save(moviepath, &cat[i], poster_ok ? pb : NULL, POSTER_W, POSTER_H);
+            fetch_sub(moviepath, cat[i].sub);   /* subs without redownloading the movie */
             found = poster_ok ? 1 : 2;
             break;
         }
@@ -2989,6 +2999,7 @@ static void scrape_folder(void) {
             for (int c = 0; c < nc; c++) if (scr_match(lstem, &cat[c])) {
                 int poster_ok = fetch_poster(&cat[c], pb);
                 movieinfo_save(full, &cat[c], poster_ok ? pb : NULL, POSTER_W, POSTER_H);
+                fetch_sub(full, cat[c].sub);
                 done[i] = 1; got++; break;   /* matched (priority-first); a missing poster is
                                               * refetched next run since movieinfo_have needs one */
             }
@@ -3046,6 +3057,7 @@ static void lib_scrape_missing(int *idx, int ni) {
             for (int c = 0; c < nc; c++) if (scr_match(lstem, &cat[c])) {
                 int poster_ok = fetch_poster(&cat[c], pb);
                 movieinfo_save(g_lib[idx[i]].url, &cat[c], poster_ok ? pb : NULL, POSTER_W, POSTER_H);
+                fetch_sub(g_lib[idx[i]].url, cat[c].sub);
                 lib_refresh_entry(idx[i]);
                 done[i] = 1; got++; break;
             }
