@@ -973,7 +973,7 @@ static void pw_request(int id, const char *url, const char *key) {
 /* ---------- DOWNLOAD QUEUE: queue several catalog downloads, run back to back ---------- */
 #define QUEUE_FILE "sdmc:/moflex_player/queue.txt"
 #define QUEUE_MAX  24
-typedef struct { char name[64]; char fname[160]; char url[512]; char art[512]; char category[32]; char dest[512]; int is_zip; } QItem;
+typedef struct { char name[64]; char fname[160]; char url[512]; char art[512]; char category[32]; char dest[512]; int is_zip; char sub[512]; } QItem;
 static QItem s_q[QUEUE_MAX]; static int s_qn = -1;      /* -1 = not loaded */
 static char s_q_dest[512] = "";                         /* remembered destination folder */
 static char s_qtoast[40] = ""; static int s_qtoast_t = 0;   /* "Queued (n)" overlay in the list */
@@ -984,8 +984,8 @@ static void queue_save(void) {
     FILE *f = fopen(QUEUE_FILE, "wb");
     if (!f) return;
     for (int i = 0; i < s_qn; i++)
-        fprintf(f, "%s\t%s\t%s\t%s\t%s\t%s\t%d\n",
-                s_q[i].name, s_q[i].fname, s_q[i].url, s_q[i].art, s_q[i].category, s_q[i].dest, s_q[i].is_zip);
+        fprintf(f, "%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\n",
+                s_q[i].name, s_q[i].fname, s_q[i].url, s_q[i].art, s_q[i].category, s_q[i].dest, s_q[i].is_zip, s_q[i].sub);
     fclose(f);
 }
 static void queue_load(void) {
@@ -998,7 +998,7 @@ static void queue_load(void) {
         char *nl = strchr(ln, '\n'); if (nl) *nl = 0;
         QItem *q = &s_q[s_qn]; memset(q, 0, sizeof *q);
         char *pp = ln; int fi = 0;
-        while (fi < 7 && pp) {
+        while (fi < 8 && pp) {
             char *t = strchr(pp, '\t'); if (t) *t = 0;
             switch (fi) {
                 case 0: snprintf(q->name, sizeof q->name, "%s", pp); break;
@@ -1008,6 +1008,7 @@ static void queue_load(void) {
                 case 4: snprintf(q->category, sizeof q->category, "%s", pp); break;
                 case 5: snprintf(q->dest, sizeof q->dest, "%s", pp); break;
                 case 6: q->is_zip = atoi(pp); break;
+                case 7: snprintf(q->sub, sizeof q->sub, "%s", pp); break;   /* absent in old queues */
             }
             pp = t ? t + 1 : NULL; fi++;
         }
@@ -1044,6 +1045,7 @@ static void queue_add_ui(const CatEntry *e) {
     snprintf(q->art, sizeof q->art, "%s", e->art);
     snprintf(q->category, sizeof q->category, "%s", e->category);
     snprintf(q->dest, sizeof q->dest, "%s", s_q_dest);
+    snprintf(q->sub, sizeof q->sub, "%s", e->sub);
     q->is_zip = e->is_zip;
     s_qn++; queue_save();
     snprintf(s_qtoast, sizeof s_qtoast, "Queued (%d)", s_qn); s_qtoast_t = 75;
@@ -1197,6 +1199,7 @@ static int queue_add_front(const CatEntry *e) {   /* 1 = queued, 2 = was already
     snprintf(q->art, sizeof q->art, "%s", e->art);
     snprintf(q->category, sizeof q->category, "%s", e->category);
     snprintf(q->dest, sizeof q->dest, "%s", s_q_dest);
+    snprintf(q->sub, sizeof q->sub, "%s", e->sub);
     q->is_zip = e->is_zip;
     s_qn++; queue_save();
     return 1;
@@ -1589,7 +1592,7 @@ cb_rebuild:;   /* X-search inside the list jumps back here with filt_search set 
 /* ================= Library: one flat, categorized view of every local movie ================= */
 #define LIB_MAX   3000
 #define LIB_CACHE "sdmc:/moflex_player/library.cache"
-#define LIB_MAGIC 0x4C494237   /* 'LIB7' -- bump to invalidate old caches when the scan changes */
+#define LIB_MAGIC 0x4C494238   /* 'LIB8' -- bump to invalidate old caches when CatEntry changes */
 static CatEntry *g_lib = NULL;   /* every playable movie on the SD, with its .nfo metadata */
 static int       g_lib_n = 0;
 
@@ -2670,6 +2673,15 @@ static int dlw_poll(void) {
         movieinfo_save(dest, &e, phave ? pb : NULL, POSTER_W, POSTER_H);
         free(pb);
         lib_add_downloaded(dest, &e);
+        if (q.sub[0]) {   /* the catalog lists a matching .srt: save it as <movie>.srt so it
+                           * auto-loads at playback; tiny file, failures are silent */
+            char sdest[PATHLEN + NAMELEN]; snprintf(sdest, sizeof sdest, "%s", dest);
+            char *dot = strrchr(sdest, '.');
+            if (dot && (size_t)(dot - sdest) + 5 < sizeof sdest) {
+                memcpy(dot, ".srt", 5);
+                download_to_file(q.sub, sdest, NULL, NULL);
+            }
+        }
     }
     queue_remove_url(q.url);
     if (queue_count() > 0) dlw_start();   /* chain the next item (sleep stays denied) */

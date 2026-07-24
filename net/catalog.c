@@ -98,6 +98,7 @@ static int ends_ci(const char *s, const char *suf) {
 
 static void fill_common(CatEntry *e, const char *title, int year, const char *desc,
                         const char *date, int runtime, int is_zip) {
+    memset(e, 0, sizeof *e);   /* it's the first touch of the slot; no stale fields */
     snprintf(e->title, sizeof(e->title), "%s", title);
     e->year = year; e->runtime = runtime; e->is_zip = is_zip;
     snprintf(e->desc, sizeof(e->desc), "%s", desc);
@@ -193,6 +194,12 @@ int catalog_parse(const char *text, int kind, const char *dl_base, const char *a
             const char *aw = sgets(mv, "artwork");
             if (aw[0]) { url_encode(aw, enc, sizeof(enc)); snprintf(e->art, sizeof(e->art), "%s%s", art_base, enc); }
             else e->art[0] = 0;
+            /* subtitles[]: {lang,label,file} -- take the first listed (usually English); the file
+             * sits under the same download base as the movie */
+            { cJSON *subs = cJSON_GetObjectItemCaseSensitive(mv, "subtitles");
+              cJSON *s0 = subs ? cJSON_GetArrayItem(subs, 0) : NULL;
+              const char *sf = s0 ? sgets(s0, "file") : "";
+              if (sf[0]) { url_encode(sf, enc, sizeof(enc)); snprintf(e->sub, sizeof(e->sub), "%s%s", dl_base, enc); } }
             e->is3d = (fn_has_3d(e->fname) || fn_has_3d(e->name)) ? 1 : 0;   /* "(3D)" marks 3D files */
             n++;
         }
