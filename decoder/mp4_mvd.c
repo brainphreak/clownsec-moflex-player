@@ -201,17 +201,17 @@ int mp4_mvd_decode(const uint8_t *sample, int size) {
     GSPGPU_FlushDataCache(g_pkt, off);
 
     void *pkt_mvd = osConvertOldLINEARMemToNew(g_pkt);   /* mvd needs NEW-range linear addresses */
-    if (lg) mvd_log("STEP 7: frame %d process (annexb %d bytes, first NAL type %d)", logframes, off, g_pkt[3] & 0x1F);
+    if (lg) mvd_log("STEP 7: frame %d process (annexb %d bytes, first NAL type %d)", g_logframes, off, g_pkt[3] & 0x1F);
     Result r = mvdstdProcessVideoFrame(pkt_mvd, off, 0, NULL);
-    if (lg) mvd_log("STEP 8: frame %d processed r=%08lX first=%d", logframes, (unsigned long)r, g_first);
+    if (lg) mvd_log("STEP 8: frame %d processed r=%08lX first=%d", g_logframes, (unsigned long)r, g_first);
     if (g_first) { mvdstdProcessVideoFrame(pkt_mvd, off, 0, NULL); g_first = 0;
                    if (lg) mvd_log("STEP 8b: first-frame-twice done"); }   /* MVD needs the first frame twice */
     if (!MVD_CHECKNALUPROC_SUCCESS(r)) return 0;
 
     /* render the decoded frame into g_out (the config points there) */
-    if (lg) mvd_log("STEP 9: frame %d render", logframes);
+    if (lg) mvd_log("STEP 9: frame %d render", g_logframes);
     mvdstdRenderVideoFrame(&g_config, true);
-    if (lg) mvd_log("STEP 10: frame %d rendered", logframes);
+    if (lg) mvd_log("STEP 10: frame %d rendered", g_logframes);
     GSPGPU_InvalidateDataCache(g_out, (u32)g_cw * g_ch * sizeof(u16));
     if (!corners_changed()) return 0;   /* MVD didn't actually write a frame yet */
 
