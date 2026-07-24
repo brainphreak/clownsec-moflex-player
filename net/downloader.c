@@ -67,6 +67,17 @@ static int xfer_cb(void *p, curl_off_t dltotal, curl_off_t dlnow, curl_off_t ul,
     return 0;
 }
 
+/* Is the wireless actually connected? Asking the AC sysmodule is instant, and skipping the
+ * network entirely while it's down avoids every slow failure mode at once (DNS blocks,
+ * connect timeouts, stall windows) -- both for the worker and for main-thread fetches. */
+static int dl_wifi_up(void) {
+    u32 st = 0;
+    if (R_FAILED(acInit())) return 1;   /* can't tell -> assume up and let timeouts handle it */
+    Result r = ACU_GetWifiStatus(&st);
+    acExit();
+    return R_FAILED(r) ? 1 : (st != 0);
+}
+
 /* Sliced retry backoff so CANCEL reacts within ~100ms even between attempts (a stalled
  * transfer used to grind through minutes of timeouts+sleeps looking completely hung). */
 static bool dl_backoff(int attempt) {   /* false = user aborted */
@@ -255,12 +266,16 @@ static int httpc_fetch(const char *url, DlFile *df, Prog *pr) {
             char rg[48]; snprintf(rg, sizeof rg, "bytes=%lld-", (long long)df->resume_off);
             httpcAddRequestHeaderField(&c, "Range", rg);
         }
-        /* ANY failure before body bytes hit the sink falls back to curl for this attempt --
-         * httpc must never make a download fail that curl could have completed. */
-        if (R_FAILED(httpcBeginRequest(&c))) { httpcCloseContext(&c); return HF_USE_CURL; }
+        /* Fall back to curl ONLY when the failure is about the URL/server (rejected URL, odd
+         * redirect, or a real HTTP error -- the network is proven alive in those cases). A
+         * NETWORK failure (no response at all) must NOT go to curl: on a dead connection its
+         * synchronous DNS lookup can block forever (NOSIGNAL disables that timeout), which
+         * left the worker "downloading" with zero movement for hours. httpc is fully
+         * timeout-bounded, so network failures retry/resume here and give up cleanly. */
+        if (R_FAILED(httpcBeginRequest(&c))) { httpcCloseContext(&c); return HF_FAIL; }
         u32 status = 0;
         if (R_FAILED(httpcGetResponseStatusCodeTimeout(&c, &status, HF_STALL_NS))) {
-            httpcCloseContext(&c); return HF_USE_CURL;
+            httpcCloseContext(&c); return HF_FAIL;   /* no response = network, not the URL */
         }
         if (status >= 300 && status < 400) {
             char loc[1024] = "";
@@ -299,7 +314,6 @@ static int httpc_fetch(const char *url, DlFile *df, Prog *pr) {
         free(buf);
         httpcCloseContext(&c);
         if (ret == HF_OK && want && got_total < want) ret = HF_FAIL;      /* connection died mid-body */
-        if (ret == HF_FAIL && got_total == 0) ret = HF_USE_CURL;          /* got nothing -> let curl try */
         return ret;
     }
     return HF_FAIL;   /* redirect loop */
@@ -311,6 +325,10 @@ bool download_to_file(const char *url, const char *dest, dl_progress_cb cb, void
 
     const int MAX_TRIES = 5;
     for (int attempt = 0; attempt < MAX_TRIES; attempt++) {
+        if (!dl_wifi_up()) {   /* no connection -> don't even try; wait out the backoff instead */
+            if (!dl_backoff(attempt)) return false;
+            continue;
+        }
         struct stat st;
         curl_off_t off = (stat(part, &st) == 0) ? (curl_off_t)st.st_size : 0;
         /* RESUME: open read+write and seek to the end ONCE, NOT append mode ("ab"). On the 3DS FAT
@@ -393,6 +411,7 @@ static size_t mem_cb(void *ptr, size_t sz, size_t nm, void *ud) {
 }
 
 bool download_to_mem(const char *url, char **out, size_t *out_len, size_t max_bytes) {
+    if (!dl_wifi_up()) return false;   /* dead wireless: fail instantly, never block the caller */
     if (!downloader_init()) return false;
     CURL *e = curl_easy_init();
     if (!e) return false;
