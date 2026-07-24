@@ -161,6 +161,8 @@ static int wb_close(WBuf *w) {         /* drain remaining bytes, stop the thread
 typedef struct { FILE *f; WBuf *wb; curl_off_t resume_off; long status; int range_ignored; } DlFile;
 static volatile int g_write_fail;   /* last failure was the SD (full card?), not the network */
 int download_write_failed(void) { return g_write_fail; }
+static volatile long g_last_http;   /* last HTTP status seen by a failed download (0 = none) */
+long download_last_http(void) { return g_last_http; }
 static size_t dl_sink(DlFile *d, const void *p, size_t n) {
     size_t w = d->wb ? wb_write(d->wb, p, n) : fwrite(p, 1, n, d->f);
     if (w != n) g_write_fail = 1;
@@ -250,25 +252,23 @@ static int httpc_fetch(const char *url, DlFile *df, Prog *pr) {
     char cur[1024]; url_enc(url, cur, sizeof cur);
     for (int redir = 0; redir < 8; redir++) {
         httpcContext c;
-        /* use_defaultproxy=0: the curl engine never used the console's proxy setting, so the
-         * httpc engine must not either (a configured proxy = choppy/stalling downloads) */
-        if (R_FAILED(httpcOpenContext(&c, HTTPC_METHOD_GET, cur, 0))) return HF_USE_CURL;
+        /* use_defaultproxy MUST be 1: with 0 the http sysmodule's session is left unconfigured
+         * and requests fail on real hardware (every working homebrew passes 1 -- this parameter
+         * broke all httpc downloads when flipped to 0 chasing a proxy theory) */
+        if (R_FAILED(httpcOpenContext(&c, HTTPC_METHOD_GET, cur, 1))) return HF_USE_CURL;
         httpcSetSSLOpt(&c, SSLCOPT_DisableVerify);   /* 3DS has no cert store (same as curl setup) */
         httpcAddRequestHeaderField(&c, "User-Agent", "moflex-player/1.0");
         if (df->resume_off > 0) {
             char rg[48]; snprintf(rg, sizeof rg, "bytes=%lld-", (long long)df->resume_off);
             httpcAddRequestHeaderField(&c, "Range", rg);
         }
-        /* Fall back to curl ONLY when the failure is about the URL/server (rejected URL, odd
-         * redirect, or a real HTTP error -- the network is proven alive in those cases). A
-         * NETWORK failure (no response at all) must NOT go to curl: on a dead connection its
-         * synchronous DNS lookup can block forever (NOSIGNAL disables that timeout), which
-         * left the worker "downloading" with zero movement for hours. httpc is fully
-         * timeout-bounded, so network failures retry/resume here and give up cleanly. */
-        if (R_FAILED(httpcBeginRequest(&c))) { httpcCloseContext(&c); return HF_FAIL; }
+        /* Any pre-body failure hands the attempt to curl -- the exact behavior of the proven
+         * builds. (Tradeoff, accepted: on a truly dead network curl's DNS wait can run long,
+         * but the UI is protected by the bounded 15s stop-wait, and every screen stays free.) */
+        if (R_FAILED(httpcBeginRequest(&c))) { httpcCloseContext(&c); return HF_USE_CURL; }
         u32 status = 0;
         if (R_FAILED(httpcGetResponseStatusCodeTimeout(&c, &status, HF_STALL_NS))) {
-            httpcCloseContext(&c); return HF_FAIL;   /* no response = network, not the URL */
+            httpcCloseContext(&c); return HF_USE_CURL;
         }
         if (status >= 300 && status < 400) {
             char loc[1024] = "";
@@ -307,6 +307,7 @@ static int httpc_fetch(const char *url, DlFile *df, Prog *pr) {
         free(buf);
         httpcCloseContext(&c);
         if (ret == HF_OK && want && got_total < want) ret = HF_FAIL;      /* connection died mid-body */
+        if (ret == HF_FAIL && got_total == 0) ret = HF_USE_CURL;          /* got nothing -> let curl try */
         return ret;
     }
     return HF_FAIL;   /* redirect loop */
@@ -314,7 +315,7 @@ static int httpc_fetch(const char *url, DlFile *df, Prog *pr) {
 
 bool download_to_file(const char *url, const char *dest, dl_progress_cb cb, void *user) {
     if (!downloader_init()) return false;
-    g_write_fail = 0;
+    g_write_fail = 0; g_last_http = 0;
     char part[512]; part_path_for_url(url, part, sizeof part);
 
     const int MAX_TRIES = 5;
@@ -338,6 +339,7 @@ bool download_to_file(const char *url, const char *dest, dl_progress_cb cb, void
         int hr = HF_USE_CURL;
         if (httpc_ready()) hr = httpc_fetch(url, &df, &pr);
         if (hr != HF_USE_CURL) {
+            if (df.status) g_last_http = df.status;
             int wok = wb_close(wb);
             if (!wok) g_write_fail = 1;
             fclose(f);
@@ -368,6 +370,7 @@ bool download_to_file(const char *url, const char *dest, dl_progress_cb cb, void
         }
         CURLcode r = curl_easy_perform(e);
         long code = 0; curl_easy_getinfo(e, CURLINFO_RESPONSE_CODE, &code);
+        if (code) g_last_http = code;
         curl_easy_cleanup(e);
         int wok = wb_close(wb);
         if (!wok) g_write_fail = 1;

@@ -30,6 +30,10 @@ long long download_partial_bytes(const char *url);
  * so the UI can say "SD full?" instead of blaming the network */
 int download_write_failed(void);
 
+/* last HTTP status a failed download saw (e.g. 404 = the file is missing on the server);
+ * 0 when the failure never got an HTTP response */
+long download_last_http(void);
+
 /* Delete the leftover partial for `url` (for "start over"). */
 void download_discard_partial(const char *url);
 
