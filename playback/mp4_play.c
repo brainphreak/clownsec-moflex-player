@@ -125,6 +125,19 @@ static int64_t v_cts_us(Mp4 *m, int i) {   /* DISPLAY time: with B-frames this !
 #define PQ_DEPTH 4
 static struct { int64_t cts; int slot; } g_pq[PQ_DEPTH];
 static int g_pq_n = 0;
+/* Display-time pool: cts of fed-but-not-yet-surfaced samples. The hardware holds/reorders
+ * pictures internally with B-frames (a fed frame may surface 1-2 feeds later, or never);
+ * pairing each SURFACED picture with the SMALLEST pooled display time keeps the presented
+ * timeline gapless no matter how the decoder delays -- labeling outputs with the fed
+ * frame's own cts dropped 2 of 3 frames (measured: 125ms present gaps at 41.7ms content). */
+static int64_t g_ft[16];
+static int     g_ftn = 0;
+static int64_t ft_pop_min(void) {
+    int mi = 0;
+    for (int i = 1; i < g_ftn; i++) if (g_ft[i] < g_ft[mi]) mi = i;
+    int64_t v = g_ft[mi]; g_ft[mi] = g_ft[--g_ftn];
+    return v;
+}
 static int g_present_log = 12;   /* countdown: log the first presents after start/seek */
 
 static int64_t a_time_us(Mp4 *m, int i) {
@@ -241,7 +254,7 @@ static void do_seek(Mp4 *m, uint8_t *vbuf, uint8_t *atmp, int sbs, int64_t dur_u
     int tvi = kf; while (tvi + 1 < m->v_count && v_time_us(m, tvi + 1) <= target_us) tvi++;
 
     mp4_mvd_reset();
-    g_pq_n = 0;   /* seek invalidates queued frames */
+    g_pq_n = 0; g_ftn = 0;   /* seek invalidates queued frames + pooled display times */
     extern void mvd_log(const char *fmt, ...);
     u64 sk0 = osGetTime();
     int got = 0, prod = 0;
@@ -402,6 +415,7 @@ MoflexResult mp4_play(const char *path) {
     g_pq_n = 0;        /* the reorder queue is static: entries from a PREVIOUS session (B-exit
                         * leaves up to 4 queued) would present as phantom frames with stale
                         * timestamps -- the frozen-bar + fast-forward-catch-up bug */
+    g_ftn = 0;
     g_present_log = 12;
 
     /* auto-resume (like moflex): jump to the saved position if any */
@@ -522,7 +536,8 @@ MoflexResult mp4_play(const char *path) {
                             vi, (unsigned long)s->size, (unsigned long)rd, (unsigned long)dec,
                             (unsigned long)aud, s->keyframe);
             }
-            if (r) { g_pq[g_pq_n].cts = v_cts_us(&m, vi); g_pq[g_pq_n].slot = r - 1; g_pq_n++; }
+            if (g_ftn < 16) g_ft[g_ftn++] = v_cts_us(&m, vi);   /* pool this frame's display time */
+            if (r) { g_pq[g_pq_n].cts = ft_pop_min(); g_pq[g_pq_n].slot = r - 1; g_pq_n++; }
             vi++;
         }
         if (g_pq_n == 0) continue;   /* nothing display-ready yet (decoder still priming) */
