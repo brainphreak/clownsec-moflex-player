@@ -1153,21 +1153,6 @@ static int dlw_start(void) {   /* main thread: launch the front queue item */
     }
     queue_load();
     if (s_qn <= 0) return 0;
-    /* Refuse to start what can't fit: a nearly-full FAT makes every write crawl and the
-     * download dies a slow confusing death (tonight's lesson). Partial bytes already on
-     * disk count toward the need; +32MB keeps a safety floor for art/metadata/etc. */
-    if (s_q[0].size > 0) {
-        long long freeb = sd_free_bytes();
-        long long need = s_q[0].size - download_partial_bytes(s_q[0].url) + 32LL * 1024 * 1024;
-        if (freeb >= 0 && freeb < need) {
-            char m[40];
-            snprintf(m, sizeof m, "SD full: %lldMB free, need %lldMB",
-                     freeb / 1048576, need / 1048576);
-            qtoast(m);
-            dl_led(1, 0);   /* red: the queue can't proceed */
-            return 0;
-        }
-    }
     s_dlw_item = s_q[0];
     s_dlw_stop = 0; s_dlw_finished = 0; s_dlw_ok = 0; s_dlw_done = s_dlw_total = 0;
     /* Worker core is per-model. New-3DS: the extra core (core 2, same as the ring's blit worker) --
