@@ -125,6 +125,7 @@ static int64_t v_cts_us(Mp4 *m, int i) {   /* DISPLAY time: with B-frames this !
 #define PQ_DEPTH 4
 static struct { int64_t cts; int slot; } g_pq[PQ_DEPTH];
 static int g_pq_n = 0;
+static int g_present_log = 12;   /* countdown: log the first presents after start/seek */
 
 static int64_t a_time_us(Mp4 *m, int i) {
     if (m->a_timescale <= 0) return 0;
@@ -241,12 +242,18 @@ static void do_seek(Mp4 *m, uint8_t *vbuf, uint8_t *atmp, int sbs, int64_t dur_u
 
     mp4_mvd_reset();
     g_pq_n = 0;   /* seek invalidates queued frames */
-    int got = 0;
+    extern void mvd_log(const char *fmt, ...);
+    u64 sk0 = osGetTime();
+    int got = 0, prod = 0;
     for (int j = kf; j <= tvi; j++) {
         int nn = mp4_read_sample(m, &m->vsamples[j], vbuf);
         int r = (nn == (int)m->vsamples[j].size) ? mp4_mvd_decode(vbuf, nn) : 0;
-        if (r) got = r;
+        if (r) { got = r; prod++; }
     }
+    mvd_log("SEEK to=%llds kf=%d tvi=%d decoded=%d produced=%d took=%lums",
+            (long long)(target_us / 1000000), kf, tvi, tvi - kf + 1, prod,
+            (unsigned long)(osGetTime() - sk0));
+    g_present_log = 12;   /* trace the next dozen presents */
     if (got) { mp4_mvd_present(got - 1, sbs); moflex_sub_overlay(sbs, target_us); gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank(); }
     *vi = tvi + 1;
 
@@ -538,6 +545,12 @@ MoflexResult mp4_play(const char *path) {
         if (quit) break;
         if (!g_playing) continue;   /* got paused mid-wait -> re-handle */
 
+        if (g_present_log > 0) {
+            extern void mvd_log(const char *fmt, ...);
+            g_present_log--;
+            mvd_log("PRESENT cts=%lldms late=%lldms queued=%d",
+                    (long long)(cur_us / 1000), (long long)((media_now_us() - cur_us) / 1000), g_pq_n);
+        }
         mp4_mvd_present(g_pq[mi].slot, sbs);
         moflex_sub_overlay(sbs, cur_us);
         gfxFlushBuffers(); gfxSwapBuffers();

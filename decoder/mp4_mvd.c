@@ -116,10 +116,12 @@ int mp4_mvd_init(int w, int h, const uint8_t *avcc, int avcc_len, int nal_len_si
 
 /* after a seek: re-prime SPS/PPS and arm the "first frame twice" so MVD resyncs cleanly on the
  * next IDR/keyframe fed to it. */
+static int g_logframes = 0;
 void mp4_mvd_reset(void) {
     if (!g_ready) return;
     prime_sps_pps();
     g_first = 1;
+    g_logframes = 0;   /* re-log the first frames after every seek */
 }
 
 void mp4_mvd_exit(void) {
@@ -192,8 +194,7 @@ int mp4_mvd_decode(const uint8_t *sample, int size) {
     }
     if (off == 0) return 0;
 
-    static int logframes = 0;
-    int lg = (logframes < 4); if (lg) logframes++;
+    int lg = (g_logframes < 6); if (lg) g_logframes++;
     g_config.physaddr_outdata0 = osConvertVirtToPhys(g_out);
     set_corners();
     GSPGPU_FlushDataCache(g_out, (u32)g_cw * g_ch * sizeof(u16));
