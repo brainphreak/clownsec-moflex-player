@@ -250,9 +250,10 @@ static int httpc_fetch(const char *url, DlFile *df, Prog *pr) {
     char cur[1024]; url_enc(url, cur, sizeof cur);
     for (int redir = 0; redir < 8; redir++) {
         httpcContext c;
-        /* use_defaultproxy=0: the old curl engine never used the console's proxy setting; going
-         * through a configured proxy made downloads choppy/stalling for those users */
-        if (R_FAILED(httpcOpenContext(&c, HTTPC_METHOD_GET, cur, 0))) return HF_USE_CURL;
+        /* use_defaultproxy MUST be 1: with 0 the http sysmodule's session is left unconfigured
+         * and requests fail on real hardware (every working homebrew passes 1 -- this parameter
+         * broke all httpc downloads when flipped to 0 chasing a proxy theory) */
+        if (R_FAILED(httpcOpenContext(&c, HTTPC_METHOD_GET, cur, 1))) return HF_USE_CURL;
         httpcSetSSLOpt(&c, SSLCOPT_DisableVerify);   /* 3DS has no cert store (same as curl setup) */
         httpcAddRequestHeaderField(&c, "User-Agent", "moflex-player/1.0");
         if (df->resume_off > 0) {
