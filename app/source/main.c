@@ -2702,7 +2702,18 @@ static int dlw_poll(void) {
             char *dot = strrchr(sdest, '.');
             if (dot && (size_t)(dot - sdest) + 5 < sizeof sdest) {
                 memcpy(dot, ".srt", 5);
-                download_to_file(q.sub, sdest, NULL, NULL);
+                if (download_to_file(q.sub, sdest, NULL, NULL)) {
+                    /* the server 200s an HTML page for MISSING files (catch-all rewrite) --
+                     * never keep a webpage masquerading as subtitles */
+                    FILE *sf = fopen(sdest, "rb");
+                    if (sf) {
+                        unsigned char hd[8] = {0};
+                        fread(hd, 1, sizeof hd, sf); fclose(sf);
+                        int i = (hd[0] == 0xEF && hd[1] == 0xBB && hd[2] == 0xBF) ? 3 : 0;
+                        while (i < 7 && (hd[i] == ' ' || hd[i] == '\r' || hd[i] == '\n' || hd[i] == '\t')) i++;
+                        if (hd[i] == '<') remove(sdest);
+                    }
+                }
             }
         }
     }
