@@ -824,6 +824,44 @@ static void fmt_size(long long b, char *o, int cap) {
     else                snprintf(o, cap, "%lld KB", b / 1024);
 }
 
+/* FAT-illegal filename characters. The FS module's RENAME command writes them happily (so a
+ * download can CREATE such a file) but its OPEN path parser rejects them -- the file lists in
+ * the browser and can never be played ("Thunderbolts*" taught us this). Strip on download,
+ * offer an in-place rename when an existing file has them. */
+static int fat_has_illegal(const char *name) {
+    for (const char *p = name; *p; p++)
+        if (*p == '*' || *p == '?' || *p == '"' || *p == '<' || *p == '>' || *p == '|' || *p == ':') return 1;
+    return 0;
+}
+static void fat_sanitize(char *name) {
+    char *w = name;
+    for (const char *p = name; *p; p++)
+        if (!(*p == '*' || *p == '?' || *p == '"' || *p == '<' || *p == '>' || *p == '|' || *p == ':')) *w++ = *p;
+    *w = 0;
+}
+/* Rename a file whose name contains FAT-illegal characters to its sanitized form.
+ * Renames the matching .srt sidecar too. Returns 1 + writes the new path on success. */
+static int fat_rescue(const char *path, char *out, size_t cap) {
+    const char *sl = strrchr(path, '/');
+    if (!sl) return 0;
+    char base[NAMELEN]; snprintf(base, sizeof base, "%s", sl + 1);
+    fat_sanitize(base);
+    if (!base[0]) return 0;
+    snprintf(out, cap, "%.*s%s", (int)(sl - path + 1), path, base);
+    if (rename(path, out) != 0) return 0;   /* rename FROM the odd name (same lenient command) */
+    char oldsub[PATHLEN + NAMELEN], newsub[PATHLEN + NAMELEN];
+    snprintf(oldsub, sizeof oldsub, "%s", path);
+    snprintf(newsub, sizeof newsub, "%s", out);
+    char *d1 = strrchr(oldsub, '.'), *d2 = strrchr(newsub, '.');
+    if (d1 && d2 && (size_t)(d1 - oldsub) + 5 < sizeof oldsub && (size_t)(d2 - newsub) + 5 < sizeof newsub) {
+        memcpy(d1, ".srt", 5); memcpy(d2, ".srt", 5);
+        rename(oldsub, newsub);   /* best-effort sidecar */
+    }
+    return 1;
+}
+
+static void lib_note_renamed(const char *oldpath, const char *newpath);   /* defined with the library */
+
 /* If an earlier download of `url` was interrupted, a central partial remains (keyed by URL, so
  * it's found even if you now pick a different folder). Ask whether to resume it or start over.
  * Returns 1 to proceed (download_to_file resumes any kept partial). */
@@ -1051,6 +1089,7 @@ static void queue_add_ui(const CatEntry *e) {
     QItem *q = &s_q[s_qn]; memset(q, 0, sizeof *q);
     snprintf(q->name, sizeof q->name, "%s", e->name);
     snprintf(q->fname, sizeof q->fname, "%s", e->fname);
+    fat_sanitize(q->fname);   /* "* ? < >"-type names save but can never be OPENED again */
     snprintf(q->url, sizeof q->url, "%s", e->url);
     snprintf(q->art, sizeof q->art, "%s", e->art);
     snprintf(q->category, sizeof q->category, "%s", e->category);
@@ -1943,6 +1982,18 @@ static void lib_save_cache(void) {
 }
 
 static int lib_load_cache_only(void);   /* defined with the library code below */
+/* a file was renamed in place (FAT-illegal characters): keep its library entry attached */
+static void lib_note_renamed(const char *oldpath, const char *newpath) {
+    if (!g_lib) return;
+    for (int i = 0; i < g_lib_n; i++)
+        if (!strcmp(g_lib[i].url, oldpath)) {
+            snprintf(g_lib[i].url, sizeof g_lib[i].url, "%s", newpath);
+            const char *b = strrchr(newpath, '/'); b = b ? b + 1 : newpath;
+            snprintf(g_lib[i].fname, sizeof g_lib[i].fname, "%s", b);
+            lib_save_cache();
+            return;
+        }
+}
 static void lib_rescan(void) {
     if (!g_lib) g_lib = (CatEntry *)malloc(sizeof(CatEntry) * LIB_MAX);
     if (!g_lib) return;
@@ -2525,6 +2576,8 @@ static void download_url_direct(void) {
     swkbdSetHintText(&s, "Save as (filename)");
     swkbdSetInitialText(&s, fname);
     if (swkbdInputText(&s, fname, sizeof(fname)) != SWKBD_BUTTON_RIGHT || !fname[0]) return;
+    fat_sanitize(fname);
+    if (!fname[0]) return;
     char destdir[PATHLEN];
     if (!pick_folder(destdir, sizeof(destdir))) return;
     char dest[PATHLEN + NAMELEN];
@@ -3431,6 +3484,19 @@ static int pick_moflex(const char *ciapath, const CiaMoflex *list, int n) {
 }
 
 static MoflexResult play_movie(const char *path) {
+    /* filenames with FAT-illegal characters list fine but can never be OPENED -- offer to fix */
+    { const char *b0 = strrchr(path, '/'); b0 = b0 ? b0 + 1 : path;
+      static char fixed[PATHLEN + NAMELEN];
+      if (fat_has_illegal(b0)) {
+          if (prompt2("FILENAME", "This name has characters the 3DS\ncannot open (* ? \" < > | :).\nRename it and play?", "RENAME", "BACK") != 0)
+              return MOFLEX_QUIT_BACK;
+          if (!fat_rescue(path, fixed, sizeof fixed)) {
+              msg_screen("FILENAME", "Rename failed -- please rename the\nfile on a computer instead.");
+              return MOFLEX_QUIT_BACK;
+          }
+          lib_note_renamed(path, fixed);   /* keep the library entry pointed at the new name */
+          path = fixed;
+      } }
     cia_clear_selection();
     const char *title_src = path; char titlebuf[NAMELEN];
     if (cia_is_cia(path)) {
