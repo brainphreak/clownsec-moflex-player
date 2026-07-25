@@ -9,6 +9,11 @@ IMA-ADPCM audio) files **natively** — decoded in portable C, no on-device FFmp
 synchronized audio. It auto-detects **stereoscopic 3D** vs flat **2D** and plays each
 correctly, including movies embedded inside `.cia` files.
 
+On a **New 3DS** it also plays **`.mp4` (H.264 + AAC)** through the console's hardware
+decoder: any resolution up to 1920x1088 (aspect-fit to the screen), side-by-side 3D
+auto-detected, B-frames handled, with the same subtitles, resume, seeking, and library
+features as moflex.
+
 Full speed on **New 3DS** (2D and 3D). On **Old 3DS**, 2D plays smoothly and **3D has been
 substantially sped up** — see **[3DS performance](#3ds-performance)** below for the HQ toggle
 and the one tip that makes the biggest difference on the older hardware.

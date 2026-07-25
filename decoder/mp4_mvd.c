@@ -16,6 +16,10 @@
 /* crash forensics: every MVD step appends a line to sdmc:/mvd_log.txt (opened+closed per line
  * so it survives a sysmodule crash + reboot). The LAST line names the failing call. */
 void mvd_log(const char *fmt, ...) {
+    static int enabled = -1;   /* opt-in: create sdmc:/moflex_player/mvdlog.txt to enable --
+                                * production playback must not pay SD writes per frame event */
+    if (enabled < 0) { FILE *m = fopen("sdmc:/moflex_player/mvdlog.txt", "rb"); enabled = m ? 1 : 0; if (m) fclose(m); }
+    if (!enabled) return;
     FILE *f = fopen("sdmc:/mvd_log.txt", "ab");
     if (!f) return;
     va_list ap; va_start(ap, fmt);

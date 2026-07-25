@@ -21,9 +21,11 @@ AccessControlInfo:
   # Exheader format version
   DescVersion                   : 2
 
-  # Minimum kernel version (2.33 == 4.5.0)
+  # Minimum kernel version (2.44 == 8.0.0). MUST be >= 2.44: it selects the NEW linear-memory
+  # region (0x30000000) for the process, which the MVD hardware-H.264 sysmodule REQUIRES --
+  # below this the app gets the old region (0x14000000) and mvd panics on the first frame.
   ReleaseKernelMajor            : "02"
-  ReleaseKernelMinor            : "33"
+  ReleaseKernelMinor            : "44"
 
   MemoryType                    : Application
   SystemMode                    : 64MB
