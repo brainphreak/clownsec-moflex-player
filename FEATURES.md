@@ -3,6 +3,8 @@
 ## Playback
 
 * Native moflex/MobiClip video decoding
+* MP4 (H.264 + AAC) hardware playback on New 3DS -- any resolution up to 1080p, B-frames included
+* Side-by-side 3D MP4s play in real 3D automatically
 * 2D & 3D auto-detection
 * Plays Moflex videos inside `.cia` files
 * Responsive draggable seeking

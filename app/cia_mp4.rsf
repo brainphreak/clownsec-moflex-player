@@ -1,12 +1,12 @@
 BasicInfo:
-  Title                   : CLOWNSEC VIDEO BETA
+  Title                   : CLOWNSEC VIDEO MP4
   CompanyCode             : "00"
-  ProductCode             : CTR-P-CSVB
+  ProductCode             : CTR-P-CSVM
   Logo                    : Homebrew
 
 TitleInfo:
   Category                : Application
-  UniqueId                : 0xf8a2d
+  UniqueId                : 0xf8a2e
 
 Option:
   UseOnSD                 : true
