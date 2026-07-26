@@ -184,6 +184,10 @@ static size_t hdr_cb(char *buf, size_t sz, size_t nm, void *ud) {
 static size_t file_cb(void *ptr, size_t sz, size_t nm, void *ud) {
     DlFile *d = (DlFile *)ud;
     if (d->range_ignored) return 0;   /* abort now rather than append a full body onto the partial */
+    /* NEVER write an error response into the file: a mid-download retry that hits a 429/5xx
+     * would append the server's HTML error page INTO the .part -- the download "completes"
+     * but the file is corrupt inside (a rate-limited 2.7GB zip taught us this) */
+    if (d->status && d->status != 200 && d->status != 206) return 0;
     return dl_sink(d, ptr, sz * nm) / (sz ? sz : 1);
 }
 
