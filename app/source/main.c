@@ -48,10 +48,22 @@ static void idle_backlight(int on) {
     gspLcdExit();
     s_idle_off = !on;
 }
+static void dl_wifi_hold(int on);   /* defined with the download helpers below */
+static int s_dlw_ndm;               /* (tentative decl of the flag defined below) */
+static volatile int s_dlw_active;
+static int s_ndm_resume;            /* wifi hold dropped for a suspend: take it back on return */
 static void idle_apt_hook(APT_HookType t, void *u) {
-    (void)u;   /* HOME / lid sleep: resetting the timer is enough -- the self-heal line in
-                * idle_scan relights on the next frame whenever the timer is fresh. */
-    if (t == APTHOOK_ONRESTORE || t == APTHOOK_ONWAKEUP) s_idle_last = osGetTime();
+    (void)u;
+    if (t == APTHOOK_ONSUSPEND || t == APTHOOK_ONSLEEP) {
+        /* The exclusive NDM wireless hold (lid-closed downloads) blocks the system's wireless
+         * handoff -- HOME hangs the whole console until it's released. Drop it for the suspend;
+         * the transfer is frozen while we're suspended anyway. */
+        if (s_dlw_ndm) { dl_wifi_hold(0); s_ndm_resume = 1; }
+    }
+    if (t == APTHOOK_ONRESTORE || t == APTHOOK_ONWAKEUP) {
+        s_idle_last = osGetTime();   /* the idle_scan relight invariant handles the screens */
+        if (s_ndm_resume) { s_ndm_resume = 0; if (s_dlw_active) dl_wifi_hold(1); }
+    }
 }
 /* Pending "re-allow sleep": aptSetSleepAllowed(true) runs APT_SleepIfShellClosed against APT's
  * OWN latched shell view -- calling it the instant the queue drains can sleep the console with
