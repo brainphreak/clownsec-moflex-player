@@ -75,6 +75,8 @@ static void clk_resume(void) { if (!g_clk_running) { g_clk_t0 = osGetTime(); g_c
  * moflex engines learned this the hard way) -- release it when HOME opens, re-acquire on
  * return; pause/resume audio alongside. ---- */
 static aptHookCookie g_mp4_apt_cookie;
+static int g_apt_sbs = 0;   /* current 3D mode, so the hook can re-apply it after HOME/sleep */
+static u32 g_wait_kd = 0;   /* tap edge scanned by the wait loop, replayed at the top of the loop */
 static void mp4_apt_hook(APT_HookType t, void *u) {
     (void)u;
     switch (t) {
@@ -82,17 +84,24 @@ static void mp4_apt_hook(APT_HookType t, void *u) {
             if (g_screen_off) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; }
             if (g_lcd_ok) { gspLcdExit(); g_lcd_ok = 0; }
             if (g_have_audio) ndspChnSetPaused(0, true);
+            else clk_pause();                /* silent file: the wall clock must not run under HOME
+                                              * or the player fast-forwards to catch up on return */
+            gfxSet3D(false);                 /* the applet renders flat (same as the moflex hooks) */
             break;
         case APTHOOK_ONRESTORE: case APTHOOK_ONWAKEUP:
+            gfxSetScreenFormat(GFX_TOP, GSP_BGR8_OES);   /* keep 24-bit after HOME (blit is 3B/px --
+                                                          * a reverted 2B/px format would overrun) */
+            gfxSet3D(g_apt_sbs);
             if (!g_lcd_ok) g_lcd_ok = R_SUCCEEDED(gspLcdInit());
             if (g_have_audio && g_playing) ndspChnSetPaused(0, false);
+            else if (g_playing) clk_resume();
             break;
         default: break;
     }
 }
 
 /* ---- battery (local; New-3DS panel) ---- */
-static int  g_batt = -1, g_batt_chg = 0, g_mcu_ok = 0;
+static int  g_batt = -1, g_batt_chg = 0, g_mcu_ok = 0, g_ptm_ok = 0;
 static u64  g_batt_next = 0;
 static void batt_refresh(void) {
     u64 now = osGetTime();
@@ -394,10 +403,12 @@ MoflexResult mp4_play(const char *path) {
     }
 
     g_mcu_ok = R_SUCCEEDED(mcuHwcInit());
+    g_ptm_ok = R_SUCCEEDED(ptmuInit());   /* battery charge state (PTMU with no session always failed) */
+    g_apt_sbs = sbs;                      /* the APT hook re-applies 3D after HOME/sleep */
     g_lcd_ok = R_SUCCEEDED(gspLcdInit()); g_screen_off = 0;   /* bottom-screen-off button */
     aptHook(&g_mp4_apt_cookie, mp4_apt_hook, NULL);   /* HOME/sleep must release gsp::Lcd */
     g_pvol = moflex_vol_get();
-    g_playing = 1;
+    g_playing = 1; g_wait_kd = 0;
 
     /* title = filename without extension */
     char title[128];
@@ -437,7 +448,8 @@ MoflexResult mp4_play(const char *path) {
     while (aptMainLoop() && !quit) {
         /* ---- input ---- */
         hidScanInput();
-        u32 kd = hidKeysDown(), kh = hidKeysHeld();
+        u32 kd = hidKeysDown() | g_wait_kd, kh = hidKeysHeld();
+        g_wait_kd = 0;
         touchPosition tp; hidTouchRead(&tp);
 
         /* Lid watchdog: with sleep denied (background downloads) a lid close/reopen fires no
@@ -583,9 +595,18 @@ MoflexResult mp4_play(const char *path) {
             /* poll for pause/seek/back so the wait doesn't feel laggy */
             hidScanInput();
             u32 wkd = hidKeysDown();
+            if (g_screen_off) {   /* dark bottom screen: any input only WAKES it (same as the
+                                   * top-of-loop rule -- B here used to exit the movie instead) */
+                if (wkd || (hidKeysHeld() & KEY_TOUCH)) {
+                    GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; last_sig = -1;
+                }
+                continue;
+            }
             if (wkd & KEY_B) { result = MOFLEX_QUIT_BACK; quit = 1; break; }
             if (wkd & KEY_A) { g_playing = 0; break; }
-            if (wkd & KEY_TOUCH) break;   /* re-handle taps at the top */
+            if (wkd & KEY_TOUCH) { g_wait_kd = wkd; break; }   /* carry the eaten tap edge to the
+                                                                * top-of-loop handler (one-shot
+                                                                * taps needed a second try) */
         }
         if (quit) break;
         if (!g_playing) continue;   /* got paused mid-wait -> re-handle */
@@ -619,6 +640,7 @@ MoflexResult mp4_play(const char *path) {
     if (g_screen_off) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; }
     if (g_lcd_ok) { gspLcdExit(); g_lcd_ok = 0; }
     if (g_mcu_ok) { mcuHwcExit(); g_mcu_ok = 0; }
+    if (g_ptm_ok) { ptmuExit(); g_ptm_ok = 0; }
     free(atmp);
     mp4_mvd_exit();
     free(buf);

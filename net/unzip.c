@@ -42,12 +42,14 @@ static int is_junk(const char *name) {
 
 /* chunk sink for zip_entry_extract: write + re-fire the progress callback so long files
  * stay responsive; returning a short count makes the extractor stop with an error. */
-struct uz_stream { FILE *f; unzip_prog_cb cb; int done, total; const char *name; int cancel; };
+struct uz_stream { FILE *f; unzip_prog_cb cb; int done, total; const char *name; int cancel, werr; };
 static size_t uz_write(void *arg, uint64_t offset, const void *data, size_t size) {
     struct uz_stream *s = (struct uz_stream *)arg;
     (void)offset;
     if (s->cb && !s->cb(s->done, s->total, s->name)) { s->cancel = 1; return 0; }
-    return fwrite(data, 1, size, s->f);
+    size_t wr = fwrite(data, 1, size, s->f);
+    if (wr != size) s->werr = 1;      /* SD full / write error: abort, don't leave truncated files */
+    return wr;
 }
 
 int unzip_to_dir_cb(const char *zip_path, const char *dest_dir, int *total_out, unzip_prog_cb cb) {
@@ -117,14 +119,17 @@ int unzip_to_dir_cb(const char *zip_path, const char *dest_dir, int *total_out, 
              * pumping. (fread also chmod()ed the result, which always fails on SD FAT -- truth
              * = the file exists with the exact uncompressed size.) */
             unsigned long long want = zip_entry_size(z);
-            struct uz_stream s = { fopen(out, "wb"), cb, extracted, total, name, 0 };
+            struct uz_stream s = { fopen(out, "wb"), cb, extracted, total, name, 0, 0 };
+            int werr = 0;
             if (s.f) {
                 zip_entry_extract(z, uz_write, &s);
                 fclose(s.f);
-                if (s.cancel) { remove(out); canceled = 1; }   /* half-written file: delete it */
+                if (s.cancel || s.werr) remove(out);   /* half-written file: delete it */
+                canceled |= s.cancel; werr = s.werr;
             }
             struct stat st;
-            if (!canceled && stat(out, &st) == 0 && (unsigned long long)st.st_size == want) extracted++;
+            if (!canceled && !werr && stat(out, &st) == 0 && (unsigned long long)st.st_size == want) extracted++;
+            if (werr) { zip_entry_close(z); uz_log("WRITE FAILED (SD full?) at %d/%d", extracted, total); break; }
         }
         zip_entry_close(z);
     }

@@ -1006,8 +1006,17 @@ static void prime_after_seek(MfxDemux *m, AVCodecContext *ctx, AVFrame *out, int
 #define GT_H 256
 static Handle g_y2r_done;
 static int g_y2r_bpp = 2;   /* Y2R output bytes/pixel: 2 = RGB565 (16-bit), 4 = RGBA8 (true 24-bit color) */
-static void g_y2r_init(int W, int H, int bpp) {
-    y2rInit();
+static int g_y2r_up = 0;   /* y2rInit succeeded: guards every Y2RU call AND the exit. Calling
+                            * y2rExit after a FAILED y2rInit drives libctru's refcount negative --
+                            * from then on every y2rInit in the process "succeeds" without a live
+                            * session and video is black until app restart. */
+static int g_y2r_init(int W, int H, int bpp) {
+    g_y2r_up = R_SUCCEEDED(y2rInit());
+    if (!g_y2r_up) return 0;               /* wedged driver: caller falls back to the classic path */
+    /* Clear any conversion a previous video left in flight (exit/HOME mid-convert): against a
+     * busy sysmodule StartConversion no-ops and the end event never fires -- lit-black video,
+     * 300ms timeout per frame, audio fine. (DriverInitialize itself is done inside y2rInit.) */
+    Y2RU_StopConversion();
     g_y2r_bpp = bpp;
     Y2RU_ConversionParams p; memset(&p, 0, sizeof p);
     p.input_format = INPUT_YUV420_INDIV_8;
@@ -1024,8 +1033,11 @@ static void g_y2r_init(int W, int H, int bpp) {
  * session -- the event grabbed by Y2RU_GetTransferEndEvent must be closed too, or every
  * video open leaks a kernel handle until the table fills (black video, audio still plays). */
 static void g_y2r_exit(void) {
+    if (!g_y2r_up) return;                    /* y2rExit after a failed init poisons the refcount */
+    Y2RU_StopConversion();                    /* never leave a conversion in flight behind */
     if (g_y2r_done) { svcCloseHandle(g_y2r_done); g_y2r_done = 0; }
-    y2rExit();
+    y2rExit();                                /* (DriverFinalize happens inside) */
+    g_y2r_up = 0;
 }
 static void g_y2r_start(AVFrame *o, C3D_Tex *tex, int W, int H) {
     int cw = W / 2, ch = H / 2, bpp = g_y2r_bpp;
@@ -1041,7 +1053,9 @@ static void g_y2r_start(AVFrame *o, C3D_Tex *tex, int W, int H) {
 /* NOTE: uses the raw cache syscall, NOT C3D_TexFlush (which goes through the shared GSP session) --
  * this runs on the decode thread and must not touch GSP while the main thread renders. */
 static void g_y2r_wait(C3D_Tex *tex) {
-    svcWaitSynchronization(g_y2r_done, 300000000LL);
+    if (R_FAILED(svcWaitSynchronization(g_y2r_done, 300000000LL)))
+        Y2RU_StopConversion();   /* timed out: clear the wedged conversion so the NEXT frame can
+                                  * convert -- self-heals in-session instead of black-until-reopen */
     svcFlushProcessDataCache(CUR_PROCESS_HANDLE, (u32)tex->data, tex->size);
 }
 
@@ -2184,7 +2198,15 @@ static MoflexResult moflex_play_ring(const char *path) {
         mobi_close(&ctx); free(ctx.priv_data); mfx_close(&m); fclose(f);
         return MOFLEX_FALLBACK;
     }
-    g_y2r_init(W, H, r3_bpp);
+    if (!g_y2r_init(W, H, r3_bpp)) {   /* y2r wedged/unavailable: classic path has a software blit */
+        aptUnhook(&g_ring_apt_cookie);
+        for (int i = 0; i < NB; i++) { C3D_TexDelete(&r3_texL[i]); C3D_TexDelete(&r3_texR[i]); }
+        C2D_Fini(); C3D_Fini();
+        gfxSetScreenFormat(GFX_TOP, GSP_BGR8_OES); gfxSetScreenFormat(GFX_BOTTOM, GSP_RGB565_OES); gfxSet3D(false);
+        av_frame_free(&fL); av_frame_free(&fR);
+        mobi_close(&ctx); free(ctx.priv_data); mfx_close(&m); fclose(f);
+        return MOFLEX_FALLBACK;
+    }
     if (have_audio) { r3_audio_setup(arate, chn); if (!r3_aok) have_audio = 0; }   /* alloc failed -> wall-clock */
     /* the hook was registered right after gfx init; now that Y2R/audio are up, arm its fields */
     g_ring_apt_w = W; g_ring_apt_h = H; g_ring_apt_bpp = r3_bpp;

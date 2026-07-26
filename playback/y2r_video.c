@@ -17,7 +17,11 @@ bool y2r_video_init(int w, int h) {
     /* escape hatch: create sdmc:/moflex_player/sw_convert.txt to force the software blit */
     FILE *sw = fopen("sdmc:/moflex_player/sw_convert.txt", "rb");
     if (sw) { fclose(sw); return false; }
-    if (R_FAILED(y2rInit())) return false;
+    if (R_FAILED(y2rInit())) return false;               /* caller falls back to the software blit */
+    /* Clear any conversion a previous video left in flight (exit/HOME mid-convert): against a
+     * busy sysmodule StartConversion no-ops and the end event never fires -> lit-black top
+     * screen with everything else running. (DriverInitialize itself runs inside y2rInit.) */
+    Y2RU_StopConversion();
 
     g_out = (u8 *)linearAlloc((size_t)w * h * 3);      /* 3 bytes/px, not 2 */
     if (!g_out) { y2rExit(); return false; }
@@ -49,8 +53,10 @@ bool y2r_video_init(int w, int h) {
 
 void y2r_video_exit(void) {
     if (!g_ready) return;
+    Y2RU_StopConversion();                    /* never leave a conversion in flight behind */
+    if (g_done) { svcCloseHandle(g_done); g_done = 0; }   /* event handle: leaked one per video open */
     if (g_out) { linearFree(g_out); g_out = NULL; }
-    y2rExit();
+    y2rExit();                                /* (DriverFinalize happens inside) */
     g_ready = 0;
 }
 
@@ -75,7 +81,8 @@ bool y2r_video_start(AVFrame *f, int w, int h) {
  * 3 bytes per pixel now instead of 2 -- same cache-blocked walk, just a wider element. */
 void y2r_video_finish(u8 *fb) {
     int w = g_w, h = g_h;
-    svcWaitSynchronization(g_done, 300000000LL);
+    if (R_FAILED(svcWaitSynchronization(g_done, 300000000LL)))
+        Y2RU_StopConversion();   /* timed out: clear the wedge so the next frame can convert */
     GSPGPU_InvalidateDataCache(g_out, (u32)w * h * 3);
     enum { TB = 16 };
     for (int xo = 0; xo < w; xo += TB) {

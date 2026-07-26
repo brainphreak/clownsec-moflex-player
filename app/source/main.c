@@ -49,16 +49,25 @@ static void idle_backlight(int on) {
     s_idle_off = !on;
 }
 static void idle_apt_hook(APT_HookType t, void *u) {
-    (void)u;   /* HOME / lid sleep: don't ASSUME the system relit the screens -- force it */
-    if (t == APTHOOK_ONRESTORE || t == APTHOOK_ONWAKEUP) {
-        s_idle_last = osGetTime();
-        if (s_idle_off) idle_backlight(1);
-    }
+    (void)u;   /* HOME / lid sleep: resetting the timer is enough -- the self-heal line in
+                * idle_scan relights on the next frame whenever the timer is fresh. */
+    if (t == APTHOOK_ONRESTORE || t == APTHOOK_ONWAKEUP) s_idle_last = osGetTime();
 }
-/* Analog direction bits (circle pad / C-stick) are EXCLUDED from the presence test: a slightly
- * drifting stick sits past the threshold and reports "held" (or flickers edges) every single
- * frame -- the timer would reset forever and the screen would never go dark. Only real
- * button / d-pad / touch EDGES count, both for staying awake and for waking. */
+/* Pending "re-allow sleep": aptSetSleepAllowed(true) runs APT_SleepIfShellClosed against APT's
+ * OWN latched shell view -- calling it the instant the queue drains can sleep the console with
+ * a just-reopened lid (only a lid cycle wakes it). When the lid reads open we DEFER the
+ * re-allow to the idle watchdog, which grants it once the shell has read open twice in a row
+ * (or immediately when it closes -- sleeping then is exactly what the user asked for). */
+static int s_sleep_pending;
+static void sleep_reallow(void) {
+    if (dl_lid_closed()) aptSetSleepAllowed(true);   /* lid closed: sleeping now is correct */
+    else s_sleep_pending = 1;
+}
+/* Analog direction KEY bits (circle pad / C-stick) are EXCLUDED from the presence test: a
+ * slightly drifting stick sits past the threshold and reports "held" (or flickers edges)
+ * every frame -- the timer would reset forever and the screen would never go dark. Stick
+ * presence is instead detected as a large PER-FRAME position delta inside idle_scan: drift
+ * crawls, a deliberate flick jumps, so only major movements count. */
 #define IDLE_ANALOG (KEY_CPAD_UP | KEY_CPAD_DOWN | KEY_CPAD_LEFT | KEY_CPAD_RIGHT | \
                      KEY_CSTICK_UP | KEY_CSTICK_DOWN | KEY_CSTICK_LEFT | KEY_CSTICK_RIGHT)
 static void idle_scan(void) {
@@ -69,22 +78,43 @@ static void idle_scan(void) {
     s_idle_prevscan = now;
     /* Lid watchdog: with sleep denied (background downloads) a lid close/reopen fires NO wake
      * event -- if anything left the LCDs dark, nothing would ever relight them. A closed->open
-     * transition always forces the backlights on. */
-    static u64 s_shell_t; static int s_shell_closed = -1;
+     * transition always forces the backlights on. A ptmu failure counts as "no reading", never
+     * as a transition. Also grants a deferred sleep re-allow (see sleep_reallow above). */
+    static u64 s_shell_t; static int s_shell_closed = -1, s_shell_prev = -1;
     if (now - s_shell_t >= 500) {
         s_shell_t = now;
-        int closed = dl_lid_closed();
-        if (s_shell_closed == 1 && !closed) { idle_backlight(1); s_idle_last = now; }
-        s_shell_closed = closed;
+        u8 sh = 1; int closed = -1;
+        if (R_SUCCEEDED(ptmuInit())) { PTMU_GetShellState(&sh); ptmuExit(); closed = (sh == 0); }
+        if (closed >= 0) {
+            if (s_shell_closed == 1 && closed == 0) { idle_backlight(1); s_idle_last = now; }
+            if (s_sleep_pending && (closed == 1 || (closed == 0 && s_shell_prev == 0))) {
+                aptSetSleepAllowed(true);   /* lid closed, or stably open (APT's view agrees by now) */
+                s_sleep_pending = 0;
+            }
+            s_shell_prev = s_shell_closed; s_shell_closed = closed;
+        }
+    }
+    /* Circle pad / C-stick: only a MAJOR movement counts as presence. Micro drift must not hold
+     * the system awake (why the KEY bits are masked out), but drift is a slow crawl -- a
+     * deliberate flick moves far in ONE frame, so a big per-frame delta is a clean "user is
+     * here" signal (and relights dark screens via the relight invariant below). */
+    {
+        static int s_cpx, s_cpy, s_csx, s_csy;
+        circlePosition cp, cs; hidCircleRead(&cp); hidCstickRead(&cs);
+        int dx = cp.dx - s_cpx, dy = cp.dy - s_cpy, ex = cs.dx - s_csx, ey = cs.dy - s_csy;
+        if (dx * dx + dy * dy >= 48 * 48 || ex * ex + ey * ey >= 48 * 48) s_idle_last = now;
+        s_cpx = cp.dx; s_cpy = cp.dy; s_csx = cs.dx; s_csy = cs.dy;
     }
     u32 edge = (hidKeysDown() | hidKeysUp()) & ~IDLE_ANALOG;
     if (edge) {
         s_idle_last = now;
-        if (s_idle_off && s_shell_closed != 1) { idle_backlight(1); s_idle_swallow = 1; }  /* wake press must not act */
+        if (s_idle_off) s_idle_swallow = 1;   /* wake press must not act -- set even when the
+                                               * relight itself is briefly gated on the lid */
     }
-    /* Self-heal: dark screens are only legitimate while the timer is expired. If a wake attempt
-     * failed (transient gsp::Lcd refusal) the flag stays set with a running timer -- keep
-     * retrying every frame until the relight actually lands. */
+    /* THE relight (single site, with the watchdog transition above): dark screens are only
+     * legitimate while the timer is expired and the lid isn't closed. Any timer reset (edge,
+     * major stick move, watchdog, APT hook, queue event) relights here, and a failed attempt
+     * (transient gsp::Lcd refusal) retries every frame until it lands. */
     if (s_idle_off && s_shell_closed != 1 && now - s_idle_last < IDLE_OFF_MS) idle_backlight(1);
     if (s_idle_swallow && !((hidKeysHeld() | hidKeysDown()) & ~IDLE_ANALOG))
         s_idle_swallow = 0;                                         /* real keys released -> live */
@@ -1245,8 +1275,9 @@ static int dlw_start(void) {   /* main thread: launch the front queue item */
         }
     }
     if (!th) th = threadCreate(dlw_thread, NULL, 32 * 1024, prio - 1, -2, true); /* app core, above UI */
-    if (!th) { aptSetSleepAllowed(true); dl_wifi_hold(0); return 0; }   /* chain-start failed -> normal lid */
+    if (!th) { sleep_reallow(); dl_wifi_hold(0); return 0; }   /* chain-start failed -> normal lid */
     s_dlw_active = 1;
+    s_sleep_pending = 0;         /* a stale deferred re-allow must not fire mid-download */
     aptSetSleepAllowed(false);   /* lid close now only darkens the LCDs; the transfer keeps going */
     dl_wifi_hold(1);             /* ...and NDM must not power the wireless down meanwhile */
     dl_led(0, 0);                /* a fresh queue clears any leftover done/failed light */
@@ -1261,7 +1292,7 @@ static void dlw_stop_wait(void) {   /* abort the in-flight download; partial + q
     if (!s_dlw_finished) s_dlw_zombie = 1;   /* it still owns s_dlw_item until it exits */
     else s_dlw_finished = 0;
     s_dlw_active = 0;
-    aptSetSleepAllowed(true);
+    sleep_reallow();
     dl_wifi_hold(0);
 }
 static void queue_remove_url(const char *url) {   /* the active item may have been reordered */
@@ -2758,10 +2789,11 @@ static void download_url_direct(void) {
     snprintf(g_dl_name, sizeof(g_dl_name), "%s", fname);
     g_last_prog = 0;
     if (!download_resume_check(url)) return;   /* B on the prompt -> back */
+    s_sleep_pending = 0;
     aptSetSleepAllowed(false);                 /* direct downloads survive a closed lid too */
     dl_wifi_hold(1);
     bool ok = download_to_file(url, dest, dl_progress, NULL);
-    aptSetSleepAllowed(true);
+    sleep_reallow();
     dl_wifi_hold(0);
     if (!ok) { download_cancel_msg(url); return; }   /* progress saved; offers DELETE FILE, B keeps it */
     size_t fl = strlen(fname);
@@ -2775,7 +2807,7 @@ static void download_url_direct(void) {
         gfxFlushBuffers(); gfxSwapBuffers();
         int tot = 0;
         int nf = unzip_to_dir_cb(dest, folder, &tot, unzip_prog);
-        if (nf > 0) remove(dest);
+        if (nf > 0 && nf == tot) remove(dest);   /* partial extraction must keep the source zip */
         char m[96];
         if (nf > 0 && nf == tot) snprintf(m, sizeof m, "Extracted %d file%s.", nf, nf == 1 ? "" : "s");
         else if (nf > 0)         snprintf(m, sizeof m, "Extracted %d of %d files.", nf, tot);
@@ -2921,11 +2953,12 @@ static int s_scrape_sub = 0;   /* what the last scrape_one did about subtitles (
 static int dlw_poll(void) {
     if (!s_dlw_active || !s_dlw_finished) return 0;
     s_dlw_active = 0; s_dlw_finished = 0;
-    /* An item just finished: if the 5-minute idle darkened the screens (lid open), relight them
-     * NOW -- the completion toast / a long zip extraction must not run invisibly on dark LCDs. */
-    if (s_idle_off && !dl_lid_closed()) { idle_backlight(1); s_idle_last = osGetTime(); }
+    /* An item just finished: fresh timer -> the idle_scan relight invariant lights the screens
+     * on the next pumped frame (first extraction chunk / next menu frame), so completion and
+     * extraction never run invisibly on idle-dark LCDs. */
+    s_idle_last = osGetTime();
     if (!s_dlw_ok) {   /* cancelled or failed: keep the item + partial data for resume */
-        aptSetSleepAllowed(true);            /* lid closed -> the console can nap now */
+        sleep_reallow();                     /* lid closed -> naps; lid open -> deferred (race-safe) */
         dl_wifi_hold(0);
         if (!s_dlw_stop) dl_led(1, 0);       /* real failure: red light so a closed lid still tells you */
         if (s_dlw_stop) qtoast("Download paused");
@@ -2954,7 +2987,12 @@ static int dlw_poll(void) {
         snprintf(folder, sizeof folder, "%.*s", (int)(fl - 4), dest);
         int tot = 0;
         int nf = unzip_to_dir_cb(dest, folder, &tot, unzip_prog);   /* brief modal extract screen */
-        if (nf > 0) { remove(dest); lib_add_extracted(folder, &e); }
+        if (nf > 0 && nf < tot) {   /* partial (e.g. SD filled): keep the zip so a retry can finish */
+            lib_add_extracted(folder, &e);
+            char pm[96]; snprintf(pm, sizeof pm, "Extracted %d of %d files.\nThe zip was kept -- use MANAGE ->\nEXTRACT ZIP to retry.", nf, tot);
+            msg_screen("DOWNLOAD", pm);
+        }
+        else if (nf > 0) { remove(dest); lib_add_extracted(folder, &e); }
         else if (nf < 0)   /* user canceled mid-extract: zip intact, finish any time from MANAGE */
             msg_screen("DOWNLOAD", "Extraction canceled.\nThe zip was kept -- use MANAGE ->\nEXTRACT ZIP to finish later.");
         else {   /* a silent failure here stranded zips with no explanation -- say it, keep the zip */
@@ -2978,7 +3016,9 @@ static int dlw_poll(void) {
         dl_wifi_hold(0);
         dl_led(0, 1);                     /* green: all done (keeps blinking through sleep) */
         if (dl_lid_closed() && s_dlw_after == 1) dl_power_off();
-        else aptSetSleepAllowed(true);    /* lid closed -> drifts into sleep; open -> user is here */
+        else sleep_reallow();             /* lid closed -> drifts into sleep; open -> deferred re-allow
+                                             * (granting it at this exact instant raced a reopening lid
+                                             * and could sleep the console with the lid open) */
     }
     return 1;
 }
