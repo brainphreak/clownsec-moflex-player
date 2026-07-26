@@ -2919,6 +2919,11 @@ static int dlw_poll(void) {
         int tot = 0;
         int nf = unzip_to_dir_cb(dest, folder, &tot, unzip_prog);   /* brief modal extract screen */
         if (nf > 0) { remove(dest); lib_add_extracted(folder, &e); }
+        else {   /* a silent failure here stranded zips with no explanation -- say it, keep the zip */
+            char em[96];
+            snprintf(em, sizeof em, "Downloaded, but extracting failed.\nThe zip was kept -- use MANAGE ->\nEXTRACT ZIP to retry.");
+            msg_screen("DOWNLOAD", em);
+        }
     } else {
         fix_download_ext(dest, sizeof dest);
         u16 *pb = (u16 *)malloc((size_t)POSTER_W * POSTER_H * sizeof(u16));
@@ -3538,8 +3543,16 @@ static void manage_menu(void) {
     if (nentries == 0) return;
     char full[PATHLEN + NAMELEN];
     snprintf(full, sizeof(full), "%s%s", cwd, entries[sel].name);
-    const char *items[] = { "RENAME", "DELETE", "MOVE (cut)", "CANCEL" };
-    int c = ui_menu("MANAGE", entries[sel].name, items, 4);
+    size_t fl0 = strlen(entries[sel].name);
+    int is_zipf = !entries[sel].is_dir && fl0 > 4 && !strcasecmp(entries[sel].name + fl0 - 4, ".zip");
+    const char *items[5]; int n = 0, act[5];
+    items[n] = "RENAME"; act[n++] = 0;
+    items[n] = "DELETE"; act[n++] = 1;
+    items[n] = "MOVE (cut)"; act[n++] = 2;
+    if (is_zipf) { items[n] = "EXTRACT ZIP"; act[n++] = 3; }
+    items[n] = "CANCEL"; act[n++] = -1;
+    int mi = ui_menu("MANAGE", entries[sel].name, items, n);
+    int c = (mi >= 0 && mi < n) ? act[mi] : -1;
     if (c == 0) {   /* rename in place (keyboard pre-filled with the current name) */
         char nn[NAMELEN];
         SwkbdState s;
@@ -3558,6 +3571,24 @@ static void manage_menu(void) {
         snprintf(move_src, sizeof(move_src), "%s", full);
         snprintf(move_name, sizeof(move_name), "%s", entries[sel].name);
         move_pending = 1;
+    }
+    else if (c == 3) {   /* extract a zip in place (e.g. a queue download whose auto-extract failed) */
+        if (!file_is_zip(full)) { msg_screen("EXTRACT", "This is not a valid zip file\n(or it is incomplete)."); return; }
+        char folder[PATHLEN + NAMELEN];
+        size_t fl = strlen(full);
+        snprintf(folder, sizeof folder, "%.*s", (int)(fl - 4), full);
+        int tot = 0;
+        int nf = unzip_to_dir_cb(full, folder, &tot, unzip_prog);
+        char m[96];
+        if (nf > 0 && nf == tot) snprintf(m, sizeof m, "Extracted %d file%s.", nf, nf == 1 ? "" : "s");
+        else if (nf > 0)         snprintf(m, sizeof m, "Extracted %d of %d files.", nf, tot);
+        else                     snprintf(m, sizeof m, tot == 0 ? "Could not open the zip." : "Extract FAILED.");
+        if (nf > 0) {
+            lib_add_extracted(folder, NULL);
+            if (prompt2("EXTRACT", "Done. Delete the zip file now?", "DELETE", "KEEP") == 0) remove(full);
+        }
+        msg_screen("EXTRACT", m);
+        scan();
     }
 }
 
