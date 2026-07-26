@@ -52,7 +52,29 @@ int unzip_to_dir_cb(const char *zip_path, const char *dest_dir, int *total_out, 
     { struct stat zs; long long zsz = (stat(zip_path, &zs) == 0) ? (long long)zs.st_size : -1;
       uz_log("OPEN %s (size=%lld)", zip_path, zsz); }
     struct zip_t *z = zip_open(zip_path, 0, 'r');
-    if (!z) { uz_log("zip_open FAILED"); return 0; }
+    if (!z) {
+        uz_log("zip_open FAILED");
+        /* probe the raw layers so the log says WHICH one lies on-device */
+        FILE *tf = fopen(zip_path, "rb");
+        if (!tf) uz_log("probe: fopen FAILED");
+        else {
+            struct stat st; long long fsz = (stat(zip_path, &st) == 0) ? (long long)st.st_size : -1;
+            int r = fseeko(tf, 0, SEEK_END);
+            uz_log("probe: seek(END) rc=%d ftello=%lld stat=%lld", r, (long long)ftello(tf), fsz);
+            unsigned char b[8] = {0};
+            r = fseeko(tf, (long long)1 << 31, SEEK_SET);          /* just past 2GiB */
+            size_t n2 = (r == 0) ? fread(b, 1, 4, tf) : 0;
+            uz_log("probe: read@2GiB rc=%d n=%d", r, (int)n2);
+            if (fsz > 22) {
+                r = fseeko(tf, fsz - 22, SEEK_SET);                 /* the EOCD signature */
+                size_t n3 = (r == 0) ? fread(b, 1, 4, tf) : 0;
+                uz_log("probe: read@EOCD rc=%d n=%d bytes=%02X %02X %02X %02X (want 50 4B 05 06)",
+                       r, (int)n3, b[0], b[1], b[2], b[3]);
+            }
+            fclose(tf);
+        }
+        return 0;
+    }
 
     ssize_t n = zip_entries_total(z);
     uz_log("entries_total=%d", (int)n);
