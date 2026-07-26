@@ -4,6 +4,18 @@
 #include <sys/types.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdarg.h>
+
+/* extraction forensics: one small log per unzip run -- the last lines name the failing layer */
+static void uz_log(const char *fmt, ...) {
+    FILE *f = fopen("sdmc:/moflex_player/unzip_log.txt", "ab");
+    if (!f) return;
+    va_list ap; va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fputc('\n', f);
+    fclose(f);
+}
 
 /* create every parent directory of `path` (path ends in a filename) */
 static void mkparents(char *path) {
@@ -36,18 +48,27 @@ int unzip_to_dir_cb(const char *zip_path, const char *dest_dir, int *total_out, 
     if (L && dir[L - 1] != '/' && L + 1 < sizeof(dir)) { dir[L] = '/'; dir[L + 1] = 0; }
     mkdir(dir, 0777);                     /* ensure the target folder exists */
 
+    remove("sdmc:/moflex_player/unzip_log.txt");
+    { struct stat zs; long long zsz = (stat(zip_path, &zs) == 0) ? (long long)zs.st_size : -1;
+      uz_log("OPEN %s (size=%lld)", zip_path, zsz); }
     struct zip_t *z = zip_open(zip_path, 0, 'r');
-    if (!z) return 0;
+    if (!z) { uz_log("zip_open FAILED"); return 0; }
 
     ssize_t n = zip_entries_total(z);
+    uz_log("entries_total=%d", (int)n);
     /* pass 1: count the real files so progress has a denominator */
     int total = 0;
     for (ssize_t i = 0; i < n; i++) {
-        if (zip_entry_openbyindex(z, i) != 0) continue;
+        int rc = zip_entry_openbyindex(z, i);
+        if (rc != 0) { if (i < 20) uz_log("entry %d: openbyindex rc=%d", (int)i, rc); continue; }
         const char *name = zip_entry_name(z);
+        if (i < 20) uz_log("entry %d: dir=%d junk=%d size=%llu name=%.60s", (int)i,
+                           (int)zip_entry_isdir(z), is_junk(name),
+                           (unsigned long long)zip_entry_size(z), name ? name : "(null)");
         if (name && !zip_entry_isdir(z) && !is_junk(name)) total++;
         zip_entry_close(z);
     }
+    uz_log("countable files=%d", total);
     if (total_out) *total_out = total;
 
     int extracted = 0;
