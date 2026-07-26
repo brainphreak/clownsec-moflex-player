@@ -113,6 +113,7 @@ unsigned int __stacksize__ = 128 * 1024;
 
 static char  cwd[PATHLEN] = "sdmc:/";
 static char  g_now_playing[NAMELEN] = "";   /* last-played movie name (ext hidden, for GUI title) */
+static int   g_home_marq_dirty = 0;         /* home title marquee wants another frame */
 static char  g_now_playing_path[PATHLEN + NAMELEN] = "";   /* full path, for resume from home */
 #define LASTPLAY_FILE "sdmc:/moflex_player/lastplay.txt"
 #define RECENT_FILE   "sdmc:/moflex_player/recent.txt"
@@ -523,7 +524,10 @@ static bool dl_progress(void *u, u32 d, u32 t) {
         ui_text_center(UI_W / 2, 12, 2, UI_NEON, "DOWNLOADING");
         ui_glow_round(28, 40, UI_W - 56, 2, 1, UI_NEON, 3, 30);
         ui_fill_round(28, 40, UI_W - 56, 2, 1, UI_NEON);
-        ui_text_fit(UI_W / 2, 68, 1, UI_NEONC, g_dl_name, UI_W - 16);
+        { int tw = ui_text_w(1, g_dl_name), avail = UI_W - 16, nr = 0;
+          if (tw <= avail) ui_text_center(UI_W / 2, 68, 1, UI_NEONC, g_dl_name);
+          else { int mq = marquee_off(4300000, tw, avail, &nr);
+                 ui_text_clipped(8 - mq, 68, 1, UI_NEONC, g_dl_name, 8, UI_W - 8); } }
         int bx = 20, bw = UI_W - 40, by = 104, bh = 16;
         ui_fill_round(bx, by, bw, bh, bh / 2, TH_TRACK);
         char pl[48];
@@ -1466,6 +1470,46 @@ static void cat_group_key(const CatEntry *e, char *out, size_t cap) {
 static int cat_grouped(const char *category) {
     return !strcasecmp(category, "TV Shows") || !strcasecmp(category, "Music Videos");
 }
+/* season number parsed from a TV entry's display name ("... Season 12 ..."), 0 if none */
+static int tv_season_of(const CatEntry *e) {
+    for (const char *p = e->name; *p; p++)
+        if (!strncasecmp(p, "Season", 6) && (p[6] == ' ' || p[6] == '.')) {
+            int n = atoi(p + 7);
+            if (n > 0) return n;
+        }
+    return 0;
+}
+/* Pick a season within a show (split zips make several parts per season). Returns 1 with
+ * *season set (0 = Show All / only one season), 0 = user backed out to the show picker. */
+static int catalog_pick_season(const CatEntry *cat, int nc, const char *show, int *season) {
+    int seas[32], parts[32], ns = 0;
+    for (int i = 0; i < nc; i++) {
+        if (strcasecmp(cat[i].category, "TV Shows") || strcasecmp(cat[i].title, show)) continue;
+        int sn = tv_season_of(&cat[i]);
+        if (sn <= 0) continue;
+        int f = -1;
+        for (int j = 0; j < ns; j++) if (seas[j] == sn) { f = j; break; }
+        if (f < 0 && ns < 32) { seas[ns] = sn; parts[ns] = 1; ns++; }
+        else if (f >= 0) parts[f]++;
+    }
+    if (ns <= 1) { *season = 0; return 1; }   /* one season (or unparseable) -> straight to files */
+    for (int a = 0; a < ns; a++)              /* ascending season order */
+        for (int b = a + 1; b < ns; b++)
+            if (seas[b] < seas[a]) { int t = seas[a]; seas[a] = seas[b]; seas[b] = t;
+                                     t = parts[a]; parts[a] = parts[b]; parts[b] = t; }
+    static char sd[32][64];
+    for (int k = 0; k < ns; k++)
+        snprintf(sd[k], 64, "Season %d  (%d file%s)", seas[k], parts[k], parts[k] == 1 ? "" : "s");
+    static char last_show[64] = ""; static int last_i = -1;
+    if (!strcasecmp(last_show, show) && last_i >= 0 && last_i < ns)
+        s_pick_init = last_i + 1;   /* B-back from the parts list lands on the same season */
+    int g = catalog_pick("SEASONS", show, sd, ns, 1, NULL);
+    snprintf(last_show, sizeof last_show, "%s", show);
+    if (g == -2) { *season = 0; last_i = -1; return 1; }   /* Show All */
+    if (g < 0) return 0;
+    *season = seas[g]; last_i = g;
+    return 1;
+}
 /* Pick a show/artist within `filt_cat`. Returns 1 with filt_group set ("" = Show All),
  * 0 = user backed out. Remembers the highlight per category for B-back navigation. */
 static int catalog_pick_group(const CatEntry *cat, int nc, const char *filt_cat,
@@ -1533,6 +1577,7 @@ static void catalog_browse(const Source *src) {
     while (idx && aptMainLoop()) {
         /* ---- navigation: pick a category (+ optional genre), Show All, or X = search ---- */
         char filt_cat[32] = "", filt_genre[32] = "", filt_search[64] = "", filt_group[64] = "";
+        int filt_season = 0;
         if (ncat > 1) {
             static char cdisp[24][64];   /* category rows with counts (selection uses cats[]) */
             for (int k = 0; k < ncat; k++) {
@@ -1545,9 +1590,17 @@ static void catalog_browse(const Source *src) {
             if (c == -4) { if (!kbd_text("Search this catalog", filt_search, sizeof filt_search)) continue; }
             else if (c >= 0) {
                 snprintf(filt_cat, sizeof filt_cat, "%s", cats[c]);
-                if (cat_grouped(filt_cat)) {   /* TV: pick a show; Music Videos: pick an artist */
+                if (cat_grouped(filt_cat)) {   /* TV: show -> season -> parts; MV: artist -> videos */
                     s_pick_init = c + 1;
-                    if (!catalog_pick_group(cat, nc, filt_cat, filt_group, sizeof filt_group)) continue;
+                    int backout = 0;
+                    for (;;) {
+                        if (!catalog_pick_group(cat, nc, filt_cat, filt_group, sizeof filt_group)) { backout = 1; break; }
+                        if (!strcasecmp(filt_cat, "TV Shows") && filt_group[0]) {
+                            if (!catalog_pick_season(cat, nc, filt_group, &filt_season)) continue;   /* back to shows */
+                        } else filt_season = 0;
+                        break;
+                    }
+                    if (backout) continue;
                     goto cb_have_filter;
                 }
                 static char gens[64][32]; int ng = distinct_genres(cat, nc, filt_cat, gens, 64);
@@ -1578,6 +1631,7 @@ cb_rebuild:;   /* X-search inside the list jumps back here with filt_search set 
             if (filt_genre[0] && !genre_match(cat[i].genres, filt_genre)) continue;
             if (filt_group[0]) { char key[64]; cat_group_key(&cat[i], key, sizeof key);
                                  if (strcasecmp(key, filt_group)) continue; }
+            if (filt_season > 0 && tv_season_of(&cat[i]) != filt_season) continue;
             if (filt_search[0] && !ci_contains(cat[i].name, filt_search)) continue;   /* search box */
             idx[ni++] = i;
         }
@@ -1715,9 +1769,18 @@ cb_rebuild:;   /* X-search inside the list jumps back here with filt_search set 
         }
         gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
     }
-        if (leave == 1 && cat_grouped(filt_cat)) {   /* B from a show/artist list -> the group picker */
-            if (catalog_pick_group(cat, nc, filt_cat, filt_group, sizeof filt_group)) goto cb_rebuild;
-            s_pick_init = 0;   /* backed out of the picker -> fall through to the categories */
+        if (leave == 1 && cat_grouped(filt_cat)) {   /* B: parts -> seasons -> shows -> categories */
+            for (;;) {
+                if (!strcasecmp(filt_cat, "TV Shows") && filt_season > 0) {
+                    if (catalog_pick_season(cat, nc, filt_group, &filt_season)) goto cb_rebuild;
+                    filt_season = 0;   /* backed out of seasons -> the show picker */
+                }
+                if (!catalog_pick_group(cat, nc, filt_cat, filt_group, sizeof filt_group)) { s_pick_init = 0; break; }
+                if (!strcasecmp(filt_cat, "TV Shows") && filt_group[0]) {
+                    if (!catalog_pick_season(cat, nc, filt_group, &filt_season)) continue;   /* back to shows */
+                } else filt_season = 0;
+                goto cb_rebuild;
+            }
         }
         if (leave == 2) break;   /* B in the list with no category level -> exit the catalog */
     }
@@ -2897,7 +2960,10 @@ static void dlw_detail_screen(void) {
         ui_text_center(UI_W / 2, 12, 2, UI_NEON, "DOWNLOADING");
         ui_glow_round(28, 40, UI_W - 56, 2, 1, UI_NEON, 3, 30);
         ui_fill_round(28, 40, UI_W - 56, 2, 1, UI_NEON);
-        ui_text_fit(UI_W / 2, 68, 1, UI_NEONC, s_dlw_item.name, UI_W - 16);
+        { int tw = ui_text_w(1, s_dlw_item.name), avail = UI_W - 16, nr = 0;
+          if (tw <= avail) ui_text_center(UI_W / 2, 68, 1, UI_NEONC, s_dlw_item.name);
+          else { int mq = marquee_off(4400000, tw, avail, &nr);
+                 ui_text_clipped(8 - mq, 68, 1, UI_NEONC, s_dlw_item.name, 8, UI_W - 8); } }
         int bx = 20, bw = UI_W - 40, by = 104, bh = 16;
         ui_fill_round(bx, by, bw, bh, bh / 2, TH_TRACK);
         char pl[48];
@@ -4045,9 +4111,14 @@ static void home_draw(int bsel, long long rpos) {
     ui_frame_round(cx, cy, cw, ch, 12, TH_LINE, 1);
 
     if (loaded) {
-        char nm[80]; snprintf(nm, sizeof(nm), "%s", g_now_playing);
-        int maxc = (cw - 16) / 8; if ((int)strlen(nm) > maxc) nm[maxc] = 0;
-        ui_text_center(UI_W / 2, cy + 12, 1, UI_NEONC, nm);
+        int tw = ui_text_w(1, g_now_playing), avail = cw - 16, nr = 0;
+        if (tw <= avail) { ui_text_center(UI_W / 2, cy + 12, 1, UI_NEONC, g_now_playing); marquee_off(-7, 0, 0, &nr); }
+        else {   /* long titles auto-scroll, like the library rows */
+            int mq = marquee_off(4200000, tw, avail, &nr);
+            int x0 = (UI_W - avail) / 2;
+            ui_text_clipped(x0 - mq, cy + 12, 1, UI_NEONC, g_now_playing, x0, x0 + avail);
+        }
+        if (nr) g_home_marq_dirty = 1;
     } else {
         ui_text_center(UI_W / 2, cy + 12, 1, UI_DIM, "No video loaded");
     }
@@ -4113,6 +4184,7 @@ static int home_gui(void) {
 
         if (redraw) {               /* only redraw on change, not every frame */
             home_draw(bsel, rpos);
+            if (g_home_marq_dirty) { g_home_marq_dirty = 0; redraw = 1; }
             ui_present();           /* offscreen -> fb in one shot (no flicker) */
             redraw = 0;
         }
