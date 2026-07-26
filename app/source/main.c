@@ -1437,6 +1437,55 @@ static void unzip_prog(int done, int total, const char *name) {
     ui_present(); gfxFlushBuffers(); gfxSwapBuffers();
 }
 
+/* ---- hierarchical catalog groups: TV shows have seasons, music videos have artists ----
+ * TV season entries keep the SHOW title in e->title (their display name is "... Season N");
+ * music-video titles follow "Artist - Song", so the artist is the prefix. */
+static void cat_group_key(const CatEntry *e, char *out, size_t cap) {
+    if (!strcasecmp(e->category, "TV Shows")) { snprintf(out, cap, "%s", e->title); return; }
+    const char *d = strstr(e->title, " - ");
+    if (d && d != e->title) snprintf(out, cap, "%.*s", (int)(d - e->title), e->title);
+    else snprintf(out, cap, "%s", e->title);
+}
+static int cat_grouped(const char *category) {
+    return !strcasecmp(category, "TV Shows") || !strcasecmp(category, "Music Videos");
+}
+/* Pick a show/artist within `filt_cat`. Returns 1 with filt_group set ("" = Show All),
+ * 0 = user backed out. Remembers the highlight per category for B-back navigation. */
+static int catalog_pick_group(const CatEntry *cat, int nc, const char *filt_cat,
+                              char *filt_group, size_t cap) {
+    static char groups[160][64], gdisp[160][64];
+    static char last_cat[32] = ""; static int last_g = -1;
+    int ngr = 0;
+    for (int i = 0; i < nc; i++) {
+        if (strcasecmp(cat[i].category, filt_cat)) continue;
+        char key[64]; cat_group_key(&cat[i], key, sizeof key);
+        int f = 0;
+        for (int j = 0; j < ngr; j++) if (!strcasecmp(groups[j], key)) { f = 1; break; }
+        if (!f && ngr < 160) snprintf(groups[ngr++], 64, "%s", key);
+    }
+    if (ngr <= 1) { filt_group[0] = 0; return 1; }   /* nothing to group -> straight to the list */
+    qsort(groups, ngr, 64, strrow_cmp);
+    for (int k = 0; k < ngr; k++) {
+        int n = 0;
+        for (int i = 0; i < nc; i++) {
+            if (strcasecmp(cat[i].category, filt_cat)) continue;
+            char key[64]; cat_group_key(&cat[i], key, sizeof key);
+            if (!strcasecmp(key, groups[k])) n++;
+        }
+        snprintf(gdisp[k], 64, "%.52s (%d)", groups[k], n);
+    }
+    int is_tv = !strcasecmp(filt_cat, "TV Shows");
+    if (!strcasecmp(last_cat, filt_cat) && last_g >= 0 && last_g < ngr)
+        s_pick_init = last_g + 1;   /* B-back from the list lands on the same show/artist */
+    int g = catalog_pick(is_tv ? "SHOWS" : "ARTISTS", filt_cat, gdisp, ngr, 1, NULL);
+    snprintf(last_cat, sizeof last_cat, "%s", filt_cat);
+    if (g == -2) { filt_group[0] = 0; last_g = -1; return 1; }   /* Show All */
+    if (g < 0) return 0;
+    snprintf(filt_group, cap, "%s", groups[g]);
+    last_g = g;
+    return 1;
+}
+
 static void catalog_browse(const Source *src) {
     ui_begin(GFX_BOTTOM); ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
     ui_text_center(UI_W / 2, 100, 2, UI_NEON, "Fetching...");
@@ -1466,7 +1515,7 @@ static void catalog_browse(const Source *src) {
 
     while (idx && aptMainLoop()) {
         /* ---- navigation: pick a category (+ optional genre), Show All, or X = search ---- */
-        char filt_cat[32] = "", filt_genre[32] = "", filt_search[64] = "";
+        char filt_cat[32] = "", filt_genre[32] = "", filt_search[64] = "", filt_group[64] = "";
         if (ncat > 1) {
             static char cdisp[24][64];   /* category rows with counts (selection uses cats[]) */
             for (int k = 0; k < ncat; k++) {
@@ -1479,6 +1528,11 @@ static void catalog_browse(const Source *src) {
             if (c == -4) { if (!kbd_text("Search this catalog", filt_search, sizeof filt_search)) continue; }
             else if (c >= 0) {
                 snprintf(filt_cat, sizeof filt_cat, "%s", cats[c]);
+                if (cat_grouped(filt_cat)) {   /* TV: pick a show; Music Videos: pick an artist */
+                    s_pick_init = c + 1;
+                    if (!catalog_pick_group(cat, nc, filt_cat, filt_group, sizeof filt_group)) continue;
+                    goto cb_have_filter;
+                }
                 static char gens[64][32]; int ng = distinct_genres(cat, nc, filt_cat, gens, 64);
                 qsort(gens, ng, 32, strrow_cmp);   /* genres alphabetical */
                 if (ng > 0) {
@@ -1498,12 +1552,15 @@ static void catalog_browse(const Source *src) {
                 s_pick_init = c + 1;   /* B-back re-highlights this category (+1: Show All row) */
             }
         }
+cb_have_filter:;
         /* ---- build the filtered + sorted index over cat[] ---- */
 cb_rebuild:;   /* X-search inside the list jumps back here with filt_search set */
         int ni = 0;
         for (int i = 0; i < nc; i++) {
             if (filt_cat[0] && strcasecmp(cat[i].category, filt_cat)) continue;
             if (filt_genre[0] && !genre_match(cat[i].genres, filt_genre)) continue;
+            if (filt_group[0]) { char key[64]; cat_group_key(&cat[i], key, sizeof key);
+                                 if (strcasecmp(key, filt_group)) continue; }
             if (filt_search[0] && !ci_contains(cat[i].name, filt_search)) continue;   /* search box */
             idx[ni++] = i;
         }
@@ -1641,6 +1698,10 @@ cb_rebuild:;   /* X-search inside the list jumps back here with filt_search set 
         }
         gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
     }
+        if (leave == 1 && cat_grouped(filt_cat)) {   /* B from a show/artist list -> the group picker */
+            if (catalog_pick_group(cat, nc, filt_cat, filt_group, sizeof filt_group)) goto cb_rebuild;
+            s_pick_init = 0;   /* backed out of the picker -> fall through to the categories */
+        }
         if (leave == 2) break;   /* B in the list with no category level -> exit the catalog */
     }
     pw_stop();
