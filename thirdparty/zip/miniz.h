@@ -6014,7 +6014,13 @@ static mz_bool mz_zip_reader_read_central_dir(mz_zip_archive *pZip,
           ((disk_index != num_this_disk) && (disk_index != 1)))
         return mz_zip_set_error(pZip, MZ_ZIP_UNSUPPORTED_MULTIDISK);
 
-      if (comp_size != MZ_UINT32_MAX) {
+      /* A writer may zip64-mark the local-header OFFSET (0xFFFFFFFF + extra field) while the
+       * sizes stay plain 32-bit values -- legal, and real tools do it for entries past 2GiB.
+       * The original check added the untranslated 0xFFFFFFFF marker to comp_size and declared
+       * such archives corrupt (every multi-GB season zip failed to open). Only range-check
+       * when the RAW offset field is a real offset. */
+      if (comp_size != MZ_UINT32_MAX &&
+          MZ_READ_LE32(p + MZ_ZIP_CDH_LOCAL_HEADER_OFS) != MZ_UINT32_MAX) {
         if (((mz_uint64)MZ_READ_LE32(p + MZ_ZIP_CDH_LOCAL_HEADER_OFS) +
              MZ_ZIP_LOCAL_DIR_HEADER_SIZE + comp_size) > pZip->m_archive_size)
           return mz_zip_set_error(pZip, MZ_ZIP_INVALID_HEADER_OR_CORRUPTED);
