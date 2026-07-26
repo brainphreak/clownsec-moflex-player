@@ -1265,7 +1265,9 @@ extern "C" {
 enum {
   /* Note: These enums can be reduced as needed to save memory or stack space -
      they are pretty conservative. */
-  MZ_ZIP_MAX_IO_BUF_SIZE = 64 * 1024,
+  /* 512KB: extraction on the 3DS is pure SD I/O (season zips STORE uncompressed moflex),
+   * and 64KB chunks meant thousands of FS round-trips -- a 2.7GB part took 30+ minutes */
+  MZ_ZIP_MAX_IO_BUF_SIZE = 512 * 1024,
   MZ_ZIP_MAX_ARCHIVE_FILENAME_SIZE = 512,
   MZ_ZIP_MAX_ARCHIVE_FILE_COMMENT_SIZE = 512
 };
