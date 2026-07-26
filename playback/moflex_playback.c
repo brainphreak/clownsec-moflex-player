@@ -1028,6 +1028,8 @@ static int g_y2r_init(int W, int H, int bpp) {
     Y2RU_SetTransferEndInterrupt(true);
     if (g_y2r_done) { svcCloseHandle(g_y2r_done); g_y2r_done = 0; }   /* never leak a previous event handle */
     Y2RU_GetTransferEndEvent(&g_y2r_done);
+    return 1;   /* MUST be here: falling off the end returned the last call's status (0 = success,
+                 * which reads as failure) and silently dropped every 3D video to the classic path */
 }
 /* Release Y2R AND the transfer-end event handle. Plain y2rExit() only closes the service
  * session -- the event grabbed by Y2RU_GetTransferEndEvent must be closed too, or every
