@@ -2181,19 +2181,22 @@ static MoflexResult moflex_play_ring(const char *path) {
     Tex3DS_SubTexture sub = { (u16)W, (u16)H, 0.0f, 1.0f, (float)W / GT_W, 1.0f - (float)H / GT_H };
     const size_t R3_RESERVE = (size_t)(R3_AWB * R3_ABUF * chn * 2) + (2u << 20);
     int NB = 0;
-    for (; NB < R3_NB_MAX; NB++) {
-        if (linearSpaceFree() < (size_t)(2 * GT_W * GT_H * r3_bpp) + R3_RESERVE) break;
+    for (; NB < R3_NB_MAX; NB++) {   /* 2D: one texture per slot -> twice the bank depth */
+        if (linearSpaceFree() < (size_t)((is3d ? 2 : 1) * GT_W * GT_H * r3_bpp) + R3_RESERVE) break;
         if (!C3D_TexInit(&r3_texL[NB], GT_W, GT_H, r3_tf)) break;
-        if (!C3D_TexInit(&r3_texR[NB], GT_W, GT_H, r3_tf)) { C3D_TexDelete(&r3_texL[NB]); break; }
+        if (is3d) {
+            if (!C3D_TexInit(&r3_texR[NB], GT_W, GT_H, r3_tf)) { C3D_TexDelete(&r3_texL[NB]); break; }
+            C3D_TexSetFilter(&r3_texR[NB], GPU_LINEAR, GPU_LINEAR);
+            r3_imgR[NB] = (C2D_Image){ &r3_texR[NB], &sub };
+        } else r3_imgR[NB] = (C2D_Image){ &r3_texL[NB], &sub };   /* never drawn flat, but never dangling */
         C3D_TexSetFilter(&r3_texL[NB], GPU_LINEAR, GPU_LINEAR);
-        C3D_TexSetFilter(&r3_texR[NB], GPU_LINEAR, GPU_LINEAR);
-        r3_imgL[NB] = (C2D_Image){ &r3_texL[NB], &sub }; r3_imgR[NB] = (C2D_Image){ &r3_texR[NB], &sub };
+        r3_imgL[NB] = (C2D_Image){ &r3_texL[NB], &sub };
     }
     /* Not enough linear heap for a usable ring on this console -> tear down and let the caller run the
      * classic path (which needs no GPU ring). This is what prevented the `wr % NB` divide-by-zero fault. */
     if (NB < 2) {
         aptUnhook(&g_ring_apt_cookie);
-        for (int i = 0; i < NB; i++) { C3D_TexDelete(&r3_texL[i]); C3D_TexDelete(&r3_texR[i]); }
+        for (int i = 0; i < NB; i++) { C3D_TexDelete(&r3_texL[i]); if (is3d) C3D_TexDelete(&r3_texR[i]); }
         C2D_Fini(); C3D_Fini();
         gfxSetScreenFormat(GFX_TOP, GSP_BGR8_OES); gfxSetScreenFormat(GFX_BOTTOM, GSP_RGB565_OES); gfxSet3D(false);
         av_frame_free(&fL); av_frame_free(&fR);
@@ -2202,7 +2205,7 @@ static MoflexResult moflex_play_ring(const char *path) {
     }
     if (!g_y2r_init(W, H, r3_bpp)) {   /* y2r wedged/unavailable: classic path has a software blit */
         aptUnhook(&g_ring_apt_cookie);
-        for (int i = 0; i < NB; i++) { C3D_TexDelete(&r3_texL[i]); C3D_TexDelete(&r3_texR[i]); }
+        for (int i = 0; i < NB; i++) { C3D_TexDelete(&r3_texL[i]); if (is3d) C3D_TexDelete(&r3_texR[i]); }
         C2D_Fini(); C3D_Fini();
         gfxSetScreenFormat(GFX_TOP, GSP_BGR8_OES); gfxSetScreenFormat(GFX_BOTTOM, GSP_RGB565_OES); gfxSet3D(false);
         av_frame_free(&fL); av_frame_free(&fR);
@@ -2750,7 +2753,7 @@ static MoflexResult moflex_play_ring(const char *path) {
     r3_audio_close();   /* unconditional: also frees a partial bank when setup failed */
     r3_vq_clear();
     C2D_TextBufDelete(sbuf); C2D_TextBufDelete(tmbuf); C2D_TextBufDelete(subbuf);
-    for (int i = 0; i < NB; i++) { C3D_TexDelete(&r3_texL[i]); C3D_TexDelete(&r3_texR[i]); }
+    for (int i = 0; i < NB; i++) { C3D_TexDelete(&r3_texL[i]); if (is3d) C3D_TexDelete(&r3_texR[i]); }
     ui_tex_free();   /* release the software-UI panel texture before C3D shuts down */
     gspWaitForVBlank(); gspWaitForVBlank();
     C2D_Fini(); C3D_Fini(); g_y2r_exit();
