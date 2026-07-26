@@ -1085,6 +1085,15 @@ static void queue_add_ui(const CatEntry *e) {
     for (int i = 0; i < s_qn; i++)
         if (!strcmp(s_q[i].url, e->url)) { snprintf(s_qtoast, sizeof s_qtoast, "Already queued"); s_qtoast_t = 75; return; }
     if (lib_has_file(e->fname)) { snprintf(s_qtoast, sizeof s_qtoast, "Already in library"); s_qtoast_t = 75; return; }
+    if (e->size > 4294901760LL) {   /* FAT32 (the only FS the 3DS reads) caps files at 4GiB --
+                                     * a bigger download is doomed to die at the 4GB mark, and
+                                     * 32-bit progress made it show nonsense like "122%" */
+        char m2[96];
+        snprintf(m2, sizeof m2, "File is %.1fGB -- over the SD card's\n4GB (FAT32) limit. It must be split\ninto smaller parts on the server.", e->size / 1073741824.0);
+        msg_screen("TOO LARGE", m2);
+        return ;
+    }
+
     if (!pick_folder(s_q_dest, sizeof s_q_dest)) return;   /* every file picks its own folder */
     QItem *q = &s_q[s_qn]; memset(q, 0, sizeof *q);
     snprintf(q->name, sizeof q->name, "%s", e->name);
@@ -1249,6 +1258,14 @@ static int queue_add_front(const CatEntry *e) {   /* 1 = queued, 2 = was already
             return 2;
         }
     if (s_qn >= QUEUE_MAX) { qtoast("Queue full"); return 0; }
+    if (e->size > 4294901760LL) {   /* FAT32 (the only FS the 3DS reads) caps files at 4GiB --
+                                     * a bigger download is doomed to die at the 4GB mark, and
+                                     * 32-bit progress made it show nonsense like "122%" */
+        char m2[96];
+        snprintf(m2, sizeof m2, "File is %.1fGB -- over the SD card's\n4GB (FAT32) limit. It must be split\ninto smaller parts on the server.", e->size / 1073741824.0);
+        msg_screen("TOO LARGE", m2);
+        return 0;
+    }
     if (!pick_folder(s_q_dest, sizeof s_q_dest)) return 0;   /* every file picks its own folder */
     memmove(&s_q[pos + 1], &s_q[pos], (size_t)(s_qn - pos) * sizeof(QItem));
     QItem *q = &s_q[pos]; memset(q, 0, sizeof *q);
