@@ -40,6 +40,7 @@
 static u64 s_idle_last, s_idle_prevscan;
 static int s_idle_off, s_idle_swallow, s_idle_hooked;
 static aptHookCookie s_idle_cookie;
+static int dl_lid_closed(void);                      /* defined with the download helpers below */
 static void idle_backlight(int on) {
     if (R_FAILED(gspLcdInit())) return;              /* transient hold -> HOME/suspend safe */
     if (on) GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTH);
@@ -48,8 +49,11 @@ static void idle_backlight(int on) {
     s_idle_off = !on;
 }
 static void idle_apt_hook(APT_HookType t, void *u) {
-    (void)u;   /* HOME / lid sleep: the system restored the backlight behind our back */
-    if (t == APTHOOK_ONRESTORE || t == APTHOOK_ONWAKEUP) { s_idle_off = 0; s_idle_last = osGetTime(); }
+    (void)u;   /* HOME / lid sleep: don't ASSUME the system relit the screens -- force it */
+    if (t == APTHOOK_ONRESTORE || t == APTHOOK_ONWAKEUP) {
+        s_idle_last = osGetTime();
+        if (s_idle_off) idle_backlight(1);
+    }
 }
 /* Analog direction bits (circle pad / C-stick) are EXCLUDED from the presence test: a slightly
  * drifting stick sits past the threshold and reports "held" (or flickers edges) every single
@@ -63,11 +67,25 @@ static void idle_scan(void) {
     u64 now = osGetTime();
     if (now - s_idle_prevscan > 2000) s_idle_last = now;   /* back from playback/extract/applet */
     s_idle_prevscan = now;
+    /* Lid watchdog: with sleep denied (background downloads) a lid close/reopen fires NO wake
+     * event -- if anything left the LCDs dark, nothing would ever relight them. A closed->open
+     * transition always forces the backlights on. */
+    static u64 s_shell_t; static int s_shell_closed = -1;
+    if (now - s_shell_t >= 500) {
+        s_shell_t = now;
+        int closed = dl_lid_closed();
+        if (s_shell_closed == 1 && !closed) { idle_backlight(1); s_idle_last = now; }
+        s_shell_closed = closed;
+    }
     u32 edge = (hidKeysDown() | hidKeysUp()) & ~IDLE_ANALOG;
     if (edge) {
         s_idle_last = now;
-        if (s_idle_off) { idle_backlight(1); s_idle_swallow = 1; }  /* wake press must not act */
+        if (s_idle_off && s_shell_closed != 1) { idle_backlight(1); s_idle_swallow = 1; }  /* wake press must not act */
     }
+    /* Self-heal: dark screens are only legitimate while the timer is expired. If a wake attempt
+     * failed (transient gsp::Lcd refusal) the flag stays set with a running timer -- keep
+     * retrying every frame until the relight actually lands. */
+    if (s_idle_off && s_shell_closed != 1 && now - s_idle_last < IDLE_OFF_MS) idle_backlight(1);
     if (s_idle_swallow && !((hidKeysHeld() | hidKeysDown()) & ~IDLE_ANALOG))
         s_idle_swallow = 0;                                         /* real keys released -> live */
     if (!s_idle_off && now - s_idle_last >= IDLE_OFF_MS) idle_backlight(0);
@@ -1445,17 +1463,31 @@ static int catalog_pick(const char *title, const char *subtitle, char items[][64
 static void lib_add_downloaded(const char *path, const CatEntry *src);   /* defined with the library code */
 static void lib_add_extracted(const char *folder, const CatEntry *src);  /* zip contents -> library (shows too) */
 
-/* live progress while a zip extracts: bar + n/total + current filename */
-static void unzip_prog(int done, int total, const char *name) {
+/* live progress while a zip extracts: bar + n/total + current filename.
+ * Fires between every write chunk, so it also keeps the app ALIVE during extraction:
+ * pumps APT (HOME suspends properly), scans input (idle/backlight/lid logic runs),
+ * and B offers to cancel. Returns 0 to cancel the extraction. */
+static int unzip_prog(int done, int total, const char *name) {
+    if (!aptMainLoop()) return 0;                     /* HOME "close software" -> stop cleanly */
+    hidScanInput();                                   /* = idle_scan: wake/idle/lid watchdog live */
+    if (hidKeysDown() & KEY_B) {
+        if (confirm("Cancel the extraction?\n(The zip file is kept)")) return 0;
+    }
+    static u64 s_uz_draw;                             /* redraw ~7x/s, not every 512KB chunk */
+    u64 now = osGetTime();
+    if (name && now - s_uz_draw < 150) return 1;
+    s_uz_draw = now;
     ui_begin(GFX_BOTTOM); ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
     ui_text_center(UI_W / 2, 84, 2, UI_NEON, "Extracting...");
-    if (name) { char nb[96]; const char *b = strrchr(name, '/'); ui_text_fit(UI_W / 2, 112, 1, UI_DIM, b ? b + 1 : name, UI_W - 16); (void)nb; }
+    if (name) { const char *b = strrchr(name, '/'); ui_text_fit(UI_W / 2, 112, 1, UI_DIM, b ? b + 1 : name, UI_W - 16); }
     int bx = 20, bw = UI_W - 40, by = 138, bh = 16;
     ui_fill_round(bx, by, bw, bh, bh / 2, TH_TRACK);
     if (total > 0) { int fw = (int)((long long)bw * done / total); if (fw > 0) ui_fill_round(bx, by, fw, bh, bh / 2, UI_NEON); }
     char pl[32]; snprintf(pl, sizeof pl, "%d / %d files", done, total);
     ui_text_center(UI_W / 2, by + bh + 10, 1, UI_INK, pl);
+    ui_text_center(UI_W / 2, by + bh + 32, 1, UI_DIM, "B = cancel");
     ui_present(); gfxFlushBuffers(); gfxSwapBuffers();
+    return 1;
 }
 
 /* ---- hierarchical catalog groups: TV shows have seasons, music videos have artists ----
@@ -2747,6 +2779,7 @@ static void download_url_direct(void) {
         char m[96];
         if (nf > 0 && nf == tot) snprintf(m, sizeof m, "Extracted %d file%s.", nf, nf == 1 ? "" : "s");
         else if (nf > 0)         snprintf(m, sizeof m, "Extracted %d of %d files.", nf, tot);
+        else if (nf < 0)         snprintf(m, sizeof m, "Extraction canceled.\nThe zip file was kept.");
         else                     snprintf(m, sizeof m, tot == 0 ? "Could not open the zip." : "Extract FAILED.");
         if (nf > 0) lib_add_extracted(folder, NULL);
         msg_screen("DOWNLOAD", m);
@@ -2888,6 +2921,9 @@ static int s_scrape_sub = 0;   /* what the last scrape_one did about subtitles (
 static int dlw_poll(void) {
     if (!s_dlw_active || !s_dlw_finished) return 0;
     s_dlw_active = 0; s_dlw_finished = 0;
+    /* An item just finished: if the 5-minute idle darkened the screens (lid open), relight them
+     * NOW -- the completion toast / a long zip extraction must not run invisibly on dark LCDs. */
+    if (s_idle_off && !dl_lid_closed()) { idle_backlight(1); s_idle_last = osGetTime(); }
     if (!s_dlw_ok) {   /* cancelled or failed: keep the item + partial data for resume */
         aptSetSleepAllowed(true);            /* lid closed -> the console can nap now */
         dl_wifi_hold(0);
@@ -2919,6 +2955,8 @@ static int dlw_poll(void) {
         int tot = 0;
         int nf = unzip_to_dir_cb(dest, folder, &tot, unzip_prog);   /* brief modal extract screen */
         if (nf > 0) { remove(dest); lib_add_extracted(folder, &e); }
+        else if (nf < 0)   /* user canceled mid-extract: zip intact, finish any time from MANAGE */
+            msg_screen("DOWNLOAD", "Extraction canceled.\nThe zip was kept -- use MANAGE ->\nEXTRACT ZIP to finish later.");
         else {   /* a silent failure here stranded zips with no explanation -- say it, keep the zip */
             char em[96];
             snprintf(em, sizeof em, "Downloaded, but extracting failed.\nThe zip was kept -- use MANAGE ->\nEXTRACT ZIP to retry.");
@@ -3582,6 +3620,7 @@ static void manage_menu(void) {
         char m[96];
         if (nf > 0 && nf == tot) snprintf(m, sizeof m, "Extracted %d file%s.", nf, nf == 1 ? "" : "s");
         else if (nf > 0)         snprintf(m, sizeof m, "Extracted %d of %d files.", nf, tot);
+        else if (nf < 0)         snprintf(m, sizeof m, "Extraction canceled.\nThe zip file was kept.");
         else                     snprintf(m, sizeof m, tot == 0 ? "Could not open the zip." : "Extract FAILED.");
         if (nf > 0) {
             lib_add_extracted(folder, NULL);

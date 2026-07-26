@@ -40,6 +40,16 @@ static int is_junk(const char *name) {
     return 0;
 }
 
+/* chunk sink for zip_entry_extract: write + re-fire the progress callback so long files
+ * stay responsive; returning a short count makes the extractor stop with an error. */
+struct uz_stream { FILE *f; unzip_prog_cb cb; int done, total; const char *name; int cancel; };
+static size_t uz_write(void *arg, uint64_t offset, const void *data, size_t size) {
+    struct uz_stream *s = (struct uz_stream *)arg;
+    (void)offset;
+    if (s->cb && !s->cb(s->done, s->total, s->name)) { s->cancel = 1; return 0; }
+    return fwrite(data, 1, size, s->f);
+}
+
 int unzip_to_dir_cb(const char *zip_path, const char *dest_dir, int *total_out, unzip_prog_cb cb) {
     if (total_out) *total_out = 0;
     char dir[1024];
@@ -93,27 +103,33 @@ int unzip_to_dir_cb(const char *zip_path, const char *dest_dir, int *total_out, 
     uz_log("countable files=%d", total);
     if (total_out) *total_out = total;
 
-    int extracted = 0;
-    for (ssize_t i = 0; i < n; i++) {
+    int extracted = 0, canceled = 0;
+    for (ssize_t i = 0; i < n && !canceled; i++) {
         if (zip_entry_openbyindex(z, i) != 0) continue;      /* skip an unreadable entry, keep going */
         const char *name = zip_entry_name(z);
         if (name && !zip_entry_isdir(z) && !is_junk(name)) {
-            if (cb) cb(extracted, total, name);
+            if (cb && !cb(extracted, total, name)) { zip_entry_close(z); canceled = 1; break; }
             char out[1024];
             snprintf(out, sizeof(out), "%s%s", dir, name);
             mkparents(out);                                  /* create any sub-folders inside the zip */
-            /* Do NOT trust zip_entry_fread's return: after writing the file it chmod()s the
-             * archive's unix permissions, and chmod always fails on the 3DS SD -> every perfectly
-             * extracted file reported failure ("Extract FAILED" with all files present).
-             * Truth = the file exists with the exact uncompressed size. */
+            /* Stream the entry out chunk by chunk (not zip_entry_fread): the callback runs
+             * BETWEEN chunks, so a multi-minute episode file stays cancelable and the UI keeps
+             * pumping. (fread also chmod()ed the result, which always fails on SD FAT -- truth
+             * = the file exists with the exact uncompressed size.) */
             unsigned long long want = zip_entry_size(z);
-            zip_entry_fread(z, out);
+            struct uz_stream s = { fopen(out, "wb"), cb, extracted, total, name, 0 };
+            if (s.f) {
+                zip_entry_extract(z, uz_write, &s);
+                fclose(s.f);
+                if (s.cancel) { remove(out); canceled = 1; }   /* half-written file: delete it */
+            }
             struct stat st;
-            if (stat(out, &st) == 0 && (unsigned long long)st.st_size == want) extracted++;
+            if (!canceled && stat(out, &st) == 0 && (unsigned long long)st.st_size == want) extracted++;
         }
         zip_entry_close(z);
     }
     zip_close(z);
+    if (canceled) { uz_log("CANCELED at %d/%d", extracted, total); return -1; }
     if (cb) cb(extracted, total, NULL);
     return extracted;
 }

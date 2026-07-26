@@ -2266,6 +2266,24 @@ static MoflexResult moflex_play_ring(const char *path) {
         hidScanInput();
         u32 kd = hidKeysDown(), kh = hidKeysHeld();
         touchPosition tp; hidTouchRead(&tp);
+        /* Lid watchdog: with sleep denied (background downloads) closing the lid doesn't sleep --
+         * the movie keeps playing dark -- and reopening fires NO wake event, so a missed system
+         * relight leaves both LCDs black with the audio running. Force them on at closed->open. */
+        {
+            static u64 s_lid_t; static int s_lid_closed = -1;
+            u64 lnow = osGetTime();
+            if (lnow - s_lid_t >= 500) {
+                s_lid_t = lnow;
+                u8 shell = 1;
+                if (R_SUCCEEDED(ptmuInit())) { PTMU_GetShellState(&shell); ptmuExit(); }
+                if (s_lid_closed == 1 && shell != 0) {
+                    if (g_lcd_ok) GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTH);
+                    else if (R_SUCCEEDED(gspLcdInit())) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTH); gspLcdExit(); }
+                    g_screen_off = 0; g_backlight_on = 1; dirty = 1;
+                }
+                s_lid_closed = (shell == 0) ? 1 : 0;
+            }
+        }
         g_ring_apt_playing = playing;   /* so the suspend hook resumes audio only if we were playing */
         if (g_ring_apt_redraw) {        /* back from HOME/sleep: the suspend hook turned 3D OFF for the
                                          * applet -- re-enable it (this was never consumed: 3D stayed

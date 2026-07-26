@@ -440,6 +440,25 @@ MoflexResult mp4_play(const char *path) {
         u32 kd = hidKeysDown(), kh = hidKeysHeld();
         touchPosition tp; hidTouchRead(&tp);
 
+        /* Lid watchdog: with sleep denied (background downloads) a lid close/reopen fires no
+         * wake event -- force the backlights on at the closed->open transition (same fix as the
+         * moflex player; a missed system relight otherwise leaves both LCDs black, audio on). */
+        {
+            static u64 s_lid_t; static int s_lid_closed = -1;
+            u64 lnow = osGetTime();
+            if (lnow - s_lid_t >= 500) {
+                s_lid_t = lnow;
+                u8 shell = 1;
+                if (R_SUCCEEDED(ptmuInit())) { PTMU_GetShellState(&shell); ptmuExit(); }
+                if (s_lid_closed == 1 && shell != 0) {
+                    if (g_lcd_ok) GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTH);
+                    else if (R_SUCCEEDED(gspLcdInit())) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTH); gspLcdExit(); }
+                    g_screen_off = 0;
+                }
+                s_lid_closed = (shell == 0) ? 1 : 0;
+            }
+        }
+
         /* bottom screen off: any input wakes it (and is swallowed so it doesn't hit a control) */
         if (g_screen_off) {
             if (kd || (kh & KEY_TOUCH)) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; }
