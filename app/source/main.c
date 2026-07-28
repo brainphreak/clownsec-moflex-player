@@ -3237,6 +3237,19 @@ static int scr_match(const char *localstem, const CatEntry *e) {
     if (!strcmp(ls, es) || !strcmp(ls, fs) || !strcmp(ls, ts)) return 1;   /* title+year match (movies & TV) */
     /* no year in the filename -> match title only (remakes may pick the wrong year; add a year to be exact) */
     if (!ly[0] && strlen(lt) >= 4 && (!strcmp(lt, et) || !strcmp(lt, ft) || !strcmp(lt, tt))) return 1;
+    /* TV folders carry qualifiers the catalog title lacks ("Uzumaki - Season 1"): cut the name at a
+     * word-boundary "Season" and retry everything with the shorter stem. Titles that BEGIN with
+     * "Season" ("Season of the Witch") are untouched -- the cut must leave a real prefix. */
+    for (const char *p = localstem + 1; *p; p++)
+        if (!isalnum((unsigned char)p[-1]) && !strncasecmp(p, "season", 6) && !isalpha((unsigned char)p[6])) {
+            size_t L = (size_t)(p - localstem);
+            while (L > 0 && (localstem[L - 1] == ' ' || localstem[L - 1] == '-')) L--;
+            if (L >= 4) {
+                char cut[256]; snprintf(cut, sizeof cut, "%.*s", (int)L, localstem);
+                return scr_match(cut, e);   /* depth 1: the prefix holds no further "Season" */
+            }
+            break;
+        }
     return 0;
 }
 /* Fetch a catalog entry's poster into pb, with one retry for transient network failures.
