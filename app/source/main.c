@@ -3414,7 +3414,21 @@ static void lib_rescan_interactive(void) {
 /* ---- startup: detect movies added outside the app (browser download, PC copy, upload) and offer
  * a rescan; after rescanning, offer art + info download for the new arrivals. ---- */
 static int startup_detect_poll(void);
-#define LATEST_URL "https://github.com/brainphreak/clownsec-moflex-player/releases/download/v1.0/latest.txt"
+/* Channel-aware update check: ONE ELF serves all three CIA identities, so the channel comes from
+ * our own TitleID at runtime (UniqueID 0xf8a2c stable / 0xf8a2d beta / 0xf8a2e mp4). Each build
+ * compares against ITS OWN release's latest.txt -- the beta used to check the production number
+ * and never noticed newer beta builds. (3DSX/HBL has no matching UniqueID -> stable URL.) */
+#define LATEST_URL_STABLE "https://github.com/brainphreak/clownsec-moflex-player/releases/download/v1.0/latest.txt"
+#define LATEST_URL_BETA   "https://github.com/brainphreak/clownsec-moflex-player/releases/download/v1.1.0-beta/latest.txt"
+#define LATEST_URL_MP4    "https://github.com/brainphreak/clownsec-moflex-player/releases/download/mp4-beta/latest.txt"
+static const char *latest_url(void) {
+    u64 tid = 0;
+    APT_GetProgramID(&tid);
+    u32 uid = (u32)((tid >> 8) & 0xFFFFF);
+    if (uid == 0xf8a2d) return LATEST_URL_BETA;
+    if (uid == 0xf8a2e) return LATEST_URL_MP4;
+    return LATEST_URL_STABLE;
+}
 static char s_upd[24] = ""; static int s_upd_shown = 0;
 static volatile int s_dtw_exit = 1;   /* worker thread fully finished (fetch included) */
 /* Parse a leading "MAJOR.MINOR" out of s WITHOUT scanf (no newlib locale involvement). */
@@ -3431,7 +3445,7 @@ static void update_check(void) {   /* worker thread; printf-free so it can't hit
         if (try) for (int w = 0; w < 50 && !s_dt_abort; w++) svcSleepThread(100 * 1000 * 1000LL);   /* 5s, abortable */
         if (osGetWifiStrength() == 0) continue;   /* offline or still associating -> retry, never block */
         char *buf = NULL; size_t len = 0;
-        if (!download_to_mem(LATEST_URL, &buf, &len, 256) || !buf) continue;   /* busy -> retry */
+        if (!download_to_mem(latest_url(), &buf, &len, 256) || !buf) continue;   /* busy -> retry */
         buf[len < 255 ? len : 255] = 0;
         int ld = 0, ln = 0, cd = 0, cn = 0;
         ver_parse(buf, &ld, &ln);
