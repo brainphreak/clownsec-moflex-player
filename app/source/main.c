@@ -3264,7 +3264,7 @@ static int fetch_poster(const CatEntry *e, u16 *pb) {
  * Returns 1 = saved with poster, 2 = saved but the poster wouldn't download, 0 = no catalog
  * matched, -1 = every catalog download failed, -2 = out of memory. The distinct failure codes
  * exist because all three used to read "No catalog had this title" -- undiagnosable. */
-static int scrape_one(const char *moviepath) {
+static int scrape_one_stem(const char *moviepath, const char *name_hint) {
     s_scrape_sub = 0;
     load_sources();
     char lstem[192]; local_stem(moviepath, lstem, sizeof lstem);
@@ -3280,7 +3280,8 @@ static int scrape_one(const char *moviepath) {
         fetched = 1;
         int nc = catalog_parse(json, sources[s].kind, sources[s].dl_base, sources[s].art_base, cat, cap);
         free(json);
-        for (int i = 0; i < nc; i++) if (scr_match(lstem, &cat[i])) {
+        for (int i = 0; i < nc; i++) if (scr_match(lstem, &cat[i]) ||
+                                          (name_hint && name_hint[0] && scr_match(name_hint, &cat[i]))) {
             int poster_ok = fetch_poster(&cat[i], pb);
             movieinfo_save(moviepath, &cat[i], poster_ok ? pb : NULL, POSTER_W, POSTER_H);
             s_scrape_sub = fetch_sub(moviepath, cat[i].sub);   /* subs without redownloading */
@@ -3291,6 +3292,10 @@ static int scrape_one(const char *moviepath) {
     free(pb); free(cat);
     return found ? found : (fetched ? 0 : -1);
 }
+/* A show recorded on a nested season folder has a path stem like "Season 1" -- useless for
+ * matching -- while its display NAME carries the real show title. Library Get Info passes the
+ * name as a second candidate; plain path-based callers use the stem alone. */
+static int scrape_one(const char *moviepath) { return scrape_one_stem(moviepath, NULL); }
 /* Batch: fill in every movie in the current folder that is MISSING metadata (skips ones that
  * already have art + description). Each catalog is fetched only once. */
 static void scrape_folder(void) {
@@ -3352,7 +3357,7 @@ static void scrape_folder(void) {
 /* Library GET INFO: refresh just this movie, in place. */
 static void lib_scrape_one(int i) {
     char path[CAT_URLLEN]; snprintf(path, sizeof path, "%s", g_lib[i].url);
-    int r = scrape_one(path);
+    int r = scrape_one_stem(path, g_lib[i].name);
     if (r > 0) { lib_refresh_entry(i); lib_save_cache(); }
     char m[160];
     snprintf(m, sizeof m, "%s%s",
