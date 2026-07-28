@@ -691,6 +691,7 @@ static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing)
     ui_begin(GFX_BOTTOM);
     if (g_panel_cheap) ui_fill_round(0, 0, UI_W, UI_H, 0, UI_BG);          /* flat bg (cheap) */
     else               ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
+    ui_text(2, UI_H - 10, 1, UI_DIM, "c");   /* engine tag: classic/fallback path (ring has none) */
 
     ui_text_clipped(10, 8, 1, UI_NEON, title, 10, VOL_X - 12);   /* clipped so it can't run into volume */
 
@@ -2961,13 +2962,18 @@ static MoflexResult moflex_play_classic(const char *path) {
                           save_pend = !playing; save_delay = SAVE_DELAY_FRAMES; }   /* arm only; unpausing disarms it */
         if (kd & KEY_UP)   { int s = (int)(g_vol / 0.25f + 0.0001f); g_vol = (s + 1) * 0.25f; if (g_vol > 4.0f) g_vol = 4.0f; vol_dirty = 1; dirty = 1; }   /* snap up to the 25% grid, capped at 400% */
         if (kd & KEY_DOWN) { int s = (int)(g_vol / 0.25f + 0.9999f); g_vol = (s - 1) * 0.25f; if (g_vol < 0.25f) g_vol = 0.25f; vol_dirty = 1; dirty = 1; }
-        {   /* Left/Right seek, hold to keep scrubbing (~30s steps) */
+        {   /* Left/Right seek: ACCUMULATE the target while held (bar previews it) -- the seek
+             * itself fires on RELEASE below, same feel as the ring player. Firing per repeat here
+             * did seek->play->seek->play: visibly jumpy on sparse-keyframe files. */
             int sdir = (kh & KEY_RIGHT) ? 1 : ((kh & KEY_LEFT) ? -1 : 0);
             if (sdir == 0) shold = 0;
             else {
                 int fire = (kd & (KEY_RIGHT | KEY_LEFT)) ? 1 : 0;   /* initial press */
-                if (!fire) { shold++; if (shold > 14 && (shold % 6 == 0)) fire = 1; }  /* repeat while held */
-                if (fire) { seek_to_us = cur_us + (int64_t)sdir * 30000000; want_seek = 1; }
+                if (!fire) { shold++; if (shold > 8 && (shold % 3 == 0)) fire = 1; }  /* repeat while held */
+                if (fire) { seek_to_us = (want_seek ? seek_to_us : cur_us) + (int64_t)sdir * 30000000;
+                            if (seek_to_us < 0) seek_to_us = 0;
+                            if (dur_us > 0 && seek_to_us > dur_us) seek_to_us = dur_us;
+                            want_seek = 1; dirty = 1; }
             }
         }
 
@@ -3011,8 +3017,8 @@ static MoflexResult moflex_play_classic(const char *path) {
         }
     after_input: ;
 
-        /* ---- apply a requested seek (resume playback, flush stale audio) ---- */
-        if (want_seek) {
+        /* ---- apply a requested seek (on L/R release; taps execute immediately) ---- */
+        if (want_seek && !(kh & (KEY_LEFT | KEY_RIGHT))) {
             if (y2r_started) { y2r_video_drain(); y2r_started = 0; }   /* drop any in-flight Y2R */
             do_seek(&m, &ctx, seek_to_us);
             vidx = 0; left_ok = 0;          /* re-establish L/R pairing after seek */
@@ -3113,7 +3119,8 @@ static MoflexResult moflex_play_classic(const char *path) {
 
         /* ---- panel redraw (throttled; skipped while the bottom screen is dark) ---- */
         if (!g_screen_off && (dirty || ++since_panel > 20)) {
-            panel_draw(title, cur_us, dur_us, playing);
+            panel_draw(title, (want_seek && (kh & (KEY_LEFT | KEY_RIGHT))) ? seek_to_us : cur_us,
+                       dur_us, playing);
             since_panel = 0; dirty = 0;
         }
     }

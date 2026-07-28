@@ -481,12 +481,16 @@ MoflexResult mp4_play(const char *path) {
         if (kd & KEY_A) { g_playing = !g_playing; }
         if (kd & KEY_UP)   { int s = (int)(g_pvol / 0.25f + 0.0001f); g_pvol = (s + 1) * 0.25f; if (g_pvol > 4.0f) g_pvol = 4.0f; vol_dirty = 1; }
         if (kd & KEY_DOWN) { int s = (int)(g_pvol / 0.25f + 0.9999f); g_pvol = (s - 1) * 0.25f; if (g_pvol < 0.25f) g_pvol = 0.25f; vol_dirty = 1; }
-        /* L/R (hold to repeat) = seek -/+ 10s */
+        /* L/R (hold to repeat): ACCUMULATE the target while held (bar previews it); the seek
+         * fires on RELEASE below -- one landing, no seek->play->seek jumping (ring parity). */
         { int lr = (kh & KEY_LEFT) ? -1 : (kh & KEY_RIGHT) ? 1 : 0;
           if (!lr) hrep = 0;
           else { int fire = (kd & (KEY_LEFT | KEY_RIGHT)) ? 1 : 0;
                  if (!fire) { hrep++; if (hrep > 8 && hrep % 4 == 0) fire = 1; }
-                 if (fire) { seek_req = 1; seek_to = cur_us + lr * SEEK_STEP_US; } } }
+                 if (fire) { seek_to = (seek_req ? seek_to : cur_us) + lr * SEEK_STEP_US;
+                             if (seek_to < 0) seek_to = 0;
+                             if (dur_us > 0 && seek_to > dur_us) seek_to = dur_us;
+                             seek_req = 1; last_sig = -1; } } }
 
         /* touch */
         if (kh & KEY_TOUCH) {
@@ -525,7 +529,7 @@ MoflexResult mp4_play(const char *path) {
         }
         if (scrub && !(kh & KEY_TOUCH)) { seek_req = 1; seek_to = scrub_us; scrub = 0; }   /* commit on release */
 
-        if (seek_req) { do_seek(&m, buf, atmp, sbs, dur_us, seek_to, &vi); cur_us = seek_to; seek_req = 0; }
+        if (seek_req && !(kh & (KEY_LEFT | KEY_RIGHT))) { do_seek(&m, buf, atmp, sbs, dur_us, seek_to, &vi); cur_us = seek_to; seek_req = 0; }
 
         /* ---- paused: hold, keep panel live, defer SD writes to here ---- */
         if (!g_playing) {
@@ -536,7 +540,7 @@ MoflexResult mp4_play(const char *path) {
                 if (cur_us > 3000000 && (dur_us <= 0 || cur_us < dur_us - 5000000)) moflex_resume_save(path, cur_us);
                 was_paused = 1;
             }
-            int64_t shown = scrub ? scrub_us : cur_us;
+            int64_t shown = scrub ? scrub_us : (seek_req ? seek_to : cur_us);
             draw_panel(title, shown, dur_us);
             gspWaitForVBlank();
             continue;
@@ -587,8 +591,9 @@ MoflexResult mp4_play(const char *path) {
         for (;;) {
             pump_audio(&m, atmp);
             int64_t now = media_now_us();
-            int sig = (int)(cur_us / 250000) ^ (g_playing << 20) ^ ((int)(g_pvol * 4) << 22) ^ (g_batt << 24);
-            if (sig != last_sig) { draw_panel(title, scrub ? scrub_us : cur_us, dur_us); last_sig = sig; }
+            int64_t pnl = scrub ? scrub_us : (seek_req ? seek_to : cur_us);
+            int sig = (int)(pnl / 250000) ^ (g_playing << 20) ^ ((int)(g_pvol * 4) << 22) ^ (g_batt << 24);
+            if (sig != last_sig) { draw_panel(title, pnl, dur_us); last_sig = sig; }
             if (now >= cur_us) break;
             if (!aptMainLoop()) { quit = 1; break; }
             gspWaitForVBlank();
