@@ -3160,7 +3160,13 @@ static void add_movies_menu(void) {
 static void local_stem(const char *path, char *o, size_t cap) {   /* basename without extension */
     const char *b = strrchr(path, '/'); b = b ? b + 1 : path;
     snprintf(o, cap, "%s", b);
-    char *d = strrchr(o, '.'); if (d && d != o) *d = 0;
+    char *d = strrchr(o, '.');
+    /* strip KNOWN media extensions only: cutting at any last '.' truncated dotted show/folder
+     * names ("The Super Mario Bros. Super Show!" -> "The Super Mario Bros") so Get Info could
+     * never match them against the catalog */
+    if (d && d != o && (!strcasecmp(d, ".moflex") || !strcasecmp(d, ".mp4") || !strcasecmp(d, ".cia") ||
+                        !strcasecmp(d, ".zip") || !strcasecmp(d, ".m4v") || !strcasecmp(d, ".mov")))
+        *d = 0;
 }
 static int four_digits(const char *p) {
     return isdigit((unsigned char)p[0]) && isdigit((unsigned char)p[1]) &&
@@ -3242,20 +3248,23 @@ static int fetch_poster(const CatEntry *e, u16 *pb) {
 }
 
 /* Try to find + save catalog metadata for ONE movie (forces a refresh; used by X:Get info).
- * Returns 0 = no match, 1 = saved with poster, 2 = saved but the poster wouldn't download. */
+ * Returns 1 = saved with poster, 2 = saved but the poster wouldn't download, 0 = no catalog
+ * matched, -1 = every catalog download failed, -2 = out of memory. The distinct failure codes
+ * exist because all three used to read "No catalog had this title" -- undiagnosable. */
 static int scrape_one(const char *moviepath) {
     s_scrape_sub = 0;
     load_sources();
     char lstem[192]; local_stem(moviepath, lstem, sizeof lstem);
-    int cap = 4096; CatEntry *cat = (CatEntry *)malloc(sizeof(CatEntry) * cap);
+    int cap = 2048; CatEntry *cat = (CatEntry *)malloc(sizeof(CatEntry) * cap);
     u16 *pb = (u16 *)malloc((size_t)POSTER_W * POSTER_H * sizeof(u16));
-    if (!cat) { free(pb); return 0; }
-    int found = 0;
+    if (!cat) { free(pb); return -2; }
+    int found = 0, fetched = 0;
     for (int s = 0; s < nsources && !found; s++) {
         printf("\x1b[2J\x1b[H=== GET INFO ===\n\nChecking %.28s ...\n", sources[s].name);
         gfxFlushBuffers(); gfxSwapBuffers();
         char *json = NULL; size_t len = 0;
         if (!download_to_mem(sources[s].url, &json, &len, 32 * 1024 * 1024)) continue;
+        fetched = 1;
         int nc = catalog_parse(json, sources[s].kind, sources[s].dl_base, sources[s].art_base, cat, cap);
         free(json);
         for (int i = 0; i < nc; i++) if (scr_match(lstem, &cat[i])) {
@@ -3267,13 +3276,13 @@ static int scrape_one(const char *moviepath) {
         }
     }
     free(pb); free(cat);
-    return found;
+    return found ? found : (fetched ? 0 : -1);
 }
 /* Batch: fill in every movie in the current folder that is MISSING metadata (skips ones that
  * already have art + description). Each catalog is fetched only once. */
 static void scrape_folder(void) {
     load_sources();
-    int cap = 4096; CatEntry *cat = (CatEntry *)malloc(sizeof(CatEntry) * cap);
+    int cap = 2048; CatEntry *cat = (CatEntry *)malloc(sizeof(CatEntry) * cap);
     u16 *pb = (u16 *)malloc((size_t)POSTER_W * POSTER_H * sizeof(u16));
     static char done[MAXE];
     int todo = 0;
@@ -3331,13 +3340,15 @@ static void scrape_folder(void) {
 static void lib_scrape_one(int i) {
     char path[CAT_URLLEN]; snprintf(path, sizeof path, "%s", g_lib[i].url);
     int r = scrape_one(path);
-    if (r) { lib_refresh_entry(i); lib_save_cache(); }
+    if (r > 0) { lib_refresh_entry(i); lib_save_cache(); }
     char m[160];
     snprintf(m, sizeof m, "%s%s",
              r == 1 ? "Info + artwork saved."
            : r == 2 ? "Info saved, but the poster\ndidn't download. Try again for the art."
+           : r == -1 ? "Could not download the catalog.\nCheck the connection and try again."
+           : r == -2 ? "Out of memory.\nRestart the app and try again."
                     : "No catalog had this title.",
-             !r ? "" : s_scrape_sub == 1 ? "\nSubtitles downloaded."
+             r <= 0 ? "" : s_scrape_sub == 1 ? "\nSubtitles downloaded."
                      : s_scrape_sub == 2 ? "\nSubtitles already present." : "\nNo subtitles in the catalog.");
     msg_screen("GET INFO", m);
 }
@@ -3345,7 +3356,7 @@ static void lib_scrape_one(int i) {
 /* Library GET INFO (batch): fill in every movie in the current list that's MISSING info. */
 static void lib_scrape_missing(int *idx, int ni) {
     load_sources();
-    int cap = 4096; CatEntry *cat = (CatEntry *)malloc(sizeof(CatEntry) * cap);
+    int cap = 2048; CatEntry *cat = (CatEntry *)malloc(sizeof(CatEntry) * cap);
     u16 *pb = (u16 *)malloc((size_t)POSTER_W * POSTER_H * sizeof(u16));
     static char done[LIB_MAX];
     int todo = 0;
@@ -3648,8 +3659,10 @@ static void getinfo_menu(void) {
         snprintf(m, sizeof m, "%s%s",
                  r == 1 ? "Info + artwork saved."
                : r == 2 ? "Info saved, but the poster\ndidn't download. Try again for the art."
+               : r == -1 ? "Could not download the catalog.\nCheck the connection and try again."
+               : r == -2 ? "Out of memory.\nRestart the app and try again."
                         : "No catalog had this title.",
-                 !r ? "" : s_scrape_sub == 1 ? "\nSubtitles downloaded."
+                 r <= 0 ? "" : s_scrape_sub == 1 ? "\nSubtitles downloaded."
                          : s_scrape_sub == 2 ? "\nSubtitles already present." : "\nNo subtitles in the catalog.");
         msg_screen("DOWNLOAD INFO", m);
     } else if (a == 1) {
