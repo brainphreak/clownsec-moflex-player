@@ -1994,6 +1994,19 @@ static void lib_add_shows_in_dir(const char *dir, const CatEntry *src) {
 static int epname_cmp(const void *a, const void *b) { return strcasecmp((const char *)a, (const char *)b); }
 #define EP_MAX 100
 static char s_epfile[EP_MAX][PATHLEN + NAMELEN];   /* full episode paths (may span season folders) */
+/* Tolerant collector: EVERY .moflex in the folder, no SxxEyy requirement. Last-resort fallback so
+ * a show whose files are named "Show - 01.moflex" (miniseries without tags) still lists episodes
+ * (name order; the picker labels fall back to the filename when there is no tag). */
+static void ep_collect_dir_any(const char *dirpath, int *n) {
+    DIR *d = opendir(dirpath);
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d)) && *n < EP_MAX) {
+        if (e->d_name[0] == '.' || !is_moflex(e->d_name)) continue;
+        snprintf(s_epfile[*n], sizeof s_epfile[0], "%s/%s", dirpath, e->d_name); (*n)++;
+    }
+    closedir(d);
+}
 static void ep_collect_dir_named(const char *dirpath, const char *showname, int *n) {
     DIR *d = opendir(dirpath);
     if (!d) return;
@@ -2038,6 +2051,7 @@ static int show_collect_eps(const char *showname, const char *url) {
             }
             closedir(pd);
         }
+        if (n == 0) ep_collect_dir_any(url, &n);   /* no SxxEyy tags anywhere -> take every moflex */
     } else {
         /* virtual "<dir>/<Show>" key: the episodes sit flat in the parent, filtered by prefix */
         char pdir[PATHLEN + NAMELEN];
