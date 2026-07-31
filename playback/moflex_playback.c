@@ -777,25 +777,36 @@ static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing)
 /* ---- subtitle options (modal, bottom screen; top keeps showing the frozen frame) ---- */
 static int sub_modal(const char *title, const char *const *items, int n, int start) {
     int sel = (start >= 0 && start < n) ? start : 0;
-    int top = 40, step = (218 - top) / (n > 0 ? n : 1);   /* adaptive: fit n items above the footer */
+    const int VIS_MAX = 7;                                /* rows on screen; longer lists scroll */
+    int vis = n < VIS_MAX ? n : VIS_MAX, off = 0, rep = 0;
+    int top = 40, step = (218 - top) / (vis > 0 ? vis : 1);
     if (step > 30) step = 30;
     int bh = step - 4; if (bh > 26) bh = 26; if (bh < 15) bh = 15;
     while (aptMainLoop()) {
         hidScanInput();
-        u32 k = hidKeysDown();
+        u32 k = hidKeysDown(), kh = hidKeysHeld();
         if (k & KEY_B) return -1;
-        if (k & KEY_DOWN) sel = (sel + 1) % n;
-        if (k & KEY_UP)   sel = (sel + n - 1) % n;
+        {   int dir = (kh & KEY_DOWN) ? 1 : (kh & KEY_UP) ? -1 : 0;   /* hold to repeat */
+            if (!dir) rep = 0;
+            else { int fire = (k & (KEY_UP | KEY_DOWN)) ? 1 : 0;
+                   if (!fire) { rep++; if (rep > 12 && rep % 3 == 0) fire = 1; }
+                   if (fire) sel = (sel + n + dir) % n; } }
+        if (sel < off) off = sel;
+        if (sel >= off + vis) off = sel - vis + 1;
         if (k & KEY_A) return sel;
         touchPosition tp; hidTouchRead(&tp);
         if (k & KEY_TOUCH)
-            for (int i = 0; i < n; i++) { int by = top + i * step;
-                if (tp.py >= by && tp.py < by + bh && tp.px >= 18 && tp.px < UI_W - 18) return i; }
+            for (int i = 0; i < vis; i++) { int by = top + i * step;
+                if (tp.py >= by && tp.py < by + bh && tp.px >= 18 && tp.px < UI_W - 18) return off + i; }
         ui_begin(GFX_BOTTOM);
         ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
         ui_text_center(UI_W / 2, 14, 2, UI_NEON, title);
-        for (int i = 0; i < n; i++) { int by = top + i * step;
-            ui_button(18, by, UI_W - 36, bh, items[i], i == sel, UI_NEONC); }
+        for (int i = 0; i < vis; i++) { int by = top + i * step;
+            ui_button(18, by, UI_W - 36, bh, items[off + i], off + i == sel, UI_NEONC); }
+        if (n > vis) {   /* position hint for scrolled lists */
+            char pg[24]; snprintf(pg, sizeof pg, "%d / %d", sel + 1, n);
+            ui_text_center(UI_W / 2, 224, 1, UI_DIM, pg);
+        }
         ui_present();
         gspWaitForVBlank();
     }
@@ -815,6 +826,17 @@ static void sub_msg(const char *msg) {
         gspWaitForVBlank();
     }
 }
+#define SRT_MAX 64
+/* alphabetical order: episode SRTs (S01e01..S01e26) must list in watch order, and with more
+ * files than rows the readdir order looked arbitrary */
+static void sub_srt_sort(char names[][128], char paths[][512], int n) {
+    for (int i = 1; i < n; i++)
+        for (int j = i; j > 0 && strcasecmp(names[j - 1], names[j]) > 0; j--) {
+            char tn[128], tp[512];
+            memcpy(tn, names[j - 1], 128); memcpy(names[j - 1], names[j], 128); memcpy(names[j], tn, 128);
+            memcpy(tp, paths[j - 1], 512); memcpy(paths[j - 1], paths[j], 512); memcpy(paths[j], tp, 512);
+        }
+}
 static int sub_srt_scan(const char *dir, char names[][128], char paths[][512], int start, int max) {
     DIR *d = opendir(dir); if (!d) return start;
     struct dirent *e; int n = start;
@@ -830,14 +852,15 @@ static int sub_srt_scan(const char *dir, char names[][128], char paths[][512], i
     return n;
 }
 static void sub_load_menu(const char *moviepath) {
-    static char names[5][128]; static char paths[5][512];
+    static char names[SRT_MAX][128]; static char paths[SRT_MAX][512];
     const char *b = strrchr(moviepath, '/');
     char dir[512]; int dl = b ? (int)(b - moviepath + 1) : 0;
     snprintf(dir, sizeof dir, "%.*s", dl, moviepath);        /* the movie's own folder */
-    int nf = sub_srt_scan(dir, names, paths, 0, 5);
-    nf = sub_srt_scan("sdmc:/moflex_player/moviedata/", names, paths, nf, 5);
+    int nf = sub_srt_scan(dir, names, paths, 0, SRT_MAX);    /* was 5: a CIA season's SRTs vanished */
+    nf = sub_srt_scan("sdmc:/moflex_player/moviedata/", names, paths, nf, SRT_MAX);
+    sub_srt_sort(names, paths, nf);
     if (nf == 0) { sub_msg("No .srt files found in the\nmovie folder or moviedata."); return; }
-    const char *items[5]; for (int i = 0; i < nf; i++) items[i] = names[i];
+    const char *items[SRT_MAX]; for (int i = 0; i < nf; i++) items[i] = names[i];
     int c = sub_modal("LOAD SRT", items, nf, 0);
     if (c < 0) return;
     if (subs_load(paths[c])) { g_sub_on = 1; sub_msg("Subtitles loaded."); }
@@ -1220,8 +1243,9 @@ static void g_panel_sw(C3D_RenderTarget *bot, const char *title, int64_t cur, in
 static int g_submenu = 0;      /* 0 = closed, 1 = options list, 2 = SRT file picker */
 static int g_sub_sel = 0;      /* selected row in the options list */
 static int g_sub_rep = 0;      /* left/right hold-repeat counter (delay/depth) */
-static int g_srt_sel = 0, g_srt_n = 0;
-static char g_srt_names[8][128], g_srt_paths[8][512];
+static int g_srt_sel = 0, g_srt_n = 0, g_srt_off = 0;
+static char g_srt_names[SRT_MAX][128], g_srt_paths[SRT_MAX][512];
+#define SRT_VIS 7   /* picker rows on screen; longer lists scroll */
 
 /* action codes per row, in display order (depth row only when 3D). Returns row count. */
 static int submenu_actions(int is3d, int *act) {
@@ -1260,7 +1284,8 @@ static void submenu_render(int is3d) {
     }
 }
 static void srtpicker_render(void) {
-    int top, step, bh; submenu_layout(g_srt_n > 0 ? g_srt_n : 1, &top, &step, &bh);
+    int vis = g_srt_n < SRT_VIS ? g_srt_n : SRT_VIS;
+    int top, step, bh; submenu_layout(vis > 0 ? vis : 1, &top, &step, &bh);
     ui_begin(GFX_BOTTOM);
     ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
     ui_text_center(UI_W / 2, 14, 2, UI_NEON, "LOAD SRT");
@@ -1268,8 +1293,13 @@ static void srtpicker_render(void) {
         ui_text_center(UI_W / 2, 100, 1, UI_INK, "No .srt files found in the");
         ui_text_center(UI_W / 2, 118, 1, UI_INK, "movie folder or moviedata.");
     }
-    for (int i = 0; i < g_srt_n; i++)
-        ui_button(18, top + i * step, UI_W - 36, bh, g_srt_names[i], i == g_srt_sel, UI_NEONC);
+    for (int i = 0; i < vis; i++)
+        ui_button(18, top + i * step, UI_W - 36, bh, g_srt_names[g_srt_off + i],
+                  g_srt_off + i == g_srt_sel, UI_NEONC);
+    if (g_srt_n > vis) {
+        char pg[24]; snprintf(pg, sizeof pg, "%d / %d", g_srt_sel + 1, g_srt_n);
+        ui_text_center(UI_W / 2, 224, 1, UI_DIM, pg);
+    }
 }
 static void g_submenu_sw(C3D_RenderTarget *bot, int is3d) {
     if (!ui_tex_init()) return;
@@ -1292,9 +1322,10 @@ static void submenu_open_srt(const char *moviepath) {
     const char *b = strrchr(moviepath, '/');
     char dir[512]; int dl = b ? (int)(b - moviepath + 1) : 0;
     snprintf(dir, sizeof dir, "%.*s", dl, moviepath);
-    g_srt_n = sub_srt_scan(dir, g_srt_names, g_srt_paths, 0, 8);
-    g_srt_n = sub_srt_scan("sdmc:/moflex_player/moviedata/", g_srt_names, g_srt_paths, g_srt_n, 8);
-    g_srt_sel = 0; g_submenu = 2;
+    g_srt_n = sub_srt_scan(dir, g_srt_names, g_srt_paths, 0, SRT_MAX);   /* was 8: episode SRTs vanished */
+    g_srt_n = sub_srt_scan("sdmc:/moflex_player/moviedata/", g_srt_names, g_srt_paths, g_srt_n, SRT_MAX);
+    sub_srt_sort(g_srt_names, g_srt_paths, g_srt_n);
+    g_srt_sel = 0; g_srt_off = 0; g_submenu = 2;
 }
 
 /* return the row a touch at (px,py) hit, or -1; also reports which half (left/right) was tapped */
@@ -1306,13 +1337,20 @@ static int submenu_hit(int px, int py, int n, int *side) {
 }
 /* one frame of menu input; returns 1 when the whole menu should close (config persisted). */
 static int submenu_input(u32 kd, u32 kh, touchPosition tp, int is3d, const char *moviepath) {
-    if (g_submenu == 2) {   /* SRT file picker */
+    if (g_submenu == 2) {   /* SRT file picker (scrolls: SRT_VIS rows of up to SRT_MAX files) */
         if (kd & KEY_B) { g_submenu = 1; return 0; }
         if (g_srt_n > 0) {
-            if (kd & KEY_DOWN) g_srt_sel = (g_srt_sel + 1) % g_srt_n;
-            if (kd & KEY_UP)   g_srt_sel = (g_srt_sel + g_srt_n - 1) % g_srt_n;
-            int side, hit = (kd & KEY_TOUCH) ? submenu_hit(tp.px, tp.py, g_srt_n, &side) : -1;
-            if (hit >= 0) g_srt_sel = hit;
+            static int rep;   /* hold to repeat through long episode lists */
+            int dir = (kh & KEY_DOWN) ? 1 : (kh & KEY_UP) ? -1 : 0;
+            if (!dir) rep = 0;
+            else { int fire = (kd & (KEY_UP | KEY_DOWN)) ? 1 : 0;
+                   if (!fire) { rep++; if (rep > 12 && rep % 3 == 0) fire = 1; }
+                   if (fire) g_srt_sel = (g_srt_sel + g_srt_n + dir) % g_srt_n; }
+            int vis = g_srt_n < SRT_VIS ? g_srt_n : SRT_VIS;
+            if (g_srt_sel < g_srt_off) g_srt_off = g_srt_sel;
+            if (g_srt_sel >= g_srt_off + vis) g_srt_off = g_srt_sel - vis + 1;
+            int side, hit = (kd & KEY_TOUCH) ? submenu_hit(tp.px, tp.py, vis, &side) : -1;
+            if (hit >= 0) g_srt_sel = g_srt_off + hit;
             if ((kd & KEY_A) || hit >= 0) { if (subs_load(g_srt_paths[g_srt_sel])) g_sub_on = 1; g_submenu = 1; }
         }
         return 0;
