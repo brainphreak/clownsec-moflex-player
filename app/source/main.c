@@ -1011,15 +1011,7 @@ static void draw_info_top(const CatEntry *e, const u16 *poster) {
     ui_clear(UI_BG);
     int y = 8;
     ui_text_wrap(10, &y, 2, UI_WHITE, e->name, 24, 2);       /* title (16px, ~24/line) */
-    static char s_sup_path[512]; static int s_sup = 0;
-    static char s_sup_audio[48], s_sup_subs[64];
-    {   /* SUPER MOFLEX badge + track languages (probe the file, or a show's first episode) */
-        if (strncmp(s_sup_path, e->url, sizeof s_sup_path - 1)) {
-            snprintf(s_sup_path, sizeof s_sup_path, "%s", e->url);
-            s_sup = entry_super(e, s_sup_audio, sizeof s_sup_audio, s_sup_subs, sizeof s_sup_subs, NULL);
-        }
-        if (s_sup || e->super) ui_text(400 - 8 - ui_text_w(1, "SUPER"), 8, 1, UI_NEON, "SUPER");
-    }
+    if (e->super) ui_text(400 - 8 - ui_text_w(1, "SUPER"), 8, 1, UI_NEON, "SUPER");
 
     /* poster box on the left */
     int px0 = 10, py0 = 48;
@@ -1047,12 +1039,10 @@ static void draw_info_top(const CatEntry *e, const u16 *poster) {
         ui_text(tx, ty, 1, is3d ? UI_NEONP : UI_DIM,
                 is3d ? "3D  (stereoscopic)" : "2D"); ty += 14;
     }
-    {   /* embedded tracks: catalog fields, else the local trailer probe */
-        const char *al = e->audio_langs[0] ? e->audio_langs : (s_sup ? s_sup_audio : "");
-        const char *sl = e->sub_langs[0]   ? e->sub_langs   : (s_sup ? s_sup_subs  : "");
+    {   /* embedded tracks: cached at scan (local) or from the catalog fields */
         char line[96];
-        if (al[0]) { snprintf(line, sizeof line, "Audio: %s", al); ui_text_wrap(tx, &ty, 1, UI_NEONC, line, 30, 2); }
-        if (sl[0]) { snprintf(line, sizeof line, "Subs: %s", sl);  ui_text_wrap(tx, &ty, 1, UI_NEONC, line, 30, 2); }
+        if (e->audio_langs[0]) { snprintf(line, sizeof line, "Audio: %s", e->audio_langs); ui_text_wrap(tx, &ty, 1, UI_NEONC, line, 30, 2); }
+        if (e->sub_langs[0])   { snprintf(line, sizeof line, "Subs: %s", e->sub_langs);     ui_text_wrap(tx, &ty, 1, UI_NEONC, line, 30, 2); }
     }
     if (e->genres[0]) { ui_text_wrap(tx, &ty, 1, UI_GRAY, e->genres, 30, 3); ty += 4; }
     if (e->desc[0])   ui_text_wrap(tx, &ty, 1, UI_INK, e->desc, 30, 12);
@@ -1938,7 +1928,7 @@ cb_rebuild:;   /* X-search inside the list jumps back here with filt_search set 
 /* ================= Library: one flat, categorized view of every local movie ================= */
 #define LIB_MAX   3000
 #define LIB_CACHE "sdmc:/moflex_player/library.cache"
-#define LIB_MAGIC 0x4C494241   /* 'LIB9' -- bump to invalidate old caches when CatEntry changes */
+#define LIB_MAGIC 0x4C494242   /* 'LIB9' -- bump to invalidate old caches when CatEntry changes */
 static CatEntry *g_lib = NULL;   /* every playable movie on the SD, with its .nfo metadata */
 static int       g_lib_n = 0;
 
@@ -2316,13 +2306,10 @@ static void lib_rescan(void) {
     if (s_scan_stop) { g_lib_n = 0; lib_load_cache_only(); }   /* aborted -> keep the OLD library,
                                                                 * never save a truncated cache */
     else {
-        for (int i = 0; i < g_lib_n; i++) {   /* one 16-byte tail read per entry (show -> ep 0) */
-            char rep[PATHLEN + NAMELEN];
-            if (g_lib[i].is_zip == 2) { if (!show_first_episode(&g_lib[i], rep, sizeof rep)) { g_lib[i].super = 0; continue; } }
-            else if (g_lib[i].is_zip == 0) snprintf(rep, sizeof rep, "%s", g_lib[i].url);
-            else { g_lib[i].super = 0; continue; }
-            g_lib[i].super = trailer_present(rep) ? 1 : 0;
-        }
+        for (int i = 0; i < g_lib_n; i++)   /* probe ONCE at scan: super flag + track languages,
+                                             * cached in the entry so hovering never opens a file */
+            g_lib[i].super = entry_super(&g_lib[i], g_lib[i].audio_langs, sizeof g_lib[i].audio_langs,
+                                         g_lib[i].sub_langs, sizeof g_lib[i].sub_langs, NULL) ? 1 : 0;
         lib_save_cache();
     }
     if (dl_was) dlw_start();     /* resume the queue (progress was kept) */
