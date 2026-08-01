@@ -792,7 +792,6 @@ static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing)
     ui_begin(GFX_BOTTOM);
     if (g_panel_cheap) ui_fill_round(0, 0, UI_W, UI_H, 0, UI_BG);          /* flat bg (cheap) */
     else               ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
-    ui_text(2, UI_H - 10, 1, UI_DIM, "c");   /* engine tag: classic/fallback path (ring has none) */
 
     {   /* title: marquee-scroll when it overflows so the episode name is readable */
         int tw = ui_text_w(1, title), avail = VOL_X - 12 - 10;
