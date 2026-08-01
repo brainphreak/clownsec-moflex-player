@@ -349,6 +349,11 @@ static void bw_exit(void) {
 #define CC_Y 104
 #define CC_W 48
 #define CC_H 28
+/* AUDIO track toggle -- mirrors CC on the LEFT, same row (dual-audio files only) */
+#define AUD_X 8
+#define AUD_Y 104
+#define AUD_W 48
+#define AUD_H 28
 /* DIM (bottom-screen-off) button -- below CC */
 #define DIM_X 244
 #define DIM_Y 138
@@ -768,6 +773,11 @@ static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing)
         ui_text(UI_W - 8 - ui_text_w(1, "LOCKED"), 38, 1, UI_NEONC, "LOCKED");
     /* subtitles: CC toggle/options (glows when on) */
     ui_button(CC_X, CC_Y, CC_W, CC_H, "CC", g_sub_on, g_sub_on ? UI_NEON : UI_DIM);
+    /* dual audio: tap toggles the language (A1 = main/English, A2 = alternate) */
+    if (g_atrk_n > 1) {
+        char al[8]; snprintf(al, sizeof al, "A%d", g_atrk_sel + 1);
+        ui_button(AUD_X, AUD_Y, AUD_W, AUD_H, al, g_atrk_sel > 0, g_atrk_sel > 0 ? UI_NEON : UI_DIM);
+    }
     /* bottom-screen-off: a crescent-moon button (video keeps playing on top) */
     if (g_lcd_ok) {
         ui_button(DIM_X, DIM_Y, DIM_W, DIM_H, "", 0, UI_NEONP);
@@ -1259,7 +1269,6 @@ static char g_srt_names[SRT_MAX][128], g_srt_paths[SRT_MAX][512];
 static int submenu_actions(int is3d, int *act) {
     int n = 0;
     act[n++] = 0; act[n++] = 1; act[n++] = 2; act[n++] = 3; act[n++] = 6;
-    if (g_atrk_n > 1) act[n++] = 7;   /* dual audio only: track selector */
     if (is3d) act[n++] = 4;
     act[n++] = 5;
     return n;
@@ -2595,6 +2604,9 @@ static MoflexResult moflex_play_ring(const char *path) {
                 seek_to_us = cur_us - 30000000; want_seek = 1;
             } else if (py >= PLAY_CY - 20 && py <= PLAY_CY + 20 && px >= FF_CX - 18 && px <= FF_CX + 18) {
                 seek_to_us = cur_us + 30000000; want_seek = 1;
+            } else if (g_atrk_n > 1 && px >= AUD_X && px < AUD_X + AUD_W && py >= AUD_Y && py < AUD_Y + AUD_H) {
+                g_atrk_sel = (g_atrk_sel + 1) % g_atrk_n;   /* audio toggle: its own button, not CC */
+                g_atrk_apply = 1; dirty = 1;
             } else if (px >= CC_X && px < CC_X + CC_W && py >= CC_Y && py < CC_Y + CC_H) {
                 g_submenu = 1; g_sub_sel = 0; dirty = 1;   /* CC: open the subtitle options menu */
             } else if (g_lcd_ok && px >= DIM_X && px < DIM_X + DIM_W && py >= DIM_Y && py < DIM_Y + DIM_H) {
