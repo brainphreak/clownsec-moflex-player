@@ -27,6 +27,15 @@ static int find_section(FILE *f, const char *cc, long long *body, unsigned *len)
     return 0;
 }
 
+int trailer_present(const char *moviepath) {
+    FILE *f = fopen(moviepath, "rb");
+    if (!f) return 0;
+    u8 ft[16]; int ok = 0;
+    if (!fseeko(f, -16, SEEK_END) && fread(ft, 1, 16, f) == 16 && !memcmp(ft + 8, "CSXTRA01", 8)) ok = 1;
+    fclose(f);
+    return ok;
+}
+
 int trailer_import_movieinfo(const char *moviepath) {
     return trailer_import_movieinfo_key(moviepath, moviepath, 0);
 }

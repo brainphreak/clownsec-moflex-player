@@ -12,4 +12,7 @@ int trailer_import_movieinfo(const char *moviepath);
  * episode's trailer. */
 int trailer_import_movieinfo_key(const char *moviepath, const char *savekey, int show_level);
 
+/* 1 if the file carries a CSXTRA trailer at all (16-byte footer probe). */
+int trailer_present(const char *moviepath);
+
 #endif

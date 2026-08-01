@@ -987,6 +987,14 @@ static void draw_info_top(const CatEntry *e, const u16 *poster) {
     ui_clear(UI_BG);
     int y = 8;
     ui_text_wrap(10, &y, 2, UI_WHITE, e->name, 24, 2);       /* title (16px, ~24/line) */
+    {   /* SUPER MOFLEX badge: self-contained file (dual audio / subs / info in the trailer) */
+        static char s_sup_path[512]; static int s_sup = 0;
+        if (strncmp(s_sup_path, e->url, sizeof s_sup_path - 1)) {
+            snprintf(s_sup_path, sizeof s_sup_path, "%s", e->url);
+            s_sup = e->is_zip == 0 ? trailer_present(e->url) : 0;
+        }
+        if (s_sup) ui_text(400 - 8 - ui_text_w(1, "SUPER"), 8, 1, UI_NEON, "SUPER");
+    }
 
     /* poster box on the left */
     int px0 = 10, py0 = 48;
