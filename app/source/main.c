@@ -2308,7 +2308,16 @@ static void lib_rescan(void) {
     lib_scan_dir("sdmc:/", 0);
     if (s_scan_stop) { g_lib_n = 0; lib_load_cache_only(); }   /* aborted -> keep the OLD library,
                                                                 * never save a truncated cache */
-    else lib_save_cache();
+    else {
+        for (int i = 0; i < g_lib_n; i++) {   /* one 16-byte tail read per entry (show -> ep 0) */
+            char rep[PATHLEN + NAMELEN];
+            if (g_lib[i].is_zip == 2) { if (!show_first_episode(&g_lib[i], rep, sizeof rep)) { g_lib[i].super = 0; continue; } }
+            else if (g_lib[i].is_zip == 0) snprintf(rep, sizeof rep, "%s", g_lib[i].url);
+            else { g_lib[i].super = 0; continue; }
+            g_lib[i].super = trailer_present(rep) ? 1 : 0;
+        }
+        lib_save_cache();
+    }
     if (dl_was) dlw_start();     /* resume the queue (progress was kept) */
 }
 
@@ -2621,8 +2630,10 @@ static int library_list(const char *filt_cat, const char *filt_genre, u16 *poste
 ll_rebuild:;   /* X-search inside the list jumps back here with s_lib_search set */
     memset(s_vs, 0xFF, sizeof s_vs);
     int *idx = lib_idxbuf, ni = 0;
+    int super_only = !strcmp(filt_cat, "\x01SUPER");
     for (int i = 0; i < g_lib_n; i++) {
-        if (filt_cat[0] && strcasecmp(lib_disp_cat(&g_lib[i]), filt_cat)) continue;
+        if (super_only) { if (!g_lib[i].super) continue; }
+        else if (filt_cat[0] && strcasecmp(lib_disp_cat(&g_lib[i]), filt_cat)) continue;
         if (filt_genre[0] && !genre_match(g_lib[i].genres, filt_genre)) continue;
         if (s_lib_search[0] && !ci_contains(g_lib[i].name, s_lib_search)) continue;   /* search box */
         idx[ni++] = i;
@@ -2749,6 +2760,10 @@ ll_rebuild:;   /* X-search inside the list jumps back here with s_lib_search set
                 else { char disp[NAMELEN]; snprintf(disp, sizeof disp, "%s", ce->name);
                     int cm = (txr - tx) / 8; if ((int)strlen(disp) > cm) disp[cm] = 0; ui_text(tx, ty, 1, tc, disp); }
                 if (yr[0]) ui_text(UI_W - 16 - ui_text_w(1, yr), ty, 1, selrow ? UI_NEONC : UI_GRAY, yr);
+                if (ce->super) {   /* SUPER MOFLEX marker, left of the year */
+                    int sx = (yr[0] ? UI_W - 16 - ui_text_w(1, yr) : UI_W - 16) - 14;
+                    ui_text(sx, ty, 1, UI_NEON, "S");
+                }
             }
             if (ni > BR_ROWS) { int th = BR_ROWS * BR_ROWH - 6, ty = BR_LIST_Y, maxs = ni - BR_ROWS;
                 int hh = th * BR_ROWS / ni; if (hh < 12) hh = 12; int hy = ty + (th - hh) * cscroll / maxs;
@@ -2784,16 +2799,24 @@ static int library_view(char *out, size_t cap) {
     while (aptMainLoop() && !chose) {
         static char cats[24][32]; int ncat = lib_distinct_categories(cats, 24);
         qsort(cats, ncat, 32, strrow_cmp);
-        static char cdisp[24][64];   /* display rows with per-category counts (selection uses cats[]) */
+        int nsuper = 0; for (int i = 0; i < g_lib_n; i++) if (g_lib[i].super) nsuper++;
+        static char cdisp[26][64]; int base = 0;
+        if (nsuper) { snprintf(cdisp[0], 64, "* SUPER MOFLEX (%d)", nsuper); base = 1; }
         for (int k = 0; k < ncat; k++) {
             int n = 0;
             for (int i = 0; i < g_lib_n; i++) if (!strcasecmp(lib_disp_cat(&g_lib[i]), cats[k])) n++;
-            snprintf(cdisp[k], 64, "%.48s (%d)", cats[k], n);
+            snprintf(cdisp[base + k], 64, "%.48s (%d)", cats[k], n);
         }
         char sub[24]; snprintf(sub, sizeof sub, "%d videos", g_lib_n);
-        int c = catalog_pick("LIBRARY", sub, cdisp, ncat, 1, "* Rescan Library");
+        int c = catalog_pick("LIBRARY", sub, cdisp, ncat + base, 1, "* Rescan Library");
         if (c == -1) break;                                   /* B -> leave the library */
         if (c == -3) { lib_rescan_interactive(); if (g_lib_n == 0) { msg_screen("LIBRARY", "No videos found."); break; } continue; }
+        if (c >= 0 && base && c == 0) {                       /* SUPER MOFLEX filter, across categories */
+            int r = library_list("\x01SUPER", "", poster, &sortmode, out, cap);
+            if (r == LL_PLAY) chose = 1; else if (r == LL_RESCAN) lib_rescan();
+            continue;
+        }
+        if (c >= 0) c -= base;                                /* shift past the virtual row */
         if (c == -4) {                                        /* X -> search the whole library */
             char q[64];
             if (kbd_text("Search your library", q, sizeof q)) {
