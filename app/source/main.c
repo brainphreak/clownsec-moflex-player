@@ -20,6 +20,7 @@
 #include "catalog.h"
 #include "poster.h"
 #include "movieinfo.h"
+#include "trailer.h"
 #include "unzip.h"
 #include "cia_moflex.h"
 #include "ui_gfx.h"
@@ -3286,6 +3287,8 @@ static int fetch_poster(const CatEntry *e, u16 *pb) {
  * exist because all three used to read "No catalog had this title" -- undiagnosable. */
 static int scrape_one_stem(const char *moviepath, const char *name_hint) {
     s_scrape_sub = 0;
+    /* SUPER MOFLEX: the file may carry its own library info + poster -- no network needed */
+    if (trailer_import_movieinfo(moviepath)) return 1;
     load_sources();
     char lstem[192]; local_stem(moviepath, lstem, sizeof lstem);
     int cap = 2048; CatEntry *cat = (CatEntry *)malloc(sizeof(CatEntry) * cap);
