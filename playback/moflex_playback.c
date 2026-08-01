@@ -548,7 +548,7 @@ static void subcfg_path(const char *movie, char *out, size_t cap) {
 static struct {
     int present;               /* footer found on this file */
     s64 payload_off;           /* demux window ends here (blocks only) */
-    s64 sub_off[12]; u32 sub_len[12]; char sub_lang[12][4]; int sub_n;   /* SUB0/SUB1 tracks */
+    s64 sub_off[16]; u32 sub_len[16]; char sub_lang[16][4]; int sub_n;   /* SUB0/SUB1 tracks */
     s64 aud_off; u32 aud_pkts; /* AUD0/AUD1 packet array */
     u32 aud_rate, aud_pktbytes;
     u16 aud_chn, aud_pktsamp;
@@ -571,11 +571,11 @@ static void trailer_probe(FILE *f) {
         if (fread(h, 1, 8, f) != 8) break;
         u32 len = h[4] | (h[5] << 8) | ((u32)h[6] << 16) | ((u32)h[7] << 24);
         if (len == 0 || p + 8 + (s64)len > end) break;   /* zero/overrun = corrupt trailer: stop */
-        if (!memcmp(h, "SUB0", 4) && len > 0 && len <= 1024 * 1024 && g_tra.sub_n < 12) {
+        if (!memcmp(h, "SUB0", 4) && len > 0 && len <= 1024 * 1024 && g_tra.sub_n < 16) {
             int k = g_tra.sub_n++;
             g_tra.sub_off[k] = p + 8; g_tra.sub_len[k] = len; g_tra.sub_lang[k][0] = 0;
         }
-        else if (!memcmp(h, "SUB1", 4) && len > 4 && len <= 1024 * 1024 && g_tra.sub_n < 12) {
+        else if (!memcmp(h, "SUB1", 4) && len > 4 && len <= 1024 * 1024 && g_tra.sub_n < 16) {
             u8 l[4]; int k = g_tra.sub_n++;
             if (fread(l, 1, 4, f) == 4) { memcpy(g_tra.sub_lang[k], l, 3); g_tra.sub_lang[k][3] = 0; }
             g_tra.sub_off[k] = p + 12; g_tra.sub_len[k] = len - 4;
