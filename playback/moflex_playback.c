@@ -1792,6 +1792,68 @@ gdone:
  *     inline wbuf[] and the gpu-path audio_worker so nothing clashes). Sized SMALL: on the Old 3DS
  *     the linear heap is tight, and an oversized reserve here starves the video ring to zero (which
  *     then faults on `wr % NB`). 24 x 2048 stereo = 192KB is ~1.1s of read-ahead, plenty. --- */
+/* ---- CSXTRA trailer: extras appended PAST the last block (the official player never reads
+ * there -- hardware-validated; in-band extra streams hang it or choke its demux queue).
+ * Layout: [blocks][sections][u64 payload_off][8B "CSXTRA01"]; section [4cc][u32 len][data]:
+ * 'SUB0' = srt bytes, 'AUD0' = u32 rate, u16 chn, u16 samples/pkt, fixed-size ADPCM packets
+ * (in-band framing) -> packet k sits at k*pktbytes, time = k*pktsamp/rate: seek is arithmetic. */
+static struct {
+    int present;               /* footer found on this file */
+    s64 payload_off;           /* demux window ends here (blocks only) */
+    s64 sub_off; u32 sub_len;  /* SUB0 body */
+    s64 aud_off; u32 aud_pkts; /* AUD0 packet array */
+    u32 aud_rate, aud_pktbytes;
+    u16 aud_chn, aud_pktsamp;
+} g_tra;
+static void trailer_probe(FILE *f) {
+    memset(&g_tra, 0, sizeof g_tra);
+    if (fseeko(f, -16, SEEK_END)) return;
+    s64 fsz = (s64)ftello(f) + 16;
+    u8 ft[16];
+    if (fread(ft, 1, 16, f) != 16 || memcmp(ft + 8, "CSXTRA01", 8)) return;
+    s64 off = 0;
+    for (int i = 7; i >= 0; i--) off = (off << 8) | ft[i];   /* le64 */
+    if (off <= 0 || off >= fsz - 16) return;
+    g_tra.payload_off = off;
+    s64 p = off, end = fsz - 16;
+    while (p + 8 <= end) {
+        u8 h[8];
+        fseeko(f, p, SEEK_SET);
+        if (fread(h, 1, 8, f) != 8) break;
+        u32 len = h[4] | (h[5] << 8) | ((u32)h[6] << 16) | ((u32)h[7] << 24);
+        if (p + 8 + (s64)len > end) break;
+        if (!memcmp(h, "SUB0", 4) && len > 0 && len <= 1024 * 1024) {
+            char *buf = (char *)malloc(len);
+            if (buf) {
+                fseeko(f, p + 8, SEEK_SET);
+                if (fread(buf, 1, len, f) == len) {
+                    mkdir("sdmc:/moflex_player", 0777);
+                    FILE *o = fopen("sdmc:/moflex_player/.embedded.srt", "wb");
+                    if (o) { fwrite(buf, 1, len, o); fclose(o); g_tra.sub_off = p + 8; g_tra.sub_len = len; }
+                }
+                free(buf);
+            }
+        }
+        else if (!memcmp(h, "AUD0", 4) && len > 8) {
+            u8 a[8];
+            if (fread(a, 1, 8, f) == 8) {
+                g_tra.aud_rate = a[0] | (a[1] << 8) | ((u32)a[2] << 16) | ((u32)a[3] << 24);
+                g_tra.aud_chn = (u16)(a[4] | (a[5] << 8));
+                g_tra.aud_pktsamp = (u16)(a[6] | (a[7] << 8));
+                if (g_tra.aud_rate >= 8000 && g_tra.aud_rate <= 48000 &&
+                    g_tra.aud_chn >= 1 && g_tra.aud_chn <= 2 && g_tra.aud_pktsamp >= 256) {
+                    g_tra.aud_pktbytes = 4u * g_tra.aud_chn + (u32)g_tra.aud_pktsamp * g_tra.aud_chn / 2;
+                    g_tra.aud_off = p + 16;
+                    g_tra.aud_pkts = (len - 8) / g_tra.aud_pktbytes;
+                }
+            }
+        }
+        p += 8 + len;
+    }
+    g_tra.present = 1;
+}
+
+
 #define R3_AWB  48            /* wavebufs: deep audio read-ahead so audio rides through decode dips */
 #define R3_ABUF 2048          /* max samples/ch per audio packet (real ~2k) */
 static ndspWaveBuf r3_wb[R3_AWB]; static int16_t *r3_ab[R3_AWB];
@@ -1849,12 +1911,12 @@ static void r3_audio_poll(void) {
     else if (r3_apos > audio + 100000)   r3_apos -= (r3_apos - audio - 100000) / 8;      /* too far ahead -> ease back */
 }
 /* buffer one audio packet. 1 = consumed, 0 = no free wavebuf (hold the packet and retry). */
-static int r3_audio_feed(MfxPacket *pkt) {
+static int r3_audio_feed_raw(const uint8_t *data, int size) {
     if (!r3_aok) return 1;
     ndspWaveBuf *w = &r3_wb[r3_awi];
     if (w->status != NDSP_WBUF_FREE && w->status != NDSP_WBUF_DONE) return 0;   /* full -> hold */
     if (w->status == NDSP_WBUF_DONE && !r3_acnt[r3_awi] && w->nsamples > 0) { r3_aplayed += w->nsamples; r3_acnt[r3_awi] = 1; }
-    int fr = adpcm_moflex_decode(pkt->data, pkt->size, r3_achn, r3_ab[r3_awi]);
+    int fr = adpcm_moflex_decode(data, size, r3_achn, r3_ab[r3_awi]);
     if (fr <= 0 || fr > R3_ABUF) return 1;                                       /* bad -> drop */
     if (g_vol != 1.0f) { int16_t *s = r3_ab[r3_awi]; int ns = fr * r3_achn;
         for (int i = 0; i < ns; i++) { int t = (int)(s[i] * g_vol); s[i] = (int16_t)(t > 32767 ? 32767 : (t < -32768 ? -32768 : t)); } }
@@ -1863,6 +1925,7 @@ static int r3_audio_feed(MfxPacket *pkt) {
     ndspChnWaveBufAdd(0, w); r3_acnt[r3_awi] = 0; r3_awi = (r3_awi + 1) % r3_nawb;
     return 1;
 }
+static int r3_audio_feed(MfxPacket *pkt) { return r3_audio_feed_raw(pkt->data, pkt->size); }
 static void r3_audio_flush(void) {   /* on seek: drop everything queued, clock offline until re-lock */
     if (!r3_aok) return;
     ndspChnWaveBufClear(0);
@@ -1988,6 +2051,7 @@ static void mp_ring_apt_hook(APT_HookType hook, void *param) {
 typedef struct {
     MfxDemux *m; AVCodecContext *ctx; AVFrame *fL, *fR;
     int W, H, is3d, NB, have_audio, old3ds, aidx; int64_t pair_dur, dur_us;
+    FILE *trf; volatile u32 tr_cur; int tr_active;   /* CSXTRA trailer audio source */
     volatile int eye_swap;               /* 3D: stream at the seek landing starts on a RIGHT eye ->
                                             route the first of each popped pair to the R texture */
     volatile int wr, rd;                 /* ring: worker advances wr, main advances rd (both atomic ints) */
@@ -2006,6 +2070,21 @@ typedef struct {
 
 /* Decode+bank ONE pair into ring slot wr%NB (or drop a pair while catching up). Runs under s->lock. */
 static void r3_produce(R3S *s) {
+    /* PHASE 0: trailer audio (Audio Track 2 of official-compatible files) -- fixed-size ADPCM
+     * packets read from past the last block on a private FILE handle; in-band audio is skipped
+     * entirely (s->aidx = -2 matches no stream). */
+    if (s->tr_active) {
+        static uint8_t trbuf[8 + 2048];
+        while (s->tr_cur < g_tra.aud_pkts && g_tra.aud_pktbytes <= sizeof trbuf) {
+            if (fseeko(s->trf, g_tra.aud_off + (s64)s->tr_cur * g_tra.aud_pktbytes, SEEK_SET)) break;
+            if (fread(trbuf, 1, g_tra.aud_pktbytes, s->trf) != g_tra.aud_pktbytes) break;
+            if (r3_audio_t0 < 0)
+                r3_audio_t0 = (s64)s->tr_cur * g_tra.aud_pktsamp * 1000000LL / g_tra.aud_rate;
+            if (!r3_audio_feed_raw(trbuf, (int)g_tra.aud_pktbytes)) { s->audio_pre_full = 1; break; }
+            s->tr_cur = s->tr_cur + 1;
+        }
+        if (s->tr_cur >= g_tra.aud_pkts) s->audio_pre_full = 1;   /* short track: don't gate forever */
+    }
     /* PHASE 1: keep the video backlog full + feed audio to the DSP bank */
     while (!s->done && r3_vqc < R3_VQ) {
         if (!s->has_pending) { if (mfx_next_packet(s->m, &s->pending) != 1) { s->done = 1; break; } s->has_pending = 1; }
@@ -2154,8 +2233,11 @@ static MoflexResult moflex_play_ring(const char *path) {
     vol_load();
     FILE *f = fopen(path, "rb");
     if (!f) return MOFLEX_ERROR;
+    trailer_probe(f);
     MfxDemux m;
-    if (mfx_open_auto(&m, f, path) != 0) { fclose(f); return MOFLEX_ERROR; }
+    int mo = g_tra.present ? mfx_open_window(&m, f, 0, g_tra.payload_off)
+                           : mfx_open_auto(&m, f, path);
+    if (mo != 0) { fclose(f); return MOFLEX_ERROR; }
     int vi = -1, ai = -1;
     g_atrk_n = 0; g_atrk_sel = 0;   /* re-filled per file; subcfg_load below restores a saved choice */
     for (int i = 0; i < m.nb_streams; i++) {
@@ -2169,9 +2251,12 @@ static MoflexResult moflex_play_ring(const char *path) {
     int W = m.streams[vi].width, H = m.streams[vi].height;
     int arate = ai >= 0 ? m.streams[ai].sample_rate : 44100, chn = ai >= 0 ? m.streams[ai].channels : 2;
     int have_audio = (ai >= 0);
-    embsub_scan(&m);                       /* consumes head packets -> reopen for a clean start */
+    if (!g_tra.present) embsub_scan(&m);   /* consumes head packets -> reopen for a clean start */
+    else g_emb_sub_found = 0;
     mfx_close(&m);
-    if (mfx_open_auto(&m, f, path) != 0) { fclose(f); return MOFLEX_ERROR; }
+    mo = g_tra.present ? mfx_open_window(&m, f, 0, g_tra.payload_off)
+                       : mfx_open_auto(&m, f, path);
+    if (mo != 0) { fclose(f); return MOFLEX_ERROR; }
     int is3d = mfx_detect_stereo(&m);
 
     int64_t pair_dur = 40000;   /* per-displayed-frame period from the stream timebase */
@@ -2212,8 +2297,8 @@ static MoflexResult moflex_play_ring(const char *path) {
         else if (L > 4 && !strcasecmp(title + L - 4, ".cia")) title[L - 4] = 0;
     }
     subs_autoload(path);
-    if (g_emb_sub_found && g_nsubs == 0)   /* embedded track loads only when no sidecar claimed it */
-        subs_load("sdmc:/moflex_player/.embedded.srt");
+    if ((g_emb_sub_found || (g_tra.present && g_tra.sub_len > 0)) && g_nsubs == 0)
+        subs_load("sdmc:/moflex_player/.embedded.srt");   /* in-band or trailer; sidecars win */
 
     /* CLEAN gfx re-init, exactly like the standalone avtest that renders smoothly on Old 3DS. The app
      * leaves the screens configured for its SOFTWARE UI (console on the bottom + a custom framebuffer
@@ -2305,11 +2390,19 @@ static MoflexResult moflex_play_ring(const char *path) {
         mobi_close(&ctx); free(ctx.priv_data); mfx_close(&m); fclose(f);
         return MOFLEX_FALLBACK;
     }
+    if (g_tra.present && g_tra.aud_pkts > 0 && g_atrk_n < 4)
+        g_atrk_streams[g_atrk_n++] = -1;    /* -1 = the trailer source (Audio Track N) */
     if (g_atrk_n > 1) {   /* dual audio: honor this movie's saved track (subcfg, loaded above) */
         if (g_atrk_sel < 0 || g_atrk_sel >= g_atrk_n) g_atrk_sel = 0;
-        ai = g_atrk_streams[g_atrk_sel];
-        arate = m.streams[ai].sample_rate; chn = m.streams[ai].channels;
+        if (g_atrk_streams[g_atrk_sel] >= 0) {
+            ai = g_atrk_streams[g_atrk_sel];
+            arate = m.streams[ai].sample_rate; chn = m.streams[ai].channels;
+        } else {                            /* trailer track selected: audio reads from the tail */
+            arate = (int)g_tra.aud_rate; chn = g_tra.aud_chn;
+            have_audio = 1;
+        }
     }
+    int use_trailer_audio = (g_atrk_n > 0 && g_atrk_sel < g_atrk_n && g_atrk_streams[g_atrk_sel] < 0);
     if (have_audio) { r3_audio_setup(arate, chn); if (!r3_aok) have_audio = 0; }   /* alloc failed -> wall-clock */
     /* the hook was registered right after gfx init; now that Y2R/audio are up, arm its fields */
     g_ring_apt_w = W; g_ring_apt_h = H; g_ring_apt_bpp = r3_bpp;
@@ -2357,6 +2450,11 @@ static MoflexResult moflex_play_ring(const char *path) {
     s.m = &m; s.ctx = &ctx; s.fL = fL; s.fR = fR;
     s.W = W; s.H = H; s.is3d = is3d; s.NB = NB; s.have_audio = have_audio; s.old3ds = !r3_isnew;
     s.aidx = ai;
+    s.trf = NULL; s.tr_cur = 0; s.tr_active = 0;
+    if (use_trailer_audio) {
+        s.trf = fopen(path, "rb");
+        if (s.trf) { s.tr_active = 1; s.aidx = -2; }   /* -2: no in-band stream feeds the DSP */
+    }
     g_panel_cheap = !r3_isnew;   /* lighten the software panel on Old-3DS to free decode CPU */
     s.pair_dur = pair_dur; s.dur_us = dur_us; s.run = 1;
     s.paused = want_seek ? 1 : 0;   /* if resuming, stay paused until the seek/prime below sets us up */
@@ -2539,6 +2637,29 @@ static MoflexResult moflex_play_ring(const char *path) {
 
         /* ---- seek: pause the worker (own demux+decoder), reset ring/demux/audio, PRIME the landing
          *      frame into slot 0, then resume. Held D-pad only accumulates the target; fires on release. ---- */
+        if (g_atrk_apply) {   /* Audio track switched in the menu */
+            g_atrk_apply = 0;
+            if (g_atrk_n > 1) {
+                int newsi = g_atrk_streams[g_atrk_sel];
+                if (newsi < 0 || s.tr_active) {
+                    /* into or out of the TRAILER source: re-open (same pattern as the HQ toggle;
+                     * position resumes in place via the normal resume save on exit) */
+                    subcfg_save(path);
+                    result = MOFLEX_REPLAY;
+                    break;
+                }
+                if (have_audio) {                     /* in-band <-> in-band: retune live */
+                    WORKER_LOCK();
+                    s.aidx = newsi;
+                    if (m.streams[newsi].sample_rate != r3_arate || m.streams[newsi].channels != r3_achn) {
+                        r3_audio_close();
+                        r3_audio_setup(m.streams[newsi].sample_rate, m.streams[newsi].channels);
+                    }
+                    WORKER_UNLOCK();
+                    seek_to_us = cur_us; want_seek = 1;   /* seek-to-here flushes + re-locks */
+                }
+            }
+        }
         if (want_seek && !(kh & (KEY_LEFT | KEY_RIGHT))) {
             WORKER_LOCK();   /* blocks until the decode thread finishes its current pair and releases */
             if (dur_us > 0) { if (seek_to_us < 0) seek_to_us = 0; if (seek_to_us > dur_us) seek_to_us = dur_us; }
@@ -2575,6 +2696,8 @@ static MoflexResult moflex_play_ring(const char *path) {
             s.wr = 0; rd = 0; s.rd = 0; s.dpair = 0; s.skipping = 0; s.done = 0; s.has_pending = 0; last_shown = -1;
             r3_vq_clear();
             if (have_audio) r3_audio_flush();
+            if (s.tr_active && g_tra.aud_pktsamp)   /* trailer audio: cursor = pure arithmetic */
+                s.tr_cur = (u32)(seek_to_us * (s64)g_tra.aud_rate / 1000000 / g_tra.aud_pktsamp);
             gated = 0; s.audio_pre_full = 0; playing = 1; r3_wallset = 0;
             cur_us = seek_to_us; s.cur_us = seek_to_us;
             /* 3D EYE PARITY: pairs can span block boundaries (Nintendo muxes), so a marker landing
@@ -2869,6 +2992,7 @@ static MoflexResult moflex_play_ring(const char *path) {
             gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();   /* paced: unpaced swaps here crashed gsp */
         }
     }
+    if (s.trf) { fclose(s.trf); s.trf = NULL; }
     av_frame_free(&fL); av_frame_free(&fR);
     mobi_close(&ctx); free(ctx.priv_data); mfx_close(&m); fclose(f);
     return result;
