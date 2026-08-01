@@ -2306,10 +2306,29 @@ static void lib_rescan(void) {
     if (s_scan_stop) { g_lib_n = 0; lib_load_cache_only(); }   /* aborted -> keep the OLD library,
                                                                 * never save a truncated cache */
     else {
-        for (int i = 0; i < g_lib_n; i++)   /* probe ONCE at scan: super flag + track languages,
-                                             * cached in the entry so hovering never opens a file */
+        for (int i = 0; i < g_lib_n; i++) {
+            /* SUPER MOFLEX: import EVERYTHING from the file ONCE at scan (info, poster, tracks),
+             * exactly like a website scrape -- afterward the library is self-sufficient and
+             * nothing ever opens the moflex again for metadata. */
             g_lib[i].super = entry_super(&g_lib[i], g_lib[i].audio_langs, sizeof g_lib[i].audio_langs,
                                          g_lib[i].sub_langs, sizeof g_lib[i].sub_langs, NULL) ? 1 : 0;
+            if (g_lib[i].super && !movieinfo_have(g_lib[i].url)) {
+                char rep[PATHLEN + NAMELEN];
+                if (g_lib[i].is_zip == 2) {
+                    if (show_first_episode(&g_lib[i], rep, sizeof rep))
+                        trailer_import_movieinfo_key(rep, g_lib[i].url, 1);   /* series info + poster */
+                } else trailer_import_movieinfo(g_lib[i].url);
+                /* pull the freshly-saved info into the entry, but keep super + langs (import cleared them) */
+                int sup = g_lib[i].super;
+                char au[48], sb[64];
+                snprintf(au, sizeof au, "%s", g_lib[i].audio_langs);
+                snprintf(sb, sizeof sb, "%s", g_lib[i].sub_langs);
+                lib_refresh_entry(i);
+                g_lib[i].super = sup;
+                snprintf(g_lib[i].audio_langs, sizeof g_lib[i].audio_langs, "%s", au);
+                snprintf(g_lib[i].sub_langs, sizeof g_lib[i].sub_langs, "%s", sb);
+            }
+        }
         lib_save_cache();
     }
     if (dl_was) dlw_start();     /* resume the queue (progress was kept) */
