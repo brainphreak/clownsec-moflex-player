@@ -1926,11 +1926,14 @@ static int has_episode_tag(const char *s) {
         }
     return 0;
 }
-static void strip_3d_tags(char *s) {       /* drop every "(3D)" + collapse the gap it leaves */
+static void strip_3d_tags(char *s) {       /* drop every "(3D)" / "(S)" + collapse the gap */
     char *d = s;
     for (char *p = s; *p; ) {
-        if (p[0] == '(' && p[1] == '3' && (p[2] == 'D' || p[2] == 'd') && p[3] == ')') {
-            p += 4;
+        int skip = 0;
+        if (p[0] == '(' && p[1] == '3' && (p[2] == 'D' || p[2] == 'd') && p[3] == ')') skip = 4;
+        else if (p[0] == '(' && (p[1] == 'S' || p[1] == 's') && p[2] == ')') skip = 3;   /* SUPER marker */
+        if (skip) {
+            p += skip;
             if (d > s && d[-1] == ' ' && (*p == ' ' || *p == 0)) d--;
             continue;
         }
