@@ -201,6 +201,7 @@ int catalog_parse(const char *text, int kind, const char *dl_base, const char *a
               const char *sf = s0 ? sgets(s0, "file") : "";
               if (sf[0]) { url_encode(sf, enc, sizeof(enc)); snprintf(e->sub, sizeof(e->sub), "%ssubs/%s", dl_base, enc); } }
             e->is3d = (fn_has_3d(e->fname) || fn_has_3d(e->name)) ? 1 : 0;   /* "(3D)" marks 3D files */
+            e->super = sgeti(mv, "superMoflex") ? 1 : 0;
             n++;
         }
         /* tvShows[] -> one entry per season zip */
@@ -236,6 +237,7 @@ int catalog_parse(const char *text, int kind, const char *dl_base, const char *a
                 snprintf(e->url, sizeof(e->url), "%stv/%s/%s", dl_base, encfolder, enc);
                 snprintf(e->art, sizeof(e->art), "%s", arturl);
                 e->is3d = (fn_has_3d(e->fname) || fn_has_3d(e->name)) ? 1 : 0;
+                e->super = sgeti(sh, "superMoflex") ? 1 : 0;
                 n++;
             }
         }

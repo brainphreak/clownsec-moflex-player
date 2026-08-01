@@ -993,7 +993,7 @@ static void draw_info_top(const CatEntry *e, const u16 *poster) {
             snprintf(s_sup_path, sizeof s_sup_path, "%s", e->url);
             s_sup = e->is_zip == 0 ? trailer_present(e->url) : 0;
         }
-        if (s_sup) ui_text(400 - 8 - ui_text_w(1, "SUPER"), 8, 1, UI_NEON, "SUPER");
+        if (s_sup || e->super) ui_text(400 - 8 - ui_text_w(1, "SUPER"), 8, 1, UI_NEON, "SUPER");
     }
 
     /* poster box on the left */
@@ -1899,7 +1899,7 @@ cb_rebuild:;   /* X-search inside the list jumps back here with filt_search set 
 /* ================= Library: one flat, categorized view of every local movie ================= */
 #define LIB_MAX   3000
 #define LIB_CACHE "sdmc:/moflex_player/library.cache"
-#define LIB_MAGIC 0x4C494238   /* 'LIB8' -- bump to invalidate old caches when CatEntry changes */
+#define LIB_MAGIC 0x4C494239   /* 'LIB9' -- bump to invalidate old caches when CatEntry changes */
 static CatEntry *g_lib = NULL;   /* every playable movie on the SD, with its .nfo metadata */
 static int       g_lib_n = 0;
 
