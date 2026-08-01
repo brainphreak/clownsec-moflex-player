@@ -269,10 +269,16 @@ static void handle_put(int fd, const char *path, char *hdrbuf, int hdr_total, in
     }
 
     char *buf = (char *)malloc(IOCHUNK);
-    while (remaining > 0 && buf && !werr) {
+    int idle = 0;                       /* consecutive 500ms receive timeouts */
+    while (remaining > 0 && buf && !werr && !g_stop) {
         int want = (int)(remaining < IOCHUNK ? remaining : IOCHUNK);
         int n = recv(fd, buf, want, 0);
-        if (n <= 0) break;
+        if (n < 0) {                    /* timeout: poll the stop flag, give up after ~30s idle */
+            if (g_stop || ++idle > 60) break;
+            continue;
+        }
+        if (n == 0) break;
+        idle = 0;
         if ((wb ? dl_wb_write(wb, buf, n) : fwrite(buf, 1, n, out)) != (size_t)n) { werr = 1; break; }
         remaining -= n; g_up_done += n;
     }
@@ -293,9 +299,12 @@ static void handle_client(int fd) {
 
     /* read until end of headers */
     int total = 0, body_start = -1;
-    while (total < HDRBUF - 1) {
+    int hidle = 0;
+    while (total < HDRBUF - 1 && !g_stop) {
         int n = recv(fd, hdr + total, HDRBUF - 1 - total, 0);
-        if (n <= 0) break;
+        if (n < 0) { if (g_stop || ++hidle > 20) break; continue; }   /* 500ms timeouts */
+        if (n == 0) break;
+        hidle = 0;
         total += n;
         hdr[total] = 0;
         char *end = strstr(hdr, "\r\n\r\n");
@@ -353,9 +362,15 @@ static void server_thread(void *arg) {
             continue;
         }
         /* client inherits the listen sock's O_NONBLOCK -> force it blocking so
-           recv() waits for data during large uploads (else they fail partway) */
+           recv() waits for data during large uploads (else they fail partway) --
+           but with a 500ms receive timeout so the loops can poll g_stop: a B press
+           or HOME must cancel the transfer NOW, not after the upload finishes. */
         fcntl(c, F_SETFL, fcntl(c, F_GETFL, 0) & ~O_NONBLOCK);
+        { struct timeval tv = { 0, 500000 };
+          setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv); }
+        g_client_fd = c;
         handle_client(c);
+        g_client_fd = -1;
         closesocket(c);
     }
 }
@@ -392,6 +407,8 @@ bool httpd_start(void) {
 
 void httpd_stop(void) {
     g_stop = true;
+    if (g_client_fd >= 0) shutdown(g_client_fd, SHUT_RDWR);   /* unblock an in-flight recv NOW
+                                                               * (owner thread still closes it) */
     if (g_listen_fd >= 0) { closesocket(g_listen_fd); g_listen_fd = -1; }
     if (g_thread) { threadJoin(g_thread, 2000000000ULL); threadFree(g_thread); g_thread = NULL; }
     strcpy(g_url, "wifi off");
