@@ -179,30 +179,51 @@ static void serve_listing(int fd, const char *dir) {
 
     send_str(fd, "</ul>");
 
-    /* JS: PUT uploads with a real progress bar (XHR upload.onprogress) + delete. */
+    /* JS: PUT uploads with progress, speed/ETA, and RESUME. Only the folder name is formatted
+     * in -- the rest goes out as literal chunks so a long script can never be truncated by a
+     * fixed snprintf buffer (and '%' needs no escaping here). */
     {
-        char dq[2200];
-        snprintf(dq, sizeof(dq),
-            "<script>const DIR=\"%s\";"
-            "function up(){const fs=document.getElementById('f').files;if(!fs.length)return;"
-            "let i=0;const log=document.getElementById('log');"
-            "(function nx(){if(i>=fs.length){location.reload();return;}"
-            "const f=fs[i],x=new XMLHttpRequest();"
-            "x.open('PUT','/up?path='+encodeURIComponent(DIR+f.name));"
-            "x.upload.onprogress=function(e){var p=e.lengthComputable?Math.floor(e.loaded*100/e.total):0;"
-            "log.innerHTML='Uploading '+(i+1)+'/'+fs.length+': '+f.name+"
-            "'<br><progress value='+e.loaded+' max='+e.total+'></progress> '+p+'%%'+"
-            "' ('+Math.floor(e.loaded/1048576)+'/'+Math.floor(e.total/1048576)+' MB)';};"
-            "x.onload=function(){log.textContent='Saved '+f.name;i++;nx();};"
-            "x.onerror=function(){log.textContent='Error uploading '+f.name;};"
-            "x.send(f);})();}"
-            "function rm(p){if(!confirm('Delete '+p+'?'))return;"
-            "fetch('/rm?path='+encodeURIComponent(p),{method:'GET'}).then(r=>location.reload());}"
-            "function mkd(){var n=document.getElementById('nf').value;if(!n)return;"
-            "fetch('/mkdir?path='+encodeURIComponent(DIR+n),{method:'GET'}).then(r=>location.reload());}"
-            "</script>", dir);
+        char dq[1200];
+        snprintf(dq, sizeof(dq), "<script>const DIR=\"%s\";", dir);
         send_str(fd, dq);
     }
+    send_str(fd,
+        "function hs(b){return b>=1073741824?(b/1073741824).toFixed(2)+' GB'"
+        ":(b/1048576).toFixed(1)+' MB';}"
+        "function ht(s){return s>=60?Math.floor(s/60)+'m '+(s%60)+'s':s+'s';}"
+        "function up(){var fs=document.getElementById('f').files;if(!fs.length)return;"
+        "var i=0,log=document.getElementById('log');"
+        "function nx(){if(i>=fs.length){location.reload();return;}"
+        /* ask the console how much of this file is already on the card, then send the rest */
+        "var f=fs[i],p=DIR+f.name,tries=0;"
+        "function probe(){fetch('/stat?path='+encodeURIComponent(p)).then(function(r){return r.text();})"
+        ".then(function(t){var o=parseInt(t)||0;send(o>=f.size?0:o);})"
+        ".catch(function(){send(0);});}"
+        "function send(off){var x=new XMLHttpRequest(),t0=Date.now(),sp=0;"
+        "x.open('PUT','/up?path='+encodeURIComponent(p)+(off?'&off='+off:''));"
+        "x.upload.onprogress=function(e){var done=off+e.loaded,el=(Date.now()-t0)/1000;"
+        "if(el>0.5){var v=e.loaded/el;sp=sp?sp*0.7+v*0.3:v;}"
+        "var eta=sp>0?Math.round((f.size-done)/sp):0;"
+        "log.innerHTML='Uploading '+(i+1)+'/'+fs.length+': '+f.name+(off?' (resumed)':'')+"
+        "'<br><progress value='+done+' max='+f.size+'></progress> '+"
+        "Math.floor(done*100/f.size)+'% '+hs(done)+' / '+hs(f.size)+"
+        "(sp>0?' - '+(sp/1048576).toFixed(2)+' MB/s, '+ht(eta)+' left':'');};"
+        "x.onload=function(){if(x.status==200){log.textContent='Saved '+f.name;i++;nx();}"
+        /* 409 = what is on the card no longer matches our offset: start that file clean */
+        "else if(x.status==409){log.textContent='Restarting '+f.name;send(0);}"
+        "else fail();};"
+        "x.onerror=fail;x.onabort=fail;"
+        "function fail(){if(++tries<=3){log.textContent='Link dropped - resuming '+f.name+"
+        "' ('+tries+'/3)';setTimeout(probe,1500);}"
+        "else log.textContent='Upload of '+f.name+' stalled - press Upload here again to resume';}"
+        "x.send(off?f.slice(off):f);}"
+        "probe();}"
+        "nx();}"
+        "function rm(p){if(!confirm('Delete '+p+'?'))return;"
+        "fetch('/rm?path='+encodeURIComponent(p),{method:'GET'}).then(r=>location.reload());}"
+        "function mkd(){var n=document.getElementById('nf').value;if(!n)return;"
+        "fetch('/mkdir?path='+encodeURIComponent(DIR+n),{method:'GET'}).then(r=>location.reload());}"
+        "</script>");
 }
 
 /* recv gated behind select(): returns like recv, or 0 on orderly close, -2 on timeout
