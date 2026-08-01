@@ -1652,24 +1652,30 @@ static int catalog_pick_group(const CatEntry *cat, int nc, const char *filt_cat,
     }
     if (ngr <= 1) { filt_group[0] = 0; return 1; }   /* nothing to group -> straight to the list */
     qsort(groups, ngr, 64, strrow_cmp);
+    int nsc = 0;   /* SUPER MOFLEX entries in this category -> a filter row at the top */
+    for (int i = 0; i < nc; i++) if (cat[i].super && !strcasecmp(cat[i].category, filt_cat)) nsc++;
+    int gb = 0;
+    if (nsc) { snprintf(gdisp[0], 64, "* SUPER MOFLEX (%d)", nsc); gb = 1; }
     for (int k = 0; k < ngr; k++) {
-        int n = 0;
+        int n = 0, sup = 0;
         for (int i = 0; i < nc; i++) {
             if (strcasecmp(cat[i].category, filt_cat)) continue;
             char key[64]; cat_group_key(&cat[i], key, sizeof key);
-            if (!strcasecmp(key, groups[k])) n++;
+            if (!strcasecmp(key, groups[k])) { n++; if (cat[i].super) sup = 1; }
         }
-        snprintf(gdisp[k], 64, "%.52s (%d)", groups[k], n);
+        if (sup) snprintf(gdisp[gb + k], 64, "%.46s [S] (%d)", groups[k], n);   /* SUPER MOFLEX show */
+        else     snprintf(gdisp[gb + k], 64, "%.52s (%d)", groups[k], n);
     }
     int is_tv = !strcasecmp(filt_cat, "TV Shows");
     if (!strcasecmp(last_cat, filt_cat) && last_g >= 0 && last_g < ngr)
-        s_pick_init = last_g + 1;   /* B-back from the list lands on the same show/artist */
-    int g = catalog_pick(is_tv ? "SHOWS" : "ARTISTS", filt_cat, gdisp, ngr, 1, NULL);
+        s_pick_init = last_g + 1 + gb;   /* B-back from the list lands on the same show/artist */
+    int g = catalog_pick(is_tv ? "SHOWS" : "ARTISTS", filt_cat, gdisp, ngr + gb, 1, NULL);
     snprintf(last_cat, sizeof last_cat, "%s", filt_cat);
     if (g == -2) { filt_group[0] = 0; last_g = -1; return 1; }   /* Show All */
     if (g < 0) return 0;
-    snprintf(filt_group, cap, "%s", groups[g]);
-    last_g = g;
+    if (gb && g == 0) { snprintf(filt_group, cap, "\x01SUPER"); last_g = -1; return 1; }   /* super filter */
+    snprintf(filt_group, cap, "%s", groups[g - gb]);
+    last_g = g - gb;
     return 1;
 }
 
@@ -1721,7 +1727,7 @@ static void catalog_browse(const Source *src) {
                     int backout = 0;
                     for (;;) {
                         if (!catalog_pick_group(cat, nc, filt_cat, filt_group, sizeof filt_group)) { backout = 1; break; }
-                        if (!strcasecmp(filt_cat, "TV Shows") && filt_group[0]) {
+                        if (!strcasecmp(filt_cat, "TV Shows") && filt_group[0] && strcmp(filt_group, "\x01SUPER")) {
                             if (!catalog_pick_season(cat, nc, filt_group, &filt_season)) continue;   /* back to shows */
                         } else filt_season = 0;
                         break;
@@ -1761,8 +1767,9 @@ cb_rebuild:;   /* X-search inside the list jumps back here with filt_search set 
             if (filt_cat[0] && strcasecmp(cat[i].category, filt_cat)) continue;
             if (super_only && !cat[i].super) continue;
             if (!super_only && filt_genre[0] && !genre_match(cat[i].genres, filt_genre)) continue;
-            if (filt_group[0]) { char key[64]; cat_group_key(&cat[i], key, sizeof key);
-                                 if (strcasecmp(key, filt_group)) continue; }
+            if (!strcmp(filt_group, "\x01SUPER")) { if (!cat[i].super) continue; }
+            else if (filt_group[0]) { char key[64]; cat_group_key(&cat[i], key, sizeof key);
+                                      if (strcasecmp(key, filt_group)) continue; }
             if (filt_season > 0 && tv_season_of(&cat[i]) != filt_season) continue;
             if (filt_search[0] && !ci_contains(cat[i].name, filt_search)) continue;   /* search box */
             idx[ni++] = i;
