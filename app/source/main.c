@@ -1704,21 +1704,17 @@ static void catalog_browse(const Source *src) {
         /* ---- navigation: pick a category (+ optional genre), Show All, or X = search ---- */
         char filt_cat[32] = "", filt_genre[32] = "", filt_search[64] = "", filt_group[64] = "";
         int filt_season = 0;
-        int nsuper = 0; for (int i = 0; i < nc; i++) if (cat[i].super) nsuper++;
-        if (ncat > 1 || nsuper) {
-            static char cdisp[26][64]; int base = 0;
-            if (nsuper) { snprintf(cdisp[0], 64, "* SUPER MOFLEX (%d)", nsuper); base = 1; }
+        if (ncat > 1) {
+            static char cdisp[24][64];   /* category rows with counts (selection uses cats[]) */
             for (int k = 0; k < ncat; k++) {
                 int n = 0;
                 for (int i = 0; i < nc; i++) if (!strcasecmp(cat[i].category, cats[k])) n++;
-                snprintf(cdisp[base + k], 64, "%.48s (%d)", cats[k], n);
+                snprintf(cdisp[k], 64, "%.48s (%d)", cats[k], n);
             }
-            int c = catalog_pick("CATEGORY", src->name, cdisp, ncat + base, 1, NULL);
+            int c = catalog_pick("CATEGORY", src->name, cdisp, ncat, 1, NULL);
             if (c == -1) break;
             if (c == -4) { if (!kbd_text("Search this catalog", filt_search, sizeof filt_search)) continue; }
-            else if (base && c == 0) { snprintf(filt_cat, sizeof filt_cat, "\x01SUPER"); goto cb_have_filter; }
             else if (c >= 0) {
-                c -= base;
                 snprintf(filt_cat, sizeof filt_cat, "%s", cats[c]);
                 if (cat_grouped(filt_cat)) {   /* TV: show -> season -> parts; MV: artist -> videos */
                     s_pick_init = c + 1;
@@ -1735,19 +1731,23 @@ static void catalog_browse(const Source *src) {
                 }
                 static char gens[64][32]; int ng = distinct_genres(cat, nc, filt_cat, gens, 64);
                 qsort(gens, ng, 32, strrow_cmp);   /* genres alphabetical */
-                if (ng > 0) {
-                    static char gdisp[64][64];   /* genre rows with counts (within this category) */
+                int nsc = 0; for (int i = 0; i < nc; i++) if (cat[i].super && !strcasecmp(cat[i].category, filt_cat)) nsc++;
+                if (ng > 0 || nsc) {
+                    static char gdisp[66][64]; int gb = 0;
+                    if (nsc) { snprintf(gdisp[0], 64, "SUPER MOFLEX (%d)", nsc); gb = 1; }
                     for (int k = 0; k < ng; k++) {
                         int n = 0;
                         for (int i = 0; i < nc; i++)
                             if (!strcasecmp(cat[i].category, filt_cat) && genre_match(cat[i].genres, gens[k])) n++;
-                        snprintf(gdisp[k], 64, "%.48s (%d)", gens[k], n);
+                        snprintf(gdisp[gb + k], 64, "%.48s (%d)", gens[k], n);
                     }
                     const char *mi[2] = { "View All", "Pick a Genre" };
                     int mm = ui_menu(filt_cat, NULL, mi, 2);
                     if (mm < 0) continue;
-                    if (mm == 1) { int g = catalog_pick("GENRE", filt_cat, gdisp, ng, 0, NULL);
-                                   if (g < 0) continue; snprintf(filt_genre, sizeof filt_genre, "%s", gens[g]); }
+                    if (mm == 1) { int g = catalog_pick("GENRE", filt_cat, gdisp, ng + gb, 0, NULL);
+                                   if (g < 0) continue;
+                                   if (gb && g == 0) snprintf(filt_genre, sizeof filt_genre, "\x01SUPER");
+                                   else snprintf(filt_genre, sizeof filt_genre, "%s", gens[g - gb]); }
                 }
                 s_pick_init = c + 1;   /* B-back re-highlights this category (+1: Show All row) */
             }
@@ -1756,11 +1756,11 @@ cb_have_filter:;
         /* ---- build the filtered + sorted index over cat[] ---- */
 cb_rebuild:;   /* X-search inside the list jumps back here with filt_search set */
         int ni = 0;
-        int super_only = !strcmp(filt_cat, "\x01SUPER");
+        int super_only = !strcmp(filt_genre, "\x01SUPER");
         for (int i = 0; i < nc; i++) {
-            if (super_only) { if (!cat[i].super) continue; }
-            else if (filt_cat[0] && strcasecmp(cat[i].category, filt_cat)) continue;
-            if (filt_genre[0] && !genre_match(cat[i].genres, filt_genre)) continue;
+            if (filt_cat[0] && strcasecmp(cat[i].category, filt_cat)) continue;
+            if (super_only && !cat[i].super) continue;
+            if (!super_only && filt_genre[0] && !genre_match(cat[i].genres, filt_genre)) continue;
             if (filt_group[0]) { char key[64]; cat_group_key(&cat[i], key, sizeof key);
                                  if (strcasecmp(key, filt_group)) continue; }
             if (filt_season > 0 && tv_season_of(&cat[i]) != filt_season) continue;
@@ -2645,11 +2645,11 @@ static int library_list(const char *filt_cat, const char *filt_genre, u16 *poste
 ll_rebuild:;   /* X-search inside the list jumps back here with s_lib_search set */
     memset(s_vs, 0xFF, sizeof s_vs);
     int *idx = lib_idxbuf, ni = 0;
-    int super_only = !strcmp(filt_cat, "\x01SUPER");
+    int super_only = !strcmp(filt_genre, "\x01SUPER");
     for (int i = 0; i < g_lib_n; i++) {
+        if (filt_cat[0] && strcasecmp(lib_disp_cat(&g_lib[i]), filt_cat)) continue;
         if (super_only) { if (!g_lib[i].super) continue; }
-        else if (filt_cat[0] && strcasecmp(lib_disp_cat(&g_lib[i]), filt_cat)) continue;
-        if (filt_genre[0] && !genre_match(g_lib[i].genres, filt_genre)) continue;
+        else if (filt_genre[0] && !genre_match(g_lib[i].genres, filt_genre)) continue;
         if (s_lib_search[0] && !ci_contains(g_lib[i].name, s_lib_search)) continue;   /* search box */
         idx[ni++] = i;
     }
@@ -2754,7 +2754,8 @@ ll_rebuild:;   /* X-search inside the list jumps back here with s_lib_search set
             ui_text(10, 8, 2, UI_NEON, "LIBRARY");
             char hdr[24]; snprintf(hdr, sizeof hdr, "%d / %d", csel + 1, ni);
             ui_text(UI_W - (int)strlen(hdr) * 8 - 10, 12, 1, UI_NEONP, hdr);
-            char sh[80]; snprintf(sh, sizeof sh, "%s%s%s", filt_cat[0] ? filt_cat : "All", filt_genre[0] ? " / " : "", filt_genre);
+            const char *fg = !strcmp(filt_genre, "\x01SUPER") ? "SUPER MOFLEX" : filt_genre;
+        char sh[80]; snprintf(sh, sizeof sh, "%s%s%s", filt_cat[0] ? filt_cat : "All", fg[0] ? " / " : "", fg);
             ui_text_left_fit(10, 30, 1, UI_NEONC, sh, UI_W - 20);
             ui_fill_round(8, 42, UI_W - 16, 1, 0, TH_LINE);
             for (int r = 0; r < BR_ROWS; r++) { int i = cscroll + r; if (i >= ni) break;
@@ -2815,24 +2816,16 @@ static int library_view(char *out, size_t cap) {
     while (aptMainLoop() && !chose) {
         static char cats[24][32]; int ncat = lib_distinct_categories(cats, 24);
         qsort(cats, ncat, 32, strrow_cmp);
-        int nsuper = 0; for (int i = 0; i < g_lib_n; i++) if (g_lib[i].super) nsuper++;
-        static char cdisp[26][64]; int base = 0;
-        if (nsuper) { snprintf(cdisp[0], 64, "* SUPER MOFLEX (%d)", nsuper); base = 1; }
+        static char cdisp[24][64];
         for (int k = 0; k < ncat; k++) {
             int n = 0;
             for (int i = 0; i < g_lib_n; i++) if (!strcasecmp(lib_disp_cat(&g_lib[i]), cats[k])) n++;
-            snprintf(cdisp[base + k], 64, "%.48s (%d)", cats[k], n);
+            snprintf(cdisp[k], 64, "%.48s (%d)", cats[k], n);
         }
         char sub[24]; snprintf(sub, sizeof sub, "%d videos", g_lib_n);
-        int c = catalog_pick("LIBRARY", sub, cdisp, ncat + base, 1, "* Rescan Library");
+        int c = catalog_pick("LIBRARY", sub, cdisp, ncat, 1, "* Rescan Library");
         if (c == -1) break;                                   /* B -> leave the library */
         if (c == -3) { lib_rescan_interactive(); if (g_lib_n == 0) { msg_screen("LIBRARY", "No videos found."); break; } continue; }
-        if (c >= 0 && base && c == 0) {                       /* SUPER MOFLEX filter, across categories */
-            int r = library_list("\x01SUPER", "", poster, &sortmode, out, cap);
-            if (r == LL_PLAY) chose = 1; else if (r == LL_RESCAN) lib_rescan();
-            continue;
-        }
-        if (c >= 0) c -= base;                                /* shift past the virtual row */
         if (c == -4) {                                        /* X -> search the whole library */
             char q[64];
             if (kbd_text("Search your library", q, sizeof q)) {
@@ -2869,18 +2862,23 @@ static int library_view(char *out, size_t cap) {
                         int r = library_list(fc, "", poster, &sortmode, out, cap);
                         if (r == LL_PLAY) chose = 1; else if (r == LL_RESCAN) rescan = 1;
                     } else {                                   /* Pick a Genre */
-                        static char gdisp[64][64];   /* genre rows with counts (within this category) */
+                        static char gdisp[66][64]; int gb = 0;   /* SUPER MOFLEX = top genre */
+                        int nsc = 0;
+                        for (int i = 0; i < g_lib_n; i++)
+                            if (g_lib[i].super && !strcasecmp(lib_disp_cat(&g_lib[i]), fc)) nsc++;
+                        if (nsc) { snprintf(gdisp[0], 64, "SUPER MOFLEX (%d)", nsc); gb = 1; }
                         for (int k = 0; k < ng; k++) {
                             int n = 0;
                             for (int i = 0; i < g_lib_n; i++)
                                 if (!strcasecmp(lib_disp_cat(&g_lib[i]), fc) && genre_match(g_lib[i].genres, gens[k])) n++;
-                            snprintf(gdisp[k], 64, "%.48s (%d)", gens[k], n);
+                            snprintf(gdisp[gb + k], 64, "%.48s (%d)", gens[k], n);
                         }
                         int gen_back = 0;
                         while (!gen_back && !chose && !rescan && aptMainLoop()) {
-                            int g = catalog_pick("GENRE", fc, gdisp, ng, 0, NULL);
+                            int g = catalog_pick("GENRE", fc, gdisp, ng + gb, 0, NULL);
                             if (g < 0) { gen_back = 1; break; }         /* back -> View All / Pick a Genre */
-                            int r = library_list(fc, gens[g], poster, &sortmode, out, cap);
+                            int r = (gb && g == 0) ? library_list(fc, "\x01SUPER", poster, &sortmode, out, cap)
+                                                   : library_list(fc, gens[g - gb], poster, &sortmode, out, cap);
                             if (r == LL_PLAY) chose = 1; else if (r == LL_RESCAN) rescan = 1;
                             s_pick_init = g;   /* back from the list -> re-show the GENRE picker HERE */
                         }
