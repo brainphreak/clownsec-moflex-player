@@ -7,4 +7,9 @@
  * write them into moviedata/ for the library. Returns 1 if info was imported. */
 int trailer_import_movieinfo(const char *moviepath);
 
+/* Same, but SAVE against a different key (a SHOW folder) and prefer the 'showdesc' field --
+ * used so a season folder's library tile gets the series description + poster from any
+ * episode's trailer. */
+int trailer_import_movieinfo_key(const char *moviepath, const char *savekey, int show_level);
+
 #endif

@@ -3458,7 +3458,10 @@ static void lib_rescan_interactive(void) {
     else           snprintf(found, sizeof found, "No new videos found.");
     int *idx = (int *)malloc(sizeof(int) * (g_lib_n ? g_lib_n : 1)); int ni = 0;
     if (idx) for (int j = 0; j < g_lib_n; j++) if (!movieinfo_have(g_lib[j].url)) {
-        if (trailer_import_movieinfo(g_lib[j].url)) { lib_refresh_entry(j); continue; }   /* self-contained */
+        if (g_lib[j].is_zip == 2) {   /* SHOW folder: series info from any episode's trailer */
+            if (show_collect_eps(g_lib[j].name, g_lib[j].url) > 0 &&
+                trailer_import_movieinfo_key(s_epfile[0], g_lib[j].url, 1)) { lib_refresh_entry(j); continue; }
+        } else if (trailer_import_movieinfo(g_lib[j].url)) { lib_refresh_entry(j); continue; }
         idx[ni++] = j;
     }
     if (ni > 0) {
@@ -3540,7 +3543,10 @@ static void startup_new_movie_check(void) {
         int *idx = (int *)malloc(sizeof(int) * g_lib_n); int ni = 0;   /* offer art+info for all missing */
         if (idx) {
             for (int j = 0; j < g_lib_n; j++) if (!movieinfo_have(g_lib[j].url)) {
-                if (trailer_import_movieinfo(g_lib[j].url)) { lib_refresh_entry(j); continue; }
+                if (g_lib[j].is_zip == 2) {
+                    if (show_collect_eps(g_lib[j].name, g_lib[j].url) > 0 &&
+                        trailer_import_movieinfo_key(s_epfile[0], g_lib[j].url, 1)) { lib_refresh_entry(j); continue; }
+                } else if (trailer_import_movieinfo(g_lib[j].url)) { lib_refresh_entry(j); continue; }
                 idx[ni++] = j;
             }
             if (ni > 0) {

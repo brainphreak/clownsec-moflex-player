@@ -28,6 +28,10 @@ static int find_section(FILE *f, const char *cc, long long *body, unsigned *len)
 }
 
 int trailer_import_movieinfo(const char *moviepath) {
+    return trailer_import_movieinfo_key(moviepath, moviepath, 0);
+}
+
+int trailer_import_movieinfo_key(const char *moviepath, const char *savekey, int show_level) {
     FILE *f = fopen(moviepath, "rb");
     if (!f) return 0;
     long long noff = 0; unsigned nlen = 0;
@@ -38,6 +42,7 @@ int trailer_import_movieinfo(const char *moviepath) {
 
     CatEntry e; memset(&e, 0, sizeof e);
     e.is3d = -1;
+    char showdesc[sizeof e.desc]; showdesc[0] = 0;
     for (char *line = nfo; line && *line; ) {
         char *nl = strpbrk(line, "\r\n");
         if (nl) { *nl = 0; nl++; while (*nl == '\r' || *nl == '\n') nl++; }
@@ -52,15 +57,17 @@ int trailer_import_movieinfo(const char *moviepath) {
             else if (!strcmp(line, "runtime"))  e.runtime = atoi(v);
             else if (!strcmp(line, "date"))     snprintf(e.date, sizeof e.date, "%s", v);
             else if (!strcmp(line, "is3d"))     e.is3d = atoi(v);
+            else if (!strcmp(line, "showdesc")) snprintf(showdesc, sizeof showdesc, "%s", v);
         }
         line = nl;
     }
     free(nfo);
+    if (show_level && showdesc[0]) snprintf(e.desc, sizeof e.desc, "%s", showdesc);
     if (!e.title[0]) { fclose(f); return 0; }
     if (e.year > 0) snprintf(e.name, sizeof e.name, "%s (%d)", e.title, e.year);
     else            snprintf(e.name, sizeof e.name, "%s", e.title);
     if (!e.category[0]) snprintf(e.category, sizeof e.category, "Movies");
-    { const char *b = strrchr(moviepath, '/'); snprintf(e.fname, sizeof e.fname, "%s", b ? b + 1 : moviepath); }
+    { const char *b = strrchr(savekey, '/'); snprintf(e.fname, sizeof e.fname, "%s", b ? b + 1 : savekey); }
 
     /* poster: pre-scaled RGB565 (ART5) -- exact library format, straight copy */
     u16 *poster = NULL; int pw = 0, ph = 0;
@@ -78,7 +85,7 @@ int trailer_import_movieinfo(const char *moviepath) {
         }
     }
     fclose(f);
-    movieinfo_save(moviepath, &e, poster, pw, ph);
+    movieinfo_save(savekey, &e, poster, pw, ph);
     free(poster);
     return 1;
 }
