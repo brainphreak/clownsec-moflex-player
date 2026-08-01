@@ -544,6 +544,7 @@ static void subcfg_path(const char *movie, char *out, size_t cap) {
  * language second for ours). Filled at open from the stream table; persisted per movie
  * with the subtitle settings. ---- */
 static int g_atrk_streams[4]; static int g_atrk_n = 0;   /* audio stream indices in this file */
+static char g_atrk_lbl[4][4];                            /* button labels: "ENG"/"JPN"/"A1".. */
 static int g_atrk_sel = 0;                               /* chosen track ordinal (0 = first) */
 static volatile int g_atrk_apply = 0;                    /* menu changed the track: player re-locks */
 static void subcfg_save(const char *movie) {
@@ -775,7 +776,7 @@ static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing)
     ui_button(CC_X, CC_Y, CC_W, CC_H, "CC", g_sub_on, g_sub_on ? UI_NEON : UI_DIM);
     /* dual audio: tap toggles the language (A1 = main/English, A2 = alternate) */
     if (g_atrk_n > 1) {
-        char al[8]; snprintf(al, sizeof al, "A%d", g_atrk_sel + 1);
+        const char *al = (g_atrk_sel < 4 && g_atrk_lbl[g_atrk_sel][0]) ? g_atrk_lbl[g_atrk_sel] : "A?";
         ui_button(AUD_X, AUD_Y, AUD_W, AUD_H, al, g_atrk_sel > 0, g_atrk_sel > 0 ? UI_NEON : UI_DIM);
     }
     /* bottom-screen-off: a crescent-moon button (video keeps playing on top) */
@@ -1810,9 +1811,10 @@ static struct {
     int present;               /* footer found on this file */
     s64 payload_off;           /* demux window ends here (blocks only) */
     s64 sub_off; u32 sub_len;  /* SUB0 body */
-    s64 aud_off; u32 aud_pkts; /* AUD0 packet array */
+    s64 aud_off; u32 aud_pkts; /* AUD0/AUD1 packet array */
     u32 aud_rate, aud_pktbytes;
     u16 aud_chn, aud_pktsamp;
+    char lang_main[4], lang_alt[4];   /* LNG0 / AUD1 tags ("ENG"/"JPN"); empty = untagged */
 } g_tra;
 static void trailer_probe(FILE *f) {
     memset(&g_tra, 0, sizeof g_tra);
@@ -1843,17 +1845,24 @@ static void trailer_probe(FILE *f) {
                 free(buf);
             }
         }
-        else if (!memcmp(h, "AUD0", 4) && len > 8) {
-            u8 a[8];
-            if (fread(a, 1, 8, f) == 8) {
+        else if (!memcmp(h, "LNG0", 4) && len >= 4) {
+            u8 l[4];
+            if (fread(l, 1, 4, f) == 4) { memcpy(g_tra.lang_main, l, 3); g_tra.lang_main[3] = 0; }
+        }
+        else if ((!memcmp(h, "AUD0", 4) || !memcmp(h, "AUD1", 4)) && len > 8) {
+            int v1 = !memcmp(h, "AUD1", 4);
+            int ah = v1 ? 12 : 8;
+            u8 a[12];
+            if ((u32)len > (u32)ah && fread(a, 1, ah, f) == (size_t)ah) {
                 g_tra.aud_rate = a[0] | (a[1] << 8) | ((u32)a[2] << 16) | ((u32)a[3] << 24);
                 g_tra.aud_chn = (u16)(a[4] | (a[5] << 8));
                 g_tra.aud_pktsamp = (u16)(a[6] | (a[7] << 8));
+                if (v1) { memcpy(g_tra.lang_alt, a + 8, 3); g_tra.lang_alt[3] = 0; }
                 if (g_tra.aud_rate >= 8000 && g_tra.aud_rate <= 48000 &&
                     g_tra.aud_chn >= 1 && g_tra.aud_chn <= 2 && g_tra.aud_pktsamp >= 256) {
                     g_tra.aud_pktbytes = 4u * g_tra.aud_chn + (u32)g_tra.aud_pktsamp * g_tra.aud_chn / 2;
-                    g_tra.aud_off = p + 16;
-                    g_tra.aud_pkts = (len - 8) / g_tra.aud_pktbytes;
+                    g_tra.aud_off = p + 8 + ah;
+                    g_tra.aud_pkts = (len - ah) / g_tra.aud_pktbytes;
                 }
             }
         }
@@ -2399,8 +2408,12 @@ static MoflexResult moflex_play_ring(const char *path) {
         mobi_close(&ctx); free(ctx.priv_data); mfx_close(&m); fclose(f);
         return MOFLEX_FALLBACK;
     }
-    if (g_tra.present && g_tra.aud_pkts > 0 && g_atrk_n < 4)
+    for (int t = 0; t < g_atrk_n && t < 4; t++) snprintf(g_atrk_lbl[t], 4, "A%d", t + 1);
+    if (g_atrk_n > 0 && g_tra.lang_main[0]) snprintf(g_atrk_lbl[0], 4, "%s", g_tra.lang_main);
+    if (g_tra.present && g_tra.aud_pkts > 0 && g_atrk_n < 4) {
+        snprintf(g_atrk_lbl[g_atrk_n], 4, "%s", g_tra.lang_alt[0] ? g_tra.lang_alt : "A2");
         g_atrk_streams[g_atrk_n++] = -1;    /* -1 = the trailer source (Audio Track N) */
+    }
     if (g_atrk_n > 1) {   /* dual audio: honor this movie's saved track (subcfg, loaded above) */
         if (g_atrk_sel < 0 || g_atrk_sel >= g_atrk_n) g_atrk_sel = 0;
         if (g_atrk_streams[g_atrk_sel] >= 0) {
