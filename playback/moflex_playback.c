@@ -866,12 +866,16 @@ static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing)
     if (g_atrk_n > 1) {
         const char *al = (g_atrk_sel < 4 && g_atrk_lbl[g_atrk_sel][0]) ? g_atrk_lbl[g_atrk_sel] : "A?";
         ui_button(AUD_X, AUD_Y, AUD_W, AUD_H, "", 0, UI_NEONC);   /* plain box, constant look */
-        int tw = ui_text_w(1, al), total = 8 + tw;               /* note (~6px) + gap + text */
+        u16 nc = UI_RGB(120, 210, 255);                          /* bright note, not the box grey */
+        const int NOTE_W = 9, GAP = 4;
+        int tw = ui_text_w(1, al), total = NOTE_W + GAP + tw;
         int sx = AUD_X + (AUD_W - total) / 2, cy = AUD_Y + AUD_H / 2;
-        ui_fill_round(sx, cy + 1, 5, 4, 2, UI_NEONC);            /* note head */
-        ui_fill(sx + 4, cy - 6, 2, 8, UI_NEONC);                 /* stem */
-        ui_fill(sx + 4, cy - 6, 4, 2, UI_NEONC);                 /* flag */
-        ui_text(sx + 8, cy - 4, 1, UI_NEONC, al);
+        /* eighth note: filled slanted head bottom-left, tall stem, small flag at the top */
+        ui_fill_round(sx, cy + 2, 6, 5, 2, nc);                  /* note head (oval) */
+        ui_fill(sx + 5, cy - 7, 2, 11, nc);                     /* stem up the right of the head */
+        ui_fill(sx + 5, cy - 7, 5, 2, nc);                     /* flag top */
+        ui_fill(sx + 8, cy - 7, 2, 4, nc);                     /* flag curl */
+        ui_text(sx + NOTE_W + GAP, cy - 4, 1, UI_NEONC, al);
     }
     /* bottom-screen-off: a crescent-moon button (video keeps playing on top) */
     if (g_lcd_ok) {

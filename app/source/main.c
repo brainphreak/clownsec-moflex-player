@@ -2190,7 +2190,8 @@ static void lib_scan_dir(const char *dir, int depth) {
             snprintf(sub, sizeof sub, "%s/", full);
             lib_scan_dir(sub, depth + 1);
         } else if (is_moflex(e->d_name)) {
-            if (has_episode_tag(e->d_name) && depth > 0) {   /* TV episode: grouped into SHOW entries */
+            if (has_episode_tag(e->d_name)) {   /* TV episode -> grouped into a SHOW entry (even a
+                                                * single loose episode at SD root gets its own show) */
                 if (!shows_done) { lib_add_shows_in_dir(dir, NULL); shows_done = 1; }
                 continue;
             }
@@ -2765,6 +2766,7 @@ ll_rebuild:;   /* X-search inside the list jumps back here with s_lib_search set
                 icon_movie(18, ry + 3, UI_NEONC);
                 { int st = vid_status(idx[i]); if (st >= 0) draw_status(9, ry + (rh - 9) / 2, st); }   /* first in the row */
                 int tx = 46, txr = UI_W - 16, ty = ry + (rh - 8) / 2;
+                if (ce->super) txr -= 14;                       /* reserve room for the S marker */
                 char yr[8] = "";
                 if (ce->year > 0) { snprintf(yr, sizeof yr, "%d", ce->year); txr -= 40; }   /* reserve room for the year */
                 int tw = ui_text_w(1, ce->name);
@@ -2774,8 +2776,8 @@ ll_rebuild:;   /* X-search inside the list jumps back here with s_lib_search set
                 else { char disp[NAMELEN]; snprintf(disp, sizeof disp, "%s", ce->name);
                     int cm = (txr - tx) / 8; if ((int)strlen(disp) > cm) disp[cm] = 0; ui_text(tx, ty, 1, tc, disp); }
                 if (yr[0]) ui_text(UI_W - 16 - ui_text_w(1, yr), ty, 1, selrow ? UI_NEONC : UI_GRAY, yr);
-                if (ce->super) {   /* SUPER MOFLEX marker, left of the year */
-                    int sx = (yr[0] ? UI_W - 16 - ui_text_w(1, yr) : UI_W - 16) - 14;
+                if (ce->super) {   /* SUPER MOFLEX marker: fixed slot left of the year column */
+                    int sx = UI_W - 16 - (yr[0] ? 40 : 0) - 12;
                     ui_text(sx, ty, 1, UI_NEON, "S");
                 }
             }
