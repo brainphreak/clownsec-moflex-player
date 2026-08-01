@@ -535,12 +535,18 @@ static void subcfg_path(const char *movie, char *out, size_t cap) {
     size_t L = strlen(out);
     if (L >= 4) snprintf(out + L - 4, cap - (L - 4), ".sub");       /* -> .../<key>.sub */
 }
+/* ---- dual-audio track selection (e.g. English first for the official player, original
+ * language second for ours). Filled at open from the stream table; persisted per movie
+ * with the subtitle settings. ---- */
+static int g_atrk_streams[4]; static int g_atrk_n = 0;   /* audio stream indices in this file */
+static int g_atrk_sel = 0;                               /* chosen track ordinal (0 = first) */
+static volatile int g_atrk_apply = 0;                    /* menu changed the track: player re-locks */
 static void subcfg_save(const char *movie) {
     mkdir("sdmc:/moflex_player", 0777); mkdir("sdmc:/moflex_player/resume", 0777);
     char p[256]; subcfg_path(movie, p, sizeof p);
     FILE *f = fopen(p, "wb"); if (!f) return;
-    fprintf(f, "1 %d %d %d %d %lld %d\n%s\n", g_sub_on, g_sub_top, g_sub_size, g_sub_depth,
-            (long long)g_sub_off, g_sub_enc, g_sub_file);
+    fprintf(f, "1 %d %d %d %d %lld %d %d\n%s\n", g_sub_on, g_sub_top, g_sub_size, g_sub_depth,
+            (long long)g_sub_off, g_sub_enc, g_atrk_sel, g_sub_file);
     fclose(f);
 }
 static void subcfg_load(const char *movie) {
@@ -549,6 +555,8 @@ static void subcfg_load(const char *movie) {
     if (!f) { int e = subenc_load(movie); if (e >= 0) g_sub_enc = e; return; }   /* pre-.sub: encoding only */
     int ver = 0, on = 0, top = 0, size = 1, depth = 0, enc = 0; long long off = 0;
     if (fscanf(f, "%d %d %d %d %d %lld %d", &ver, &on, &top, &size, &depth, &off, &enc) == 7 && ver == 1) {
+        int asel = 0;
+        if (fscanf(f, "%d", &asel) == 1 && asel >= 0 && asel < 4) g_atrk_sel = asel;   /* newer files */
         g_sub_on    = !!on;
         g_sub_top   = !!top;
         g_sub_size  = (size  >= 1 && size <= 3) ? size : 1;
@@ -1251,6 +1259,7 @@ static char g_srt_names[SRT_MAX][128], g_srt_paths[SRT_MAX][512];
 static int submenu_actions(int is3d, int *act) {
     int n = 0;
     act[n++] = 0; act[n++] = 1; act[n++] = 2; act[n++] = 3; act[n++] = 6;
+    if (g_atrk_n > 1) act[n++] = 7;   /* dual audio only: track selector */
     if (is3d) act[n++] = 4;
     act[n++] = 5;
     return n;
@@ -1269,6 +1278,7 @@ static void submenu_label(int a, char *r, int cap) {
                   snprintf(r, cap, "Delay:  %c%d.%02d s", g_sub_off < 0 ? '-' : '+', (int)(da / 1000000), (int)((da % 1000000) / 10000)); } break;
         case 6: snprintf(r, cap, "Encoding:  %s%s", g_sub_enc_name[g_sub_enc], g_sub_mode < 0 ? " (UTF-8)" : ""); break;
         case 4: snprintf(r, cap, "Depth (3D):  %+d", g_sub_depth); break;
+        case 7: snprintf(r, cap, "Audio:  Track %d / %d", g_atrk_sel + 1, g_atrk_n); break;
         default: snprintf(r, cap, "Load SRT file..."); break;
     }
 }
@@ -1387,6 +1397,10 @@ static int submenu_input(u32 kd, u32 kh, touchPosition tp, int is3d, const char 
         case 4: if (rep) { g_sub_depth += rep; if (g_sub_depth < -16) g_sub_depth = -16; if (g_sub_depth > 16) g_sub_depth = 16; } break;
         case 6: if (press) { g_sub_enc = (g_sub_enc + (press < 0 ? 4 : 1)) % 5;
                              if (g_sub_file[0]) { char w[512]; snprintf(w, sizeof w, "%s", g_sub_file); subs_load(w); } } break;
+        case 7: if (press && g_atrk_n > 1) {
+                    g_atrk_sel = (g_atrk_sel + g_atrk_n + (press < 0 ? -1 : 1)) % g_atrk_n;
+                    g_atrk_apply = 1;   /* the player loop retunes + re-locks at the current spot */
+                } break;
         default: if (press) submenu_open_srt(moviepath); break;   /* Load SRT... */
     }
     return 0;
@@ -1467,9 +1481,13 @@ static MoflexResult moflex_play_gpu(const char *path) {
     MfxDemux m;
     if (mfx_open_auto(&m, f, path) != 0) { fclose(f); return MOFLEX_ERROR; }
     int vi = -1, ai = -1;
+    g_atrk_n = 0; g_atrk_sel = 0;   /* re-filled per file; subcfg_load below restores a saved choice */
     for (int i = 0; i < m.nb_streams; i++) {
         if (m.streams[i].media_type == MFX_TYPE_VIDEO && vi < 0) vi = i;
-        if (m.streams[i].media_type == MFX_TYPE_AUDIO && ai < 0) ai = i;
+        if (m.streams[i].media_type == MFX_TYPE_AUDIO) {
+            if (ai < 0) ai = i;
+            if (g_atrk_n < 4) g_atrk_streams[g_atrk_n++] = i;
+        }
     }
     if (vi < 0) { mfx_close(&m); fclose(f); return MOFLEX_ERROR; }
     int W = m.streams[vi].width, H = m.streams[vi].height;
@@ -1969,7 +1987,7 @@ static void mp_ring_apt_hook(APT_HookType hook, void *param) {
  * and lets decode run ahead to build a cushion. Producer/consumer, like the official player. */
 typedef struct {
     MfxDemux *m; AVCodecContext *ctx; AVFrame *fL, *fR;
-    int W, H, is3d, NB, have_audio, old3ds; int64_t pair_dur, dur_us;
+    int W, H, is3d, NB, have_audio, old3ds, aidx; int64_t pair_dur, dur_us;
     volatile int eye_swap;               /* 3D: stream at the seek landing starts on a RIGHT eye ->
                                             route the first of each popped pair to the R texture */
     volatile int wr, rd;                 /* ring: worker advances wr, main advances rd (both atomic ints) */
@@ -1992,7 +2010,10 @@ static void r3_produce(R3S *s) {
     while (!s->done && r3_vqc < R3_VQ) {
         if (!s->has_pending) { if (mfx_next_packet(s->m, &s->pending) != 1) { s->done = 1; break; } s->has_pending = 1; }
         int mt = s->m->streams[s->pending.stream_index].media_type;
-        if (mt == MFX_TYPE_AUDIO && s->have_audio) {
+        if (mt == MFX_TYPE_AUDIO && s->have_audio && s->pending.stream_index != s->aidx) {
+            s->has_pending = 0;   /* a NON-selected audio track (dual audio): skip it entirely --
+                                   * feeding every audio stream to one DSP channel garbles both */
+        } else if (mt == MFX_TYPE_AUDIO && s->have_audio) {
             if (r3_audio_feed(&s->pending)) {
                 if (r3_audio_t0 < 0) { int64_t at = s->m->ts; r3_audio_t0 = at < 0 ? 0 : at; }  /* audio origin */
                 s->has_pending = 0;
@@ -2112,9 +2133,13 @@ static MoflexResult moflex_play_ring(const char *path) {
     MfxDemux m;
     if (mfx_open_auto(&m, f, path) != 0) { fclose(f); return MOFLEX_ERROR; }
     int vi = -1, ai = -1;
+    g_atrk_n = 0; g_atrk_sel = 0;   /* re-filled per file; subcfg_load below restores a saved choice */
     for (int i = 0; i < m.nb_streams; i++) {
         if (m.streams[i].media_type == MFX_TYPE_VIDEO && vi < 0) vi = i;
-        if (m.streams[i].media_type == MFX_TYPE_AUDIO && ai < 0) ai = i;
+        if (m.streams[i].media_type == MFX_TYPE_AUDIO) {
+            if (ai < 0) ai = i;
+            if (g_atrk_n < 4) g_atrk_streams[g_atrk_n++] = i;
+        }
     }
     if (vi < 0) { mfx_close(&m); fclose(f); return MOFLEX_ERROR; }
     int W = m.streams[vi].width, H = m.streams[vi].height;
@@ -2251,6 +2276,11 @@ static MoflexResult moflex_play_ring(const char *path) {
         mobi_close(&ctx); free(ctx.priv_data); mfx_close(&m); fclose(f);
         return MOFLEX_FALLBACK;
     }
+    if (g_atrk_n > 1) {   /* dual audio: honor this movie's saved track (subcfg, loaded above) */
+        if (g_atrk_sel < 0 || g_atrk_sel >= g_atrk_n) g_atrk_sel = 0;
+        ai = g_atrk_streams[g_atrk_sel];
+        arate = m.streams[ai].sample_rate; chn = m.streams[ai].channels;
+    }
     if (have_audio) { r3_audio_setup(arate, chn); if (!r3_aok) have_audio = 0; }   /* alloc failed -> wall-clock */
     /* the hook was registered right after gfx init; now that Y2R/audio are up, arm its fields */
     g_ring_apt_w = W; g_ring_apt_h = H; g_ring_apt_bpp = r3_bpp;
@@ -2297,6 +2327,7 @@ static MoflexResult moflex_play_ring(const char *path) {
     R3S s; memset(&s, 0, sizeof s);
     s.m = &m; s.ctx = &ctx; s.fL = fL; s.fR = fR;
     s.W = W; s.H = H; s.is3d = is3d; s.NB = NB; s.have_audio = have_audio; s.old3ds = !r3_isnew;
+    s.aidx = ai;
     g_panel_cheap = !r3_isnew;   /* lighten the software panel on Old-3DS to free decode CPU */
     s.pair_dur = pair_dur; s.dur_us = dur_us; s.run = 1;
     s.paused = want_seek ? 1 : 0;   /* if resuming, stay paused until the seek/prime below sets us up */
@@ -3083,7 +3114,8 @@ static MoflexResult moflex_play_classic(const char *path) {
                  * service and hitches the video (the shared SDMC path). We checkpoint only when
                  * stopped: on pause (above) and on exit (done:), when the read loop is idle. */
                 int mt = m.streams[pkt.stream_index].media_type;
-                if (mt == MFX_TYPE_AUDIO && have_audio) {
+                if (mt == MFX_TYPE_AUDIO && have_audio && pkt.stream_index != ai) { /* other track */ }
+                else if (mt == MFX_TYPE_AUDIO && have_audio) {
                     u64 ta = svcGetSystemTick();
                     ndspWaveBuf *wb = &wbuf[wb_idx];
                     int spins = 0;
@@ -3231,9 +3263,13 @@ static MoflexResult moflex_play_soft(const char *path) {
     MfxDemux m;
     if (mfx_open_auto(&m, f, path) != 0) { fclose(f); return MOFLEX_ERROR; }
     int vi = -1, ai = -1;
+    g_atrk_n = 0; g_atrk_sel = 0;   /* re-filled per file; subcfg_load below restores a saved choice */
     for (int i = 0; i < m.nb_streams; i++) {
         if (m.streams[i].media_type == MFX_TYPE_VIDEO && vi < 0) vi = i;
-        if (m.streams[i].media_type == MFX_TYPE_AUDIO && ai < 0) ai = i;
+        if (m.streams[i].media_type == MFX_TYPE_AUDIO) {
+            if (ai < 0) ai = i;
+            if (g_atrk_n < 4) g_atrk_streams[g_atrk_n++] = i;
+        }
     }
     if (vi < 0) { mfx_close(&m); fclose(f); return MOFLEX_ERROR; }
     int W = m.streams[vi].width, H = m.streams[vi].height;
