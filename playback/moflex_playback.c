@@ -540,6 +540,93 @@ static void subcfg_path(const char *movie, char *out, size_t cap) {
     size_t L = strlen(out);
     if (L >= 4) snprintf(out + L - 4, cap - (L - 4), ".sub");       /* -> .../<key>.sub */
 }
+/* ---- CSXTRA trailer: extras appended PAST the last block (the official player never reads
+ * there -- hardware-validated; in-band extra streams hang it or choke its demux queue).
+ * Layout: [blocks][sections][u64 payload_off][8B "CSXTRA01"]; section [4cc][u32 len][data]:
+ * 'SUB0' = srt bytes, 'AUD0' = u32 rate, u16 chn, u16 samples/pkt, fixed-size ADPCM packets
+ * (in-band framing) -> packet k sits at k*pktbytes, time = k*pktsamp/rate: seek is arithmetic. */
+static struct {
+    int present;               /* footer found on this file */
+    s64 payload_off;           /* demux window ends here (blocks only) */
+    s64 sub_off[6]; u32 sub_len[6]; char sub_lang[6][4]; int sub_n;   /* SUB0/SUB1 tracks */
+    s64 aud_off; u32 aud_pkts; /* AUD0/AUD1 packet array */
+    u32 aud_rate, aud_pktbytes;
+    u16 aud_chn, aud_pktsamp;
+    char lang_main[4], lang_alt[4];   /* LNG0 / AUD1 tags ("ENG"/"JPN"); empty = untagged */
+} g_tra;
+static void trailer_probe(FILE *f) {
+    memset(&g_tra, 0, sizeof g_tra);
+    if (fseeko(f, -16, SEEK_END)) return;
+    s64 fsz = (s64)ftello(f) + 16;
+    u8 ft[16];
+    if (fread(ft, 1, 16, f) != 16 || memcmp(ft + 8, "CSXTRA01", 8)) return;
+    s64 off = 0;
+    for (int i = 7; i >= 0; i--) off = (off << 8) | ft[i];   /* le64 */
+    if (off <= 0 || off >= fsz - 16) return;
+    g_tra.payload_off = off;
+    s64 p = off, end = fsz - 16;
+    while (p + 8 <= end) {
+        u8 h[8];
+        fseeko(f, p, SEEK_SET);
+        if (fread(h, 1, 8, f) != 8) break;
+        u32 len = h[4] | (h[5] << 8) | ((u32)h[6] << 16) | ((u32)h[7] << 24);
+        if (p + 8 + (s64)len > end) break;
+        if (!memcmp(h, "SUB0", 4) && len > 0 && len <= 1024 * 1024 && g_tra.sub_n < 6) {
+            int k = g_tra.sub_n++;
+            g_tra.sub_off[k] = p + 8; g_tra.sub_len[k] = len; g_tra.sub_lang[k][0] = 0;
+        }
+        else if (!memcmp(h, "SUB1", 4) && len > 4 && len <= 1024 * 1024 && g_tra.sub_n < 6) {
+            u8 l[4]; int k = g_tra.sub_n++;
+            if (fread(l, 1, 4, f) == 4) { memcpy(g_tra.sub_lang[k], l, 3); g_tra.sub_lang[k][3] = 0; }
+            g_tra.sub_off[k] = p + 12; g_tra.sub_len[k] = len - 4;
+        }
+        else if (!memcmp(h, "LNG0", 4) && len >= 4) {
+            u8 l[4];
+            if (fread(l, 1, 4, f) == 4) { memcpy(g_tra.lang_main, l, 3); g_tra.lang_main[3] = 0; }
+        }
+        else if ((!memcmp(h, "AUD0", 4) || !memcmp(h, "AUD1", 4)) && len > 8) {
+            int v1 = !memcmp(h, "AUD1", 4);
+            int ah = v1 ? 12 : 8;
+            u8 a[12];
+            if ((u32)len > (u32)ah && fread(a, 1, ah, f) == (size_t)ah) {
+                g_tra.aud_rate = a[0] | (a[1] << 8) | ((u32)a[2] << 16) | ((u32)a[3] << 24);
+                g_tra.aud_chn = (u16)(a[4] | (a[5] << 8));
+                g_tra.aud_pktsamp = (u16)(a[6] | (a[7] << 8));
+                if (v1) { memcpy(g_tra.lang_alt, a + 8, 3); g_tra.lang_alt[3] = 0; }
+                if (g_tra.aud_rate >= 8000 && g_tra.aud_rate <= 48000 &&
+                    g_tra.aud_chn >= 1 && g_tra.aud_chn <= 2 && g_tra.aud_pktsamp >= 256) {
+                    g_tra.aud_pktbytes = 4u * g_tra.aud_chn + (u32)g_tra.aud_pktsamp * g_tra.aud_chn / 2;
+                    g_tra.aud_off = p + 8 + ah;
+                    g_tra.aud_pkts = (len - ah) / g_tra.aud_pktbytes;
+                }
+            }
+        }
+        p += 8 + len;
+    }
+    g_tra.present = 1;
+}
+
+
+
+/* Copy embedded subtitle track k to the scratch file (fresh handle: the demuxer owns f). */
+static int g_trsub_sel = 0;
+static int trsub_stash(const char *path, int k) {
+    if (k < 0 || k >= g_tra.sub_n) return 0;
+    FILE *sf = fopen(path, "rb");
+    if (!sf) return 0;
+    char *buf = (char *)malloc(g_tra.sub_len[k]);
+    int ok = 0;
+    if (buf && !fseeko(sf, g_tra.sub_off[k], SEEK_SET) &&
+        fread(buf, 1, g_tra.sub_len[k], sf) == g_tra.sub_len[k]) {
+        mkdir("sdmc:/moflex_player", 0777);
+        FILE *o = fopen("sdmc:/moflex_player/.embedded.srt", "wb");
+        if (o) { fwrite(buf, 1, g_tra.sub_len[k], o); fclose(o); ok = 1; }
+    }
+    free(buf); fclose(sf);
+    return ok;
+}
+
+
 /* ---- dual-audio track selection (e.g. English first for the official player, original
  * language second for ours). Filled at open from the stream table; persisted per movie
  * with the subtitle settings. ---- */
@@ -1270,6 +1357,7 @@ static char g_srt_names[SRT_MAX][128], g_srt_paths[SRT_MAX][512];
 static int submenu_actions(int is3d, int *act) {
     int n = 0;
     act[n++] = 0; act[n++] = 1; act[n++] = 2; act[n++] = 3; act[n++] = 6;
+    if (g_tra.sub_n > 1) act[n++] = 8;   /* built-in subtitle track cycler */
     if (is3d) act[n++] = 4;
     act[n++] = 5;
     return n;
@@ -1289,6 +1377,10 @@ static void submenu_label(int a, char *r, int cap) {
         case 6: snprintf(r, cap, "Encoding:  %s%s", g_sub_enc_name[g_sub_enc], g_sub_mode < 0 ? " (UTF-8)" : ""); break;
         case 4: snprintf(r, cap, "Depth (3D):  %+d", g_sub_depth); break;
         case 7: snprintf(r, cap, "Audio:  Track %d / %d", g_atrk_sel + 1, g_atrk_n); break;
+        case 8: snprintf(r, cap, "Sub Track:  %s (%d/%d)",
+                         g_trsub_sel < g_tra.sub_n && g_tra.sub_lang[g_trsub_sel][0]
+                             ? g_tra.sub_lang[g_trsub_sel] : "---",
+                         g_trsub_sel + 1, g_tra.sub_n); break;
         default: snprintf(r, cap, "Load SRT file..."); break;
     }
 }
@@ -1410,6 +1502,13 @@ static int submenu_input(u32 kd, u32 kh, touchPosition tp, int is3d, const char 
         case 7: if (press && g_atrk_n > 1) {
                     g_atrk_sel = (g_atrk_sel + g_atrk_n + (press < 0 ? -1 : 1)) % g_atrk_n;
                     g_atrk_apply = 1;   /* the player loop retunes + re-locks at the current spot */
+                } break;
+        case 8: if (press && g_tra.sub_n > 1) {
+                    g_trsub_sel = (g_trsub_sel + g_tra.sub_n + (press < 0 ? -1 : 1)) % g_tra.sub_n;
+                    if (trsub_stash(moviepath, g_trsub_sel)) {
+                        subs_load("sdmc:/moflex_player/.embedded.srt");
+                        g_sub_on = 1;   /* picking a language implies wanting it shown */
+                    }
                 } break;
         default: if (press) submenu_open_srt(moviepath); break;   /* Load SRT... */
     }
@@ -1802,76 +1901,6 @@ gdone:
  *     inline wbuf[] and the gpu-path audio_worker so nothing clashes). Sized SMALL: on the Old 3DS
  *     the linear heap is tight, and an oversized reserve here starves the video ring to zero (which
  *     then faults on `wr % NB`). 24 x 2048 stereo = 192KB is ~1.1s of read-ahead, plenty. --- */
-/* ---- CSXTRA trailer: extras appended PAST the last block (the official player never reads
- * there -- hardware-validated; in-band extra streams hang it or choke its demux queue).
- * Layout: [blocks][sections][u64 payload_off][8B "CSXTRA01"]; section [4cc][u32 len][data]:
- * 'SUB0' = srt bytes, 'AUD0' = u32 rate, u16 chn, u16 samples/pkt, fixed-size ADPCM packets
- * (in-band framing) -> packet k sits at k*pktbytes, time = k*pktsamp/rate: seek is arithmetic. */
-static struct {
-    int present;               /* footer found on this file */
-    s64 payload_off;           /* demux window ends here (blocks only) */
-    s64 sub_off; u32 sub_len;  /* SUB0 body */
-    s64 aud_off; u32 aud_pkts; /* AUD0/AUD1 packet array */
-    u32 aud_rate, aud_pktbytes;
-    u16 aud_chn, aud_pktsamp;
-    char lang_main[4], lang_alt[4];   /* LNG0 / AUD1 tags ("ENG"/"JPN"); empty = untagged */
-} g_tra;
-static void trailer_probe(FILE *f) {
-    memset(&g_tra, 0, sizeof g_tra);
-    if (fseeko(f, -16, SEEK_END)) return;
-    s64 fsz = (s64)ftello(f) + 16;
-    u8 ft[16];
-    if (fread(ft, 1, 16, f) != 16 || memcmp(ft + 8, "CSXTRA01", 8)) return;
-    s64 off = 0;
-    for (int i = 7; i >= 0; i--) off = (off << 8) | ft[i];   /* le64 */
-    if (off <= 0 || off >= fsz - 16) return;
-    g_tra.payload_off = off;
-    s64 p = off, end = fsz - 16;
-    while (p + 8 <= end) {
-        u8 h[8];
-        fseeko(f, p, SEEK_SET);
-        if (fread(h, 1, 8, f) != 8) break;
-        u32 len = h[4] | (h[5] << 8) | ((u32)h[6] << 16) | ((u32)h[7] << 24);
-        if (p + 8 + (s64)len > end) break;
-        if (!memcmp(h, "SUB0", 4) && len > 0 && len <= 1024 * 1024) {
-            char *buf = (char *)malloc(len);
-            if (buf) {
-                fseeko(f, p + 8, SEEK_SET);
-                if (fread(buf, 1, len, f) == len) {
-                    mkdir("sdmc:/moflex_player", 0777);
-                    FILE *o = fopen("sdmc:/moflex_player/.embedded.srt", "wb");
-                    if (o) { fwrite(buf, 1, len, o); fclose(o); g_tra.sub_off = p + 8; g_tra.sub_len = len; }
-                }
-                free(buf);
-            }
-        }
-        else if (!memcmp(h, "LNG0", 4) && len >= 4) {
-            u8 l[4];
-            if (fread(l, 1, 4, f) == 4) { memcpy(g_tra.lang_main, l, 3); g_tra.lang_main[3] = 0; }
-        }
-        else if ((!memcmp(h, "AUD0", 4) || !memcmp(h, "AUD1", 4)) && len > 8) {
-            int v1 = !memcmp(h, "AUD1", 4);
-            int ah = v1 ? 12 : 8;
-            u8 a[12];
-            if ((u32)len > (u32)ah && fread(a, 1, ah, f) == (size_t)ah) {
-                g_tra.aud_rate = a[0] | (a[1] << 8) | ((u32)a[2] << 16) | ((u32)a[3] << 24);
-                g_tra.aud_chn = (u16)(a[4] | (a[5] << 8));
-                g_tra.aud_pktsamp = (u16)(a[6] | (a[7] << 8));
-                if (v1) { memcpy(g_tra.lang_alt, a + 8, 3); g_tra.lang_alt[3] = 0; }
-                if (g_tra.aud_rate >= 8000 && g_tra.aud_rate <= 48000 &&
-                    g_tra.aud_chn >= 1 && g_tra.aud_chn <= 2 && g_tra.aud_pktsamp >= 256) {
-                    g_tra.aud_pktbytes = 4u * g_tra.aud_chn + (u32)g_tra.aud_pktsamp * g_tra.aud_chn / 2;
-                    g_tra.aud_off = p + 8 + ah;
-                    g_tra.aud_pkts = (len - ah) / g_tra.aud_pktbytes;
-                }
-            }
-        }
-        p += 8 + len;
-    }
-    g_tra.present = 1;
-}
-
-
 #define R3_AWB  48            /* wavebufs: deep audio read-ahead so audio rides through decode dips */
 #define R3_ABUF 2048          /* max samples/ch per audio packet (real ~2k) */
 static ndspWaveBuf r3_wb[R3_AWB]; static int16_t *r3_ab[R3_AWB];
@@ -2315,8 +2344,11 @@ static MoflexResult moflex_play_ring(const char *path) {
         else if (L > 4 && !strcasecmp(title + L - 4, ".cia")) title[L - 4] = 0;
     }
     subs_autoload(path);
-    if ((g_emb_sub_found || (g_tra.present && g_tra.sub_len > 0)) && g_nsubs == 0)
-        subs_load("sdmc:/moflex_player/.embedded.srt");   /* in-band or trailer; sidecars win */
+    if (g_trsub_sel < 0 || g_trsub_sel >= g_tra.sub_n) g_trsub_sel = 0;
+    if (g_nsubs == 0) {                                  /* sidecars win over embedded */
+        if (g_tra.sub_n > 0) { if (trsub_stash(path, g_trsub_sel)) subs_load("sdmc:/moflex_player/.embedded.srt"); }
+        else if (g_emb_sub_found) subs_load("sdmc:/moflex_player/.embedded.srt");
+    }
 
     /* CLEAN gfx re-init, exactly like the standalone avtest that renders smoothly on Old 3DS. The app
      * leaves the screens configured for its SOFTWARE UI (console on the bottom + a custom framebuffer
