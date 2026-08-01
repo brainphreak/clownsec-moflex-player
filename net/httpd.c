@@ -24,6 +24,7 @@
 
 static u32 *g_soc_buf;
 static volatile int g_listen_fd = -1;
+static volatile int g_client_fd = -1;
 static volatile bool g_stop;
 static Thread g_thread;
 static char g_url[64] = "wifi off";
@@ -204,6 +205,17 @@ static void serve_listing(int fd, const char *dir) {
     }
 }
 
+/* recv gated behind select(): returns like recv, or 0 on orderly close, -2 on timeout
+ * (caller polls g_stop / idle caps). Keeps the socket blocking for the send paths. */
+static int recv_wait(int fd, void *buf, int want) {
+    fd_set r; FD_ZERO(&r); FD_SET(fd, &r);
+    struct timeval tv = { 0, 500000 };                 /* 500ms per wait */
+    int sel = select(fd + 1, &r, NULL, NULL, &tv);
+    if (sel == 0) return -2;                           /* timeout: poll and come back */
+    if (sel < 0) return -1;
+    return recv(fd, buf, want, 0);
+}
+
 /* ---------- PUT upload ---------- */
 
 /* live upload progress, polled by the on-device UI (the web page has its own bar) */
@@ -269,15 +281,15 @@ static void handle_put(int fd, const char *path, char *hdrbuf, int hdr_total, in
     }
 
     char *buf = (char *)malloc(IOCHUNK);
-    int idle = 0;                       /* consecutive 500ms receive timeouts */
+    int idle = 0;                       /* consecutive 500ms select timeouts */
     while (remaining > 0 && buf && !werr && !g_stop) {
         int want = (int)(remaining < IOCHUNK ? remaining : IOCHUNK);
-        int n = recv(fd, buf, want, 0);
-        if (n < 0) {                    /* timeout: poll the stop flag, give up after ~30s idle */
+        int n = recv_wait(fd, buf, want);
+        if (n == -2) {                  /* timeout: poll the stop flag, ~30s dead-client cap */
             if (g_stop || ++idle > 60) break;
             continue;
         }
-        if (n == 0) break;
+        if (n <= 0) break;
         idle = 0;
         if ((wb ? dl_wb_write(wb, buf, n) : fwrite(buf, 1, n, out)) != (size_t)n) { werr = 1; break; }
         remaining -= n; g_up_done += n;
@@ -301,9 +313,9 @@ static void handle_client(int fd) {
     int total = 0, body_start = -1;
     int hidle = 0;
     while (total < HDRBUF - 1 && !g_stop) {
-        int n = recv(fd, hdr + total, HDRBUF - 1 - total, 0);
-        if (n < 0) { if (g_stop || ++hidle > 20) break; continue; }   /* 500ms timeouts */
-        if (n == 0) break;
+        int n = recv_wait(fd, hdr + total, HDRBUF - 1 - total);
+        if (n == -2) { if (g_stop || ++hidle > 20) break; continue; }   /* 500ms waits, ~10s cap */
+        if (n <= 0) break;
         hidle = 0;
         total += n;
         hdr[total] = 0;
@@ -361,13 +373,9 @@ static void server_thread(void *arg) {
             svcSleepThread(50000000);   /* 50ms; listen sock is non-blocking */
             continue;
         }
-        /* client inherits the listen sock's O_NONBLOCK -> force it blocking so
-           recv() waits for data during large uploads (else they fail partway) --
-           but with a 500ms receive timeout so the loops can poll g_stop: a B press
-           or HOME must cancel the transfer NOW, not after the upload finishes. */
+        /* client blocking for clean sends; receives go through select() with a timeout so
+           the loops can poll g_stop -- a B press or HOME must cancel the transfer NOW. */
         fcntl(c, F_SETFL, fcntl(c, F_GETFL, 0) & ~O_NONBLOCK);
-        { struct timeval tv = { 0, 500000 };
-          setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv); }
         g_client_fd = c;
         handle_client(c);
         g_client_fd = -1;
