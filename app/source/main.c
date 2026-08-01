@@ -3309,7 +3309,7 @@ static int fetch_poster(const CatEntry *e, u16 *pb) {
 static int scrape_one_stem(const char *moviepath, const char *name_hint) {
     s_scrape_sub = 0;
     /* SUPER MOFLEX: the file may carry its own library info + poster -- no network needed */
-    if (trailer_import_movieinfo(moviepath)) return 1;
+    if (trailer_import_movieinfo(moviepath)) return 3;   /* imported from the file's own trailer */
     load_sources();
     char lstem[192]; local_stem(moviepath, lstem, sizeof lstem);
     int cap = 2048; CatEntry *cat = (CatEntry *)malloc(sizeof(CatEntry) * cap);
@@ -3405,12 +3405,13 @@ static void lib_scrape_one(int i) {
     if (r > 0) { lib_refresh_entry(i); lib_save_cache(); }
     char m[160];
     snprintf(m, sizeof m, "%s%s",
-             r == 1 ? "Info + artwork saved."
+             r == 3 ? "Loaded from the SUPER MOFLEX file.\nInfo + artwork are self-contained."
+           : r == 1 ? "Info + artwork saved."
            : r == 2 ? "Info saved, but the poster\ndidn't download. Try again for the art."
            : r == -1 ? "Could not download the catalog.\nCheck the connection and try again."
            : r == -2 ? "Out of memory.\nRestart the app and try again."
                     : "No catalog had this title.",
-             r <= 0 ? "" : s_scrape_sub == 1 ? "\nSubtitles downloaded."
+             r <= 0 ? "" : (r == 3) ? "" : s_scrape_sub == 1 ? "\nSubtitles downloaded."
                      : s_scrape_sub == 2 ? "\nSubtitles already present." : "\nNo subtitles in the catalog.");
     msg_screen("GET INFO", m);
 }
@@ -3735,12 +3736,13 @@ static void getinfo_menu(void) {
         int r = scrape_one(full);
         char m[160];
         snprintf(m, sizeof m, "%s%s",
-                 r == 1 ? "Info + artwork saved."
+                 r == 3 ? "Loaded from the SUPER MOFLEX file.\nInfo + artwork are self-contained."
+               : r == 1 ? "Info + artwork saved."
                : r == 2 ? "Info saved, but the poster\ndidn't download. Try again for the art."
                : r == -1 ? "Could not download the catalog.\nCheck the connection and try again."
                : r == -2 ? "Out of memory.\nRestart the app and try again."
                         : "No catalog had this title.",
-                 r <= 0 ? "" : s_scrape_sub == 1 ? "\nSubtitles downloaded."
+                 r <= 0 ? "" : (r == 3) ? "" : s_scrape_sub == 1 ? "\nSubtitles downloaded."
                          : s_scrape_sub == 2 ? "\nSubtitles already present." : "\nNo subtitles in the catalog.");
         msg_screen("DOWNLOAD INFO", m);
     } else if (a == 1) {
