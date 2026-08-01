@@ -1643,11 +1643,11 @@ static MoflexResult moflex_play_gpu(const char *path) {
     AVFrame *fL = av_frame_alloc(), *fR = av_frame_alloc();
 
     const char *bn = strrchr(path, '/'); bn = bn ? bn + 1 : path;
-    char title[64];
+    char title[200];
     const char *cia_title = cia_selection_title(path);   /* movie title if playing inside a CIA */
-    if (cia_title) snprintf(title, sizeof title, "%.60s", cia_title);
+    if (cia_title) snprintf(title, sizeof title, "%s", cia_title);
     else {
-        snprintf(title, sizeof title, "%.60s", bn);
+        snprintf(title, sizeof title, "%s", bn);
         size_t L = strlen(title);
         if (L > 7 && !strcasecmp(title + L - 7, ".moflex")) title[L - 7] = 0;
         else if (L > 4 && !strcasecmp(title + L - 4, ".zip")) title[L - 4] = 0;
@@ -2354,11 +2354,11 @@ static MoflexResult moflex_play_ring(const char *path) {
     AVFrame *fL = av_frame_alloc(), *fR = av_frame_alloc();
 
     const char *bn = strrchr(path, '/'); bn = bn ? bn + 1 : path;
-    char title[64];
+    char title[200];
     const char *cia_title = cia_selection_title(path);
-    if (cia_title) snprintf(title, sizeof title, "%.60s", cia_title);
+    if (cia_title) snprintf(title, sizeof title, "%s", cia_title);
     else {
-        snprintf(title, sizeof title, "%.60s", bn);
+        snprintf(title, sizeof title, "%s", bn);
         size_t L = strlen(title);
         if (L > 7 && !strcasecmp(title + L - 7, ".moflex")) title[L - 7] = 0;
         else if (L > 4 && !strcasecmp(title + L - 4, ".zip")) title[L - 4] = 0;
@@ -3172,11 +3172,11 @@ static MoflexResult moflex_play_classic(const char *path) {
 
     /* short movie title: the embedded movie's real name if playing inside a CIA, else the filename */
     const char *base = strrchr(path, '/'); base = base ? base + 1 : path;
-    char title[64];
+    char title[200];
     const char *cia_title = cia_selection_title(path);
-    if (cia_title) snprintf(title, sizeof(title), "%.60s", cia_title);
+    if (cia_title) snprintf(title, sizeof(title), "%s", cia_title);
     else {
-        snprintf(title, sizeof(title), "%.60s", base);
+        snprintf(title, sizeof(title), "%s", base);
         size_t L = strlen(title);                      /* hide extension */
         if (L > 7 && !strcasecmp(title + L - 7, ".moflex")) title[L - 7] = 0;
         else if (L > 4 && !strcasecmp(title + L - 4, ".zip")) title[L - 4] = 0;
@@ -3538,10 +3538,10 @@ static MoflexResult moflex_play_soft(const char *path) {
         return MOFLEX_FALLBACK;
     }
 
-    char title[64]; const char *bn = strrchr(path, '/'); bn = bn ? bn + 1 : path;
+    char title[200]; const char *bn = strrchr(path, '/'); bn = bn ? bn + 1 : path;
     const char *cia_title = cia_selection_title(path);
-    if (cia_title) snprintf(title, sizeof title, "%.60s", cia_title);
-    else { snprintf(title, sizeof title, "%.60s", bn); size_t L = strlen(title);
+    if (cia_title) snprintf(title, sizeof title, "%s", cia_title);
+    else { snprintf(title, sizeof title, "%s", bn); size_t L = strlen(title);
         if (L > 7 && !strcasecmp(title + L - 7, ".moflex")) title[L - 7] = 0;
         else if (L > 4 && !strcasecmp(title + L - 4, ".zip")) title[L - 4] = 0;
         else if (L > 4 && !strcasecmp(title + L - 4, ".cia")) title[L - 4] = 0; }
