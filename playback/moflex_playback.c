@@ -2126,6 +2126,30 @@ static void r3_dec_thread(void *arg) {
     }
 }
 
+/* Embedded subtitles: a DATA stream beyond the seek index whose head frame is an SRT
+ * (the remuxer packs the whole .srt as one frame). Found by scanning the first packets;
+ * stashed to a scratch file and loaded through the normal SRT path -- sidecar files still
+ * win, and the CC menu / encodings / toggle all behave exactly as with external tracks. */
+static int g_emb_sub_found = 0;
+static void embsub_scan(MfxDemux *m) {
+    g_emb_sub_found = 0;
+    int vid_seen = 0; MfxPacket pk;
+    for (int guard = 0; guard < 400 && vid_seen < 40; guard++) {   /* subs live at the head */
+        if (mfx_next_packet(m, &pk) != 1) break;
+        int mt = m->streams[pk.stream_index].media_type;
+        if (mt == MFX_TYPE_VIDEO) { vid_seen++; continue; }
+        if (mt != MFX_TYPE_DATA || pk.size < 16) continue;
+        int is_srt = 0, lim = pk.size < 300 ? pk.size : 300;
+        for (int i = 0; i + 2 < lim; i++)
+            if (pk.data[i] == '-' && pk.data[i + 1] == '-' && pk.data[i + 2] == '>') { is_srt = 1; break; }
+        if (!is_srt) continue;                       /* e.g. the seek index frame */
+        mkdir("sdmc:/moflex_player", 0777);
+        FILE *o = fopen("sdmc:/moflex_player/.embedded.srt", "wb");
+        if (o) { fwrite(pk.data, 1, pk.size, o); fclose(o); g_emb_sub_found = 1; }
+        break;
+    }
+}
+
 static MoflexResult moflex_play_ring(const char *path) {
     vol_load();
     FILE *f = fopen(path, "rb");
@@ -2145,6 +2169,9 @@ static MoflexResult moflex_play_ring(const char *path) {
     int W = m.streams[vi].width, H = m.streams[vi].height;
     int arate = ai >= 0 ? m.streams[ai].sample_rate : 44100, chn = ai >= 0 ? m.streams[ai].channels : 2;
     int have_audio = (ai >= 0);
+    embsub_scan(&m);                       /* consumes head packets -> reopen for a clean start */
+    mfx_close(&m);
+    if (mfx_open_auto(&m, f, path) != 0) { fclose(f); return MOFLEX_ERROR; }
     int is3d = mfx_detect_stereo(&m);
 
     int64_t pair_dur = 40000;   /* per-displayed-frame period from the stream timebase */
@@ -2185,6 +2212,8 @@ static MoflexResult moflex_play_ring(const char *path) {
         else if (L > 4 && !strcasecmp(title + L - 4, ".cia")) title[L - 4] = 0;
     }
     subs_autoload(path);
+    if (g_emb_sub_found && g_nsubs == 0)   /* embedded track loads only when no sidecar claimed it */
+        subs_load("sdmc:/moflex_player/.embedded.srt");
 
     /* CLEAN gfx re-init, exactly like the standalone avtest that renders smoothly on Old 3DS. The app
      * leaves the screens configured for its SOFTWARE UI (console on the bottom + a custom framebuffer
