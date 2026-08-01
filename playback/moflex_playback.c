@@ -2902,6 +2902,14 @@ static MoflexResult moflex_play_ring(const char *path) {
                     }
                 }
             }
+            /* TRAILER AUDIO: re-anchor on the position we ACTUALLY landed on, not the one we asked
+             * for. The keyframe landing runs seconds early on sparse-keyframe encodes, 3D parity
+             * steps another block back, and resume-exact walks forward again -- in-band audio rides
+             * the demuxer through all of that, but the trailer cursor is pure arithmetic, so the
+             * earlier estimate from seek_to_us left the second language ahead of the picture until
+             * something re-opened the file (switching tracks and back "fixed" it). */
+            if (s.tr_active && g_tra.aud_pktsamp && g_tra.aud_rate)
+                s.tr_cur = (u32)(cur_us * (s64)g_tra.aud_rate / 1000000 / g_tra.aud_pktsamp);
             s.paused = 0;
             WORKER_UNLOCK();   /* resume the decode thread from the new position */
             want_seek = 0;
