@@ -794,7 +794,18 @@ static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing)
     else               ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
     ui_text(2, UI_H - 10, 1, UI_DIM, "c");   /* engine tag: classic/fallback path (ring has none) */
 
-    ui_text_clipped(10, 8, 1, UI_NEON, title, 10, VOL_X - 12);   /* clipped so it can't run into volume */
+    {   /* title: marquee-scroll when it overflows so the episode name is readable */
+        int tw = ui_text_w(1, title), avail = VOL_X - 12 - 10;
+        if (tw <= avail) ui_text(10, 8, 1, UI_NEON, title);
+        else {
+            static u64 t0; static const char *last;
+            if (last != title) { last = title; t0 = osGetTime(); }
+            int span = tw - avail + 24;                       /* extra pause room */
+            int off = (int)(((osGetTime() - t0) / 40) % (span + 60)) - 30;   /* pause, scroll, pause */
+            if (off < 0) off = 0; if (off > span) off = span;
+            ui_text_clipped(10 - off, 8, 1, UI_NEON, title, 10, VOL_X - 12);
+        }
+    }
 
     char tc[16], td[16], line[40];
     fmt_time(cur, tc, sizeof(tc));
@@ -3113,8 +3124,13 @@ static MoflexResult moflex_play_classic(const char *path) {
 
     mobi_opt = 14;   /* prefetch + idct-skip + DC-only: bit-exact, ~6-8% faster decode (esp. Old 3DS) */
 
+    /* SUPER MOFLEX: bound the demuxer to the block region so the classic engine (used as the
+     * ring's fallback) never reads the appended trailer as video -- that showed as a black
+     * screen / garbage. Trailer subtitles still load; the trailer audio track is ring-only. */
+    trailer_probe(f);
     MfxDemux m;
-    if (mfx_open_auto(&m, f, path) != 0) { printf("\x1b[2J\x1b[Hmfx_open failed\npress A\n"); mp_wait_key(); fclose(f); return MOFLEX_ERROR; }
+    int cmo = g_tra.present ? mfx_open_window(&m, f, 0, g_tra.payload_off) : mfx_open_auto(&m, f, path);
+    if (cmo != 0) { printf("\x1b[2J\x1b[Hmfx_open failed\npress A\n"); mp_wait_key(); fclose(f); return MOFLEX_ERROR; }
 
     int vi = -1, ai = -1;
     for (int i = 0; i < m.nb_streams; i++) {
@@ -3169,6 +3185,10 @@ static MoflexResult moflex_play_classic(const char *path) {
     }
 
     subs_autoload(path);   /* load a matching .srt (sidecar or moviedata/) if one exists */
+    if (g_nsubs == 0 && g_tra.present && g_tra.sub_n > 0) {   /* trailer subtitles (SUPER MOFLEX) */
+        if (g_trsub_sel < 0 || g_trsub_sel >= g_tra.sub_n) g_trsub_sel = 0;
+        if (trsub_stash(path, g_trsub_sel)) subs_load("sdmc:/moflex_player/.embedded.srt");
+    }
 
     /* audio */
     #undef NWB
