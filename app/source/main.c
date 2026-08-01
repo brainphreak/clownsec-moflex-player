@@ -2290,6 +2290,7 @@ static void lib_note_renamed(const char *oldpath, const char *newpath) {
             return;
         }
 }
+static void lib_refresh_entry(int i);   /* defined below */
 static void lib_rescan(void) {
     if (!g_lib) g_lib = (CatEntry *)malloc(sizeof(CatEntry) * LIB_MAX);
     if (!g_lib) return;
