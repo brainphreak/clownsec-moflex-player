@@ -110,6 +110,30 @@ static void fill_common(CatEntry *e, const char *title, int year, const char *de
         snprintf(e->name, sizeof(e->name), "%s%s", title, is_zip ? " [ZIP]" : "");
 }
 
+/* audioTracks[] / embeddedSubtitles[] -> compact display strings */
+static void join_tracks(cJSON *obj, CatEntry *e) {
+    cJSON *arr = cJSON_GetObjectItemCaseSensitive(obj, "audioTracks");
+    cJSON *it;
+    e->audio_langs[0] = e->sub_langs[0] = 0;
+    if (cJSON_IsArray(arr)) cJSON_ArrayForEach(it, arr) {
+        const char *lb = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(it, "label"));
+        if (!lb || !lb[0]) continue;
+        size_t L = strlen(e->audio_langs);
+        snprintf(e->audio_langs + L, sizeof(e->audio_langs) - L, "%s%s", L ? ", " : "", lb);
+    }
+    arr = cJSON_GetObjectItemCaseSensitive(obj, "embeddedSubtitles");
+    if (cJSON_IsArray(arr)) cJSON_ArrayForEach(it, arr) {
+        const char *lg = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(it, "lang"));
+        if (!lg || !lg[0]) continue;
+        char up[8]; int k = 0;
+        for (; lg[k] && k < 3; k++) up[k] = (char)toupper((unsigned char)lg[k]);
+        up[k] = 0;
+        if (strstr(e->sub_langs, up)) continue;          /* dedup (en appears for SDH/Signs too) */
+        size_t L = strlen(e->sub_langs);
+        snprintf(e->sub_langs + L, sizeof(e->sub_langs) - L, "%s%s", L ? " " : "", up);
+    }
+}
+
 /* does a filename/title carry a "3D" marker? (used for mixed catalogs) */
 static int fn_has_3d(const char *s) {
     for (; s && s[0] && s[1]; s++)
@@ -202,6 +226,7 @@ int catalog_parse(const char *text, int kind, const char *dl_base, const char *a
               if (sf[0]) { url_encode(sf, enc, sizeof(enc)); snprintf(e->sub, sizeof(e->sub), "%ssubs/%s", dl_base, enc); } }
             e->is3d = (fn_has_3d(e->fname) || fn_has_3d(e->name)) ? 1 : 0;   /* "(3D)" marks 3D files */
             e->super = sgeti(mv, "superMoflex") ? 1 : 0;
+            join_tracks(mv, e);
             n++;
         }
         /* tvShows[] -> one entry per season zip */
@@ -238,6 +263,7 @@ int catalog_parse(const char *text, int kind, const char *dl_base, const char *a
                 snprintf(e->art, sizeof(e->art), "%s", arturl);
                 e->is3d = (fn_has_3d(e->fname) || fn_has_3d(e->name)) ? 1 : 0;
                 e->super = sgeti(sh, "superMoflex") ? 1 : 0;
+                join_tracks(sh, e);
                 n++;
             }
         }

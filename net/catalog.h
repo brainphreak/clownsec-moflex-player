@@ -23,6 +23,8 @@ typedef struct {
     int  is3d;                /* 1 = 3D, 0 = 2D, -1 = unknown (guess from filename) */
     int  super;               /* 1 = SUPER MOFLEX (dual audio/subs/info embedded) -- from the
                                * catalog's superMoflex field; local files probe the trailer */
+    char audio_langs[48];     /* "English, Japanese" (catalog audioTracks / trailer tags) */
+    char sub_langs[64];       /* "ENG SDH GER ..." (catalog embeddedSubtitles / trailer tags) */
 } CatEntry;
 
 /* kind: 0 = clownsec shape (movies[]/tvShows[]), 1 = zackk shape (items[]).

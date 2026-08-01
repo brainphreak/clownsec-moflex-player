@@ -987,11 +987,14 @@ static void draw_info_top(const CatEntry *e, const u16 *poster) {
     ui_clear(UI_BG);
     int y = 8;
     ui_text_wrap(10, &y, 2, UI_WHITE, e->name, 24, 2);       /* title (16px, ~24/line) */
-    {   /* SUPER MOFLEX badge: self-contained file (dual audio / subs / info in the trailer) */
-        static char s_sup_path[512]; static int s_sup = 0;
+    static char s_sup_path[512]; static int s_sup = 0;
+    static char s_sup_audio[48], s_sup_subs[64];
+    {   /* SUPER MOFLEX badge + track languages (local files probe their own trailer) */
         if (strncmp(s_sup_path, e->url, sizeof s_sup_path - 1)) {
             snprintf(s_sup_path, sizeof s_sup_path, "%s", e->url);
-            s_sup = e->is_zip == 0 ? trailer_present(e->url) : 0;
+            s_sup_audio[0] = s_sup_subs[0] = 0;
+            s_sup = e->is_zip == 0 ?
+                trailer_langs(e->url, s_sup_audio, sizeof s_sup_audio, s_sup_subs, sizeof s_sup_subs) : 0;
         }
         if (s_sup || e->super) ui_text(400 - 8 - ui_text_w(1, "SUPER"), 8, 1, UI_NEON, "SUPER");
     }
@@ -1021,6 +1024,13 @@ static void draw_info_top(const CatEntry *e, const u16 *poster) {
         int is3d = (e->is3d >= 0) ? e->is3d : cat_is_3d(e);   /* catalog/.nfo flag, else the filename */
         ui_text(tx, ty, 1, is3d ? UI_NEONP : UI_DIM,
                 is3d ? "3D  (stereoscopic)" : "2D"); ty += 14;
+    }
+    {   /* embedded tracks: catalog fields, else the local trailer probe */
+        const char *al = e->audio_langs[0] ? e->audio_langs : (s_sup ? s_sup_audio : "");
+        const char *sl = e->sub_langs[0]   ? e->sub_langs   : (s_sup ? s_sup_subs  : "");
+        char line[96];
+        if (al[0]) { snprintf(line, sizeof line, "Audio: %s", al); ui_text_wrap(tx, &ty, 1, UI_NEONC, line, 30, 2); }
+        if (sl[0]) { snprintf(line, sizeof line, "Subs: %s", sl);  ui_text_wrap(tx, &ty, 1, UI_NEONC, line, 30, 2); }
     }
     if (e->genres[0]) { ui_text_wrap(tx, &ty, 1, UI_GRAY, e->genres, 30, 3); ty += 4; }
     if (e->desc[0])   ui_text_wrap(tx, &ty, 1, UI_INK, e->desc, 30, 12);
@@ -1899,7 +1909,7 @@ cb_rebuild:;   /* X-search inside the list jumps back here with filt_search set 
 /* ================= Library: one flat, categorized view of every local movie ================= */
 #define LIB_MAX   3000
 #define LIB_CACHE "sdmc:/moflex_player/library.cache"
-#define LIB_MAGIC 0x4C494239   /* 'LIB9' -- bump to invalidate old caches when CatEntry changes */
+#define LIB_MAGIC 0x4C494241   /* 'LIB9' -- bump to invalidate old caches when CatEntry changes */
 static CatEntry *g_lib = NULL;   /* every playable movie on the SD, with its .nfo metadata */
 static int       g_lib_n = 0;
 

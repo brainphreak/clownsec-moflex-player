@@ -36,6 +36,56 @@ int trailer_present(const char *moviepath) {
     return ok;
 }
 
+static const char *lang_label(const char *c3) {
+    static const struct { const char *c, *l; } M[] = {
+        {"ENG","English"},{"JPN","Japanese"},{"GER","German"},{"SPA","Spanish"},
+        {"CAS","Spanish"},{"FRE","French"},{"ITA","Italian"},{"POR","Portuguese"},
+        {"RUS","Russian"},{"SDH","English"},{"SGN","English"},
+    };
+    for (unsigned i = 0; i < sizeof M / sizeof M[0]; i++)
+        if (!strcmp(M[i].c, c3)) return M[i].l;
+    return c3;
+}
+
+int trailer_langs(const char *moviepath, char *audio, int acap, char *subs, int scap) {
+    if (audio && acap) audio[0] = 0;
+    if (subs && scap) subs[0] = 0;
+    FILE *f = fopen(moviepath, "rb");
+    if (!f) return 0;
+    u8 ft[16];
+    if (fseeko(f, -16, SEEK_END) || fread(ft, 1, 16, f) != 16 || memcmp(ft + 8, "CSXTRA01", 8)) {
+        fclose(f); return 0;
+    }
+    long long fsz; fseeko(f, 0, SEEK_END); fsz = (long long)ftello(f);
+    long long off = 0;
+    for (int i = 7; i >= 0; i--) off = (off << 8) | ft[i];
+    long long p = off, end = fsz - 16;
+    while (p + 8 <= end) {
+        u8 h[8];
+        if (fseeko(f, p, SEEK_SET) || fread(h, 1, 8, f) != 8) break;
+        unsigned l = h[4] | (h[5] << 8) | ((unsigned)h[6] << 16) | ((unsigned)h[7] << 24);
+        if (p + 8 + (long long)l > end) break;
+        char c3[4] = "";
+        if (!memcmp(h, "LNG0", 4) && l >= 4) {
+            u8 b[4]; if (fread(b, 1, 4, f) == 4) { memcpy(c3, b, 3); c3[3] = 0; }
+            if (audio && c3[0]) snprintf(audio, acap, "%s", lang_label(c3));
+        } else if (!memcmp(h, "AUD1", 4) && l > 12) {
+            u8 b[12]; if (fread(b, 1, 12, f) == 12) { memcpy(c3, b + 8, 3); c3[3] = 0; }
+            if (audio && c3[0]) { size_t L = strlen(audio);
+                snprintf(audio + L, acap - L, "%s%s", L ? ", " : "", lang_label(c3)); }
+        } else if (!memcmp(h, "SUB1", 4) && l > 4) {
+            u8 b[4]; if (fread(b, 1, 4, f) == 4) { memcpy(c3, b, 3); c3[3] = 0; }
+            if (subs && c3[0]) { size_t L = strlen(subs);
+                snprintf(subs + L, scap - L, "%s%s", L ? " " : "", c3); }
+        } else if (!memcmp(h, "SUB0", 4) && subs && !subs[0]) {
+            snprintf(subs, scap, "YES");
+        }
+        p += 8 + l;
+    }
+    fclose(f);
+    return 1;
+}
+
 int trailer_import_movieinfo(const char *moviepath) {
     return trailer_import_movieinfo_key(moviepath, moviepath, 0);
 }

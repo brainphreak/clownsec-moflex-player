@@ -15,4 +15,8 @@ int trailer_import_movieinfo_key(const char *moviepath, const char *savekey, int
 /* 1 if the file carries a CSXTRA trailer at all (16-byte footer probe). */
 int trailer_present(const char *moviepath);
 
+/* Fill display strings for the embedded tracks ("English, Japanese" / "ENG SDH GER ...").
+ * Either output may be NULL. Returns 1 if a trailer was found. */
+int trailer_langs(const char *moviepath, char *audio, int acap, char *subs, int scap);
+
 #endif
