@@ -1,4 +1,5 @@
 #include "httpd.h"
+#include "downloader.h"
 
 #include <3ds.h>
 #include <sys/socket.h>
@@ -19,7 +20,7 @@
 #define SOC_BUFSZ   0x100000
 #define PORT        8080
 #define HDRBUF      8192
-#define IOCHUNK     16384
+#define IOCHUNK     65536
 
 static u32 *g_soc_buf;
 static volatile int g_listen_fd = -1;
@@ -235,35 +236,53 @@ static void handle_put(int fd, const char *path, char *hdrbuf, int hdr_total, in
     }
     if (content_len < 0) { send_status(fd, "411 Length Required", "text/plain", "need length"); return; }
 
-    FILE *out = fopen(fpath, "wb");
+    /* RESUME: &off=N appends the remainder to an existing partial (the page probed /stat).
+     * The offset must equal the file's current size or the client restarts from scratch. */
+    char offs[24]; long long off = 0;
+    get_query(path, "off", offs, sizeof offs);
+    if (offs[0]) off = atoll(offs);
+    FILE *out = NULL;
+    if (off > 0) {
+        struct stat st;
+        if (stat(fpath, &st) != 0 || (long long)st.st_size != off) {
+            send_status(fd, "409 Conflict", "text/plain", "offset mismatch");
+            return;
+        }
+        out = fopen(fpath, "r+b");
+        if (out && fseeko(out, off, SEEK_SET)) { fclose(out); out = NULL; }
+    } else out = fopen(fpath, "wb");
     if (!out) { send_status(fd, "500 Error", "text/plain", "open failed"); return; }
 
     { const char *b = strrchr(fpath, '/'); b = b ? b + 1 : fpath; snprintf(g_up_name, sizeof g_up_name, "%s", b); }
-    g_up_total = content_len; g_up_done = 0; g_up_active = 1;   /* -> on-device progress bar */
+    g_up_total = off + content_len; g_up_done = off; g_up_active = 1;   /* -> on-device progress bar */
 
+    /* the catalog-download speed trick: recv() and SD commits overlap on two threads */
+    DlWBuf *wb = dl_wb_open(out);
+    int werr = 0;
     long remaining = content_len;
     /* bytes already read past the header */
     int have = hdr_total - body_start;
     if (have > 0) {
         int w = (int)((have < remaining) ? have : remaining);
-        fwrite(hdrbuf + body_start, 1, w, out);
+        if ((wb ? dl_wb_write(wb, hdrbuf + body_start, w) : fwrite(hdrbuf + body_start, 1, w, out)) != (size_t)w) werr = 1;
         remaining -= w; g_up_done += w;
     }
 
     char *buf = (char *)malloc(IOCHUNK);
-    while (remaining > 0 && buf) {
+    while (remaining > 0 && buf && !werr) {
         int want = (int)(remaining < IOCHUNK ? remaining : IOCHUNK);
         int n = recv(fd, buf, want, 0);
         if (n <= 0) break;
-        fwrite(buf, 1, n, out);
+        if ((wb ? dl_wb_write(wb, buf, n) : fwrite(buf, 1, n, out)) != (size_t)n) { werr = 1; break; }
         remaining -= n; g_up_done += n;
     }
     free(buf);
+    if (wb && !dl_wb_close(wb)) werr = 1;
     fclose(out);
     g_up_active = 0;
 
-    if (remaining == 0) send_status(fd, "200 OK", "text/plain", "ok");
-    else                send_status(fd, "500 Error", "text/plain", "incomplete");
+    if (remaining == 0 && !werr) send_status(fd, "200 OK", "text/plain", "ok");
+    else                         send_status(fd, "500 Error", "text/plain", "incomplete");
 }
 
 /* ---------- request dispatch ---------- */
@@ -288,7 +307,15 @@ static void handle_client(int fd) {
     sscanf(hdr, "%7s %1023s", method, path);
 
     if (!strcmp(method, "GET")) {
-        if (!strncmp(path, "/rm", 3)) {
+        if (!strncmp(path, "/stat", 5)) {          /* resume probe: current byte size (0 = none) */
+            char fpath[1024];
+            get_query(path, "path", fpath, sizeof(fpath));
+            long long sz = 0;
+            struct stat st;
+            if (fpath[0] && !strncmp(fpath, "sdmc:/", 6) && stat(fpath, &st) == 0) sz = st.st_size;
+            char b[32]; snprintf(b, sizeof b, "%lld", sz);
+            send_status(fd, "200 OK", "text/plain", b);
+        } else if (!strncmp(path, "/rm", 3)) {
             char fpath[1024];
             get_query(path, "path", fpath, sizeof(fpath));
             if (fpath[0] && !strncmp(fpath, "sdmc:/", 6)) remove(fpath);

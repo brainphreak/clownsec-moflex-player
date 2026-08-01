@@ -510,6 +510,7 @@ static void upload_screen(void) {
     int ok = httpd_start();
     int redraw = 1, tdown = 0, tx0 = 0, ty0 = 0, wasactive = 0;
     long lastdone = -1;
+    u64 up_t = 0; long up_b = 0; int up_x100 = 0;   /* live receive speed (EMA), like the queue view */
     while (aptMainLoop()) {
         hidScanInput();
         u32 k = hidKeysDown(), ku = hidKeysUp();
@@ -521,7 +522,7 @@ static void upload_screen(void) {
         long done = 0, total = 0; char nm[128] = "";
         int active = ok ? httpd_upload_progress(&done, &total, nm, sizeof nm) : 0;
         if (active) { if (done != lastdone) { lastdone = done; redraw = 1; } wasactive = 1; }
-        else if (wasactive) { wasactive = 0; lastdone = -1; redraw = 1; }   /* just finished */
+        else if (wasactive) { wasactive = 0; lastdone = -1; redraw = 1; up_t = 0; up_x100 = 0; }   /* just finished */
         if (redraw) {
             ui_begin(GFX_BOTTOM);
             ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
@@ -543,6 +544,25 @@ static void upload_screen(void) {
                 if (total >= 1048576) snprintf(pl, sizeof pl, "%ld / %ld MB   %d%%", done / 1048576, total / 1048576, pct);
                 else                  snprintf(pl, sizeof pl, "%ld / %ld KB   %d%%", done / 1024, total / 1024, pct);
                 ui_text_center(UI_W / 2, by + bh + 8, 1, UI_INK, pl);
+                u64 now2 = osGetTime();
+                if (up_t == 0) { up_t = now2; up_b = done; }
+                else if (now2 - up_t >= 250) {   /* smoothed live speed, same style as downloads */
+                    double inst = (double)(done - up_b) * 8.0 / 1000.0 / (double)(now2 - up_t);
+                    up_x100 = up_x100 ? (int)(up_x100 * 0.5 + inst * 100.0 * 0.5) : (int)(inst * 100.0);
+                    up_t = now2; up_b = done;
+                }
+                if (up_x100 > 0) {
+                    char spd[48]; snprintf(spd, sizeof spd, "%d.%02d Mbps  (%d KB/s)", up_x100 / 100, up_x100 % 100, up_x100 * 10 / 8);
+                    ui_text_center(UI_W / 2, by + bh + 28, 1, UI_NEON, spd);
+                    if (total > done) {
+                        u32 bps = (u32)up_x100 * 1250u;
+                        u32 es = (u32)((u64)(total - done) / (bps ? bps : 1));
+                        char eta[32];
+                        if (es >= 3600) snprintf(eta, sizeof eta, "ETA %luh %02lum", (unsigned long)(es / 3600), (unsigned long)(es % 3600 / 60));
+                        else            snprintf(eta, sizeof eta, "ETA %lu:%02lu", (unsigned long)(es / 60), (unsigned long)(es % 60));
+                        ui_text_center(UI_W / 2, by + bh + 46, 1, UI_NEONC, eta);
+                    }
+                }
             } else {
                 ui_text_center(UI_W / 2, 62, 1, UI_INK, "Server ON. On the same Wi-Fi, open:");
                 ui_text_center_fit(UI_W / 2, 84, 2, UI_NEONC, httpd_url(), UI_W - 16);

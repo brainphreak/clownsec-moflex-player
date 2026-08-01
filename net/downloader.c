@@ -157,6 +157,11 @@ static int wb_close(WBuf *w) {         /* drain remaining bytes, stop the thread
     return ok;
 }
 
+/* public wrappers: the upload receive path reuses the committer */
+DlWBuf *dl_wb_open(void *file) { return (DlWBuf *)wb_open((FILE *)file); }
+size_t  dl_wb_write(DlWBuf *w, const void *p, size_t n) { return wb_write((WBuf *)w, p, n); }
+int     dl_wb_close(DlWBuf *w) { return wb_close((WBuf *)w); }
+
 /* ---- to file (resumable) ---- */
 typedef struct { FILE *f; WBuf *wb; curl_off_t resume_off; long status; int range_ignored; } DlFile;
 static volatile int g_write_fail;   /* last failure was the SD (full card?), not the network */
