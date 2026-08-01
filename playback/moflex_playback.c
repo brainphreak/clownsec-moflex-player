@@ -861,10 +861,17 @@ static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing)
         ui_text(UI_W - 8 - ui_text_w(1, "LOCKED"), 38, 1, UI_NEONC, "LOCKED");
     /* subtitles: CC toggle/options (glows when on) */
     ui_button(CC_X, CC_Y, CC_W, CC_H, "CC", g_sub_on, g_sub_on ? UI_NEON : UI_DIM);
-    /* dual audio: tap toggles the language (A1 = main/English, A2 = alternate) */
+    /* dual audio: tap SELECTS the language (not a toggle -> never glow). A music note before
+     * the code makes it unmistakably audio, distinct from CC subtitles. */
     if (g_atrk_n > 1) {
         const char *al = (g_atrk_sel < 4 && g_atrk_lbl[g_atrk_sel][0]) ? g_atrk_lbl[g_atrk_sel] : "A?";
-        ui_button(AUD_X, AUD_Y, AUD_W, AUD_H, al, g_atrk_sel > 0, g_atrk_sel > 0 ? UI_NEON : UI_DIM);
+        ui_button(AUD_X, AUD_Y, AUD_W, AUD_H, "", 0, UI_NEONC);   /* plain box, constant look */
+        int tw = ui_text_w(1, al), total = 8 + tw;               /* note (~6px) + gap + text */
+        int sx = AUD_X + (AUD_W - total) / 2, cy = AUD_Y + AUD_H / 2;
+        ui_fill_round(sx, cy + 1, 5, 4, 2, UI_NEONC);            /* note head */
+        ui_fill(sx + 4, cy - 6, 2, 8, UI_NEONC);                 /* stem */
+        ui_fill(sx + 4, cy - 6, 4, 2, UI_NEONC);                 /* flag */
+        ui_text(sx + 8, cy - 4, 1, UI_NEONC, al);
     }
     /* bottom-screen-off: a crescent-moon button (video keeps playing on top) */
     if (g_lcd_ok) {
