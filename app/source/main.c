@@ -3401,7 +3401,11 @@ static void lib_scrape_missing(int *idx, int ni) {
     u16 *pb = (u16 *)malloc((size_t)POSTER_W * POSTER_H * sizeof(u16));
     static char done[LIB_MAX];
     int todo = 0;
-    for (int i = 0; i < ni; i++) { done[i] = movieinfo_have(g_lib[idx[i]].url) ? 1 : 0; if (!done[i]) todo++; }
+    for (int i = 0; i < ni; i++) {
+        done[i] = movieinfo_have(g_lib[idx[i]].url) ? 1 : 0;
+        if (!done[i] && trailer_import_movieinfo(g_lib[idx[i]].url)) { done[i] = 1; lib_refresh_entry(idx[i]); }
+        if (!done[i]) todo++;
+    }
     if (!cat || todo == 0) {
         msg_screen("GET INFO", todo == 0 ? "Every movie here already has info." : "Out of memory.");
         free(pb); free(cat); return;
@@ -3453,7 +3457,10 @@ static void lib_rescan_interactive(void) {
     if (added > 0) snprintf(found, sizeof found, "%d new video%s added.", added, added == 1 ? "" : "s");
     else           snprintf(found, sizeof found, "No new videos found.");
     int *idx = (int *)malloc(sizeof(int) * (g_lib_n ? g_lib_n : 1)); int ni = 0;
-    if (idx) for (int j = 0; j < g_lib_n; j++) if (!movieinfo_have(g_lib[j].url)) idx[ni++] = j;
+    if (idx) for (int j = 0; j < g_lib_n; j++) if (!movieinfo_have(g_lib[j].url)) {
+        if (trailer_import_movieinfo(g_lib[j].url)) { lib_refresh_entry(j); continue; }   /* self-contained */
+        idx[ni++] = j;
+    }
     if (ni > 0) {
         char body[128];
         snprintf(body, sizeof body, "%s\n%d video%s missing art & info.\nDownload art & info?",
@@ -3532,7 +3539,10 @@ static void startup_new_movie_check(void) {
         if (g_lib_n == 0) { msg_screen("LIBRARY", "No videos found on the SD card.\nDownload or add some first."); return; }
         int *idx = (int *)malloc(sizeof(int) * g_lib_n); int ni = 0;   /* offer art+info for all missing */
         if (idx) {
-            for (int j = 0; j < g_lib_n; j++) if (!movieinfo_have(g_lib[j].url)) idx[ni++] = j;
+            for (int j = 0; j < g_lib_n; j++) if (!movieinfo_have(g_lib[j].url)) {
+                if (trailer_import_movieinfo(g_lib[j].url)) { lib_refresh_entry(j); continue; }
+                idx[ni++] = j;
+            }
             if (ni > 0) {
                 if (prompt2("GET INFO", "Download art & info?", "DOWNLOAD", "SKIP") == 0) lib_scrape_missing(idx, ni);
             }
