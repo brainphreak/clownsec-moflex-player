@@ -1714,17 +1714,21 @@ static void catalog_browse(const Source *src) {
         /* ---- navigation: pick a category (+ optional genre), Show All, or X = search ---- */
         char filt_cat[32] = "", filt_genre[32] = "", filt_search[64] = "", filt_group[64] = "";
         int filt_season = 0;
-        if (ncat > 1) {
-            static char cdisp[24][64];   /* category rows with counts (selection uses cats[]) */
+        int nsuper = 0; for (int i = 0; i < nc; i++) if (cat[i].super) nsuper++;
+        if (ncat > 1 || nsuper) {
+            static char cdisp[26][64]; int base = 0;
+            if (nsuper) { snprintf(cdisp[0], 64, "* SUPER MOFLEX (%d)", nsuper); base = 1; }
             for (int k = 0; k < ncat; k++) {
                 int n = 0;
                 for (int i = 0; i < nc; i++) if (!strcasecmp(cat[i].category, cats[k])) n++;
-                snprintf(cdisp[k], 64, "%.48s (%d)", cats[k], n);
+                snprintf(cdisp[base + k], 64, "%.48s (%d)", cats[k], n);
             }
-            int c = catalog_pick("CATEGORY", src->name, cdisp, ncat, 1, NULL);
+            int c = catalog_pick("CATEGORY", src->name, cdisp, ncat + base, 1, NULL);
             if (c == -1) break;
             if (c == -4) { if (!kbd_text("Search this catalog", filt_search, sizeof filt_search)) continue; }
+            else if (base && c == 0) { snprintf(filt_cat, sizeof filt_cat, "\x01SUPER"); goto cb_have_filter; }
             else if (c >= 0) {
+                c -= base;
                 snprintf(filt_cat, sizeof filt_cat, "%s", cats[c]);
                 if (cat_grouped(filt_cat)) {   /* TV: show -> season -> parts; MV: artist -> videos */
                     s_pick_init = c + 1;
@@ -1762,8 +1766,10 @@ cb_have_filter:;
         /* ---- build the filtered + sorted index over cat[] ---- */
 cb_rebuild:;   /* X-search inside the list jumps back here with filt_search set */
         int ni = 0;
+        int super_only = !strcmp(filt_cat, "\x01SUPER");
         for (int i = 0; i < nc; i++) {
-            if (filt_cat[0] && strcasecmp(cat[i].category, filt_cat)) continue;
+            if (super_only) { if (!cat[i].super) continue; }
+            else if (filt_cat[0] && strcasecmp(cat[i].category, filt_cat)) continue;
             if (filt_genre[0] && !genre_match(cat[i].genres, filt_genre)) continue;
             if (filt_group[0]) { char key[64]; cat_group_key(&cat[i], key, sizeof key);
                                  if (strcasecmp(key, filt_group)) continue; }
@@ -1885,6 +1891,7 @@ cb_rebuild:;   /* X-search inside the list jumps back here with filt_search set 
                 else if (selrow) ui_text_clipped(tx - g_mq_off, ty, 1, tc, ce->name, tx, txr);
                 else { char disp[NAMELEN]; snprintf(disp, sizeof disp, "%s", ce->name);
                     int cm = (txr - tx) / 8; if ((int)strlen(disp) > cm) disp[cm] = 0; ui_text(tx, ty, 1, tc, disp); }
+                if (ce->super) ui_text(UI_W - 18 - ui_text_w(1, "S"), ty, 1, UI_NEON, "S");
             }
             if (ni > BR_ROWS) { int th = BR_ROWS * BR_ROWH - 6, ty = BR_LIST_Y, maxs = ni - BR_ROWS;
                 int hh = th * BR_ROWS / ni; if (hh < 12) hh = 12; int hy = ty + (th - hh) * cscroll / maxs;
