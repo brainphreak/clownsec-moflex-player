@@ -982,6 +982,30 @@ static int cat_is_3d(const CatEntry *e) {
     return 0;
 }
 
+/* first playable episode path of a show folder into out (defined with the show helpers). */
+static int show_first_episode(const CatEntry *e, char *out, int cap);
+/* Resolve a library entry to a file that may carry a SUPER MOFLEX trailer (a show folder ->
+ * its first episode), then probe the trailer. Fills audio/subs display strings + a sub count.
+ * Returns 1 if a trailer was found. */
+static int entry_super(const CatEntry *e, char *audio, int acap, char *subs, int scap, int *nsub) {
+    if (audio && acap) audio[0] = 0;
+    if (subs && scap) subs[0] = 0;
+    if (nsub) *nsub = 0;
+    char probe[PATHLEN + NAMELEN];
+    if (e->is_zip == 2) {                       /* show folder: use the first episode */
+        if (!show_first_episode(e, probe, sizeof probe)) return 0;
+    } else if (e->is_zip == 0) {
+        snprintf(probe, sizeof probe, "%s", e->url);
+    } else return 0;                            /* a .zip season: no trailer */
+    int got = trailer_langs(probe, audio, acap, subs, scap);
+    if (got && subs && nsub) {                  /* count space-separated language codes */
+        int n = subs[0] ? 1 : 0;
+        for (const char *q = subs; *q; q++) if (*q == ' ') n++;
+        *nsub = n;
+    }
+    return got;
+}
+
 static void draw_info_top(const CatEntry *e, const u16 *poster) {
     ui_begin(GFX_TOP);
     ui_clear(UI_BG);
@@ -989,12 +1013,10 @@ static void draw_info_top(const CatEntry *e, const u16 *poster) {
     ui_text_wrap(10, &y, 2, UI_WHITE, e->name, 24, 2);       /* title (16px, ~24/line) */
     static char s_sup_path[512]; static int s_sup = 0;
     static char s_sup_audio[48], s_sup_subs[64];
-    {   /* SUPER MOFLEX badge + track languages (local files probe their own trailer) */
+    {   /* SUPER MOFLEX badge + track languages (probe the file, or a show's first episode) */
         if (strncmp(s_sup_path, e->url, sizeof s_sup_path - 1)) {
             snprintf(s_sup_path, sizeof s_sup_path, "%s", e->url);
-            s_sup_audio[0] = s_sup_subs[0] = 0;
-            s_sup = e->is_zip == 0 ?
-                trailer_langs(e->url, s_sup_audio, sizeof s_sup_audio, s_sup_subs, sizeof s_sup_subs) : 0;
+            s_sup = entry_super(e, s_sup_audio, sizeof s_sup_audio, s_sup_subs, sizeof s_sup_subs, NULL);
         }
         if (s_sup || e->super) ui_text(400 - 8 - ui_text_w(1, "SUPER"), 8, 1, UI_NEON, "SUPER");
     }
@@ -2103,6 +2125,11 @@ static int show_collect_eps(const char *showname, const char *url) {
     }
     if (n) qsort(s_epfile, n, sizeof s_epfile[0], epname_cmp);   /* SxxEyy sorts into watch order */
     return n;
+}
+static int show_first_episode(const CatEntry *e, char *out, int cap) {
+    if (show_collect_eps(e->name, e->url) <= 0) return 0;
+    snprintf(out, cap, "%s", s_epfile[0]);
+    return 1;
 }
 
 /* One episode's watch status: 2 watched, 1 in progress, 0 new. */
@@ -3400,18 +3427,33 @@ static void scrape_folder(void) {
 
 /* Library GET INFO: refresh just this movie, in place. */
 static void lib_scrape_one(int i) {
-    char path[CAT_URLLEN]; snprintf(path, sizeof path, "%s", g_lib[i].url);
-    int r = scrape_one_stem(path, g_lib[i].name);
+    CatEntry *e = &g_lib[i];
+    /* SUPER MOFLEX (file OR a show whose episodes carry trailers): import locally, no network */
+    char au[48], sb[64]; int nsub = 0;
+    if (entry_super(e, au, sizeof au, sb, sizeof sb, &nsub)) {
+        char rep[PATHLEN + NAMELEN];
+        if (e->is_zip == 2) { if (!show_first_episode(e, rep, sizeof rep)) rep[0] = 0; }
+        else snprintf(rep, sizeof rep, "%s", e->url);
+        int ok = e->is_zip == 2 ? trailer_import_movieinfo_key(rep, e->url, 1)
+                                 : trailer_import_movieinfo(e->url);
+        if (ok) { lib_refresh_entry(i); lib_save_cache(); }
+        char m[200];
+        snprintf(m, sizeof m, "SUPER MOFLEX detected.\nInfo + artwork loaded from the file.\nAudio: %s\nSubtitles: %d language%s",
+                 au[0] ? au : "-", nsub, nsub == 1 ? "" : "s");
+        msg_screen("SUPER MOFLEX", m);
+        return;
+    }
+    char path[CAT_URLLEN]; snprintf(path, sizeof path, "%s", e->url);
+    int r = scrape_one_stem(path, e->name);
     if (r > 0) { lib_refresh_entry(i); lib_save_cache(); }
     char m[160];
     snprintf(m, sizeof m, "%s%s",
-             r == 3 ? "Loaded from the SUPER MOFLEX file.\nInfo + artwork are self-contained."
-           : r == 1 ? "Info + artwork saved."
+             r == 1 ? "Info + artwork saved."
            : r == 2 ? "Info saved, but the poster\ndidn't download. Try again for the art."
            : r == -1 ? "Could not download the catalog.\nCheck the connection and try again."
            : r == -2 ? "Out of memory.\nRestart the app and try again."
                     : "No catalog had this title.",
-             r <= 0 ? "" : (r == 3) ? "" : s_scrape_sub == 1 ? "\nSubtitles downloaded."
+             r <= 0 ? "" : s_scrape_sub == 1 ? "\nSubtitles downloaded."
                      : s_scrape_sub == 2 ? "\nSubtitles already present." : "\nNo subtitles in the catalog.");
     msg_screen("GET INFO", m);
 }
