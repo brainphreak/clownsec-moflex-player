@@ -20,7 +20,7 @@ static int find_section(FILE *f, const char *cc, long long *body, unsigned *len)
         u8 h[8];
         if (fseeko(f, p, SEEK_SET) || fread(h, 1, 8, f) != 8) return 0;
         unsigned l = h[4] | (h[5] << 8) | ((unsigned)h[6] << 16) | ((unsigned)h[7] << 24);
-        if (p + 8 + (long long)l > end) return 0;
+        if (l == 0 || p + 8 + (long long)l > end) return 0;   /* zero/overrun = corrupt: stop */
         if (!memcmp(h, cc, 4)) { *body = p + 8; *len = l; return 1; }
         p += 8 + l;
     }
@@ -64,7 +64,7 @@ int trailer_langs(const char *moviepath, char *audio, int acap, char *subs, int 
         u8 h[8];
         if (fseeko(f, p, SEEK_SET) || fread(h, 1, 8, f) != 8) break;
         unsigned l = h[4] | (h[5] << 8) | ((unsigned)h[6] << 16) | ((unsigned)h[7] << 24);
-        if (p + 8 + (long long)l > end) break;
+        if (l == 0 || p + 8 + (long long)l > end) break;   /* zero/overrun = corrupt: stop */
         char c3[4] = "";
         if (!memcmp(h, "LNG0", 4) && l >= 4) {
             u8 b[4]; if (fread(b, 1, 4, f) == 4) { memcpy(c3, b, 3); c3[3] = 0; }

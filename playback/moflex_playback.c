@@ -570,7 +570,7 @@ static void trailer_probe(FILE *f) {
         fseeko(f, p, SEEK_SET);
         if (fread(h, 1, 8, f) != 8) break;
         u32 len = h[4] | (h[5] << 8) | ((u32)h[6] << 16) | ((u32)h[7] << 24);
-        if (p + 8 + (s64)len > end) break;
+        if (len == 0 || p + 8 + (s64)len > end) break;   /* zero/overrun = corrupt trailer: stop */
         if (!memcmp(h, "SUB0", 4) && len > 0 && len <= 1024 * 1024 && g_tra.sub_n < 12) {
             int k = g_tra.sub_n++;
             g_tra.sub_off[k] = p + 8; g_tra.sub_len[k] = len; g_tra.sub_lang[k][0] = 0;
