@@ -2351,9 +2351,24 @@ static void lib_refresh_entry(int i) {
     char oldname[CAT_NAMELEN]; snprintf(oldname, sizeof oldname, "%s", ce->name);
     char path[CAT_URLLEN]; snprintf(path, sizeof path, "%s", ce->url);
     char date[12];         snprintf(date, sizeof date, "%s", ce->date);
+    /* movieinfo_load overwrites the WHOLE entry, which drops the SUPER flag and the embedded
+     * track languages -- they come from the file's trailer, not from any .nfo. The scan used to
+     * save and restore them around this call and Get Info did not, so scraping a SUPER MOFLEX
+     * silently lost its (S) until the next full rescan. Preserve them here so every caller is
+     * covered, and re-probe when the entry has not been checked yet. */
+    int  sup = ce->super;
+    char au[sizeof ce->audio_langs], sb[sizeof ce->sub_langs];
+    snprintf(au, sizeof au, "%s", ce->audio_langs);
+    snprintf(sb, sizeof sb, "%s", ce->sub_langs);
     movieinfo_load(path, ce);
     snprintf(ce->url, sizeof ce->url, "%s", path);
     snprintf(ce->date, sizeof ce->date, "%s", date);
+    ce->super = sup;
+    snprintf(ce->audio_langs, sizeof ce->audio_langs, "%s", au);
+    snprintf(ce->sub_langs, sizeof ce->sub_langs, "%s", sb);
+    if (!ce->super)                                  /* never probed (or a brand-new entry) */
+        ce->super = entry_super(ce, ce->audio_langs, sizeof ce->audio_langs,
+                                ce->sub_langs, sizeof ce->sub_langs, NULL) ? 1 : 0;
     if (!ce->category[0]) snprintf(ce->category, sizeof ce->category, "Uncategorized");
     lib_episode_name(ce);
     if (was_show) {
@@ -3480,7 +3495,13 @@ static void lib_scrape_one(int i) {
         else snprintf(rep, sizeof rep, "%s", e->url);
         int ok = e->is_zip == 2 ? trailer_import_movieinfo_key(rep, e->url, 1)
                                  : trailer_import_movieinfo(e->url);
-        if (ok) { lib_refresh_entry(i); lib_save_cache(); }
+        if (ok) lib_refresh_entry(i);
+        /* we just probed the trailer: keep what it told us on the entry, so the (S) badge and
+         * the Audio/Subs lines survive a Get Info without waiting for the next full rescan */
+        e->super = 1;
+        snprintf(e->audio_langs, sizeof e->audio_langs, "%s", au);
+        snprintf(e->sub_langs, sizeof e->sub_langs, "%s", sb);
+        lib_save_cache();
         char m[200];
         snprintf(m, sizeof m, "SUPER MOFLEX detected.\nInfo + artwork loaded from the file.\nAudio: %s\nSubtitles: %d language%s",
                  au[0] ? au : "-", nsub, nsub == 1 ? "" : "s");
