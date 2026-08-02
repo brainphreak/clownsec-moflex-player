@@ -424,7 +424,8 @@ static int  g_nsubs = 0;
 static int  g_sub_on = 0;      /* enabled */
 static int  g_sub_top = 0;     /* 0 = bottom of the top screen, 1 = top */
 static int  g_sub_depth = 0;   /* 3D parallax: per-eye horizontal shift (-=out toward you, +=into screen) */
-static int  g_sub_size = 1;    /* font scale: 1 = small (sharpest), 2 = medium, 3 = large */
+static int  g_sub_size = 2;    /* font scale: pixel height is 16 x this (1 = smallest) */
+#define SUB_SIZE_MAX 6
 static int64_t g_sub_off = 0;  /* timing offset in us (+ = show later, - = show earlier) */
 /* Encoding for 8-bit (non-UTF-8) SRTs -- UTF-8 is auto-detected; the various legacy codepages
  * can't be told apart from the bytes, so the user picks. Index into sub_cp_hi[] (see subcp.h). */
@@ -655,7 +656,7 @@ static void subcfg_load(const char *movie) {
         if (fscanf(f, "%d", &asel) == 1 && asel >= 0 && asel < 4) g_atrk_sel = asel;   /* newer files */
         g_sub_on    = !!on;
         g_sub_top   = !!top;
-        g_sub_size  = (size  >= 1 && size <= 3) ? size : 1;
+        g_sub_size  = (size  >= 1 && size <= SUB_SIZE_MAX) ? size : 2;
         g_sub_depth = depth < -16 ? -16 : (depth > 16 ? 16 : depth);
         g_sub_off   = (int64_t)off;
         g_sub_enc   = (enc >= 0 && enc < 5) ? enc : 0;
@@ -812,7 +813,7 @@ static void sub_draw_lines(u8 *fb, int cx, int y0, char lines[SUB_MAXLN][SUB_LNW
 static void sub_overlay(int is3d, int64_t us) {
     const char *t = subs_active(us);
     if (!t || !t[0]) return;
-    int sc = g_sub_size < 1 ? 1 : g_sub_size > 3 ? 3 : g_sub_size;
+    int sc = g_sub_size < 1 ? 1 : g_sub_size > SUB_SIZE_MAX ? SUB_SIZE_MAX : g_sub_size;
     int maxch = (SCR_W - 20) / (8 * sc);
     char lines[SUB_MAXLN][SUB_LNW]; int nl = sub_wrap(t, lines, maxch);
     if (nl == 0) return;
@@ -1048,7 +1049,7 @@ static void sub_load_menu(const char *moviepath) {
 /* live depth (parallax) adjuster: sample caption previewed in 3D on the top screen */
 static void sub_depth_menu(int is3d) {
     const char *sample = "Subtitle depth";
-    int sc = g_sub_size < 1 ? 1 : g_sub_size > 3 ? 3 : g_sub_size;
+    int sc = g_sub_size < 1 ? 1 : g_sub_size > SUB_SIZE_MAX ? SUB_SIZE_MAX : g_sub_size;
     char lines[SUB_MAXLN][SUB_LNW]; int nl = sub_wrap(sample, lines, (SCR_W - 20) / (8 * sc));
     int hrep = 0;
     while (aptMainLoop()) {
@@ -1121,7 +1122,7 @@ static void sub_menu(const char *moviepath, int is3d) {
         char i0[28], i1[28], i2[28], i3[28], i4[28], i5[28];
         snprintf(i0, sizeof i0, "Subtitles: %s", g_sub_on ? "ON" : "OFF");
         snprintf(i1, sizeof i1, "Position: %s", g_sub_top ? "TOP" : "BOTTOM");
-        snprintf(i2, sizeof i2, "Size: %s", g_sub_size == 1 ? "Small" : g_sub_size == 2 ? "Medium" : "Large");
+        snprintf(i2, sizeof i2, "Size: %d / %d", g_sub_size, SUB_SIZE_MAX);
         int64_t da = g_sub_off < 0 ? -g_sub_off : g_sub_off;
         snprintf(i3, sizeof i3, "Delay: %c%d.%02d s", g_sub_off < 0 ? '-' : '+',
                  (int)(da / 1000000), (int)((da % 1000000) / 10000));
@@ -1140,7 +1141,7 @@ static void sub_menu(const char *moviepath, int is3d) {
         int a = act[c];
         if (a == 0) { if (g_nsubs > 0) g_sub_on = !g_sub_on; else sub_msg("No subtitles loaded.\nUse 'Load SRT file'."); }
         else if (a == 1) g_sub_top = !g_sub_top;
-        else if (a == 2) g_sub_size = g_sub_size >= 3 ? 1 : g_sub_size + 1;
+        else if (a == 2) g_sub_size = g_sub_size >= SUB_SIZE_MAX ? 1 : g_sub_size + 1;
         else if (a == 3) sub_offset_menu();
         else if (a == 4) sub_depth_menu(is3d);
         else if (a == 5) sub_load_menu(moviepath);
@@ -1444,7 +1445,7 @@ static void submenu_label(int a, char *r, int cap) {
     switch (a) {
         case 0: snprintf(r, cap, "Subtitles:  %s", g_sub_on ? "ON" : "OFF"); break;
         case 1: snprintf(r, cap, "Position:  %s", g_sub_top ? "Top" : "Bottom"); break;
-        case 2: snprintf(r, cap, "Size:  %s", g_sub_size == 1 ? "Small" : g_sub_size == 2 ? "Medium" : "Large"); break;
+        case 2: snprintf(r, cap, "Size:  %d / %d   (left/right)", g_sub_size, SUB_SIZE_MAX); break;
         case 3: { int64_t da = g_sub_off < 0 ? -g_sub_off : g_sub_off;
                   snprintf(r, cap, "Delay:  %c%d.%02d s", g_sub_off < 0 ? '-' : '+', (int)(da / 1000000), (int)((da % 1000000) / 10000)); } break;
         case 6: snprintf(r, cap, "Encoding:  %s%s", g_sub_enc_name[g_sub_enc], g_sub_mode < 0 ? " (UTF-8)" : ""); break;
@@ -1558,14 +1559,18 @@ static int submenu_input(u32 kd, u32 kh, touchPosition tp, int is3d, const char 
     else { rep = (kd & (KEY_LEFT | KEY_RIGHT)) ? held : 0;
            if (!rep) { g_sub_rep++; if (g_sub_rep > 10 && g_sub_rep % 3 == 0) rep = held; } }
     if (t_row >= 0) {                                  /* a row was tapped this frame */
-        if (a == 3 || a == 4) rep = t_side;            /* delay/depth: left half -, right half + */
+        if (a == 2 || a == 3 || a == 4) rep = t_side;  /* size/delay/depth: left half -, right half + */
         else press = 1;                                /* toggle/cycle/encoding/load: activate */
     }
     switch (a) {
         case 0: if (press) { if (g_nsubs > 0) g_sub_on = !g_sub_on; } break;
         case 1: if (press) g_sub_top = !g_sub_top; break;
-        case 2: if (press > 0) g_sub_size = g_sub_size >= 3 ? 1 : g_sub_size + 1;
-                else if (press < 0) g_sub_size = g_sub_size <= 1 ? 3 : g_sub_size - 1; break;
+        case 2: {   /* a step, not a cycle: left/right (or the row's halves) nudge one level */
+            int d = rep ? rep : press;
+            if (d > 0) { if (g_sub_size < SUB_SIZE_MAX) g_sub_size++; }
+            else if (d < 0) { if (g_sub_size > 1) g_sub_size--; }
+            break;
+        }
         case 3: if (rep) { g_sub_off += (int64_t)rep * 250000;
                            if (g_sub_off < -60000000) g_sub_off = -60000000;
                            if (g_sub_off >  60000000) g_sub_off =  60000000; } break;
@@ -2109,6 +2114,91 @@ static int64_t r3_bts[R3_NB_MAX];   /* absolute movie time (m.ts) for subs/seekb
 /* draw the active cue onto the CURRENT citro2d scene (one eye), centred, with a 1px outline for
  * legibility. dx = per-eye horizontal shift for 3D subtitle depth. Uses the same g_sub_* settings
  * (size / top-vs-bottom / on) as the software path, so the SUBTITLES menu drives both. */
+/* ---- cue -> texture ------------------------------------------------------------------------
+ * The ring path used to draw subtitles with citro2d and the SYSTEM font, which is why Korean
+ * showed as '?' on a non-Korean console and why small sizes looked thin: coverage and weight
+ * were whatever the console shipped. It now rasterises the cue with OUR glyph tables into a
+ * texture -- once per cue, not per frame -- and draws that as a quad. Both eyes reuse the same
+ * texture with an x offset, so 3D depth costs nothing extra.
+ * The cue is always rasterised at 1x and scaled on the GPU, which keeps the texture small and
+ * makes any size (not just 1/2/3) a matter of the draw call. */
+#define ST_W 512                 /* must stay GT_W: r3_tile_off() assumes that stride */
+#define ST_H 64
+static C3D_Tex g_stex; static Tex3DS_SubTexture g_ssub; static C2D_Image g_simg;
+static int g_stex_ok = 0, g_stex_w = 0, g_stex_h = 0;
+static char g_stex_txt[SUB_TXT]; static int g_stex_cells = -1;
+
+static int subtex_init(void) {
+    if (g_stex_ok) return 1;
+    if (!C3D_TexInit(&g_stex, ST_W, ST_H, GPU_RGBA8)) return 0;
+    C3D_TexSetFilter(&g_stex, GPU_NEAREST, GPU_NEAREST);   /* crisp at integer scales */
+    g_stex_ok = 1; g_stex_txt[0] = 0; g_stex_cells = -1;
+    return 1;
+}
+static void subtex_free(void) { if (g_stex_ok) { C3D_TexDelete(&g_stex); g_stex_ok = 0; } }
+
+/* one pixel into the tiled RGBA8 texture. NOTE: byte order here is A,B,G,R in memory, which is
+ * what citro3d expects for GPU_RGBA8; if text ever comes out with swapped colours this u32 is
+ * the single place to flip. */
+static inline void subtex_px(u32 x, u32 y, u32 rgba) {
+    if (x >= ST_W || y >= ST_H) return;
+    ((u32 *)g_stex.data)[r3_tile_off(x, y)] = rgba;
+}
+static void subtex_glyph(uint32_t cp, int x, int y, u32 rgba) {
+    const unsigned short *w = sub_glyph16(cp);
+    if (w) { for (int r = 0; r < 16; r++) for (int c = 0; c < 16; c++)
+                 if (w[r] & (0x8000u >> c)) subtex_px(x + c, y + r, rgba);
+             return; }
+    const char *g = sub_glyph(cp); if (!g) g = font8x8_basic['?'];
+    for (int r = 0; r < 8; r++) for (int c = 0; c < 8; c++)
+        if (g[r] & (1 << c)) subtex_px(x + c, y + r + 8, rgba);   /* baseline of a 16px line */
+}
+/* Rasterise the cue. Returns 1 when the texture holds it (and sets g_stex_w/h). */
+static int subtex_build(const char *text, int cells) {
+    if (!subtex_init()) return 0;
+    if (g_stex_cells == cells && !strcmp(g_stex_txt, text)) return 1;   /* unchanged */
+    snprintf(g_stex_txt, sizeof g_stex_txt, "%s", text); g_stex_cells = cells;
+
+    char lines[SUB_MAXLN][SUB_LNW];
+    int nl = sub_wrap(text, lines, cells);
+    if (nl <= 0) return 0;
+    const int lh = 16 + 4;
+    if (nl * lh > ST_H) nl = ST_H / lh;
+    int wmax = 0;
+    for (int i = 0; i < nl; i++) { int w = sub_str_cells(lines[i]) * 8; if (w > wmax) wmax = w; }
+    if (wmax > ST_W - 2) wmax = ST_W - 2;
+    g_stex_w = wmax + 2; g_stex_h = nl * lh;                  /* +2: room for the outline */
+
+    memset(g_stex.data, 0, ST_W * ST_H * 4);                  /* transparent */
+    for (int i = 0; i < nl; i++) {
+        int lw = sub_str_cells(lines[i]) * 8;
+        int x0 = (g_stex_w - lw) / 2, y0 = i * lh;
+        for (int pass = 0; pass < 2; pass++) {                /* black outline, then white text */
+            const char *s = lines[i];
+            int x = x0;
+            while (*s) {
+                uint32_t cp = u8_next(&s);
+                if (pass == 0) {                              /* 4-way offset outline */
+                    subtex_glyph(cp, x - 1, y0, 0x000000FF); subtex_glyph(cp, x + 1, y0, 0x000000FF);
+                    subtex_glyph(cp, x, y0 - 1, 0x000000FF);  subtex_glyph(cp, x, y0 + 1, 0x000000FF);
+                } else subtex_glyph(cp, x, y0, 0xFFFFFFFF);
+                x += sub_cp_cells(cp) * 8;
+            }
+        }
+    }
+    C3D_TexFlush(&g_stex);
+    g_ssub = (Tex3DS_SubTexture){ (u16)g_stex_w, (u16)g_stex_h, 0.0f, 1.0f,
+                                  (float)g_stex_w / ST_W, 1.0f - (float)g_stex_h / ST_H };
+    g_simg = (C2D_Image){ &g_stex, &g_ssub };
+    return 1;
+}
+static void r3_draw_sub_tex(int dx, float scale) {
+    if (!g_stex_ok || g_stex_w <= 0) return;
+    float w = g_stex_w * scale, h = g_stex_h * scale;
+    float x = (SCR_W - w) * 0.5f + (float)dx;
+    float y = g_sub_top ? 8.0f : (SCR_H - h - 10.0f);
+    C2D_DrawImageAt(g_simg, x, y, 0.0f, NULL, scale, scale);
+}
 static void r3_draw_sub(C2D_Text *t, int dx, u32 col, u32 outline) {
     float sc = 0.5f + 0.25f * (float)(g_sub_size - 1);   /* 1->0.5  2->0.75  3->1.0 */
     float w = 0, h = 0; C2D_TextGetDimensions(t, sc, sc, &w, &h);
@@ -2498,6 +2588,8 @@ static MoflexResult moflex_play_ring(const char *path) {
     if (NB < 2) {
         aptUnhook(&g_ring_apt_cookie);
         for (int i = 0; i < NB; i++) { C3D_TexDelete(&r3_texL[i]); if (is3d) C3D_TexDelete(&r3_texR[i]); }
+        subtex_free();
+    subtex_free();
         C2D_Fini(); C3D_Fini();
         gfxSetScreenFormat(GFX_TOP, GSP_BGR8_OES); gfxSetScreenFormat(GFX_BOTTOM, GSP_RGB565_OES); gfxSet3D(false);
         av_frame_free(&fL); av_frame_free(&fR);
@@ -2507,6 +2599,8 @@ static MoflexResult moflex_play_ring(const char *path) {
     if (!g_y2r_init(W, H, r3_bpp)) {   /* y2r wedged/unavailable: classic path has a software blit */
         aptUnhook(&g_ring_apt_cookie);
         for (int i = 0; i < NB; i++) { C3D_TexDelete(&r3_texL[i]); if (is3d) C3D_TexDelete(&r3_texR[i]); }
+        subtex_free();
+    subtex_free();
         C2D_Fini(); C3D_Fini();
         gfxSetScreenFormat(GFX_TOP, GSP_BGR8_OES); gfxSetScreenFormat(GFX_BOTTOM, GSP_RGB565_OES); gfxSet3D(false);
         av_frame_free(&fL); av_frame_free(&fR);
@@ -3028,20 +3122,21 @@ static MoflexResult moflex_play_ring(const char *path) {
             snprintf(ts, sizeof ts, "%s / %s", tc, td);   /* clean current / duration */
             if (strcmp(ts, last_ts)) { snprintf(last_ts, sizeof last_ts, "%s", ts);
                                        C2D_TextBufClear(tmbuf); C2D_TextParse(&ttime, tmbuf, ts); C2D_TextOptimize(&ttime); }
-            if (cue && *cue) {                          /* (re)parse only when the cue text changes */
-                if (!sub_valid || strcmp(cue, last_sub)) {
-                    snprintf(last_sub, sizeof last_sub, "%s", cue);
-                    C2D_TextBufClear(subbuf); C2D_TextParse(&tsub, subbuf, cue); C2D_TextOptimize(&tsub); sub_valid = 1;
-                }
+            if (cue && *cue) {                          /* rasterise only when the cue text changes */
+                int scc = g_sub_size < 1 ? 1 : g_sub_size;
+                sub_valid = subtex_build(cue, (SCR_W - 20) / (8 * scc));
+                if (sub_valid) snprintf(last_sub, sizeof last_sub, "%s", cue);
             } else { sub_valid = 0; last_sub[0] = 0; }
             int b = (show >= 0) ? show : last_shown;
             C3D_FrameBegin(0);
             C2D_TargetClear(topL, black); C2D_SceneBegin(topL);
             C2D_DrawImageAt(r3_imgL[b], 0, 0, 0, NULL, 1, 1);
-            if (sub_valid) r3_draw_sub(&tsub, is3d ? -g_sub_depth : 0, subcol, subout);
+            if (sub_valid) r3_draw_sub_tex(is3d ? -g_sub_depth : 0,
+                                           (float)(g_sub_size < 1 ? 1 : g_sub_size));
             C2D_TargetClear(topR, black); C2D_SceneBegin(topR);
             C2D_DrawImageAt(is3d ? r3_imgR[b] : r3_imgL[b], 0, 0, 0, NULL, 1, 1);
-            if (sub_valid) r3_draw_sub(&tsub, is3d ? g_sub_depth : 0, subcol, subout);
+            if (sub_valid) r3_draw_sub_tex(is3d ? g_sub_depth : 0,
+                                           (float)(g_sub_size < 1 ? 1 : g_sub_size));
             if (g_screen_off) { g_dark_sw(bot); g_panel_force = 1; }      /* dark: panel stale -> force on wake */
             else if (g_submenu) { g_submenu_sw(bot, is3d); g_panel_force = 1; }  /* submenu: panel stale on exit */
             else { if (dirty) g_panel_force = 1;                          /* UI changed -> re-render the panel */
@@ -3114,6 +3209,7 @@ static MoflexResult moflex_play_ring(const char *path) {
     r3_vq_clear();
     C2D_TextBufDelete(sbuf); C2D_TextBufDelete(tmbuf); C2D_TextBufDelete(subbuf);
     for (int i = 0; i < NB; i++) { C3D_TexDelete(&r3_texL[i]); if (is3d) C3D_TexDelete(&r3_texR[i]); }
+    subtex_free();
     ui_tex_free();   /* release the software-UI panel texture before C3D shuts down */
     gspWaitForVBlank(); gspWaitForVBlank();
     C2D_Fini(); C3D_Fini(); g_y2r_exit();
