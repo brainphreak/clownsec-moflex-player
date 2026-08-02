@@ -377,6 +377,7 @@ static void fmt_time(int64_t us, char *o, int cap) {
 extern char font8x8_basic[128][8];   /* defined once in ui_gfx.c */
 #include "font8x8_ext.h"             /* IBM-VGA-style Latin-1 + Greek + Turkish (matches font8x8_basic) */
 #include "font16.h"                  /* 16x16 Hangul / kana / kanji (Nanum Gothic, Noto Sans JP) */
+#include "font8x16.h"                /* 8x16 Latin / Greek / Cyrillic / Hebrew (Noto Sans) */
 #include "font512.h"                 /* fallback for Cyrillic/Hebrew/other foreign scripts */
 #include "subcp.h"                   /* 8-bit codepage -> Unicode maps (Turkish/Cyrillic/Greek/...) */
 
@@ -723,6 +724,17 @@ static const unsigned short *sub_glyph16(uint32_t cp) {
     while (lo <= hi) {
         int mid = (lo + hi) >> 1; unsigned c = font16_cjk_cp[mid];
         if (c == cp) return font16_cjk[mid];
+        if (c < cp)  lo = mid + 1; else hi = mid - 1;
+    }
+    return NULL;
+}
+/* 8x16: the alphabetic scripts at the same height as the wide ones, so a line mixing English
+ * and Japanese has a single glyph height and accents have room (an 8x8 cedilla was a stub). */
+static const unsigned char *sub_glyph8x16(uint32_t cp) {
+    int lo = 0, hi = FONT8X16_N - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) >> 1; unsigned c = font8x16_cp[mid];
+        if (c == cp) return font8x16[mid];
         if (c < cp)  lo = mid + 1; else hi = mid - 1;
     }
     return NULL;
@@ -2156,7 +2168,11 @@ static void subtex_glyph(uint32_t cp, int x, int y, u32 rgba) {
     if (w) { for (int r = 0; r < 16; r++) for (int c = 0; c < 16; c++)
                  if (w[r] & (0x8000u >> c)) subtex_px(x + c, y + r, rgba);
              return; }
-    const char *g = sub_glyph(cp); if (!g) g = font8x8_basic['?'];
+    const unsigned char *n = sub_glyph8x16(cp);
+    if (n) { for (int r = 0; r < 16; r++) for (int c = 0; c < 8; c++)
+                 if (n[r] & (1 << c)) subtex_px(x + c, y + r, rgba);
+             return; }
+    const char *g = sub_glyph(cp); if (!g) g = font8x8_basic['?'];   /* last resort, half height */
     for (int r = 0; r < 8; r++) for (int c = 0; c < 8; c++)
         if (g[r] & (1 << c)) subtex_px(x + c, y + r + 8, rgba);   /* baseline of a 16px line */
 }

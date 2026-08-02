@@ -240,9 +240,21 @@ static int recv_wait(int fd, void *buf, int want) {
 /* ---------- PUT upload ---------- */
 
 /* live upload progress, polled by the on-device UI (the web page has its own bar) */
+/* completed uploads, published to the UI thread (single writer, single reader) */
+#define UP_DONE_N 8
+static char g_done[UP_DONE_N][1024];
+static volatile unsigned g_done_wr = 0, g_done_rd = 0;
+
 static volatile long g_up_done = 0, g_up_total = 0;
 static volatile int  g_up_active = 0;
 static char g_up_name[128];
+int httpd_take_upload(char *path, int cap) {
+    if (g_done_rd == g_done_wr) return 0;
+    snprintf(path, cap, "%s", g_done[g_done_rd % UP_DONE_N]);
+    g_done_rd++;
+    return 1;
+}
+
 int httpd_upload_progress(long *done, long *total, char *name, int namecap) {
     if (!g_up_active) return 0;
     if (done)  *done  = g_up_done;
@@ -320,8 +332,14 @@ static void handle_put(int fd, const char *path, char *hdrbuf, int hdr_total, in
     fclose(out);
     g_up_active = 0;
 
-    if (remaining == 0 && !werr) send_status(fd, "200 OK", "text/plain", "ok");
-    else                         send_status(fd, "500 Error", "text/plain", "incomplete");
+    if (remaining == 0 && !werr) {
+        /* hand the finished path to the UI thread: it adds the file to the library and scrapes
+         * its info, so an uploaded movie behaves like one that was there at the last scan */
+        int slot = g_done_wr % UP_DONE_N;
+        snprintf(g_done[slot], sizeof g_done[0], "%s", fpath);
+        g_done_wr++;
+        send_status(fd, "200 OK", "text/plain", "ok");
+    } else send_status(fd, "500 Error", "text/plain", "incomplete");
 }
 
 /* ---------- request dispatch ---------- */

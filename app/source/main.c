@@ -341,6 +341,7 @@ static void icon_file(int x, int y, u16 c);
 static void strip_ext(char *d);
 static int  ui_menu(const char *title, const char *subtitle, const char *const *items, int n);
 static int  scrape_one(const char *moviepath);           /* Get Info for one movie (defined later) */
+static int  lib_add_local(const char *path);             /* a file that just appeared on the card */
 static void lib_getinfo_menu(int *idx, int ni, int csel); /* library Get Info: this / all-missing (defined later) */
 
 
@@ -524,6 +525,18 @@ static void upload_screen(void) {
         int active = ok ? httpd_upload_progress(&done, &total, nm, sizeof nm) : 0;
         if (active) { if (done != lastdone) { lastdone = done; redraw = 1; } wasactive = 1; }
         else if (wasactive) { wasactive = 0; lastdone = -1; redraw = 1; up_t = 0; up_x100 = 0; }   /* just finished */
+        /* A file that arrived over Wi-Fi is on the card but not in the library, and nothing told
+         * the library about it. Add it and fetch its info here -- for a SUPER MOFLEX that is a
+         * local trailer read, otherwise a catalog lookup -- so an upload behaves like a file that
+         * was present at the last scan instead of waiting to be noticed. */
+        {
+            char up[PATHLEN + NAMELEN];
+            while (ok && httpd_take_upload(up, sizeof up)) {
+                if (!is_moflex(up)) continue;              /* companions ride along, silently */
+                lib_add_local(up);
+                redraw = 1;
+            }
+        }
         if (redraw) {
             ui_begin(GFX_BOTTOM);
             ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
@@ -2566,6 +2579,46 @@ static void lib_add_downloaded(const char *path, const CatEntry *src) {
     time_t now = time(NULL); struct tm *tmv = localtime(&now);
     if (tmv) strftime(c->date, sizeof c->date, "%Y-%m-%d", tmv);
     lib_save_cache();
+}
+
+/* A file that appeared on the card by itself (a Wi-Fi upload): add it to the library and fill in
+ * what we can WITHOUT the user having to find it and press Get Info. A SUPER MOFLEX carries its
+ * own info, so that costs one local read; anything else falls back to the catalog scrape that
+ * Get Info would have run. Returns the library index, or -1. */
+static int lib_add_local(const char *path) {
+    if (!is_moflex(path)) return -1;
+    if (g_lib_n == 0) { lib_load_cache_only(); if (g_lib_n == 0) return -1; }  /* no library yet ->
+                                                                               * the first scan gets it */
+    if (!g_lib) return -1;
+    int at = -1;
+    for (int i = 0; i < g_lib_n; i++) if (!strcmp(g_lib[i].url, path)) { at = i; break; }
+    if (at < 0) {
+        if (g_lib_n >= LIB_MAX) return -1;
+        at = g_lib_n++;
+        CatEntry *c = &g_lib[at];
+        memset(c, 0, sizeof *c);
+        snprintf(c->url, sizeof c->url, "%s", path);
+        const char *bn = strrchr(path, '/'); bn = bn ? bn + 1 : path;
+        snprintf(c->fname, sizeof c->fname, "%s", bn);
+        snprintf(c->name, sizeof c->name, "%s", bn); strip_ext(c->name);
+        c->is3d = -1;                                     /* unknown: guessed from the name */
+        time_t now = time(NULL); struct tm *tmv = localtime(&now);
+        if (tmv) strftime(c->date, sizeof c->date, "%Y-%m-%d", tmv);
+    }
+    CatEntry *e = &g_lib[at];
+    char au[48], sb[64];
+    if (entry_super(e, au, sizeof au, sb, sizeof sb, NULL)) {   /* self-describing: no network */
+        e->super = 1;
+        snprintf(e->audio_langs, sizeof e->audio_langs, "%s", au);
+        snprintf(e->sub_langs, sizeof e->sub_langs, "%s", sb);
+        if (trailer_import_movieinfo(e->url)) lib_refresh_entry(at);
+    } else if (!movieinfo_have(e->url)) {
+        if (scrape_one(e->url) > 0) lib_refresh_entry(at);      /* the same lookup Get Info does */
+    } else lib_refresh_entry(at);
+    if (!e->category[0]) snprintf(e->category, sizeof e->category, "Uncategorized");
+    lib_episode_name(e);
+    lib_save_cache();
+    return at;
 }
 
 /* After a zip extracts: put its contents in the library. Episode-tagged folders become ONE show

@@ -17,4 +17,9 @@ const char *httpd_url(void);
  * returns 1; otherwise returns 0. Lets the on-device UI show a progress bar. */
 int httpd_upload_progress(long *done, long *total, char *name, int namecap);
 
+/* Pop the path of an upload that just completed (1 = got one, 0 = none pending). The UI thread
+ * drains this so a file sent from the browser lands in the library with its info, instead of
+ * waiting for the user to notice it and rescan. */
+int httpd_take_upload(char *path, int cap);
+
 #endif
