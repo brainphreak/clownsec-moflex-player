@@ -703,8 +703,14 @@ static inline u32 rgb565_bgr8(u16 c) {
  * These scripts cannot be drawn in an 8x8 cell: Hangul stacks three jamo, kanji carry far more
  * strokes than 64 pixels hold. */
 static const unsigned short *sub_glyph16(uint32_t cp) {
-    if (cp >= FONT16_HANGUL_LO && cp <= FONT16_HANGUL_HI) return font16_hangul[cp - FONT16_HANGUL_LO];
-    if (cp >= FONT16_KANA_LO   && cp <= FONT16_KANA_HI)   return font16_kana[cp - FONT16_KANA_LO];
+    if (cp >= FONT16_KANA_LO && cp <= FONT16_KANA_HI) return font16_kana[cp - FONT16_KANA_LO];
+    if (cp >= 0xAC00 && cp <= 0xD7A3) {                  /* KS X 1001 syllables, indexed */
+        int a = 0, b = FONT16_HANGUL_N - 1;
+        while (a <= b) { int m = (a + b) >> 1; unsigned c = font16_hangul_cp[m];
+            if (c == cp) return font16_hangul[m];
+            if (c < cp) a = m + 1; else b = m - 1; }
+        return NULL;
+    }
     int lo = 0, hi = FONT16_CJK_N - 1;
     while (lo <= hi) {
         int mid = (lo + hi) >> 1; unsigned c = font16_cjk_cp[mid];
