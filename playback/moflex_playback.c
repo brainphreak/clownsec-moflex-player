@@ -394,6 +394,7 @@ static int u8_cplen(const char *s) { int n = 0; while (*s) { u8_next(&s); n++; }
 
 static const char sub_note_glyph[8] = { 0x08, 0x08, 0x08, 0x08, 0x08, 0x0E, 0x0F, 0x06 };  /* ♪ */
 
+static const unsigned short *sub_glyph16(uint32_t cp);   /* 16x16 tables, defined below */
 /* 8x8 bitmap for a Unicode codepoint; NULL if we have no glyph (e.g. CJK). */
 static const char *sub_glyph(uint32_t cp) {
     if (cp == 0x266A || cp == 0x266B) return sub_note_glyph;             /* ♪ ♫ */
@@ -407,7 +408,13 @@ static const char *sub_glyph(uint32_t cp) {
         case 0x0130: return font8x8_turk[2]; case 0x0131: return font8x8_turk[3];   /* İ ı */
         case 0x015E: return font8x8_turk[4]; case 0x015F: return font8x8_turk[5];   /* Ş ş */
     }
-    int lo = 0, hi = FONT512_MAP_N - 1;                                 /* Cyrillic/Hebrew/other: 512_8 fallback */
+    if (cp >= 0x400 && cp <= 0x45F) {                                   /* Cyrillic, matching weight */
+        const char *g = font8x8_cyr[cp - 0x400];
+        int ink = 0; for (int r = 0; r < 8; r++) ink |= g[r];            /* row 1 is blank on
+                                                                         * lowercase: test them all */
+        if (ink) return g;
+    }
+    int lo = 0, hi = FONT512_MAP_N - 1;                                 /* Hebrew/other: 512_8 fallback */
     while (lo <= hi) {
         int mid = (lo + hi) >> 1; unsigned c = font512_map[mid].cp;
         if (c == cp) return (const char *)font512[font512_map[mid].idx];
@@ -473,7 +480,7 @@ static void sub_clean(const char *in, char *out, int cap) {
         else if (cp == 0x2013 || cp == 0x2014)                 out[o++] = '-';
         else if (cp == 0x00A0)                                 out[o++] = ' ';   /* nbsp */
         else if (cp == 0x2026) { if (o < cap - 3) { out[o++]='.'; out[o++]='.'; out[o++]='.'; } }
-        else if (sub_glyph(cp)) {                              /* renderable -> emit as UTF-8 */
+        else if (sub_glyph(cp) || sub_glyph16(cp)) {           /* renderable -> emit as UTF-8 */
             if (cp < 0x80) out[o++] = (char)cp;
             else if (cp < 0x800) { out[o++] = (char)(0xC0 | (cp >> 6)); out[o++] = (char)(0x80 | (cp & 0x3F)); }
             else { out[o++] = (char)(0xE0 | (cp >> 12)); out[o++] = (char)(0x80 | ((cp >> 6) & 0x3F)); out[o++] = (char)(0x80 | (cp & 0x3F)); }
