@@ -376,6 +376,7 @@ static void fmt_time(int64_t us, char *o, int cap) {
 /* ---------- subtitles: external .srt (sidecar next to the movie, or in moviedata/) ---------- */
 extern char font8x8_basic[128][8];   /* defined once in ui_gfx.c */
 #include "font8x8_ext.h"             /* IBM-VGA-style Latin-1 + Greek + Turkish (matches font8x8_basic) */
+#include "font16.h"                  /* 16x16 Hangul / kana / kanji (Nanum Gothic, Noto Sans JP) */
 #include "font512.h"                 /* fallback for Cyrillic/Hebrew/other foreign scripts */
 #include "subcp.h"                   /* 8-bit codepage -> Unicode maps (Turkish/Cyrillic/Greek/...) */
 
@@ -399,6 +400,8 @@ static const char *sub_glyph(uint32_t cp) {
     if (cp < 0x80)                    return font8x8_basic[cp];          /* ASCII (IBM VGA) */
     if (cp >= 0xA0 && cp <= 0xFF)     return font8x8_ext_latin[cp - 0xA0]; /* Latin-1 (matching style) */
     if (cp >= 0x390 && cp <= 0x3C9)   return font8x8_greek[cp - 0x390];  /* Greek (matching style) */
+    for (unsigned g = 0; g < sizeof font8x8_greek2_cp / sizeof font8x8_greek2_cp[0]; g++)
+        if (font8x8_greek2_cp[g] == cp) return font8x8_greek2[g];        /* accented Greek, same weight */
     switch (cp) {                                                        /* Turkish Ext-A (composed to match) */
         case 0x011E: return font8x8_turk[0]; case 0x011F: return font8x8_turk[1];   /* Ğ ğ */
         case 0x0130: return font8x8_turk[2]; case 0x0131: return font8x8_turk[3];   /* İ ı */
@@ -696,6 +699,30 @@ static inline u32 rgb565_bgr8(u16 c) {
     u32 b = (u32)(( c        & 0x1F) * 255 / 31);
     return b | (g << 8) | (r << 16);
 }
+/* 16x16 bitmap for a codepoint (Hangul / kana / JIS X 0208 kanji), NULL if it is not one.
+ * These scripts cannot be drawn in an 8x8 cell: Hangul stacks three jamo, kanji carry far more
+ * strokes than 64 pixels hold. */
+static const unsigned short *sub_glyph16(uint32_t cp) {
+    if (cp >= FONT16_HANGUL_LO && cp <= FONT16_HANGUL_HI) return font16_hangul[cp - FONT16_HANGUL_LO];
+    if (cp >= FONT16_KANA_LO   && cp <= FONT16_KANA_HI)   return font16_kana[cp - FONT16_KANA_LO];
+    int lo = 0, hi = FONT16_CJK_N - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) >> 1; unsigned c = font16_cjk_cp[mid];
+        if (c == cp) return font16_cjk[mid];
+        if (c < cp)  lo = mid + 1; else hi = mid - 1;
+    }
+    return NULL;
+}
+/* width of one codepoint in 8px cells: wide glyphs take two */
+static int sub_cp_cells(uint32_t cp) { return sub_glyph16(cp) ? 2 : 1; }
+/* cells a whole string occupies, and whether it contains any 16px glyph */
+static int sub_str_cells(const char *s) {
+    int n = 0; while (*s) n += sub_cp_cells(u8_next(&s)); return n;
+}
+static int sub_line_tall(const char *s) {
+    while (*s) if (sub_glyph16(u8_next(&s))) return 1;
+    return 0;
+}
 static void sub_fbpx(u8 *fb, int x, int y, u32 c) {
     if ((unsigned)x < SCR_W && (unsigned)y < SCR_H) {
         u8 *p = fb + ((size_t)x * SCR_H + (SCR_H - 1 - y)) * 3;
@@ -703,13 +730,25 @@ static void sub_fbpx(u8 *fb, int x, int y, u32 c) {
     }
 }
 static void sub_fbtext(u8 *fb, int x, int y, int sc, u32 col, const char *s) {
+    int tall = sub_line_tall(s);            /* a 16px line drops the 8px glyphs to its baseline */
     while (*s) {
         uint32_t cp = u8_next(&s);                          /* one UTF-8 codepoint per glyph */
+        const unsigned short *w = sub_glyph16(cp);
+        if (w) {                                            /* 16x16: Hangul, kana, kanji */
+            for (int row = 0; row < 16; row++) { unsigned bits = w[row];
+                for (int c = 0; c < 16; c++) if (bits & (0x8000u >> c))
+                    for (int a = 0; a < sc; a++) for (int b = 0; b < sc; b++)
+                        sub_fbpx(fb, x + c * sc + a, y + row * sc + b, col);
+            }
+            x += 16 * sc;
+            continue;
+        }
         const char *g = sub_glyph(cp); if (!g) g = font8x8_basic['?'];   /* no glyph -> '?' */
+        int y8 = y + (tall ? 8 * sc : 0);                   /* sit on the tall line's baseline */
         for (int row = 0; row < 8; row++) { char bits = g[row];
             for (int c = 0; c < 8; c++) if (bits & (1 << c))
                 for (int a = 0; a < sc; a++) for (int b = 0; b < sc; b++)
-                    sub_fbpx(fb, x + c * sc + a, y + row * sc + b, col);
+                    sub_fbpx(fb, x + c * sc + a, y8 + row * sc + b, col);
         }
         x += 8 * sc;
     }
@@ -731,10 +770,13 @@ static int sub_wrap(const char *t, char lines[SUB_MAXLN][SUB_LNW], int maxch) {
         for (const char *p = seg; p < segend && nl < SUB_MAXLN; ) {
             while (p < segend && (*p == ' ' || *p == '\t' || *p == '\r')) p++;
             if (p >= segend) break;
-            const char *w = p; int ww = 0;       /* word: byte range [w,p), ww codepoints */
-            while (p < segend && *p != ' ' && *p != '\t' && *p != '\r') { const char *q = p; u8_next(&q); p = q; ww++; }
-            if (ww > maxch) {                    /* word longer than a line -> truncate at a codepoint edge */
-                const char *q = w; for (int k = 0; k < maxch; k++) u8_next(&q); p = q; ww = maxch;
+            const char *w = p; int ww = 0;       /* word: byte range [w,p), ww CELLS wide */
+            while (p < segend && *p != ' ' && *p != '\t' && *p != '\r') {
+                const char *q = p; uint32_t cp = u8_next(&q);
+                if (ww + sub_cp_cells(cp) > maxch && ww > 0) break;   /* CJK: no spaces to break on,
+                                                                      * so break inside the run
+                                                                      * rather than truncating it */
+                p = q; ww += sub_cp_cells(cp);
             }
             int wb = (int)(p - w);
             if (cw == 0) { memcpy(cur, w, wb); cb = wb; cw = ww; }
@@ -748,10 +790,14 @@ static int sub_wrap(const char *t, char lines[SUB_MAXLN][SUB_LNW], int maxch) {
 }
 /* draw the wrapped lines centered at cx (white text + a thin black outline, no box) */
 static void sub_draw_lines(u8 *fb, int cx, int y0, char lines[SUB_MAXLN][SUB_LNW], int nl, int sc) {
-    int lh = 8 * sc + 4;
+    int tall = 0;
+    for (int i = 0; i < nl; i++) if (sub_line_tall(lines[i])) { tall = 1; break; }
+    int lh = (tall ? 16 : 8) * sc + 4;
+    int block = nl * lh;                       /* tall lines grow upward, not off the screen */
+    y0 -= tall ? (block - (nl * (8 * sc + 4))) : 0;
     for (int i = 0; i < nl; i++) {
         const char *s = lines[i];
-        int x = cx - u8_cplen(s) * 8 * sc / 2, y = y0 + i * lh;   /* center by glyph count, not bytes */
+        int x = cx - sub_str_cells(s) * 8 * sc / 2, y = y0 + i * lh;   /* centre on real width */
         sub_fbtext(fb, x - 1, y, sc, 0, s); sub_fbtext(fb, x + 1, y, sc, 0, s);
         sub_fbtext(fb, x, y - 1, sc, 0, s); sub_fbtext(fb, x, y + 1, sc, 0, s);
         sub_fbtext(fb, x, y, sc, 0x00FFFFFF, s);          /* white, B|G|R all 0xFF */
