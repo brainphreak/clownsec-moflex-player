@@ -1481,10 +1481,16 @@ static int distinct_genres(const CatEntry *cat, int nc, const char *category, ch
 /* neon scrolling picker for a list of short strings. Returns index, -2 (Show All), or -1 (back). */
 static void draw_status(int x, int y, int st);          /* watched badges (defined with the library code) */
 static const signed char *s_pick_status = NULL;         /* optional per-item badge for the NEXT catalog_pick */
+/* Optional per-ROW top screen for the NEXT catalog_pick: the picker itself only owns the bottom
+ * screen, so a list used to leave whatever was already up there -- which is why every episode of
+ * a show showed the SHOW's info. Set this to draw the highlighted item instead. */
+static void (*s_pick_top)(int item) = NULL;
 static int s_pick_init = 0;   /* initial highlight ROW for the NEXT catalog_pick (one-shot):
                                * callers set it when re-showing a list so B-back lands where you were */
 static int catalog_pick(const char *title, const char *subtitle, char items[][64], int n, int show_all, const char *extra) {
     const signed char *pst = s_pick_status; s_pick_status = NULL;   /* consumed by this call only */
+    void (*ptop)(int) = s_pick_top; s_pick_top = NULL;              /* ditto */
+    int ptop_drawn = -1;
     int has_extra = (extra && extra[0]) ? 1 : 0;
     int total = n + (show_all ? 1 : 0) + has_extra;
     int sel = 0, top = 0, redraw = 1, td = 0, tx0 = 0, ty0 = 0, tsc0 = 0, tmv = 0;
@@ -1525,6 +1531,10 @@ static int catalog_pick(const char *title, const char *subtitle, char items[][64
           if (nr) redraw = 1; }
         if (dlw_poll()) redraw = 1;   /* a background download finished while we were here */
         { static int qt; if (s_dlw_active && ++qt >= 20) { qt = 0; redraw = 1; } }   /* keep the strip live */
+        if (redraw && ptop) {                 /* highlighted row changed -> repaint the top screen */
+            int item = sel - has_extra;                 /* the extra row sits above the items */
+            if (item != ptop_drawn) { ptop(item); ptop_drawn = item; }
+        }
         if (redraw) {
             ui_begin(GFX_BOTTOM);
             ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
@@ -2165,6 +2175,30 @@ static int show_status(const char *showname, const char *url) {
     return (w == n) ? 2 : touched ? 1 : 0;
 }
 
+/* Top screen for the highlighted EPISODE. A SUPER MOFLEX episode carries its own title, synopsis
+ * and air date in its trailer, so show those rather than repeating the series blurb for all
+ * thirteen episodes -- importing on first sight, which is a local read of the file we are already
+ * pointing at. Falls back to the show's own info when an episode has nothing of its own. */
+static CatEntry s_ep_show;          /* the series entry, for the fallback */
+static int s_ep_have_show;
+static void ep_draw_top(int i) {
+    if (i < 0 || i >= EP_MAX || !s_epfile[i][0]) {
+        if (s_ep_have_show) draw_info_top(&s_ep_show, NULL);
+        return;
+    }
+    const char *path = s_epfile[i];
+    if (!movieinfo_have(path)) trailer_import_movieinfo(path);   /* silent, local, once */
+    CatEntry meta;
+    if (movieinfo_load(path, &meta)) {
+        static u16 art[POSTER_W * POSTER_H];
+        int have = movieinfo_poster(path, art, POSTER_W, POSTER_H);
+        if (!have && s_ep_have_show) have = movieinfo_poster(s_ep_show.url, art, POSTER_W, POSTER_H);
+        draw_info_top(&meta, have ? art : NULL);
+    } else if (s_ep_have_show) {
+        draw_info_top(&s_ep_show, NULL);                          /* nothing of its own: the series */
+    }
+}
+
 static int show_pick_episode(const char *showname, const char *url, char *out, size_t cap) {
     static char eps[EP_MAX][64];
     static signed char epst[EP_MAX];
@@ -2179,6 +2213,10 @@ static int show_pick_episode(const char *showname, const char *url, char *out, s
         epst[i] = (signed char)ep_status(s_epfile[i]);
     }
     s_pick_status = epst;   /* same watched badges as the library list */
+    s_ep_have_show = 0;
+    for (int i = 0; i < g_lib_n; i++)                             /* the series entry, for fallback */
+        if (!strcmp(g_lib[i].url, url)) { s_ep_show = g_lib[i]; s_ep_have_show = 1; break; }
+    s_pick_top = ep_draw_top;
     int c = catalog_pick("EPISODES", showname, eps, n, 0, NULL);
     if (c < 0) return 0;
     snprintf(out, cap, "%s", s_epfile[c]);
