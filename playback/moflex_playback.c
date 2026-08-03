@@ -432,8 +432,8 @@ static int  g_nsubs = 0;
 static int  g_sub_on = 0;      /* enabled */
 static int  g_sub_top = 0;     /* 0 = bottom of the top screen, 1 = top */
 static int  g_sub_depth = 0;   /* 3D parallax: per-eye horizontal shift (-=out toward you, +=into screen) */
-static int  g_sub_size = 2;    /* font scale: pixel height is 16 x this (1 = smallest) */
-#define SUB_SIZE_MAX 6
+static int  g_sub_size = 1;    /* font scale: glyphs are 16 tall, so 1x is already legible */
+#define SUB_SIZE_MAX 4
 static int64_t g_sub_off = 0;  /* timing offset in us (+ = show later, - = show earlier) */
 /* Encoding for 8-bit (non-UTF-8) SRTs -- UTF-8 is auto-detected; the various legacy codepages
  * can't be told apart from the bytes, so the user picks. Index into sub_cp_hi[] (see subcp.h). */
@@ -664,7 +664,7 @@ static void subcfg_load(const char *movie) {
         if (fscanf(f, "%d", &asel) == 1 && asel >= 0 && asel < 4) g_atrk_sel = asel;   /* newer files */
         g_sub_on    = !!on;
         g_sub_top   = !!top;
-        g_sub_size  = (size  >= 1 && size <= SUB_SIZE_MAX) ? size : 2;
+        g_sub_size  = (size  >= 1 && size <= SUB_SIZE_MAX) ? size : 1;
         g_sub_depth = depth < -16 ? -16 : (depth > 16 ? 16 : depth);
         g_sub_off   = (int64_t)off;
         g_sub_enc   = (enc >= 0 && enc < 5) ? enc : 0;
@@ -738,6 +738,25 @@ static const unsigned char *sub_glyph8x16(uint32_t cp) {
         if (c < cp)  lo = mid + 1; else hi = mid - 1;
     }
     return NULL;
+}
+/* Rows of a glyph cell that actually carry ink. A 16x16 kanji fills its cell, while an 8x16
+ * Latin letter leaves ~5 rows of built-in padding -- packing lines by cell height therefore put a
+ * near-blank line between Latin rows while Japanese looked right. Lines are spaced on ink. */
+static void sub_cp_ink(uint32_t cp, int *top, int *bot) {
+    const unsigned short *w = sub_glyph16(cp);
+    if (w) { for (int r = 0; r < 16; r++) if (w[r]) { if (r < *top) *top = r; if (r > *bot) *bot = r; }
+             return; }
+    const unsigned char *n = sub_glyph8x16(cp);
+    if (n) { for (int r = 0; r < 16; r++) if (n[r]) { if (r < *top) *top = r; if (r > *bot) *bot = r; }
+             return; }
+    const char *g = sub_glyph(cp);
+    if (g) for (int r = 0; r < 8; r++) if (g[r]) {          /* 8x8 sits on the 16px baseline */
+        int rr = r + 8; if (rr < *top) *top = rr; if (rr > *bot) *bot = rr; }
+}
+static void sub_line_ink(const char *s, int *top, int *bot) {
+    *top = 16; *bot = -1;
+    while (*s) sub_cp_ink(u8_next(&s), top, bot);
+    if (*bot < 0) { *top = 0; *bot = 15; }                  /* blank line: keep a full row */
 }
 /* width of one codepoint in 8px cells: wide glyphs take two */
 static int sub_cp_cells(uint32_t cp) { return sub_glyph16(cp) ? 2 : 1; }
@@ -2185,17 +2204,25 @@ static int subtex_build(const char *text, int cells) {
     char lines[SUB_MAXLN][SUB_LNW];
     int nl = sub_wrap(text, lines, cells);
     if (nl <= 0) return 0;
-    const int lh = 16 + 4;
-    if (nl * lh > ST_H) nl = ST_H / lh;
+    /* space the lines on their INK, so a Latin pair sits as close as a Japanese pair */
+    const int GAP = 4;                                        /* blank rows between lines */
+    int itop[SUB_MAXLN], ibot[SUB_MAXLN], ypos[SUB_MAXLN], yy = 1;   /* 1: room for the outline */
+    for (int i = 0; i < nl; i++) {
+        sub_line_ink(lines[i], &itop[i], &ibot[i]);
+        ypos[i] = yy - itop[i];                               /* draw offset: ink lands at yy */
+        yy += (ibot[i] - itop[i] + 1) + GAP;
+    }
+    while (nl > 1 && yy - GAP + 1 > ST_H) { nl--; yy = ypos[nl - 1] + ibot[nl - 1] + 1 + GAP; }
     int wmax = 0;
     for (int i = 0; i < nl; i++) { int w = sub_str_cells(lines[i]) * 8; if (w > wmax) wmax = w; }
     if (wmax > ST_W - 2) wmax = ST_W - 2;
-    g_stex_w = wmax + 2; g_stex_h = nl * lh;                  /* +2: room for the outline */
+    g_stex_w = wmax + 2; g_stex_h = yy - GAP + 1;             /* +1/+2: room for the outline */
+    if (g_stex_h > ST_H) g_stex_h = ST_H;
 
     memset(g_stex.data, 0, ST_W * ST_H * 4);                  /* transparent */
     for (int i = 0; i < nl; i++) {
         int lw = sub_str_cells(lines[i]) * 8;
-        int x0 = (g_stex_w - lw) / 2, y0 = i * lh;
+        int x0 = (g_stex_w - lw) / 2, y0 = ypos[i];
         for (int pass = 0; pass < 2; pass++) {                /* black outline, then white text */
             const char *s = lines[i];
             int x = x0;
