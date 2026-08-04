@@ -1490,7 +1490,7 @@ static int s_pick_init = 0;   /* initial highlight ROW for the NEXT catalog_pick
 static int catalog_pick(const char *title, const char *subtitle, char items[][64], int n, int show_all, const char *extra) {
     const signed char *pst = s_pick_status; s_pick_status = NULL;   /* consumed by this call only */
     void (*ptop)(int) = s_pick_top; s_pick_top = NULL;              /* ditto */
-    int ptop_drawn = -1;
+    int ptop_drawn = -1, ptop_settle = 0, ptop_first = 1;
     int has_extra = (extra && extra[0]) ? 1 : 0;
     int total = n + (show_all ? 1 : 0) + has_extra;
     int sel = 0, top = 0, redraw = 1, td = 0, tx0 = 0, ty0 = 0, tsc0 = 0, tmv = 0;
@@ -1531,9 +1531,18 @@ static int catalog_pick(const char *title, const char *subtitle, char items[][64
           if (nr) redraw = 1; }
         if (dlw_poll()) redraw = 1;   /* a background download finished while we were here */
         { static int qt; if (s_dlw_active && ++qt >= 20) { qt = 0; redraw = 1; } }   /* keep the strip live */
-        if (redraw && ptop) {                 /* highlighted row changed -> repaint the top screen */
+        if (ptop) {                           /* highlighted row changed -> repaint the top screen */
             int item = sel - has_extra;                 /* the extra row sits above the items */
-            if (item != ptop_drawn) { ptop(item); ptop_drawn = item; }
+            if (item != ptop_drawn) {
+                /* ep_draw_top() READS THE SD CARD (trailer import, poster decode). Painting it on
+                 * every step of a held scroll stalls the list on each episode -- the repeat is
+                 * firing, the I/O is what blocks. Let the highlight settle first, so holding down
+                 * costs one read when you stop rather than one per episode passed. */
+                if (kh & (NAV_UP | NAV_DOWN | KEY_LEFT | KEY_RIGHT)) ptop_settle = 0;
+                else if (ptop_first || ++ptop_settle >= 5) {
+                    ptop(item); ptop_drawn = item; ptop_settle = 0; ptop_first = 0;
+                }
+            }
         }
         if (redraw) {
             ui_begin(GFX_BOTTOM);

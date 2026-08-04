@@ -354,6 +354,12 @@ static void bw_exit(void) {
 #define AUD_Y 104
 #define AUD_W 48
 #define AUD_H 28
+/* ZOOM (framing) -- below AUDIO on the left, mirroring DIM below CC. Framing is not a subtitle
+ * setting, so it gets its own button rather than a row in the CC menu. */
+#define ZM_X 8
+#define ZM_Y 138   /* "VIEW": zoom, convergence, ghost -- none of them subtitle settings */
+#define ZM_W 48
+#define ZM_H 28
 /* DIM (bottom-screen-off) button -- below CC */
 #define DIM_X 244
 #define DIM_Y 138
@@ -438,12 +444,31 @@ static int  g_sub_pos = 10;
 #define SUB_POS_DEF 10
 static int  g_sub_depth = 0;   /* 3D parallax: per-eye horizontal shift (-=out toward you, +=into screen) */
 static int  g_sub_size = 1;    /* 1..SUB_SIZE_MAX; the step maps to a scale per font (see SUB_*_SC) */
-#define SUB_SIZE_MAX 4
+#define SUB_SIZE_MAX 7
+#define SUB_SIZE_OLD 4         /* the coarse 1..4 ladder this replaced (config compatibility) */
 /* Which face draws a cue. The console's own font is proportional and anti-aliased and simply
  * looks better than an 8x16 bitmap -- but it only carries what the console's REGION shipped
  * (no Hangul outside Korean units, no kana/kanji outside Japanese ones). SYSTEM therefore means
  * "system font when it covers this cue, our tables when it does not"; PIXEL forces our tables. */
 static int  g_sub_font = 0;    /* 0 = system (auto-fallback), 1 = pixel */
+/* Framing: crop a letterboxed encode out to the panel edges. The zoom is MEASURED off the picture
+ * (see lb_*), so this is one switch rather than a percentage to hand-tune, and it is deliberately
+ * independent of the 3D slider -- the slider stays purely the console's 2D/3D control. */
+static int  g_zoom = 100;      /* per movie: percent magnification, 100 = the encode untouched */
+#define ZOOM_MIN 100
+#define ZOOM_MAX 250
+/* Convergence: per-eye horizontal shift in px (+ = eyes apart = the scene sits back behind the
+ * glass, - = eyes together = it comes toward you). Relocates the depth window; does not compress
+ * it -- nothing available to us compresses it except mixing the views. */
+static int  g_conv = 0;
+#define CONV_MAX 3             /* measured on hardware: past ~3px the barrier's crosstalk turns
+                                * the doubled edges from "pushed back" into unwatchable */
+/* Ghost cancellation: percent of the opposite eye subtracted before display, countering the
+ * barrier's crosstalk. Off by default: it clips where the result would go below black, and the
+ * right amount depends on where your head is. */
+static int  g_ghost = 0;
+#define GHOST_MAX 25
+static float lb_fill_zoom(void);   /* measured fill factor, for the menu (defined below) */
 static int64_t g_sub_off = 0;  /* timing offset in us (+ = show later, - = show earlier) */
 /* Encoding for 8-bit (non-UTF-8) SRTs -- UTF-8 is auto-detected; the various legacy codepages
  * can't be told apart from the bytes, so the user picks. Index into sub_cp_hi[] (see subcp.h). */
@@ -660,11 +685,14 @@ static void subcfg_save(const char *movie) {
     mkdir("sdmc:/moflex_player", 0777); mkdir("sdmc:/moflex_player/resume", 0777);
     char p[256]; subcfg_path(movie, p, sizeof p);
     FILE *f = fopen(p, "wb"); if (!f) return;
-    /* field 2 stays the old TOP/BOTTOM flag so a downgrade still lands the captions on the right
-     * half of the screen; the exact placement rides in the trailing g_sub_pos */
-    fprintf(f, "1 %d %d %d %d %lld %d %d %d %d\n%s\n", g_sub_on, g_sub_pos > 120, g_sub_size,
+    /* Fields 2 and 4 keep their ORIGINAL coarse meaning (TOP/BOTTOM, size out of 4) so a
+     * downgrade still lands somewhere sane; the exact placement, the fine 1..7 size and the
+     * framing ride in trailing fields, which older builds never read. */
+    int coarse = (g_sub_size * SUB_SIZE_OLD + SUB_SIZE_MAX - 1) / SUB_SIZE_MAX;
+    if (coarse < 1) coarse = 1;
+    fprintf(f, "1 %d %d %d %d %lld %d %d %d %d %d %d %d %d\n%s\n", g_sub_on, g_sub_pos > 120, coarse,
             g_sub_depth, (long long)g_sub_off, g_sub_enc, g_atrk_sel, g_sub_font, g_sub_pos,
-            g_sub_file);
+            g_sub_size, g_zoom, g_conv, g_ghost, g_sub_file);
     fclose(f);
 }
 static void subcfg_load(const char *movie) {
@@ -673,6 +701,7 @@ static void subcfg_load(const char *movie) {
     g_sub_font = 0;                     /* the console's own face */
     g_sub_size = 1;
     g_sub_pos  = SUB_POS_DEF;
+    g_zoom = ZOOM_MIN; g_conv = 0; g_ghost = 0;
     char p[256]; subcfg_path(movie, p, sizeof p);
     FILE *f = fopen(p, "rb");
     if (!f) { int e = subenc_load(movie); if (e >= 0) g_sub_enc = e; return; }   /* pre-.sub: encoding only */
@@ -686,7 +715,16 @@ static void subcfg_load(const char *movie) {
         if (fscanf(f, "%d", &pos) == 1 && pos >= 0 && pos <= SUB_POS_MAX) g_sub_pos = pos;
         else g_sub_pos = top ? SUB_POS_MAX - 20 : SUB_POS_DEF;   /* migrate the old TOP/BOTTOM flag */
         g_sub_on    = !!on;
-        g_sub_size  = (size  >= 1 && size <= SUB_SIZE_MAX) ? size : 1;
+        /* size: the coarse 1..4 field spreads onto the 1..7 ladder (2 -> 3, 3 -> 5, 4 -> 7, so
+         * the ends stay the ends), then the fine field overrides when this build wrote the file */
+        g_sub_size  = (size >= 1 && size <= SUB_SIZE_OLD)
+                      ? 1 + (size - 1) * (SUB_SIZE_MAX - 1) / (SUB_SIZE_OLD - 1) : 1;
+        { int fine = 0;
+          if (fscanf(f, "%d", &fine) == 1 && fine >= 1 && fine <= SUB_SIZE_MAX) g_sub_size = fine;
+          int z = 0, cv = 0, gh = 0;
+          if (fscanf(f, "%d", &z) == 1 && z >= ZOOM_MIN && z <= ZOOM_MAX) g_zoom = z;
+          if (fscanf(f, "%d", &cv) == 1 && cv >= -CONV_MAX && cv <= CONV_MAX) g_conv = cv;
+          if (fscanf(f, "%d", &gh) == 1 && gh >= 0 && gh <= GHOST_MAX) g_ghost = gh; }
         g_sub_depth = depth < -16 ? -16 : (depth > 16 ? 16 : depth);
         g_sub_off   = (int64_t)off;
         g_sub_enc   = (enc >= 0 && enc < 5) ? enc : 0;
@@ -897,7 +935,7 @@ static int sub_wrap(const char *t, char lines[SUB_MAXLN][SUB_LNW], int maxch) {
  * two there; the GPU paths carry the finer ladder (SUB_SYS_SC / SUB_TEX_SC). */
 static int sub_fb_scale(void) {
     int s = g_sub_size < 1 ? 1 : (g_sub_size > SUB_SIZE_MAX ? SUB_SIZE_MAX : g_sub_size);
-    return s >= 3 ? 2 : 1;
+    return s >= 5 ? 2 : 1;
 }
 /* draw the wrapped lines centered at cx (white text + a thin black outline, no box) */
 static void sub_draw_lines(u8 *fb, int cx, int y0, char lines[SUB_MAXLN][SUB_LNW], int nl, int sc) {
@@ -1045,6 +1083,9 @@ static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing)
         ui_fill(sx + 8, cy - 7, 2, 4, nc);                     /* flag curl */
         ui_text(sx + NOTE_W + GAP, cy - 4, 1, UI_NEONC, al);
     }
+    /* display settings (zoom / convergence / ghost): glows once any of them is doing something */
+    { int on = (g_zoom > ZOOM_MIN) || g_conv || g_ghost;
+      ui_button(ZM_X, ZM_Y, ZM_W, ZM_H, "VIEW", on, on ? UI_NEON : UI_DIM); }
     /* bottom-screen-off: a crescent-moon button (video keeps playing on top) */
     if (g_lcd_ok) {
         ui_button(DIM_X, DIM_Y, DIM_W, DIM_H, "", 0, UI_NEONP);
@@ -1546,12 +1587,13 @@ static void ui_tex_present(C3D_RenderTarget *bot) { ui_tex_upload(); ui_tex_blit
 static int g_panel_force = 1;   /* force a re-render next time (first frame, wake from dark, submenu exit) */
 static void g_panel_sw(C3D_RenderTarget *bot, const char *title, int64_t cur, int64_t dur, int playing) {
     if (!ui_tex_init()) return;
-    static int64_t l_sec = -1; static int l_bar = -1, l_play = -1, l_vol = -1, l_batt = -2;
+    static int64_t l_sec = -1; static int l_bar = -1, l_play = -1, l_vol = -1, l_batt = -2, l_zm = -1;
+    int vw = g_zoom * 1000 + (g_conv + CONV_MAX) * 32 + g_ghost;   /* any VIEW change repaints */
     int sec = (int)(cur / 1000000);
     int bar = dur > 0 ? (int)((double)BAR_W * (double)cur / (double)dur) : 0;
     int vol = (int)(g_vol * 100 + 0.5f);
-    if (g_panel_force || sec != l_sec || bar != l_bar || playing != l_play || vol != l_vol || g_batt_pct != l_batt) {
-        g_panel_force = 0; l_sec = sec; l_bar = bar; l_play = playing; l_vol = vol; l_batt = g_batt_pct;
+    if (g_panel_force || sec != l_sec || bar != l_bar || playing != l_play || vol != l_vol || g_batt_pct != l_batt || vw != l_zm) {
+        g_panel_force = 0; l_sec = sec; l_bar = bar; l_play = playing; l_vol = vol; l_batt = g_batt_pct; l_zm = vw;
         ui_capture(1);
         panel_draw(title, cur, dur, playing);   /* fills g_buf; ui_present() is a no-op under capture */
         ui_tex_upload();
@@ -1632,10 +1674,124 @@ static void srtpicker_render(void) {
         ui_text_center(UI_W / 2, 224, 1, UI_DIM, pg);
     }
 }
+static int submenu_hit(int px, int py, int n, int *side);   /* row hit test, defined below */
+/* ---- VIEW screen (opened from the panel button, NOT the CC menu) ----
+ * Zoom, convergence and ghost are display settings, not subtitle ones. A submenu STATE rather
+ * than a modal loop, so the film keeps playing above while you judge each change -- framing or
+ * convergence against a frozen frame is guesswork. Rows reuse the CC menu's layout + hit test. */
+#define VIEW_ROWS 4
+static int g_view_sel = 0, g_view_rep = 0;
+static void view_label(int i, char *r, int cap) {
+    switch (i) {
+        case 0: snprintf(r, cap, "Zoom:  %d%%   (left/right)", g_zoom); break;
+        case 1: { int z = (int)(lb_fill_zoom() * 100.0f + 0.5f);
+                  if (z <= ZOOM_MIN)    snprintf(r, cap, "Fill screen:  no bars found");
+                  else if (g_zoom == z) snprintf(r, cap, "Fill screen:  applied (A resets)");
+                  else                  snprintf(r, cap, "Fill screen:  %d%%   (A applies)", z); } break;
+        case 2: snprintf(r, cap, "Convergence:  %+d   (left/right)", g_conv); break;
+        default: if (g_ghost) snprintf(r, cap, "Ghost fix:  %d%%   (left/right)", g_ghost);
+                 else         snprintf(r, cap, "Ghost fix:  OFF   (left/right)"); break;
+    }
+}
+static void view_render(void) {
+    int top, step, bh; submenu_layout(VIEW_ROWS, &top, &step, &bh);
+    ui_begin(GFX_BOTTOM);
+    ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
+    ui_text_center(UI_W / 2, 14, 2, UI_NEON, "VIEW");
+    for (int i = 0; i < VIEW_ROWS; i++) {
+        char r[44]; view_label(i, r, sizeof r);
+        ui_button(18, top + i * step, UI_W - 36, bh, r, i == g_view_sel, UI_NEONC);
+    }
+    ui_text(8, 226, 1, UI_DIM, "B - back");
+}
+/* One frame of VIEW input. Returns 1 when the screen should close. */
+static int view_input(u32 kd, u32 kh, touchPosition tp) {
+    if (kd & (KEY_B | KEY_SELECT)) return 1;
+    if (kd & KEY_DOWN) g_view_sel = (g_view_sel + 1) % VIEW_ROWS;
+    if (kd & KEY_UP)   g_view_sel = (g_view_sel + VIEW_ROWS - 1) % VIEW_ROWS;
+    int t_side = 0, t_row = (kd & KEY_TOUCH) ? submenu_hit(tp.px, tp.py, VIEW_ROWS, &t_side) : -1;
+    if (t_row >= 0) g_view_sel = t_row;
+    int i = g_view_sel;
+    int press = (kd & KEY_A) ? 1 : 0;
+    int held = (kh & KEY_RIGHT) ? 1 : (kh & KEY_LEFT) ? -1 : 0;
+    int th_side = 0, th_row = (kh & KEY_TOUCH) ? submenu_hit(tp.px, tp.py, VIEW_ROWS, &th_side) : -1;
+    if (!held && i != 1 && th_row == i) held = th_side;   /* stylus held on a row's half repeats */
+    int rep = 0;
+    if (!held) g_view_rep = 0;
+    else { rep = (kd & (KEY_LEFT | KEY_RIGHT | KEY_TOUCH)) ? held : 0;
+           if (rep) g_view_rep = 0;
+           else { g_view_rep++; if (g_view_rep > 8 && g_view_rep % 2 == 0) rep = held; } }
+    if (t_row == 1) press = 1;                            /* the preset row activates on tap */
+    switch (i) {
+        case 0: if (rep) { g_zoom += rep * 2 * sub_ramp(g_view_rep);
+                           if (g_zoom < ZOOM_MIN) g_zoom = ZOOM_MIN;
+                           if (g_zoom > ZOOM_MAX) g_zoom = ZOOM_MAX; } break;
+        case 1: if (press) { int z = (int)(lb_fill_zoom() * 100.0f + 0.5f);
+                             g_zoom = (z > ZOOM_MIN && g_zoom != z) ? z : ZOOM_MIN; } break;
+        case 2: if (rep) { g_conv += rep;
+                           if (g_conv < -CONV_MAX) g_conv = -CONV_MAX;
+                           if (g_conv >  CONV_MAX) g_conv =  CONV_MAX; } break;
+        default: if (rep) { g_ghost += rep;
+                            if (g_ghost < 0) g_ghost = 0;
+                            if (g_ghost > GHOST_MAX) g_ghost = GHOST_MAX; } break;
+    }
+    return 0;
+}
+/* Shifting an eye exposes a sliver at one screen edge only that eye can see; the eyes disagree
+ * about what is there, which shimmers. Trim both to what they share. Not needed once zoomed --
+ * the magnified picture already overflows the panel. */
+static void r3_mask_edges(int m, u32 col) {
+    if (m <= 0) return;
+    if (m > SCR_W / 2) m = SCR_W / 2;
+    C2D_DrawRectSolid(0.0f, 0.0f, 0.0f, (float)m, (float)SCR_H, col);
+    C2D_DrawRectSolid((float)(SCR_W - m), 0.0f, 0.0f, (float)m, (float)SCR_H, col);
+}
+/* ---- 3D strength, on the slider ----
+ * The one lever that genuinely changes perceived depth: show each eye a blend of both frames and
+ * the disparity signal weakens with it. Geometry cannot do this -- a 2D transform changes
+ * disparity by screen POSITION, and depth needs it changed by distance in the scene.
+ * Capped well below 0.5 (which would be flat 2D) because the opposite eye's copy shows as a
+ * double edge, worst exactly where disparity is largest. Top of the slider = untouched. */
+/* Subtract a fraction of the opposite eye to counter the barrier's crosstalk. The tint darkens
+ * the source to g_ghost% first, then REVERSE_SUBTRACT does dst = dst - src. The GPU clamps at
+ * zero, which is the honest limit: where the subtraction would go below black it simply crushes.
+ * The blend state is C2D's, so flush around it and put it back exactly as found. */
+static void r3_ghost_sub(C2D_Image img, float x, float y, float sc) {
+    C2D_ImageTint t;
+    C2D_PlainImageTint(&t, C2D_Color32(0, 0, 0, 255), 1.0f - (float)g_ghost * 0.01f);
+    C2D_Flush();
+    C3D_AlphaBlend(GPU_BLEND_REVERSE_SUBTRACT, GPU_BLEND_ADD, GPU_ONE, GPU_ONE,
+                   GPU_SRC_ALPHA, GPU_ONE_MINUS_SRC_ALPHA);
+    C2D_DrawImageAt(img, x, y, 0, &t, sc, sc);
+    C2D_Flush();
+    C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_SRC_ALPHA, GPU_ONE_MINUS_SRC_ALPHA,
+                   GPU_SRC_ALPHA, GPU_ONE_MINUS_SRC_ALPHA);
+}
+#define R3_MIX_MAX 0.40f       /* how flat the bottom of the travel gets. Raised from 0.30 on
+                                * hardware: 0.30 stopped short of a useful reduction. Past ~0.40
+                                * the opposite eye's copy reads as a double edge before it reads
+                                * as less depth, so this is about the practical ceiling. */
+/* At the very bottom the console drops the parallax barrier and shows flat 2D on its own -- the
+ * doubled lines reported there were a stale second buffer, not the eyes (see dirty2). Matching
+ * the eyes at the detent anyway costs nothing and states the intent: mono means mono, whatever
+ * the hardware is doing. Substituting the LEFT image, note, rather than blending to 50/50 -- an
+ * average of two offset views is itself a doubled picture, never a clean one. */
+#define R3_MONO_AT 0.005f      /* the detent only: the console really does handle 2D there, so
+                                * do not eat usable travel -- this is belt-and-braces */
+static int r3_stereo(int is3d) {
+    if (!is3d) return 0;
+    return osGet3DSliderState() > R3_MONO_AT;
+}
+static float r3_mix(int stereo) {
+    if (!stereo) return 0.0f;
+    float sl = osGet3DSliderState();
+    if (sl > 1.0f) sl = 1.0f;
+    return (1.0f - sl) * R3_MIX_MAX;
+}
 static void g_submenu_sw(C3D_RenderTarget *bot, int is3d) {
     if (!ui_tex_init()) return;
     ui_capture(1);
-    if (g_submenu == 2) srtpicker_render(); else submenu_render(is3d);
+    if (g_submenu == 3) view_render(); else if (g_submenu == 2) srtpicker_render(); else submenu_render(is3d);
     ui_tex_present(bot);
 }
 /* dark bottom screen: pure black -- with ONLY the lock toast when it flashes on (never the panel) */
@@ -1668,6 +1824,10 @@ static int submenu_hit(int px, int py, int n, int *side) {
 }
 /* one frame of menu input; returns 1 when the whole menu should close (config persisted). */
 static int submenu_input(u32 kd, u32 kh, touchPosition tp, int is3d, const char *moviepath) {
+    if (g_submenu == 3) {   /* VIEW screen: closes straight back to the film */
+        if (view_input(kd, kh, tp)) { subcfg_save(moviepath); g_submenu = 0; return 1; }
+        return 0;
+    }
     if (g_submenu == 2) {   /* SRT file picker (scrolls: SRT_VIS rows of up to SRT_MAX files) */
         if (kd & KEY_B) { g_submenu = 1; return 0; }
         if (g_srt_n > 0) {
@@ -2364,13 +2524,87 @@ static int subtex_build(const char *text, int maxpx) {
 /* Size steps. Both faces have to land on the same on-screen height for a given step, and every
  * step has to be usable -- doubling the bitmap at step 2 put four lines across the screen. The
  * system font is ~30px tall at 1.0, the bitmap cell is 16px, hence the two ladders. */
-static const float SUB_SYS_SC[SUB_SIZE_MAX] = { 0.50f, 0.62f, 0.75f, 0.92f };
+static const float SUB_SYS_SC[SUB_SIZE_MAX] = { 0.50f, 0.57f, 0.64f, 0.71f, 0.78f, 0.85f, 0.92f };
 /* The bitmap face carries 2px stems and ink-tight line packing, so it READS heavier than the
  * system font at the same cap height -- its top steps need to sit below the matching ones. */
-static const float SUB_TEX_SC[SUB_SIZE_MAX] = { 1.00f, 1.15f, 1.35f, 1.55f };
+static const float SUB_TEX_SC[SUB_SIZE_MAX] = { 1.00f, 1.09f, 1.18f, 1.27f, 1.37f, 1.46f, 1.55f };
 static int sub_step(void) {
     int s = g_sub_size < 1 ? 1 : (g_sub_size > SUB_SIZE_MAX ? SUB_SIZE_MAX : g_sub_size);
     return s - 1;
+}
+/* ---- letterbox measurement ----
+ * Measure the bars off the decoded picture instead of asking for a percentage. The one rule that
+ * matters: only ever record a BIGGER picture, never a smaller one. A fade, a night exterior or a
+ * title card is legitimately black to the edges, and believing any single frame would zoom the
+ * whole film to fit its darkest shot. Bars start wide and only shrink, so the measurement
+ * converges on the widest content the film ever shows and then stays put.
+ * It only ever feeds the "Fill screen" preset -- nothing moves on its own. */
+static int g_lb_top, g_lb_bot, g_lb_left, g_lb_right, g_lb_w, g_lb_h, g_lb_have;
+static void lb_reset(void) {
+    g_lb_top = g_lb_bot = g_lb_left = g_lb_right = 1 << 20;
+    g_lb_w = g_lb_h = 0; g_lb_have = 0;
+}
+#define LB_BLACK 30            /* Y at or below this is bar, not picture */
+static void lb_sample(const AVFrame *f, int W, int H) {
+    if (!f || !f->data[0] || W < 32 || H < 32) return;
+    const uint8_t *Y = f->data[0]; int ls = f->linesize[0];
+    int t, b, l, r, x, y;
+    for (y = 0; y < H / 2; y++) {                        /* bar rows at the top */
+        const uint8_t *row = Y + (size_t)y * ls; int lit = 0;
+        for (x = 0; x < W; x += 4) if (row[x] > LB_BLACK) { lit = 1; break; }
+        if (lit) break;
+    }
+    t = y;
+    for (y = 0; y < H / 2; y++) {                        /* ...and at the bottom */
+        const uint8_t *row = Y + (size_t)(H - 1 - y) * ls; int lit = 0;
+        for (x = 0; x < W; x += 4) if (row[x] > LB_BLACK) { lit = 1; break; }
+        if (lit) break;
+    }
+    b = y;
+    if (t >= H / 2 - 1 && b >= H / 2 - 1) return;         /* wholly black frame: tells us nothing */
+    for (x = 0; x < W / 2; x++) {                        /* pillar columns, within the live rows */
+        int lit = 0;
+        for (y = t; y < H - b; y += 4) if (Y[(size_t)y * ls + x] > LB_BLACK) { lit = 1; break; }
+        if (lit) break;
+    }
+    l = x;
+    for (x = 0; x < W / 2; x++) {
+        int lit = 0;
+        for (y = t; y < H - b; y += 4) if (Y[(size_t)y * ls + (W - 1 - x)] > LB_BLACK) { lit = 1; break; }
+        if (lit) break;
+    }
+    r = x;
+    if (t < g_lb_top)   g_lb_top = t;
+    if (b < g_lb_bot)   g_lb_bot = b;
+    if (l < g_lb_left)  g_lb_left = l;
+    if (r < g_lb_right) g_lb_right = r;
+    g_lb_w = W; g_lb_h = H; g_lb_have = 1;
+}
+/* The zoom that would put the measured content exactly on the panel. */
+static float lb_fill_zoom(void) {
+    if (!g_lb_have || g_lb_w <= 0) return 1.0f;
+    int cw = g_lb_w - g_lb_left - g_lb_right, ch = g_lb_h - g_lb_top - g_lb_bot;
+    if (cw < g_lb_w / 2 || ch < g_lb_h / 2) return 1.0f;   /* implausible: leave it alone */
+    float zw = (float)SCR_W / (float)cw, zh = (float)SCR_H / (float)ch;
+    float z = zw > zh ? zw : zh;
+    if (z < 1.0f) z = 1.0f;
+    if (z > (float)ZOOM_MAX * 0.01f) z = (float)ZOOM_MAX * 0.01f;
+    return z;
+}
+/* Zoom + offset for the draw. Centring on the measured CONTENT rather than on the frame is what
+ * makes uneven bars come out even; with no measurement it falls back to the frame centre. */
+static void r3_frame(float *z, float *ox, float *oy) {
+    float sc = (float)g_zoom * 0.01f;
+    if (sc < 1.0f) sc = 1.0f;
+    float cx = SCR_W * 0.5f, cy = SCR_H * 0.5f;
+    if (g_lb_have && g_lb_w > 0) {
+        int cw = g_lb_w - g_lb_left - g_lb_right, ch = g_lb_h - g_lb_top - g_lb_bot;
+        if (cw >= g_lb_w / 2 && ch >= g_lb_h / 2) {
+            cx = (float)(g_lb_left + (g_lb_w - g_lb_right)) * 0.5f;
+            cy = (float)(g_lb_top  + (g_lb_h - g_lb_bot))   * 0.5f;
+        }
+    }
+    *z = sc; *ox = SCR_W * 0.5f - cx * sc; *oy = SCR_H * 0.5f - cy * sc;
 }
 static void r3_draw_sub_tex(int dx, float scale) {
     if (!g_stex_ok || g_stex_w <= 0) return;
@@ -2592,6 +2826,9 @@ static void r3_produce(R3S *s) {
         int starving = ((u32)osGetTime() - g_r3_last_present) >= 100;
         elide = stale && !starving;
     }
+    /* keep measuring all through the film: a scope feature can open on a 16:9 logo card, and
+     * since bars only ever shrink, a wider shot arriving later corrects an early guess */
+    { static int lbn = 0; if (okL && ++lbn >= 12) { lbn = 0; lb_sample(s->fL, s->W, s->H); } }
     if (!s->is3d) {
         if (okL && !elide) { g_y2r_start(s->fL, &r3_texL[slot], s->W, s->H); g_y2r_wait(&r3_texL[slot]);
                    r3_rts[slot] = dpair * s->pair_dur; r3_bts[slot] = vts;
@@ -2839,6 +3076,7 @@ static MoflexResult moflex_play_ring(const char *path) {
     /* the hook was registered right after gfx init; now that Y2R/audio are up, arm its fields */
     g_ring_apt_w = W; g_ring_apt_h = H; g_ring_apt_bpp = r3_bpp;
     g_ring_apt_audio = have_audio; g_ring_apt_playing = 1;
+    lb_reset();                          /* bars are a property of THIS film */
 
     C2D_TextBuf sbuf = C2D_TextBufNew(256), tmbuf = C2D_TextBufNew(48);
     C2D_Text ttitle, thint, ttime;
@@ -2856,6 +3094,12 @@ static MoflexResult moflex_play_ring(const char *path) {
     memset(ready, 0, sizeof r3_ready);
     int64_t last_bts = 0;
     int playing = 1, gated = 0, last_shown = -1, dirty = 1;
+    /* citro3d double-buffers each render target, so ONE repaint refreshes one of the two buffers
+     * and the other still holds the previous pair. Playing hides this -- every frame repaints
+     * both in turn -- but a PAUSED repaint leaves the display alternating between the new picture
+     * and the stale one, which the panel interleaves as doubled lines. Every dirty repaint
+     * therefore runs twice. */
+    int dirty2 = 0;
     const int PRIME = (NB >= 16) ? 8 : (NB > 2 ? NB / 2 : 1);   /* pre-roll depth, clamped to a small ring */
     int64_t cur_us = 0, dur_us = m.duration_us, seek_to_us = 0; int want_seek = 0, shold = 0;
     int scrubbing = 0; int64_t scrub_us = 0;   /* touch-drag on the bar: preview while held, seek on release */
@@ -3033,6 +3277,8 @@ static MoflexResult moflex_play_ring(const char *path) {
                 g_atrk_apply = 1; dirty = 1;
             } else if (px >= CC_X && px < CC_X + CC_W && py >= CC_Y && py < CC_Y + CC_H) {
                 g_submenu = 1; g_sub_sel = 0; dirty = 1;   /* CC: open the subtitle options menu */
+            } else if (px >= ZM_X && px < ZM_X + ZM_W && py >= ZM_Y && py < ZM_Y + ZM_H) {
+                g_submenu = 3; g_view_sel = 0; dirty = 1;   /* VIEW: video keeps playing above it */
             } else if (g_lcd_ok && px >= DIM_X && px < DIM_X + DIM_W && py >= DIM_Y && py < DIM_Y + DIM_H) {
                 g_screen_off = 1; dirty = 1;   /* moon: darken (a button or touch wakes it; reconcile handles backlight) */
             } else if (g_hq_avail && px >= HQ_X && px < HQ_X + HQ_W && py >= HQ_Y && py < HQ_Y + HQ_H) {
@@ -3075,25 +3321,40 @@ static MoflexResult moflex_play_ring(const char *path) {
          *      frame into slot 0, then resume. Held D-pad only accumulates the target; fires on release. ---- */
         if (g_atrk_apply) {   /* Audio track switched in the menu */
             g_atrk_apply = 0;
-            if (g_atrk_n > 1) {
+            /* Swap the audio SOURCE in place -- including across the in-band/trailer boundary,
+             * which used to re-open the whole movie and blank both screens. Nothing about the
+             * video changes when the language does, so nothing about the video needs rebuilding:
+             * only which packets feed the DSP. The seek-to-here below re-anchors s.tr_cur (the
+             * trailer's cursor is pure arithmetic from the position) and re-locks A/V, exactly as
+             * it already did for an in-band swap. */
+            if (g_atrk_n > 1 && have_audio) {
                 int newsi = g_atrk_streams[g_atrk_sel];
-                if (newsi < 0 || s.tr_active) {
-                    /* into or out of the TRAILER source: re-open (same pattern as the HQ toggle;
-                     * position resumes in place via the normal resume save on exit) */
-                    subcfg_save(path);
-                    result = MOFLEX_REPLAY;
-                    break;
-                }
-                if (have_audio) {                     /* in-band <-> in-band: retune live */
-                    WORKER_LOCK();
-                    s.aidx = newsi;
-                    if (m.streams[newsi].sample_rate != r3_arate || m.streams[newsi].channels != r3_achn) {
-                        r3_audio_close();
-                        r3_audio_setup(m.streams[newsi].sample_rate, m.streams[newsi].channels);
+                int to_tr = (newsi < 0);              /* < 0 = the CSXTRA trailer's own track */
+                int nrate = 0, nchn = 0, ok = 1;
+                if (to_tr) {
+                    if (g_tra.present && g_tra.aud_pkts > 0 && g_tra.aud_rate)
+                        { nrate = (int)g_tra.aud_rate; nchn = (int)g_tra.aud_chn; }
+                    else ok = 0;
+                    if (ok && !s.trf) {               /* first crossing needs its private handle */
+                        s.trf = fopen(path, "rb");
+                        if (!s.trf) ok = 0;
                     }
-                    WORKER_UNLOCK();
-                    seek_to_us = cur_us; want_seek = 1;   /* seek-to-here flushes + re-locks */
+                } else if (newsi < m.nb_streams) {
+                    nrate = m.streams[newsi].sample_rate; nchn = m.streams[newsi].channels;
+                } else ok = 0;
+                if (!ok) {   /* can't swap in place -> the old re-open, so the track still changes */
+                    subcfg_save(path); result = MOFLEX_REPLAY; break;
                 }
+                WORKER_LOCK();
+                s.tr_active = to_tr;
+                s.aidx = to_tr ? -2 : newsi;          /* -2 deliberately matches no in-band stream */
+                s.audio_pre_full = 0;                 /* the old track's gate must not stick */
+                if (nrate != r3_arate || nchn != r3_achn) {
+                    r3_audio_close(); r3_audio_setup(nrate, nchn);
+                } else r3_audio_flush();              /* same format: just drop the old track */
+                WORKER_UNLOCK();
+                if (!r3_aok) have_audio = 0;          /* re-alloc failed: fall back to the wall clock */
+                seek_to_us = cur_us; want_seek = 1;
             }
         }
         if (want_seek && !(kh & (KEY_LEFT | KEY_RIGHT))) {
@@ -3274,6 +3535,10 @@ static MoflexResult moflex_play_ring(const char *path) {
         }
 
         if (kd) dirty = 1;   /* any control input -> repaint the held frame / panel */
+        /* The 3D slider is NOT a key. Without this the strength blend only tracked it while
+         * frames were arriving -- move it on a paused frame and nothing redrew. */
+        if (is3d) { static float last_sl = -1.0f; float sl = osGet3DSliderState();
+                    if (sl - last_sl > 0.004f || last_sl - sl > 0.004f) { last_sl = sl; dirty = 1; } }
 
         if (have_audio && playing) r3_audio_poll();   /* clock FROZEN while paused -> pause is instant */
 
@@ -3326,7 +3591,7 @@ static MoflexResult moflex_play_ring(const char *path) {
          * The subtitle/time-string PREP now lives inside this block too: it used to run every loop
          * iteration (wasted CPU while banking), so calm scenes now spend that time decoding ahead -> a
          * bigger cushion -> heavy scenes coast longer before they get choppy. */
-        if ((show >= 0 || dirty) && (show >= 0 || last_shown >= 0)) {
+        if ((show >= 0 || dirty || dirty2) && (show >= 0 || last_shown >= 0)) {
             const char *cue = subs_active(disp_us);   /* NULL if subs off or no cue now */
             char tc[16], td[16], ts[64];
             fmt_time(disp_us, tc, sizeof tc);
@@ -3363,21 +3628,39 @@ static MoflexResult moflex_play_ring(const char *path) {
                 if (sub_valid) snprintf(last_sub, sizeof last_sub, "%s", cue);
             } else { sub_valid = 0; last_sub[0] = 0; }
             int b = (show >= 0) ? show : last_shown;
+            /* a zoom overflows the target, which scissors it -- no bars to draw */
+            float zm, zox, zoy; r3_frame(&zm, &zox, &zoy);
+            /* one decision for the whole frame: stereo, or the left image in both eyes */
+            int stereo = r3_stereo(is3d);
+            int cv = stereo ? g_conv : 0;
+            /* the shift only bares an edge while the picture is NOT overflowing already */
+            int cmask = (zm <= 1.001f) ? (cv < 0 ? -cv : cv) : 0;
+            float mix = r3_mix(stereo);
+            C2D_ImageTint mixt; C2D_AlphaImageTint(&mixt, mix);
+            /* a magnified picture really does have magnified disparities, so captions track it */
+            int sdep = (int)((float)g_sub_depth * zm + (g_sub_depth < 0 ? -0.5f : 0.5f));
+            C2D_Image imR = stereo ? r3_imgR[b] : r3_imgL[b];
             C3D_FrameBegin(0);
             C2D_TargetClear(topL, black); C2D_SceneBegin(topL);
-            C2D_DrawImageAt(r3_imgL[b], 0, 0, 0, NULL, 1, 1);
-            if (sub_valid) { if (sub_sys) r3_draw_sub(tsub, tsub_n, is3d ? -g_sub_depth : 0, subcol, subout);
-                             else r3_draw_sub_tex(is3d ? -g_sub_depth : 0, SUB_TEX_SC[sub_step()]); }
+            C2D_DrawImageAt(r3_imgL[b], zox - cv, zoy, 0, NULL, zm, zm);
+            if (mix > 0.0f) C2D_DrawImageAt(imR, zox + cv, zoy, 0, &mixt, zm, zm);
+            if (stereo && g_ghost) r3_ghost_sub(imR, zox + cv, zoy, zm);
+            r3_mask_edges(cmask, black);
+            if (sub_valid) { if (sub_sys) r3_draw_sub(tsub, tsub_n, stereo ? -sdep : 0, subcol, subout);
+                             else r3_draw_sub_tex(stereo ? -sdep : 0, SUB_TEX_SC[sub_step()]); }
             C2D_TargetClear(topR, black); C2D_SceneBegin(topR);
-            C2D_DrawImageAt(is3d ? r3_imgR[b] : r3_imgL[b], 0, 0, 0, NULL, 1, 1);
-            if (sub_valid) { if (sub_sys) r3_draw_sub(tsub, tsub_n, is3d ? g_sub_depth : 0, subcol, subout);
-                             else r3_draw_sub_tex(is3d ? g_sub_depth : 0, SUB_TEX_SC[sub_step()]); }
+            C2D_DrawImageAt(imR, zox + cv, zoy, 0, NULL, zm, zm);
+            if (mix > 0.0f) C2D_DrawImageAt(r3_imgL[b], zox - cv, zoy, 0, &mixt, zm, zm);
+            if (stereo && g_ghost) r3_ghost_sub(r3_imgL[b], zox - cv, zoy, zm);
+            r3_mask_edges(cmask, black);
+            if (sub_valid) { if (sub_sys) r3_draw_sub(tsub, tsub_n, stereo ? sdep : 0, subcol, subout);
+                             else r3_draw_sub_tex(stereo ? sdep : 0, SUB_TEX_SC[sub_step()]); }
             if (g_screen_off) { g_dark_sw(bot); g_panel_force = 1; }      /* dark: panel stale -> force on wake */
             else if (g_submenu) { g_submenu_sw(bot, is3d); g_panel_force = 1; }  /* submenu: panel stale on exit */
             else { if (dirty) g_panel_force = 1;                          /* UI changed -> re-render the panel */
                    g_panel_sw(bot, title, disp_us, dur_us, playing); }   /* panel (lock toast on top) */
             u64 _tg = svcGetSystemTick(); C3D_FrameEnd(0); pf_gpu += svcGetSystemTick() - _tg;
-            dirty = 0;
+            dirty2 = dirty; dirty = 0;   /* second pass fills the other buffer (see above) */
             if (show >= 0) {
                 u64 nt = svcGetSystemTick();   /* cadence: refreshes this newly-shown frame replaced */
                 if (cad_last) { int v = (int)((double)(nt - cad_last) * 1000.0 / SYSCLOCK_ARM11 / VS_MS + 0.5);
