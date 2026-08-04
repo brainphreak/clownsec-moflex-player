@@ -107,6 +107,31 @@ static void resume_clear(const char *movie) {
 /* ---- HQ (24-bit color) preference: one global flag, remembered across launches. Only meaningful on
  * Old-3DS (New-3DS always runs 24-bit). Off by default -> the smooth 16-bit path out of the box; the
  * viewer opts into 24-bit with the on-screen HQ button when a movie can afford it. ---- */
+/* ---- picture + panel, GLOBAL rather than per movie: these describe the room you are sitting in
+ * and the screen you are looking at, not a property of the film. ---- */
+static int g_pq_bright = 0;    /* -32..+32 display levels, added to the Y2R output offsets */
+static int g_pq_con = 0;       /* -40..+40 percent on the luma coefficient */
+static int g_pq_sat = 0;       /* -100..+100 percent on the chroma coefficients */
+#define PQ_BRIGHT_MAX 32
+#define PQ_CON_MAX 40
+#define PQ_SAT_MAX 100
+#define PQ_FILE "sdmc:/moflex_player/picture.cfg"
+static void pq_load(void) {
+    FILE *f = fopen(PQ_FILE, "rb"); if (!f) return;
+    int b = 0, c = 0, sa = 0;
+    if (fscanf(f, "%d %d %d", &b, &c, &sa) == 3) {
+        if (b >= -PQ_BRIGHT_MAX && b <= PQ_BRIGHT_MAX) g_pq_bright = b;
+        if (c >= -PQ_CON_MAX && c <= PQ_CON_MAX) g_pq_con = c;
+        if (sa >= -PQ_SAT_MAX && sa <= PQ_SAT_MAX) g_pq_sat = sa;
+    }
+    fclose(f);
+}
+static void pq_save(void) {
+    mkdir("sdmc:/moflex_player", 0777);
+    FILE *f = fopen(PQ_FILE, "wb"); if (!f) return;
+    fprintf(f, "%d %d %d\n", g_pq_bright, g_pq_con, g_pq_sat);
+    fclose(f);
+}
 #define HQ_FILE "sdmc:/moflex_player/hq.cfg"
 static void hq_load(void) {
     FILE *f = fopen(HQ_FILE, "rb"); if (!f) return;
@@ -1083,9 +1108,9 @@ static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing)
         ui_fill(sx + 8, cy - 7, 2, 4, nc);                     /* flag curl */
         ui_text(sx + NOTE_W + GAP, cy - 4, 1, UI_NEONC, al);
     }
-    /* display settings (zoom / convergence / ghost): glows once any of them is doing something */
-    { int on = (g_zoom > ZOOM_MIN) || g_conv || g_ghost;
-      ui_button(ZM_X, ZM_Y, ZM_W, ZM_H, "VIEW", on, on ? UI_NEON : UI_DIM); }
+    /* VIEW: opens the picture settings. NOT a toggle, so it never glows -- a glow on this row
+     * means "on", and there is nothing here to be on. */
+    ui_button(ZM_X, ZM_Y, ZM_W, ZM_H, "VIEW", 0, UI_NEONC);
     /* bottom-screen-off: a crescent-moon button (video keeps playing on top) */
     if (g_lcd_ok) {
         ui_button(DIM_X, DIM_Y, DIM_W, DIM_H, "", 0, UI_NEONP);
@@ -1399,6 +1424,64 @@ static int g_y2r_up = 0;   /* y2rInit succeeded: guards every Y2RU call AND the 
                             * y2rExit after a FAILED y2rInit drives libctru's refcount negative --
                             * from then on every y2rInit in the process "succeeds" without a live
                             * session and video is black until app restart. */
+/* Brightness / contrast / saturation cost NOTHING: they are the YUV->RGB matrix that the Y2R
+ * hardware already applies to every frame, so changing its coefficients is free where doing the
+ * same arithmetic per pixel on the CPU would not be.
+ *   R = rgb_Y*Y          + r_V*V + r_offset      (coefficients 0-4 unsigned 2.8,
+ *   G = rgb_Y*Y - g_U*U  - g_V*V + g_offset       offsets 5-7 SIGNED 11.5)
+ *   B = rgb_Y*Y + b_U*U          + b_offset
+ * contrast   -> scale rgb_Y (and the offsets with it, or black drifts off zero)
+ * saturation -> scale the chroma terms only
+ * brightness -> add to the offsets; 32 units = one display level at 11.5
+ * The base set is READ BACK from the standard coefficient rather than hardcoded, so this tracks
+ * whatever conversion params the player asks for. */
+static Y2RU_ColorCoefficients g_y2r_base; static int g_y2r_base_ok = 0;
+static volatile int g_pq_dirty = 1;
+/* Brightness/contrast/saturation happen during the YUV->RGB CONVERSION, not the draw, so on a
+ * paused frame the texture is already converted and nothing changes until playback resumes --
+ * which makes them impossible to judge where you most want to. This asks the present loop to
+ * re-convert the frame on screen. Zoom/convergence/ghost need none of it: they are draw-time. */
+static volatile int g_pq_redo = 0;
+static u16 pq_mul(u16 v, float f) {
+    int r = (int)((float)v * f + 0.5f);
+    if (r < 0) r = 0; if (r > 0x3FF) r = 0x3FF;         /* 2.8 unsigned tops out just under 4.0 */
+    return (u16)r;
+}
+static u16 pq_off(u16 base, float con, int lift) {
+    float b = (float)(s16)base * con;
+    int v = (int)(b >= 0.0f ? b + 0.5f : b - 0.5f) + lift;
+    if (v < -32768) v = -32768; if (v > 32767) v = 32767;
+    return (u16)(s16)v;
+}
+static int pq_round(float v) { return (int)(v >= 0.0f ? v + 0.5f : v - 0.5f); }
+static void pq_apply(void) {
+    if (!g_y2r_base_ok) return;
+    float con = 1.0f + (float)g_pq_con * 0.01f;
+    float sat = 1.0f + (float)g_pq_sat * 0.01f;
+    Y2RU_ColorCoefficients c;
+    c.rgb_Y = pq_mul(g_y2r_base.rgb_Y, con);
+    c.r_V   = pq_mul(g_y2r_base.r_V,   con * sat);
+    c.g_V   = pq_mul(g_y2r_base.g_V,   con * sat);
+    c.g_U   = pq_mul(g_y2r_base.g_U,   con * sat);
+    c.b_U   = pq_mul(g_y2r_base.b_U,   con * sat);
+    /* U and V arrive UNSIGNED with 128 meaning "no colour", so each base offset already cancels a
+     * 128*coefficient term. Scale the chroma coefficients WITHOUT re-cancelling it and neutral
+     * grey stops being neutral: that is a TINT -- pink one way, green the other -- which is what
+     * scaling them alone produced. In 11.5 offset units the correction is
+     *     32 * (coeff/256) * 128 * con * (1-sat)  ==  16 * coeff * con * (1-sat)
+     * added for R and B, subtracted for G whose chroma terms are negative in the formula. */
+    float k = 16.0f * con * (1.0f - sat);
+    /* Contrast has to pivot about MID-GREY, not about black. Scaling the luma coefficient alone
+     * is gain: it lifts the whole picture, which reads as brightness and made the two controls
+     * feel swapped. out = con*in + 128*(1-con) keeps mid-grey put, so darks go down as brights go
+     * up. In 11.5 offset units that pivot term is 128 * 32 * (1-con) = 4096 * (1-con). */
+    int lift = g_pq_bright * 32 + pq_round(4096.0f * (1.0f - con));
+    c.r_offset = pq_off(g_y2r_base.r_offset, con, lift + pq_round(k * (float)g_y2r_base.r_V));
+    c.g_offset = pq_off(g_y2r_base.g_offset, con,
+                        lift - pq_round(k * (float)(g_y2r_base.g_U + g_y2r_base.g_V)));
+    c.b_offset = pq_off(g_y2r_base.b_offset, con, lift + pq_round(k * (float)g_y2r_base.b_U));
+    Y2RU_SetCoefficients(&c);
+}
 static int g_y2r_init(int W, int H, int bpp) {
     g_y2r_up = R_SUCCEEDED(y2rInit());
     if (!g_y2r_up) return 0;               /* wedged driver: caller falls back to the classic path */
@@ -1414,6 +1497,8 @@ static int g_y2r_init(int W, int H, int bpp) {
     p.input_line_width = (s16)W; p.input_lines = (s16)H;
     p.standard_coefficient = COEFFICIENT_ITU_R_BT_601_SCALING; p.alpha = 0xFF;   /* TV range (content is 16..235) */
     Y2RU_SetConversionParams(&p);
+    if (R_SUCCEEDED(Y2RU_GetCoefficients(&g_y2r_base))) g_y2r_base_ok = 1;   /* the standard set */
+    g_pq_dirty = 1;                        /* re-applied by the worker before the next conversion */
     Y2RU_SetTransferEndInterrupt(true);
     if (g_y2r_done) { svcCloseHandle(g_y2r_done); g_y2r_done = 0; }   /* never leak a previous event handle */
     Y2RU_GetTransferEndEvent(&g_y2r_done);
@@ -1431,6 +1516,7 @@ static void g_y2r_exit(void) {
     g_y2r_up = 0;
 }
 static void g_y2r_start(AVFrame *o, C3D_Tex *tex, int W, int H) {
+    if (g_pq_dirty) { g_pq_dirty = 0; pq_apply(); }   /* between conversions: never mid-transfer */
     int cw = W / 2, ch = H / 2, bpp = g_y2r_bpp;
     GSPGPU_FlushDataCache(o->data[0], (u32)W * H);
     GSPGPU_FlushDataCache(o->data[1], (u32)cw * ch);
@@ -1679,7 +1765,7 @@ static int submenu_hit(int px, int py, int n, int *side);   /* row hit test, def
  * Zoom, convergence and ghost are display settings, not subtitle ones. A submenu STATE rather
  * than a modal loop, so the film keeps playing above while you judge each change -- framing or
  * convergence against a frozen frame is guesswork. Rows reuse the CC menu's layout + hit test. */
-#define VIEW_ROWS 4
+#define VIEW_ROWS 7
 static int g_view_sel = 0, g_view_rep = 0;
 static void view_label(int i, char *r, int cap) {
     switch (i) {
@@ -1689,8 +1775,25 @@ static void view_label(int i, char *r, int cap) {
                   else if (g_zoom == z) snprintf(r, cap, "Fill screen:  applied (A resets)");
                   else                  snprintf(r, cap, "Fill screen:  %d%%   (A applies)", z); } break;
         case 2: snprintf(r, cap, "Convergence:  %+d   (left/right)", g_conv); break;
-        default: if (g_ghost) snprintf(r, cap, "Ghost fix:  %d%%   (left/right)", g_ghost);
-                 else         snprintf(r, cap, "Ghost fix:  OFF   (left/right)"); break;
+        case 3: if (g_ghost) snprintf(r, cap, "Ghost fix:  %d%%   (left/right)", g_ghost);
+                else         snprintf(r, cap, "Ghost fix:  OFF   (left/right)"); break;
+        case 4: snprintf(r, cap, "Brightness:  %+d   (left/right)", g_pq_bright); break;
+        case 5: snprintf(r, cap, "Contrast:  %+d   (left/right)", g_pq_con); break;
+        default: snprintf(r, cap, "Saturation:  %+d   (left/right)", g_pq_sat); break;
+    }
+}
+/* A second A within this window resets the row -- every one of these has a natural default, and
+ * walking a value back by hand is tedious when you have overshot. */
+#define VIEW_DBL_MS 400
+static void view_reset_row(int i) {
+    switch (i) {
+        case 0: g_zoom = ZOOM_MIN; break;
+        case 2: g_conv = 0; break;
+        case 3: g_ghost = 0; break;
+        case 4: g_pq_bright = 0; g_pq_dirty = 1; g_pq_redo = 1; break;
+        case 5: g_pq_con = 0; g_pq_dirty = 1; g_pq_redo = 1; break;
+        case 6: g_pq_sat = 0; g_pq_dirty = 1; g_pq_redo = 1; break;
+        default: break;                                  /* row 1 is the preset, nothing to reset */
     }
 }
 static void view_render(void) {
@@ -1722,6 +1825,12 @@ static int view_input(u32 kd, u32 kh, touchPosition tp) {
            if (rep) g_view_rep = 0;
            else { g_view_rep++; if (g_view_rep > 8 && g_view_rep % 2 == 0) rep = held; } }
     if (t_row == 1) press = 1;                            /* the preset row activates on tap */
+    if (press && i != 1) {                                /* A twice in a row -> back to default */
+        static u64 last_ms = 0; static int last_row = -1;
+        u64 now = osGetTime();
+        if (last_row == i && now - last_ms < VIEW_DBL_MS) { view_reset_row(i); last_row = -1; return 0; }
+        last_ms = now; last_row = i;
+    }
     switch (i) {
         case 0: if (rep) { g_zoom += rep * 2 * sub_ramp(g_view_rep);
                            if (g_zoom < ZOOM_MIN) g_zoom = ZOOM_MIN;
@@ -1731,9 +1840,21 @@ static int view_input(u32 kd, u32 kh, touchPosition tp) {
         case 2: if (rep) { g_conv += rep;
                            if (g_conv < -CONV_MAX) g_conv = -CONV_MAX;
                            if (g_conv >  CONV_MAX) g_conv =  CONV_MAX; } break;
-        default: if (rep) { g_ghost += rep;
-                            if (g_ghost < 0) g_ghost = 0;
-                            if (g_ghost > GHOST_MAX) g_ghost = GHOST_MAX; } break;
+        case 3: if (rep) { g_ghost += rep;
+                           if (g_ghost < 0) g_ghost = 0;
+                           if (g_ghost > GHOST_MAX) g_ghost = GHOST_MAX; } break;
+        case 4: if (rep) { g_pq_bright += rep * 2;
+                           if (g_pq_bright < -PQ_BRIGHT_MAX) g_pq_bright = -PQ_BRIGHT_MAX;
+                           if (g_pq_bright >  PQ_BRIGHT_MAX) g_pq_bright =  PQ_BRIGHT_MAX;
+                           g_pq_dirty = 1; g_pq_redo = 1; } break;
+        case 5: if (rep) { g_pq_con += rep * 2;
+                           if (g_pq_con < -PQ_CON_MAX) g_pq_con = -PQ_CON_MAX;
+                           if (g_pq_con >  PQ_CON_MAX) g_pq_con =  PQ_CON_MAX;
+                           g_pq_dirty = 1; g_pq_redo = 1; } break;
+        default: if (rep) { g_pq_sat += rep * 5;
+                            if (g_pq_sat < -PQ_SAT_MAX) g_pq_sat = -PQ_SAT_MAX;
+                            if (g_pq_sat >  PQ_SAT_MAX) g_pq_sat =  PQ_SAT_MAX;
+                            g_pq_dirty = 1; g_pq_redo = 1; } break;
     }
     return 0;
 }
@@ -1752,17 +1873,30 @@ static void r3_mask_edges(int m, u32 col) {
  * disparity by screen POSITION, and depth needs it changed by distance in the scene.
  * Capped well below 0.5 (which would be flat 2D) because the opposite eye's copy shows as a
  * double edge, worst exactly where disparity is largest. Top of the slider = untouched. */
-/* Subtract a fraction of the opposite eye to counter the barrier's crosstalk. The tint darkens
- * the source to g_ghost% first, then REVERSE_SUBTRACT does dst = dst - src. The GPU clamps at
- * zero, which is the honest limit: where the subtraction would go below black it simply crushes.
- * The blend state is C2D's, so flush around it and put it back exactly as found. */
-static void r3_ghost_sub(C2D_Image img, float x, float y, float sc) {
+/* Crosstalk cancellation, properly: (own - k*other) / (1 - k).
+ * Subtracting alone is only HALF of it -- the two eyes are mostly the same picture, so
+ * own - k*other is roughly own*(1-k) across flat areas and the whole frame dims by k. The divide
+ * is what puts the level back, and it is a multiply by 1/(1-k), which factors into one extra
+ * draw: subtract g*other, then add g*own, with g = k/(1-k). Then
+ *     own + g*own - g*other  ==  own/(1-k) - k*other/(1-k)  ==  (own - k*other)/(1-k).
+ * Subtract BEFORE adding: in a bright area both eyes are high, so subtracting first keeps the
+ * intermediate below clipping and highlights survive. The GPU still clamps at zero, which is the
+ * honest limit of the technique -- where the correction wants to go below black, it crushes.
+ * The blend state belongs to C2D, so flush around it and put it back exactly as found. */
+static void r3_ghost(C2D_Image own, float ownx, C2D_Image other, float otherx, float y, float sc) {
+    float k = (float)g_ghost * 0.01f;
+    if (k <= 0.0f || k >= 0.5f) return;
+    float g = k / (1.0f - k);
     C2D_ImageTint t;
-    C2D_PlainImageTint(&t, C2D_Color32(0, 0, 0, 255), 1.0f - (float)g_ghost * 0.01f);
+    C2D_PlainImageTint(&t, C2D_Color32(0, 0, 0, 255), 1.0f - g);   /* -> g * texel */
     C2D_Flush();
     C3D_AlphaBlend(GPU_BLEND_REVERSE_SUBTRACT, GPU_BLEND_ADD, GPU_ONE, GPU_ONE,
                    GPU_SRC_ALPHA, GPU_ONE_MINUS_SRC_ALPHA);
-    C2D_DrawImageAt(img, x, y, 0, &t, sc, sc);
+    C2D_DrawImageAt(other, otherx, y, 0, &t, sc, sc);              /* dst -= g*other */
+    C2D_Flush();
+    C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_ONE, GPU_ONE,
+                   GPU_SRC_ALPHA, GPU_ONE_MINUS_SRC_ALPHA);
+    C2D_DrawImageAt(own, ownx, y, 0, &t, sc, sc);                  /* dst += g*own  -> level back */
     C2D_Flush();
     C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_SRC_ALPHA, GPU_ONE_MINUS_SRC_ALPHA,
                    GPU_SRC_ALPHA, GPU_ONE_MINUS_SRC_ALPHA);
@@ -1825,7 +1959,7 @@ static int submenu_hit(int px, int py, int n, int *side) {
 /* one frame of menu input; returns 1 when the whole menu should close (config persisted). */
 static int submenu_input(u32 kd, u32 kh, touchPosition tp, int is3d, const char *moviepath) {
     if (g_submenu == 3) {   /* VIEW screen: closes straight back to the film */
-        if (view_input(kd, kh, tp)) { subcfg_save(moviepath); g_submenu = 0; return 1; }
+        if (view_input(kd, kh, tp)) { subcfg_save(moviepath); pq_save(); g_submenu = 0; return 1; }
         return 0;
     }
     if (g_submenu == 2) {   /* SRT file picker (scrolls: SRT_VIS rows of up to SRT_MAX files) */
@@ -2596,6 +2730,11 @@ static float lb_fill_zoom(void) {
 static void r3_frame(float *z, float *ox, float *oy) {
     float sc = (float)g_zoom * 0.01f;
     if (sc < 1.0f) sc = 1.0f;
+    if (sc <= 1.0f) { *z = 1.0f; *ox = 0.0f; *oy = 0.0f; return; }   /* 100% = untouched, full stop:
+                                                                     * centring on measured content
+                                                                     * would nudge a film with
+                                                                     * uneven bars by a pixel or
+                                                                     * two even at 1:1 */
     float cx = SCR_W * 0.5f, cy = SCR_H * 0.5f;
     if (g_lb_have && g_lb_w > 0) {
         int cw = g_lb_w - g_lb_left - g_lb_right, ch = g_lb_h - g_lb_top - g_lb_bot;
@@ -3015,6 +3154,7 @@ static MoflexResult moflex_play_ring(const char *path) {
     /* services for the panel controls (same as the classic path): battery level + bottom-screen backlight */
     ptmuInit(); g_mcu_ok = R_SUCCEEDED(mcuHwcInit()); g_batt_pct = -1; g_batt_next = 0;
     g_lcd_ok = R_SUCCEEDED(gspLcdInit()); g_screen_off = 0;
+    pq_load();               /* picture settings are global, not per movie */
 
     /* grow the pair ring until the linear heap is nearly spent (reserve audio bank + GPU slack) */
     Tex3DS_SubTexture sub = { (u16)W, (u16)H, 0.0f, 1.0f, (float)W / GT_W, 1.0f - (float)H / GT_H };
@@ -3628,6 +3768,19 @@ static MoflexResult moflex_play_ring(const char *path) {
                 if (sub_valid) snprintf(last_sub, sizeof last_sub, "%s", cue);
             } else { sub_valid = 0; last_sub[0] = 0; }
             int b = (show >= 0) ? show : last_shown;
+            /* Picture settings act during the YUV->RGB conversion, so a frame already sitting in
+             * the ring keeps the old ones -- on a PAUSED frame nothing would change until
+             * playback resumed, which is exactly where you want to judge them. Re-convert the
+             * frame on screen. The worker is idle while paused, but take its lock anyway: Y2R has
+             * one conversion in flight at a time and it is the worker that normally owns it. */
+            if (g_pq_redo && show < 0 && b >= 0) {
+                g_pq_redo = 0;
+                WORKER_LOCK();
+                if (g_pq_dirty) { g_pq_dirty = 0; pq_apply(); }
+                if (s.fL) { g_y2r_start(s.fL, &r3_texL[b], W, H); g_y2r_wait(&r3_texL[b]); }
+                if (is3d && s.fR) { g_y2r_start(s.fR, &r3_texR[b], W, H); g_y2r_wait(&r3_texR[b]); }
+                WORKER_UNLOCK();
+            }
             /* a zoom overflows the target, which scissors it -- no bars to draw */
             float zm, zox, zoy; r3_frame(&zm, &zox, &zoy);
             /* one decision for the whole frame: stereo, or the left image in both eyes */
@@ -3644,14 +3797,14 @@ static MoflexResult moflex_play_ring(const char *path) {
             C2D_TargetClear(topL, black); C2D_SceneBegin(topL);
             C2D_DrawImageAt(r3_imgL[b], zox - cv, zoy, 0, NULL, zm, zm);
             if (mix > 0.0f) C2D_DrawImageAt(imR, zox + cv, zoy, 0, &mixt, zm, zm);
-            if (stereo && g_ghost) r3_ghost_sub(imR, zox + cv, zoy, zm);
+            if (stereo && g_ghost) r3_ghost(r3_imgL[b], zox - cv, imR, zox + cv, zoy, zm);
             r3_mask_edges(cmask, black);
             if (sub_valid) { if (sub_sys) r3_draw_sub(tsub, tsub_n, stereo ? -sdep : 0, subcol, subout);
                              else r3_draw_sub_tex(stereo ? -sdep : 0, SUB_TEX_SC[sub_step()]); }
             C2D_TargetClear(topR, black); C2D_SceneBegin(topR);
             C2D_DrawImageAt(imR, zox + cv, zoy, 0, NULL, zm, zm);
             if (mix > 0.0f) C2D_DrawImageAt(r3_imgL[b], zox - cv, zoy, 0, &mixt, zm, zm);
-            if (stereo && g_ghost) r3_ghost_sub(r3_imgL[b], zox - cv, zoy, zm);
+            if (stereo && g_ghost) r3_ghost(imR, zox + cv, r3_imgL[b], zox - cv, zoy, zm);
             r3_mask_edges(cmask, black);
             if (sub_valid) { if (sub_sys) r3_draw_sub(tsub, tsub_n, stereo ? sdep : 0, subcol, subout);
                              else r3_draw_sub_tex(stereo ? sdep : 0, SUB_TEX_SC[sub_step()]); }
@@ -4227,6 +4380,7 @@ static MoflexResult moflex_play_soft(const char *path) {
     int use_y2r = y2r_video_init(W, H);
 
     g_lcd_ok = R_SUCCEEDED(gspLcdInit()); g_screen_off = 0;
+    pq_load();               /* picture settings are global, not per movie */
     ptmuInit(); g_mcu_ok = R_SUCCEEDED(mcuHwcInit()); g_batt_pct = -1; g_batt_next = 0;
 
     int playing = 1;
