@@ -3773,7 +3773,10 @@ static MoflexResult moflex_play_ring(const char *path) {
              * playback resumed, which is exactly where you want to judge them. Re-convert the
              * frame on screen. The worker is idle while paused, but take its lock anyway: Y2R has
              * one conversion in flight at a time and it is the worker that normally owns it. */
-            if (g_pq_redo && show < 0 && b >= 0) {
+            /* GATE ON !playing, not on "no frame due": show < 0 is also true on a UI repaint
+             * between presents, and firing there converted the worker's LATEST frame into an
+             * already-queued ring slot -- wrong frame, wrong slot, visible as a glitch. */
+            if (g_pq_redo && !playing && s.paused && show < 0 && b >= 0) {
                 g_pq_redo = 0;
                 WORKER_LOCK();
                 if (g_pq_dirty) { g_pq_dirty = 0; pq_apply(); }
