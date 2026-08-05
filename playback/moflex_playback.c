@@ -112,6 +112,9 @@ static void resume_clear(const char *movie) {
 static int g_pq_bright = 0;    /* -32..+32 display levels, added to the Y2R output offsets */
 static int g_pq_con = 0;       /* -40..+40 percent on the luma coefficient */
 static int g_pq_sat = 0;       /* -100..+100 percent on the chroma coefficients */
+/* set on any change; the Y2R worker re-applies the coefficients between conversions (defined with
+ * the rest of the Y2R plumbing below, declared here so the software VIEW menu can raise it) */
+extern volatile int g_pq_dirty;
 #define PQ_BRIGHT_MAX 32
 #define PQ_CON_MAX 40
 #define PQ_SAT_MAX 100
@@ -1291,6 +1294,73 @@ static void sub_position_menu(void) {
         gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
     }
 }
+/* ---- VIEW for the SOFTWARE paths (2D / classic) ----
+ * The citro2d VIEW screen belongs to the ring engine; the classic path has no citro2d at all, so
+ * this is a blocking software-UI menu in the same style as its CC button.
+ * Only the rows that MEAN something here: brightness/contrast/saturation are Y2R coefficients and
+ * cost nothing on any path. Zoom is absent because Y2R writes the rotated frame straight into the
+ * framebuffer with no scaling stage -- adding one is a whole extra pass per frame. Convergence and
+ * ghost are absent because they are stereo-only. */
+#define VSW_ROWS 3
+static void view_menu_sw(void) {
+    int sel = 0, hrep = 0;
+    u64 dbl_ms = 0; int dbl_row = -1;
+    pq_load();
+    while (aptMainLoop()) {
+        hidScanInput();
+        u32 k = hidKeysDown(), kh = hidKeysHeld();
+        if (k & (KEY_B | KEY_SELECT)) break;
+        if (k & KEY_DOWN) sel = (sel + 1) % VSW_ROWS;
+        if (k & KEY_UP)   sel = (sel + VSW_ROWS - 1) % VSW_ROWS;
+        int lr = (kh & KEY_RIGHT) ? 1 : (kh & KEY_LEFT) ? -1 : 0;
+        touchPosition tp; hidTouchRead(&tp);
+        int top = 54, step = 34, bh = 28;
+        if (k & KEY_TOUCH) {                              /* tap a row's half to step it */
+            for (int i = 0; i < VSW_ROWS; i++)
+                if (tp.py >= top + i * step && tp.py < top + i * step + bh && tp.px >= 18 && tp.px < UI_W - 18) {
+                    sel = i; lr = tp.px < UI_W / 2 ? -1 : 1; hrep = 0; break;
+                }
+        }
+        if (!lr) hrep = 0;
+        else { int fire = (k & (KEY_LEFT | KEY_RIGHT | KEY_TOUCH)) ? 1 : 0;
+               int mul = 1;
+               if (!fire) { hrep++; if (hrep > 8 && hrep % 2 == 0) { fire = 1; mul = sub_ramp(hrep); } }
+               if (fire) {
+                   if (sel == 0) { g_pq_bright += lr * 2 * mul;
+                                   if (g_pq_bright < -PQ_BRIGHT_MAX) g_pq_bright = -PQ_BRIGHT_MAX;
+                                   if (g_pq_bright >  PQ_BRIGHT_MAX) g_pq_bright =  PQ_BRIGHT_MAX; }
+                   else if (sel == 1) { g_pq_con += lr * 2 * mul;
+                                   if (g_pq_con < -PQ_CON_MAX) g_pq_con = -PQ_CON_MAX;
+                                   if (g_pq_con >  PQ_CON_MAX) g_pq_con =  PQ_CON_MAX; }
+                   else { g_pq_sat += lr * 5 * mul;
+                                   if (g_pq_sat < -PQ_SAT_MAX) g_pq_sat = -PQ_SAT_MAX;
+                                   if (g_pq_sat >  PQ_SAT_MAX) g_pq_sat =  PQ_SAT_MAX; }
+                   g_pq_dirty = 1;
+               } }
+        if (k & KEY_A) {                                  /* A twice on a row -> its default */
+            u64 now = osGetTime();
+            if (dbl_row == sel && now - dbl_ms < 400) {
+                if (sel == 0) g_pq_bright = 0; else if (sel == 1) g_pq_con = 0; else g_pq_sat = 0;
+                g_pq_dirty = 1; dbl_row = -1;
+            } else { dbl_ms = now; dbl_row = sel; }
+        }
+        char r0[40], r1[40], r2[40];
+        snprintf(r0, sizeof r0, "Brightness:  %+d", g_pq_bright);
+        snprintf(r1, sizeof r1, "Contrast:  %+d", g_pq_con);
+        snprintf(r2, sizeof r2, "Saturation:  %+d", g_pq_sat);
+        const char *rows[VSW_ROWS] = { r0, r1, r2 };
+        ui_begin(GFX_BOTTOM);
+        ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
+        ui_text_center(UI_W / 2, 16, 2, UI_NEON, "VIEW");
+        for (int i = 0; i < VSW_ROWS; i++)
+            ui_button(18, top + i * step, UI_W - 36, bh, rows[i], i == sel, UI_NEONC);
+        ui_text_center(UI_W / 2, 176, 1, UI_DIM, "left/right adjust   A A resets");
+        ui_text(8, 226, 1, UI_DIM, "B - back");
+        ui_present();
+        gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
+    }
+    pq_save();
+}
 /* subtitle timing offset, in 0.25s steps (for lip-sync fine-tuning) */
 static void sub_offset_menu(void) {
     int hrep = 0;
@@ -1436,7 +1506,7 @@ static int g_y2r_up = 0;   /* y2rInit succeeded: guards every Y2RU call AND the 
  * The base set is READ BACK from the standard coefficient rather than hardcoded, so this tracks
  * whatever conversion params the player asks for. */
 static Y2RU_ColorCoefficients g_y2r_base; static int g_y2r_base_ok = 0;
-static volatile int g_pq_dirty = 1;
+volatile int g_pq_dirty = 1;
 /* Brightness/contrast/saturation happen during the YUV->RGB CONVERSION, not the draw, so on a
  * paused frame the texture is already converted and nothing changes until playback resumes --
  * which makes them impossible to judge where you most want to. This asks the present loop to
@@ -1765,9 +1835,14 @@ static int submenu_hit(int px, int py, int n, int *side);   /* row hit test, def
  * Zoom, convergence and ghost are display settings, not subtitle ones. A submenu STATE rather
  * than a modal loop, so the film keeps playing above while you judge each change -- framing or
  * convergence against a frozen frame is guesswork. Rows reuse the CC menu's layout + hit test. */
-#define VIEW_ROWS 7
+/* Convergence and ghost are stereo-only: on a 2D file the list stops before them. */
+#define VIEW_ROWS_3D 7
+#define VIEW_ROWS_2D 5         /* Zoom, Fill, Brightness, Contrast, Saturation */
+static int g_view_is3d = 1;
+#define VIEW_ROWS (g_view_is3d ? VIEW_ROWS_3D : VIEW_ROWS_2D)
 static int g_view_sel = 0, g_view_rep = 0;
 static void view_label(int i, char *r, int cap) {
+    if (!g_view_is3d && i >= 2) i += 2;   /* 2D: skip convergence + ghost */
     switch (i) {
         case 0: snprintf(r, cap, "Zoom:  %d%%   (left/right)", g_zoom); break;
         case 1: { int z = (int)(lb_fill_zoom() * 100.0f + 0.5f);
@@ -1815,6 +1890,7 @@ static int view_input(u32 kd, u32 kh, touchPosition tp) {
     int t_side = 0, t_row = (kd & KEY_TOUCH) ? submenu_hit(tp.px, tp.py, VIEW_ROWS, &t_side) : -1;
     if (t_row >= 0) g_view_sel = t_row;
     int i = g_view_sel;
+    if (!g_view_is3d && i >= 2) i += 2;   /* same remap as the labels */
     int press = (kd & KEY_A) ? 1 : 0;
     int held = (kh & KEY_RIGHT) ? 1 : (kh & KEY_LEFT) ? -1 : 0;
     int th_side = 0, th_row = (kh & KEY_TOUCH) ? submenu_hit(tp.px, tp.py, VIEW_ROWS, &th_side) : -1;
@@ -3418,7 +3494,7 @@ static MoflexResult moflex_play_ring(const char *path) {
             } else if (px >= CC_X && px < CC_X + CC_W && py >= CC_Y && py < CC_Y + CC_H) {
                 g_submenu = 1; g_sub_sel = 0; dirty = 1;   /* CC: open the subtitle options menu */
             } else if (px >= ZM_X && px < ZM_X + ZM_W && py >= ZM_Y && py < ZM_Y + ZM_H) {
-                g_submenu = 3; g_view_sel = 0; dirty = 1;   /* VIEW: video keeps playing above it */
+                g_submenu = 3; g_view_sel = 0; g_view_is3d = is3d; dirty = 1;   /* VIEW: film plays on */
             } else if (g_lcd_ok && px >= DIM_X && px < DIM_X + DIM_W && py >= DIM_Y && py < DIM_Y + DIM_H) {
                 g_screen_off = 1; dirty = 1;   /* moon: darken (a button or touch wakes it; reconcile handles backlight) */
             } else if (g_hq_avail && px >= HQ_X && px < HQ_X + HQ_W && py >= HQ_Y && py < HQ_Y + HQ_H) {
@@ -4136,6 +4212,12 @@ static MoflexResult moflex_play_classic(const char *path) {
             } else if (kd & KEY_TOUCH) {
                 if (g_lcd_ok && px >= DIM_X && px < DIM_X + DIM_W && py >= DIM_Y && py < DIM_Y + DIM_H) {
                     GSPLCD_PowerOffBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 1;   /* dark until any button press */
+                } else if (px >= ZM_X && px < ZM_X + ZM_W && py >= ZM_Y && py < ZM_Y + ZM_H) {
+                    if (have_audio) ndspChnSetPaused(0, true);      /* VIEW: picture settings */
+                    view_menu_sw();
+                    if (have_audio) ndspChnSetPaused(0, !playing);
+                    dirty = 1;
+                    if (!playing) { want_seek = 1; seek_to_us = cur_us; }   /* re-convert the held frame */
                 } else if (px >= CC_X && px < CC_X + CC_W && py >= CC_Y && py < CC_Y + CC_H) {   /* CC: subtitle options */
                     if (have_audio) ndspChnSetPaused(0, true);
                     sub_menu(path, is3d);
@@ -4443,6 +4525,11 @@ static MoflexResult moflex_play_soft(const char *path) {
             } else if (kd & KEY_TOUCH) {
                 if (g_lcd_ok && px >= DIM_X && px < DIM_X + DIM_W && py >= DIM_Y && py < DIM_Y + DIM_H) {
                     GSPLCD_PowerOffBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 1;
+                } else if (px >= ZM_X && px < ZM_X + ZM_W && py >= ZM_Y && py < ZM_Y + ZM_H) {
+                    if (have_audio) ndspChnSetPaused(0, true);      /* VIEW: picture settings */
+                    view_menu_sw();
+                    if (have_audio) ndspChnSetPaused(0, !playing); dirty = 1;
+                    if (!playing) { want_seek = 1; seek_to_us = cur_us; }
                 } else if (px >= CC_X && px < CC_X + CC_W && py >= CC_Y && py < CC_Y + CC_H) {
                     if (have_audio) ndspChnSetPaused(0, true); sub_menu(path, is3d);
                     if (have_audio) ndspChnSetPaused(0, !playing); dirty = 1;
@@ -4609,10 +4696,18 @@ MoflexResult moflex_play(const char *path) {
      * clock) -- my simplified drop overshoots audio and freezes. Flip to 1 to A/B the ring. */
     #define RING_3D_ENABLE 1
 #if RING_3D_ENABLE
-    if (is3d) {                                           /* Both consoles use the RING now: New-3DS threaded,
-                                                           * Old-3DS inline (banking + avtest's no-flush catch-up
-                                                           * + display elision). Falls back to classic if the
-                                                           * ring can't allocate its buffers. */
+    /* 3D always takes the ring. 2D takes it on NEW-3DS ONLY, for the VIEW controls that live
+     * there (zoom in particular -- the classic path has Y2R write the rotated frame straight to
+     * the framebuffer with no stage to scale in).
+     * Old-3DS 2D deliberately stays on classic: the ring's final step is the GPU drawing the
+     * texture into the framebuffer, a whole extra read+write of every frame, and that console is
+     * memory-bandwidth-bound -- the same reason threading its decode made things WORSE (d52->d91).
+     * Nothing about 2D playback needs the ring, so Old-3DS keeps the path already proven on it. */
+    int use_ring = is3d;
+    if (!use_ring) { bool isnew = false; APT_CheckNew3DS(&isnew); use_ring = isnew; }
+    if (use_ring) {                                       /* New-3DS threaded, Old-3DS inline.
+                                                           * Falls back to classic if the ring
+                                                           * can't allocate its buffers. */
         for (;;) {
             MoflexResult r = moflex_play_ring(path);
             if (r == MOFLEX_REPLAY) continue;   /* HQ toggled -> re-open in the new color depth (resumes in place) */
