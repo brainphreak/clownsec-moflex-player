@@ -685,6 +685,7 @@ static void trailer_probe(FILE *f) {
 
 /* Copy embedded subtitle track k to the scratch file (fresh handle: the demuxer owns f). */
 static int g_trsub_sel = 0;
+#define EMB_SRT "sdmc:/moflex_player/.embedded.srt"
 static int trsub_stash(const char *path, int k) {
     if (k < 0 || k >= g_tra.sub_n) return 0;
     FILE *sf = fopen(path, "rb");
@@ -694,7 +695,7 @@ static int trsub_stash(const char *path, int k) {
     if (buf && !fseeko(sf, g_tra.sub_off[k], SEEK_SET) &&
         fread(buf, 1, g_tra.sub_len[k], sf) == g_tra.sub_len[k]) {
         mkdir("sdmc:/moflex_player", 0777);
-        FILE *o = fopen("sdmc:/moflex_player/.embedded.srt", "wb");
+        FILE *o = fopen(EMB_SRT, "wb");
         if (o) { fwrite(buf, 1, g_tra.sub_len[k], o); fclose(o); ok = 1; }
     }
     free(buf); fclose(sf);
@@ -774,6 +775,14 @@ static void subs_autoload(const char *moviepath) {
     subcfg_load(moviepath);   /* this movie's saved settings (else keep last-used) */
     if (g_sub_file[0]) {      /* the exact track they were watching with -- keeps their on/off choice */
         char want[512]; snprintf(want, sizeof want, "%s", g_sub_file);   /* subs_load() rewrites g_sub_file */
+        /* The embedded stash is a CACHE at a FIXED path. Rebuilding a movie rewrites the
+         * subtitles inside it but never touches that file, so loading it blind replays the
+         * subtitles the movie had the FIRST time it was opened -- re-timed subtitles looked like
+         * they were being ignored, because they were. Re-extract before trusting it. */
+        if (!strcmp(want, EMB_SRT) && g_tra.sub_n > 0) {
+            if (g_trsub_sel < 0 || g_trsub_sel >= g_tra.sub_n) g_trsub_sel = 0;
+            trsub_stash(moviepath, g_trsub_sel);
+        }
         if (subs_load(want)) return;
         g_sub_file[0] = 0;    /* the saved track is gone -> fall through to the sidecar search */
     }
@@ -2105,7 +2114,7 @@ static int submenu_input(u32 kd, u32 kh, touchPosition tp, int is3d, const char 
         case 8: if (press && g_tra.sub_n > 1) {
                     g_trsub_sel = (g_trsub_sel + g_tra.sub_n + (press < 0 ? -1 : 1)) % g_tra.sub_n;
                     if (trsub_stash(moviepath, g_trsub_sel)) {
-                        subs_load("sdmc:/moflex_player/.embedded.srt");
+                        subs_load(EMB_SRT);
                         g_sub_on = 1;   /* picking a language implies wanting it shown */
                     }
                 } break;
@@ -3172,8 +3181,8 @@ static MoflexResult moflex_play_ring(const char *path) {
     subs_autoload(path);
     if (g_trsub_sel < 0 || g_trsub_sel >= g_tra.sub_n) g_trsub_sel = 0;
     if (g_nsubs == 0) {                                  /* sidecars win over embedded */
-        if (g_tra.sub_n > 0) { if (trsub_stash(path, g_trsub_sel)) subs_load("sdmc:/moflex_player/.embedded.srt"); }
-        else if (g_emb_sub_found) subs_load("sdmc:/moflex_player/.embedded.srt");
+        if (g_tra.sub_n > 0) { if (trsub_stash(path, g_trsub_sel)) subs_load(EMB_SRT); }
+        else if (g_emb_sub_found) subs_load(EMB_SRT);
     }
 
     /* CLEAN gfx re-init, exactly like the standalone avtest that renders smoothly on Old 3DS. The app
@@ -4092,7 +4101,7 @@ static MoflexResult moflex_play_classic(const char *path) {
     subs_autoload(path);   /* load a matching .srt (sidecar or moviedata/) if one exists */
     if (g_nsubs == 0 && g_tra.present && g_tra.sub_n > 0) {   /* trailer subtitles (SUPER MOFLEX) */
         if (g_trsub_sel < 0 || g_trsub_sel >= g_tra.sub_n) g_trsub_sel = 0;
-        if (trsub_stash(path, g_trsub_sel)) subs_load("sdmc:/moflex_player/.embedded.srt");
+        if (trsub_stash(path, g_trsub_sel)) subs_load(EMB_SRT);
     }
 
     /* audio */
