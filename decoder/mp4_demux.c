@@ -73,7 +73,11 @@ static void parse_stsd_mem(const uint8_t *b, int64_t body, int64_t bend, Trak *t
          * width=height=avcc_len=0, which then went into mvdstdInit() and crashed. */
         if (fmt == BOX('h','v','c','1') || fmt == BOX('h','e','v','1') ||
             fmt == BOX('a','v','0','1') || fmt == BOX('m','p','4','v') ||
-            fmt == BOX('v','p','0','9') || fmt == BOX('V','P','9','0')) {
+            fmt == BOX('v','p','0','9') || fmt == BOX('V','P','9','0') ||
+            /* Dolby Vision ships as HEVC under its own labels, and a VP8 track would fall
+             * through to "no video track" -- both are the same "we cannot decode this" answer */
+            fmt == BOX('d','v','h','1') || fmt == BOX('d','v','h','e') ||
+            fmt == BOX('v','p','0','8')) {
             t->is_video = 1; t->vfourcc = fmt;              /* known video, unsupported codec */
             if (pos + 8 + 28 <= bend) { t->width = mu16(b + pos + 8 + 24); t->height = mu16(b + pos + 8 + 26); }
         }

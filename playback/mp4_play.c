@@ -354,6 +354,36 @@ MoflexResult mp4_play(const char *path) {
         mp4_msg("Video stream is not valid H.264\n(mislabeled file?). Re-encode\nwith x264 (H.264/AVC).");
         mp4_close(&m); return MOFLEX_QUIT_BACK;
     }
+    /* PROFILE. MVD is 8-bit 4:2:0 only, and nothing above checks for that. A 10-bit encode --
+     * which is what you get by transcoding a 10-bit HEVC source without forcing the pixel
+     * format -- is High 10, passes every test above, initialises the hardware happily, and then
+     * NEVER RETURNS A PICTURE. On screen that is a frozen frame whose timeline still moves when
+     * you seek, which tells the user nothing. Name the reason instead.
+     * avcC byte 1 is AVCProfileIndication. */
+    {
+        int prof = m.avcc[1];
+        if (prof != 66 && prof != 77 && prof != 88 && prof != 100) {
+            const char *what;
+            switch (prof) {
+                case 110: what = "10-bit (High 10)";      break;
+                case 122: what = "4:2:2 (High 4:2:2)";    break;
+                case 244: what = "4:4:4 (High 4:4:4)";    break;
+                case 44:  what = "CAVLC 4:4:4 Intra";     break;
+                default:  what = NULL;                    break;
+            }
+            char msg[160];
+            if (what)
+                snprintf(msg, sizeof msg,
+                         "This is %s H.264.\nThe 3DS decoder is 8-bit 4:2:0 only.\n"
+                         "Re-encode with -pix_fmt yuv420p", what);
+            else
+                snprintf(msg, sizeof msg,
+                         "H.264 profile %d is not supported\n(8-bit 4:2:0 only). Re-encode with\n"
+                         "-profile:v high -pix_fmt yuv420p", prof);
+            mp4_msg(msg);
+            mp4_close(&m); return MOFLEX_QUIT_BACK;
+        }
+    }
     /* ANY resolution the hardware can decode is accepted -- the present step aspect-fits each
      * frame (or each SBS half) into the 400x240 screen, so 480p/720p/1080p files just work.
      * Only refuse what MVD itself cannot do (H.264 level 4.x frame limit). */
