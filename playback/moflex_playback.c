@@ -39,6 +39,8 @@ static int   g_lock_toast = 0;   /* frames left to show the "touch locked" toast
 static int   g_backlight_on = 1; /* actual bottom backlight state (reconciled from g_screen_off + toast) */
 static int   g_hq = 0;           /* Old-3DS: 24-bit HQ color on? default OFF (fast 16-bit); HQ button toggles */
 static int   g_hq_avail = 0;     /* HQ button shown this playback? (Old-3DS only -- New-3DS is always 24-bit) */
+static int   g_autolvl = 0;      /* 0 = off, 1 = LOW, 2 = HIGH (see al_update) -- global pref */
+static void  al_reset(void);     /* defined with the leveller, used by the SOUND menu above it */
 static int   g_hq_loaded = 0;    /* g_hq loaded from disk once */
 
 /* ---- battery indicator (player panel) ---- */
@@ -121,8 +123,9 @@ extern volatile int g_pq_dirty;
 #define PQ_FILE "sdmc:/moflex_player/picture.cfg"
 static void pq_load(void) {
     FILE *f = fopen(PQ_FILE, "rb"); if (!f) return;
-    int b = 0, c = 0, sa = 0;
+    int b = 0, c = 0, sa = 0, al = 0;
     if (fscanf(f, "%d %d %d", &b, &c, &sa) == 3) {
+        if (fscanf(f, "%d", &al) == 1 && al >= 0 && al <= 2) g_autolvl = al;
         if (b >= -PQ_BRIGHT_MAX && b <= PQ_BRIGHT_MAX) g_pq_bright = b;
         if (c >= -PQ_CON_MAX && c <= PQ_CON_MAX) g_pq_con = c;
         if (sa >= -PQ_SAT_MAX && sa <= PQ_SAT_MAX) g_pq_sat = sa;
@@ -132,7 +135,7 @@ static void pq_load(void) {
 static void pq_save(void) {
     mkdir("sdmc:/moflex_player", 0777);
     FILE *f = fopen(PQ_FILE, "wb"); if (!f) return;
-    fprintf(f, "%d %d %d\n", g_pq_bright, g_pq_con, g_pq_sat);
+    fprintf(f, "%d %d %d %d\n", g_pq_bright, g_pq_con, g_pq_sat, g_autolvl);
     fclose(f);
 }
 #define HQ_FILE "sdmc:/moflex_player/hq.cfg"
@@ -384,8 +387,15 @@ static void bw_exit(void) {
 #define AUD_H 28
 /* ZOOM (framing) -- below AUDIO on the left, mirroring DIM below CC. Framing is not a subtitle
  * setting, so it gets its own button rather than a row in the CC menu. */
+/* Row 3 (y=172). VIEW used to sit at y=138, directly on top of the Old-3DS HQ button -- both
+ * were drawn, so on that console they overlapped. The extras get their own row. */
 #define ZM_X 8
-#define ZM_Y 138   /* "VIEW": zoom, convergence, ghost -- none of them subtitle settings */
+#define ZM_Y 172   /* "VIEW": zoom, convergence, ghost -- none of them subtitle settings */
+/* LVL: automatic loudness levelling, mirroring VIEW on the right, under the moon */
+#define AL_X 244
+#define AL_Y 172
+#define AL_W 48
+#define AL_H 28
 #define ZM_W 48
 #define ZM_H 28
 /* DIM (bottom-screen-off) button -- below CC */
@@ -1106,19 +1116,24 @@ static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing)
     ui_button(CC_X, CC_Y, CC_W, CC_H, "CC", g_sub_on, g_sub_on ? UI_NEON : UI_DIM);
     /* dual audio: tap SELECTS the language (not a toggle -> never glow). A music note before
      * the code makes it unmistakably audio, distinct from CC subtitles. */
-    if (g_atrk_n > 1) {
-        const char *al = (g_atrk_sel < 4 && g_atrk_lbl[g_atrk_sel][0]) ? g_atrk_lbl[g_atrk_sel] : "A?";
+    {
+        /* SOUND: was a dual-audio-only language cycler. It is now the door to everything audio --
+         * track, levelling, whatever comes next -- so it is always present, and shows the current
+         * language when there is a choice to make. */
+        const char *al = (g_atrk_n > 1 && g_atrk_sel < 4 && g_atrk_lbl[g_atrk_sel][0])
+                         ? g_atrk_lbl[g_atrk_sel] : "";
         ui_button(AUD_X, AUD_Y, AUD_W, AUD_H, "", 0, UI_NEONC);   /* plain box, constant look */
         u16 nc = UI_RGB(120, 210, 255);                          /* bright note, not the box grey */
         const int NOTE_W = 9, GAP = 4;
-        int tw = ui_text_w(1, al), total = NOTE_W + GAP + tw;
+        int tw = al[0] ? ui_text_w(1, al) : 0;
+        int total = NOTE_W + (tw ? GAP + tw : 0);
         int sx = AUD_X + (AUD_W - total) / 2, cy = AUD_Y + AUD_H / 2;
         /* eighth note: filled slanted head bottom-left, tall stem, small flag at the top */
         ui_fill_round(sx, cy + 2, 6, 5, 2, nc);                  /* note head (oval) */
         ui_fill(sx + 5, cy - 7, 2, 11, nc);                     /* stem up the right of the head */
         ui_fill(sx + 5, cy - 7, 5, 2, nc);                     /* flag top */
         ui_fill(sx + 8, cy - 7, 2, 4, nc);                     /* flag curl */
-        ui_text(sx + NOTE_W + GAP, cy - 4, 1, UI_NEONC, al);
+        if (al[0]) ui_text(sx + NOTE_W + GAP, cy - 4, 1, UI_NEONC, al);
     }
     /* VIEW: opens the picture settings. NOT a toggle, so it never glows -- a glow on this row
      * means "on", and there is nothing here to be on. */
@@ -1753,7 +1768,7 @@ static int g_panel_force = 1;   /* force a re-render next time (first frame, wak
 static void g_panel_sw(C3D_RenderTarget *bot, const char *title, int64_t cur, int64_t dur, int playing) {
     if (!ui_tex_init()) return;
     static int64_t l_sec = -1; static int l_bar = -1, l_play = -1, l_vol = -1, l_batt = -2, l_zm = -1;
-    int vw = g_zoom * 1000 + (g_conv + CONV_MAX) * 32 + g_ghost;   /* any VIEW change repaints */
+    int vw = g_zoom * 1000 + (g_conv + CONV_MAX) * 32 + g_ghost + (g_autolvl ? 1 << 20 : 0);   /* any VIEW change repaints */
     int sec = (int)(cur / 1000000);
     int bar = dur > 0 ? (int)((double)BAR_W * (double)cur / (double)dur) : 0;
     int vol = (int)(g_vol * 100 + 0.5f);
@@ -2007,10 +2022,71 @@ static float r3_mix(int stereo) {
     if (sl > 1.0f) sl = 1.0f;
     return (1.0f - sl) * R3_MIX_MAX;
 }
+/* ---- SOUND screen (the note button on the panel) ----
+ * Audio track selection used to be a bare cycle-on-tap with no affordance for anything else.
+ * Everything to do with sound now lives behind one button. */
+#define SND_ROWS_MAX 2
+static int g_snd_sel = 0;
+static int snd_rows(int *act) {
+    int n = 0;
+    if (g_atrk_n > 1) act[n++] = 0;          /* language: only when the file has a choice */
+    act[n++] = 1;                            /* auto level */
+    return n;
+}
+static void snd_label(int a, char *r, int cap) {
+    if (a == 0) {
+        const char *l = (g_atrk_sel < 4 && g_atrk_lbl[g_atrk_sel][0]) ? g_atrk_lbl[g_atrk_sel] : "A?";
+        snprintf(r, cap, "Language:  %s  (%d/%d)", l, g_atrk_sel + 1, g_atrk_n);
+    } else {
+        static const char *N[3] = { "OFF", "LOW", "HIGH" };
+        snprintf(r, cap, "Auto level:  %s", N[g_autolvl < 0 || g_autolvl > 2 ? 0 : g_autolvl]);
+    }
+}
+static void snd_render(void) {
+    int act[SND_ROWS_MAX]; int n = snd_rows(act);
+    int top, step, bh; submenu_layout(n, &top, &step, &bh);
+    ui_begin(GFX_BOTTOM);
+    ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
+    ui_text_center(UI_W / 2, 14, 2, UI_NEON, "SOUND");
+    for (int i = 0; i < n; i++) {
+        char r[44]; snd_label(act[i], r, sizeof r);
+        ui_button(18, top + i * step, UI_W - 36, bh, r, i == g_snd_sel, UI_NEONC);
+    }
+    ui_text_center(UI_W / 2, 200, 1, UI_DIM,
+                   g_autolvl == 2 ? "HIGH: loudest, but flattens quiet and loud together"
+                 : g_autolvl == 1 ? "LOW: audible on the 3DS, keeps more of the dynamics"
+                                  : "Auto level lifts quiet films without clipping the loud parts");
+    ui_text(8, 226, 1, UI_DIM, "B - back");
+}
+/* One frame of SOUND input. Returns 1 when the screen should close. */
+static int snd_input(u32 kd, u32 kh, touchPosition tp) {
+    int act[SND_ROWS_MAX]; int n = snd_rows(act);
+    if (g_snd_sel >= n) g_snd_sel = n - 1;
+    if (g_snd_sel < 0) g_snd_sel = 0;
+    if (kd & (KEY_B | KEY_SELECT)) return 1;
+    if (kd & KEY_DOWN) g_snd_sel = (g_snd_sel + 1) % n;
+    if (kd & KEY_UP)   g_snd_sel = (g_snd_sel + n - 1) % n;
+    int side = 0, row = (kd & KEY_TOUCH) ? submenu_hit(tp.px, tp.py, n, &side) : -1;
+    if (row >= 0) g_snd_sel = row;
+    int press = (kd & (KEY_A | KEY_LEFT | KEY_RIGHT)) ? 1 : (row >= 0 ? 1 : 0);
+    if (!press) return 0;
+    int dir = (kd & KEY_LEFT) ? -1 : 1;
+    if (act[g_snd_sel] == 0) {
+        if (g_atrk_n > 1) {
+            g_atrk_sel = (g_atrk_sel + g_atrk_n + dir) % g_atrk_n;
+            g_atrk_apply = 1;                    /* the loop swaps the source in place */
+        }
+    } else {
+        g_autolvl = (g_autolvl + 3 + dir) % 3;   /* off -> low -> high, and back with LEFT */
+        al_reset();                              /* start from unity, not mid-ramp */
+        pq_save();
+    }
+    return 0;
+}
 static void g_submenu_sw(C3D_RenderTarget *bot, int is3d) {
     if (!ui_tex_init()) return;
     ui_capture(1);
-    if (g_submenu == 3) view_render(); else if (g_submenu == 2) srtpicker_render(); else submenu_render(is3d);
+    if (g_submenu == 4) snd_render(); else if (g_submenu == 3) view_render(); else if (g_submenu == 2) srtpicker_render(); else submenu_render(is3d);
     ui_tex_present(bot);
 }
 /* dark bottom screen: pure black -- with ONLY the lock toast when it flashes on (never the panel) */
@@ -2043,6 +2119,10 @@ static int submenu_hit(int px, int py, int n, int *side) {
 }
 /* one frame of menu input; returns 1 when the whole menu should close (config persisted). */
 static int submenu_input(u32 kd, u32 kh, touchPosition tp, int is3d, const char *moviepath) {
+    if (g_submenu == 4) {   /* SOUND screen */
+        if (snd_input(kd, kh, tp)) { subcfg_save(moviepath); g_submenu = 0; return 1; }
+        return 0;
+    }
     if (g_submenu == 3) {   /* VIEW screen: closes straight back to the film */
         if (view_input(kd, kh, tp)) { subcfg_save(moviepath); pq_save(); g_submenu = 0; return 1; }
         return 0;
@@ -2566,6 +2646,53 @@ static void r3_audio_poll(void) {
     else if (r3_apos > audio + 100000)   r3_apos -= (r3_apos - audio - 100000) / 8;      /* too far ahead -> ease back */
 }
 /* buffer one audio packet. 1 = consumed, 0 = no free wavebuf (hold the packet and retry). */
+/* ---- automatic loudness levelling ----
+ * Films are mastered for a cinema, not a handheld. Measured across this library they sit near
+ * -27 LUFS -- roughly 10 dB under what a small speaker needs -- which is why even 400% volume is
+ * not enough on a quiet film. A fixed boost cannot fix that: some films are already loud and
+ * would only clip. So follow the signal instead. Raise quiet material toward a target, leave
+ * loud material alone, and LIMIT what is left rather than clamping it, so peaks bend instead of
+ * turning into square waves.
+ * Cheap by construction: the level is tracked once per PACKET (~23 ms), and only the gain
+ * multiply and a rarely-taken soft-limit branch run per sample -- the same loop that already
+ * applies g_vol. */
+/* Two strengths, because levelling trades loudness against dynamics and the right point differs
+ * per film and per room. Measured on Avatar S01E01 (-26.6 LUFS, 13.7 LU as authored):
+ *   LOW   -> -19.5 LUFS, 5.2 LU   (+3.4 dB) -- audible on the 3DS, keeps some light and shade
+ *   HIGH  -> -15.5 LUFS, 3.9 LU   (+7.4 dB) -- loudest, noticeably flatter
+ * Neither clips: peaks are bent by al_soft() rather than squared off. */
+static const float AL_TARGET_[3]  = { 0.0f, 2200.0f, 3400.0f };
+static const float AL_MAXGAIN_[3] = { 1.0f,    3.0f,    8.0f };
+#define AL_TARGET   AL_TARGET_[g_autolvl]
+#define AL_MAXGAIN  AL_MAXGAIN_[g_autolvl]
+#define AL_GATE     120.0f             /* below this the packet is silence -- hold, do not chase */
+#define AL_KNEE     26000              /* soft-limit above here */
+static float al_env = 0.0f, al_gain = 1.0f;
+static void al_reset(void) { al_env = 0.0f; al_gain = 1.0f; }
+static inline int al_soft(int v) {
+    int a = v < 0 ? -v : v;
+    if (a <= AL_KNEE) return v;
+    /* hyperbolic knee: approaches 32767 without ever crossing it, one divide per loud sample */
+    int d = a - AL_KNEE, span = 32767 - AL_KNEE;
+    int y = AL_KNEE + (int)((float)span * d / (float)(d + span));
+    return v < 0 ? -y : y;
+}
+static float al_update(const int16_t *s, int ns) {
+    double sq = 0.0;
+    for (int i = 0; i < ns; i += 4) sq += (double)s[i] * s[i];   /* every 4th sample is plenty */
+    float rms = (float)sqrt(sq / ((ns + 3) / 4));
+    al_env = al_env <= 0.0f ? rms : al_env * 0.90f + rms * 0.10f;
+    float want = al_gain;
+    if (al_env > AL_GATE) {
+        want = AL_TARGET / al_env;
+        if (want > AL_MAXGAIN) want = AL_MAXGAIN;
+        if (want < 1.0f) want = 1.0f;              /* never turn a loud film DOWN */
+    }
+    /* down fast (a loud scene must not clip while the gain catches up), up slowly (a boost that
+     * chases every pause is audible as breathing) */
+    al_gain += (want < al_gain) ? (want - al_gain) * 0.25f : (want - al_gain) * 0.02f;
+    return al_gain;
+}
 static int r3_audio_feed_raw(const uint8_t *data, int size) {
     if (!r3_aok) return 1;
     ndspWaveBuf *w = &r3_wb[r3_awi];
@@ -2573,8 +2700,16 @@ static int r3_audio_feed_raw(const uint8_t *data, int size) {
     if (w->status == NDSP_WBUF_DONE && !r3_acnt[r3_awi] && w->nsamples > 0) { r3_aplayed += w->nsamples; r3_acnt[r3_awi] = 1; }
     int fr = adpcm_moflex_decode(data, size, r3_achn, r3_ab[r3_awi]);
     if (fr <= 0 || fr > R3_ABUF) return 1;                                       /* bad -> drop */
-    if (g_vol != 1.0f) { int16_t *s = r3_ab[r3_awi]; int ns = fr * r3_achn;
-        for (int i = 0; i < ns; i++) { int t = (int)(s[i] * g_vol); s[i] = (int16_t)(t > 32767 ? 32767 : (t < -32768 ? -32768 : t)); } }
+    { int16_t *s = r3_ab[r3_awi]; int ns = fr * r3_achn;
+      float g = g_vol;
+      if (g_autolvl > 0 && g_autolvl <= 2) g *= al_update(s, ns);
+      if (g != 1.0f) {
+          for (int i = 0; i < ns; i++) {
+              int t = (int)(s[i] * g);
+              t = al_soft(t);                       /* bend the peaks rather than square them */
+              s[i] = (int16_t)(t > 32767 ? 32767 : (t < -32768 ? -32768 : t));
+          }
+      } }
     DSP_FlushDataCache(r3_ab[r3_awi], fr * r3_achn * 2);
     memset(w, 0, sizeof *w); w->data_vaddr = r3_ab[r3_awi]; w->nsamples = fr;
     ndspChnWaveBufAdd(0, w); r3_acnt[r3_awi] = 0; r3_awi = (r3_awi + 1) % r3_nawb;
@@ -3497,9 +3632,8 @@ static MoflexResult moflex_play_ring(const char *path) {
                 seek_to_us = cur_us - 30000000; want_seek = 1;
             } else if (py >= PLAY_CY - 20 && py <= PLAY_CY + 20 && px >= FF_CX - 18 && px <= FF_CX + 18) {
                 seek_to_us = cur_us + 30000000; want_seek = 1;
-            } else if (g_atrk_n > 1 && px >= AUD_X && px < AUD_X + AUD_W && py >= AUD_Y && py < AUD_Y + AUD_H) {
-                g_atrk_sel = (g_atrk_sel + 1) % g_atrk_n;   /* audio toggle: its own button, not CC */
-                g_atrk_apply = 1; dirty = 1;
+            } else if (px >= AUD_X && px < AUD_X + AUD_W && py >= AUD_Y && py < AUD_Y + AUD_H) {
+                g_submenu = 4; g_snd_sel = 0; dirty = 1;    /* SOUND: track + levelling */
             } else if (px >= CC_X && px < CC_X + CC_W && py >= CC_Y && py < CC_Y + CC_H) {
                 g_submenu = 1; g_sub_sel = 0; dirty = 1;   /* CC: open the subtitle options menu */
             } else if (px >= ZM_X && px < ZM_X + ZM_W && py >= ZM_Y && py < ZM_Y + ZM_H) {
@@ -4221,6 +4355,8 @@ static MoflexResult moflex_play_classic(const char *path) {
             } else if (kd & KEY_TOUCH) {
                 if (g_lcd_ok && px >= DIM_X && px < DIM_X + DIM_W && py >= DIM_Y && py < DIM_Y + DIM_H) {
                     GSPLCD_PowerOffBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 1;   /* dark until any button press */
+                } else if (px >= AL_X && px < AL_X + AL_W && py >= AL_Y && py < AL_Y + AL_H) {
+                    g_autolvl = !g_autolvl; al_reset(); pq_save(); dirty = 1;   /* LVL */
                 } else if (px >= ZM_X && px < ZM_X + ZM_W && py >= ZM_Y && py < ZM_Y + ZM_H) {
                     if (have_audio) ndspChnSetPaused(0, true);      /* VIEW: picture settings */
                     view_menu_sw();
@@ -4534,6 +4670,8 @@ static MoflexResult moflex_play_soft(const char *path) {
             } else if (kd & KEY_TOUCH) {
                 if (g_lcd_ok && px >= DIM_X && px < DIM_X + DIM_W && py >= DIM_Y && py < DIM_Y + DIM_H) {
                     GSPLCD_PowerOffBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 1;
+                } else if (px >= AL_X && px < AL_X + AL_W && py >= AL_Y && py < AL_Y + AL_H) {
+                    g_autolvl = !g_autolvl; al_reset(); pq_save(); dirty = 1;   /* LVL */
                 } else if (px >= ZM_X && px < ZM_X + ZM_W && py >= ZM_Y && py < ZM_Y + ZM_H) {
                     if (have_audio) ndspChnSetPaused(0, true);      /* VIEW: picture settings */
                     view_menu_sw();
