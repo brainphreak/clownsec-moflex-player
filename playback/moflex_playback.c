@@ -391,7 +391,7 @@ static void bw_exit(void) {
  * button, but that row runs straight through the key-map line at y=190. Only one of the two can
  * have this slot, so HQ gives it up and becomes a row inside VIEW on the console that has it. */
 #define ZM_X 8
-#define ZM_Y 138   /* "VIEW": zoom, convergence, ghost -- none of them subtitle settings */
+#define ZM_Y 138   /* "VIDEO": zoom, convergence, ghost, picture -- pairs with AUDIO above it */
 /* LVL: automatic loudness levelling, mirroring VIEW on the right, under the moon */
 #define AL_X 244
 #define AL_Y 172
@@ -1126,7 +1126,7 @@ static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing)
     }
     /* VIEW: opens the picture settings. NOT a toggle, so it never glows -- a glow on this row
      * means "on", and there is nothing here to be on. */
-    ui_button(ZM_X, ZM_Y, ZM_W, ZM_H, "VIEW", 0, UI_NEONC);
+    ui_button(ZM_X, ZM_Y, ZM_W, ZM_H, "VIDEO", 0, UI_NEONC);
     /* bottom-screen-off: a crescent-moon button (video keeps playing on top) */
     if (g_lcd_ok) {
         ui_button(DIM_X, DIM_Y, DIM_W, DIM_H, "", 0, UI_NEONP);
@@ -1361,7 +1361,7 @@ static void view_menu_sw(void) {
         const char *rows[VSW_ROWS] = { r0, r1, r2 };
         ui_begin(GFX_BOTTOM);
         ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
-        ui_text_center(UI_W / 2, 16, 2, UI_NEON, "VIEW");
+        ui_text_center(UI_W / 2, 16, 2, UI_NEON, "VIDEO");
         for (int i = 0; i < VSW_ROWS; i++)
             ui_button(18, top + i * step, UI_W - 36, bh, rows[i], i == sel, UI_NEONC);
         ui_text_center(UI_W / 2, 176, 1, UI_DIM, "left/right adjust   A A resets");
@@ -1902,7 +1902,7 @@ static void view_render(void) {
     int top, step, bh; submenu_layout(VIEW_ROWS, &top, &step, &bh);
     ui_begin(GFX_BOTTOM);
     ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
-    ui_text_center(UI_W / 2, 14, 2, UI_NEON, "VIEW");
+    ui_text_center(UI_W / 2, 14, 2, UI_NEON, "VIDEO");
     for (int i = 0; i < VIEW_ROWS; i++) {
         char r[44]; view_label(i, r, sizeof r);
         ui_button(18, top + i * step, UI_W - 36, bh, r, i == g_view_sel, UI_NEONC);
