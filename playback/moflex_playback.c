@@ -1120,20 +1120,11 @@ static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing)
         /* SOUND: was a dual-audio-only language cycler. It is now the door to everything audio --
          * track, levelling, whatever comes next -- so it is always present, and shows the current
          * language when there is a choice to make. */
-        const char *al = (g_atrk_n > 1 && g_atrk_sel < 4 && g_atrk_lbl[g_atrk_sel][0])
-                         ? g_atrk_lbl[g_atrk_sel] : "";
-        ui_button(AUD_X, AUD_Y, AUD_W, AUD_H, "", 0, UI_NEONC);   /* plain box, constant look */
-        u16 nc = UI_RGB(120, 210, 255);                          /* bright note, not the box grey */
-        const int NOTE_W = 9, GAP = 4;
-        int tw = al[0] ? ui_text_w(1, al) : 0;
-        int total = NOTE_W + (tw ? GAP + tw : 0);
-        int sx = AUD_X + (AUD_W - total) / 2, cy = AUD_Y + AUD_H / 2;
-        /* eighth note: filled slanted head bottom-left, tall stem, small flag at the top */
-        ui_fill_round(sx, cy + 2, 6, 5, 2, nc);                  /* note head (oval) */
-        ui_fill(sx + 5, cy - 7, 2, 11, nc);                     /* stem up the right of the head */
-        ui_fill(sx + 5, cy - 7, 5, 2, nc);                     /* flag top */
-        ui_fill(sx + 8, cy - 7, 2, 4, nc);                     /* flag curl */
-        if (al[0]) ui_text(sx + NOTE_W + GAP, cy - 4, 1, UI_NEONC, al);
+        /* Plain "AUDIO", the same shape as VIEW next to it. The note glyph plus the current
+         * language read as a language TOGGLE -- which is what this button used to be -- and so
+         * people pressed it expecting the track to change rather than a menu to open. The label
+         * says what the button is; what is selected belongs inside, where it can be chosen. */
+        ui_button(AUD_X, AUD_Y, AUD_W, AUD_H, "AUDIO", 0, UI_NEONC);
     }
     /* VIEW: opens the picture settings. NOT a toggle, so it never glows -- a glow on this row
      * means "on", and there is nothing here to be on. */
