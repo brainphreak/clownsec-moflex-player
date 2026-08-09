@@ -387,10 +387,11 @@ static void bw_exit(void) {
 #define AUD_H 28
 /* ZOOM (framing) -- below AUDIO on the left, mirroring DIM below CC. Framing is not a subtitle
  * setting, so it gets its own button rather than a row in the CC menu. */
-/* Row 3 (y=172). VIEW used to sit at y=138, directly on top of the Old-3DS HQ button -- both
- * were drawn, so on that console they overlapped. The extras get their own row. */
+/* VIEW sits directly under AUDIO. It spent a while on row 3 (y=172) to dodge the Old-3DS HQ
+ * button, but that row runs straight through the key-map line at y=190. Only one of the two can
+ * have this slot, so HQ gives it up and becomes a row inside VIEW on the console that has it. */
 #define ZM_X 8
-#define ZM_Y 172   /* "VIEW": zoom, convergence, ghost -- none of them subtitle settings */
+#define ZM_Y 138   /* "VIEW": zoom, convergence, ghost -- none of them subtitle settings */
 /* LVL: automatic loudness levelling, mirroring VIEW on the right, under the moon */
 #define AL_X 244
 #define AL_Y 172
@@ -403,11 +404,8 @@ static void bw_exit(void) {
 #define DIM_Y 138
 #define DIM_W 48
 #define DIM_H 28
-/* HQ (24-bit color) toggle -- mirrors the DIM button on the LEFT, same row (Old-3DS only) */
-#define HQ_X 8
-#define HQ_Y 138
-#define HQ_W 48
-#define HQ_H 28
+/* HQ (24-bit color) has no panel button any more: y=138 is VIEW's, and the row below collides
+ * with the key map. It is a row inside VIEW instead, shown on Old-3DS only. */
 
 static void fmt_time(int64_t us, char *o, int cap) {
     if (us < 0) us = 0;
@@ -1136,9 +1134,6 @@ static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing)
         ui_fill_round(mx - mr, my - mr, 2 * mr, 2 * mr, mr, UI_NEONC);                 /* full disc */
         ui_fill_round(mx - mr + 6, my - mr - 2, 2 * mr, 2 * mr, mr, UI_BG2); /* carve -> crescent */
     }
-    /* HQ (24-bit color) toggle -- Old-3DS only; glows when 24-bit is on, else dim (=fast 16-bit) */
-    if (g_hq_avail)
-        ui_button(HQ_X, HQ_Y, HQ_W, HQ_H, "HQ", g_hq, g_hq ? UI_NEON : UI_DIM);
     panel_lock_toast();   /* drawn LAST -> always on top of every control */
     ui_present();
 }
@@ -1854,10 +1849,26 @@ static int submenu_hit(int px, int py, int n, int *side);   /* row hit test, def
 #define VIEW_ROWS_3D 7
 #define VIEW_ROWS_2D 5         /* Zoom, Fill, Brightness, Contrast, Saturation */
 static int g_view_is3d = 1;
-#define VIEW_ROWS (g_view_is3d ? VIEW_ROWS_3D : VIEW_ROWS_2D)
+/* HQ (24-bit colour) is an Old-3DS-only choice and used to be a panel button; it lost its slot
+ * to VIEW and lives here as a trailing row on that console. Kept OUT of the index remap below
+ * by giving it its own action code, so the existing rows keep their numbers. */
+#define VIEW_BASE (g_view_is3d ? VIEW_ROWS_3D : VIEW_ROWS_2D)
+#define VIEW_ROWS (VIEW_BASE + (g_hq_avail ? 1 : 0))
+#define VIEW_ACT_HQ 99
 static int g_view_sel = 0, g_view_rep = 0;
-static void view_label(int i, char *r, int cap) {
-    if (!g_view_is3d && i >= 2) i += 2;   /* 2D: skip convergence + ghost */
+static int g_hq_req = 0;      /* set when the HQ row is toggled; the panel turns it into a replay */
+/* display row -> action code (the 2D list skips convergence + ghost) */
+static int view_act(int row) {
+    if (g_hq_avail && row == VIEW_BASE) return VIEW_ACT_HQ;
+    if (!g_view_is3d && row >= 2) row += 2;
+    return row;
+}
+static void view_label(int row, char *r, int cap) {
+    int i = view_act(row);
+    if (i == VIEW_ACT_HQ) {
+        snprintf(r, cap, "HQ colour:  %s   (A toggles)", g_hq ? "24-bit" : "16-bit");
+        return;
+    }
     switch (i) {
         case 0: snprintf(r, cap, "Zoom:  %d%%   (left/right)", g_zoom); break;
         case 1: { int z = (int)(lb_fill_zoom() * 100.0f + 0.5f);
@@ -1875,7 +1886,8 @@ static void view_label(int i, char *r, int cap) {
 /* A second A within this window resets the row -- every one of these has a natural default, and
  * walking a value back by hand is tedious when you have overshot. */
 #define VIEW_DBL_MS 400
-static void view_reset_row(int i) {
+static void view_reset_row(int row) {
+    int i = view_act(row);
     switch (i) {
         case 0: g_zoom = ZOOM_MIN; break;
         case 2: g_conv = 0; break;
@@ -1904,8 +1916,7 @@ static int view_input(u32 kd, u32 kh, touchPosition tp) {
     if (kd & KEY_UP)   g_view_sel = (g_view_sel + VIEW_ROWS - 1) % VIEW_ROWS;
     int t_side = 0, t_row = (kd & KEY_TOUCH) ? submenu_hit(tp.px, tp.py, VIEW_ROWS, &t_side) : -1;
     if (t_row >= 0) g_view_sel = t_row;
-    int i = g_view_sel;
-    if (!g_view_is3d && i >= 2) i += 2;   /* same remap as the labels */
+    int i = view_act(g_view_sel);
     int press = (kd & KEY_A) ? 1 : 0;
     int held = (kh & KEY_RIGHT) ? 1 : (kh & KEY_LEFT) ? -1 : 0;
     int th_side = 0, th_row = (kh & KEY_TOUCH) ? submenu_hit(tp.px, tp.py, VIEW_ROWS, &th_side) : -1;
@@ -1915,6 +1926,13 @@ static int view_input(u32 kd, u32 kh, touchPosition tp) {
     else { rep = (kd & (KEY_LEFT | KEY_RIGHT | KEY_TOUCH)) ? held : 0;
            if (rep) g_view_rep = 0;
            else { g_view_rep++; if (g_view_rep > 8 && g_view_rep % 2 == 0) rep = held; } }
+    if (i == VIEW_ACT_HQ) {
+        if (press || (t_row >= 0 && t_row == g_view_sel && (kd & KEY_TOUCH))) {
+            g_hq_req = 1;                                 /* panel re-opens the film in the new depth */
+            return 1;
+        }
+        return 0;
+    }
     if (t_row == 1) press = 1;                            /* the preset row activates on tap */
     if (press && i != 1) {                                /* A twice in a row -> back to default */
         static u64 last_ms = 0; static int last_row = -1;
@@ -2044,9 +2062,9 @@ static void snd_render(void) {
         ui_button(18, top + i * step, UI_W - 36, bh, r, i == g_snd_sel, UI_NEONC);
     }
     ui_text_center(UI_W / 2, 200, 1, UI_DIM,
-                   g_autolvl == 2 ? "HIGH: loudest, but flattens quiet and loud together"
-                 : g_autolvl == 1 ? "LOW: audible on the 3DS, keeps more of the dynamics"
-                                  : "Auto level lifts quiet films without clipping the loud parts");
+                   g_autolvl == 2 ? "HIGH: loudest, flattens dynamics"
+                 : g_autolvl == 1 ? "LOW: audible, keeps most dynamics"
+                                  : "Lifts quiet films without clipping");
     ui_text(8, 226, 1, UI_DIM, "B - back");
 }
 /* One frame of SOUND input. Returns 1 when the screen should close. */
@@ -3579,6 +3597,12 @@ static MoflexResult moflex_play_ring(const char *path) {
         if (g_submenu) {                       /* subtitle menu owns input while open; movie plays on */
             submenu_input(kd, kh, tp, is3d, path);
             dirty = 1;
+            if (g_hq_req) {
+                /* HQ row in VIEW: the ring's texture format is fixed at init, so the film has to
+                 * be re-opened for a colour-depth change to take -- resume puts it back in place. */
+                g_hq_req = 0; g_hq = !g_hq; hq_save();
+                result = MOFLEX_REPLAY; break;
+            }
         } else {
         if (kd & KEY_B) { result = MOFLEX_QUIT_BACK; break; }
         if (kd & KEY_A) {
@@ -3631,10 +3655,6 @@ static MoflexResult moflex_play_ring(const char *path) {
                 g_submenu = 3; g_view_sel = 0; g_view_is3d = is3d; dirty = 1;   /* VIEW: film plays on */
             } else if (g_lcd_ok && px >= DIM_X && px < DIM_X + DIM_W && py >= DIM_Y && py < DIM_Y + DIM_H) {
                 g_screen_off = 1; dirty = 1;   /* moon: darken (a button or touch wakes it; reconcile handles backlight) */
-            } else if (g_hq_avail && px >= HQ_X && px < HQ_X + HQ_W && py >= HQ_Y && py < HQ_Y + HQ_H) {
-                /* HQ: flip color depth. The texture format is fixed at ring init, so re-open the movie
-                 * (resume restores the exact spot) to rebuild the ring in the new format. */
-                g_hq = !g_hq; hq_save(); result = MOFLEX_REPLAY; break;
             } else if (py >= BTN_Y && py < BTN_Y + BTN_H) {
                 if      (px >= BKB_X && px < BKB_X + BKB_W) { result = MOFLEX_QUIT_OPEN; break; }   /* OPEN VIDEO */
                 else if (px >= OPB_X && px < OPB_X + OPB_W) { result = MOFLEX_QUIT_MANAGE; break; }   /* MANAGE VIDEOS */
