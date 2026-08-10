@@ -134,6 +134,10 @@ static int     g_nsec = 0;
 static Poster g_pos[MAX_POSTERS];
 static int    g_nposters = 0;
 static int    g_withinfo = 0;    /* how many came with a description */
+/* Where the shelves came from. moviedata/ carries a .nfo beside each poster -- title, year,
+ * genres, description. art/ is the catalogue's poster cache and has no text at all, so titles
+ * from there have nothing to show AND no genre, which lands every one of them in GENERAL. */
+static int    g_from_data = 0, g_from_art = 0;
 /* The same room serves both stores; only the source of the shelves and the VERB differ.
  * Library: take one off the shelf and play it. Catalogue: take one and queue the download. */
 enum { STORE_LIBRARY = 0, STORE_CATALOG = 1 };
@@ -275,8 +279,8 @@ static int load_posters(int *built) {
     mkdir(CACHE_DIR, 0777);
     /* moviedata first: those entries come with a description, which is what the info panel
      * is for. art/ only tops up the shelf when there is room left. */
-    scan_dir(DATA_DIR, SRC_W, SRC_H, 1, built);
-    scan_dir(ART_DIR,  0,     0,     0, built);
+    g_from_data = scan_dir(DATA_DIR, SRC_W, SRC_H, 1, built);
+    g_from_art  = scan_dir(ART_DIR,  0,     0,     0, built);
     return g_nposters;
 }
 
@@ -1298,6 +1302,17 @@ static void scene_init(void) {
     C3D_CullFace(GPU_CULL_NONE);
 }
 
+/* Never submit an empty draw.
+ *
+ * This is what locked the console. Removing the wall stock set its vertex count to zero, but
+ * the draw call itself stayed -- so every frame, in both eyes, the GPU was handed a
+ * zero-vertex primitive. The PICA200 does not ignore that, it wedges, and HOME and START go
+ * with it. It bit on the very first frame, which is why one panel update appeared and then
+ * nothing. Every draw in this file goes through here now. */
+static void draw_range(int first, int count) {
+    if (count <= 0) return;
+    C3D_DrawArrays(GPU_TRIANGLES, first, count);
+}
 static void set_buf(void *vbo, int nverts) {
     C3D_BufInfo *buf = C3D_GetBufInfo();
     BufInfo_Init(buf);
@@ -1485,6 +1500,10 @@ int main(void) {
             if (kd & KEY_DDOWN)  nsel = step_sel(sel, 0, -1, 0, cx, cz, EYE);
             if (nsel != sel) {
                 sel = nsel; aim_lock = 1;
+                /* load the cover as soon as it is SELECTED, not when it is picked up. The
+                 * highlighted case turns face-on, and until this it turned face-on wearing
+                 * the blank spine sheet -- white, with the real art appearing only on pickup. */
+                if (!g_pos[sel].is_more) load_detail(&g_pos[sel], sel);
                 if (held >= 0) {          /* holding one: swap it for the next along the shelf */
                     held = sel; spin = 0.0f;
                     rebuild_back(&g_pos[sel]); g_back_for = sel;
@@ -1586,19 +1605,18 @@ int main(void) {
             set_buf(g_roomvbo, roomn);
             C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &view);
             bind_tex(g_mat_ok ? &g_carpet : &g_room, 1);
-            C3D_DrawArrays(GPU_TRIANGLES, 0, g_n_floor);
+            draw_range(0, g_n_floor);
             bind_tex(&g_room, 1);
-            C3D_DrawArrays(GPU_TRIANGLES, g_n_floor, g_n_shell);
+            draw_range(g_n_floor, g_n_shell);
             bind_tex(g_mat_ok ? &g_wood : &g_room, 1);
-            C3D_DrawArrays(GPU_TRIANGLES, g_n_floor + g_n_shell, g_n_units);
+            draw_range(g_n_floor + g_n_shell, g_n_units);
             if (g_covers_ok) {
                 bind_tex(&g_covers, g_covers_ok);
-                C3D_DrawArrays(GPU_TRIANGLES, g_n_floor + g_n_shell + g_n_units, g_n_cover);
+                draw_range(g_n_floor + g_n_shell + g_n_units, g_n_cover);
             }
             if (g_n_light > 0) {
                 bind_tex(&g_white, g_white_ok);
-                C3D_DrawArrays(GPU_TRIANGLES,
-                               g_n_floor + g_n_shell + g_n_units + g_n_cover, g_n_light);
+                draw_range(g_n_floor + g_n_shell + g_n_units + g_n_cover, g_n_light);
             }
 
             /* shopfront fittings: windows and a door on the near wall, signs above */
@@ -1612,14 +1630,14 @@ int main(void) {
                     Mtx_Translate(&m, wx, 1.9f, STORE_Z0 - 0.05f, true);
                     Mtx_Scale(&m, 6.0f, 2.6f, 1.0f);
                     C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
-                    C3D_DrawArrays(GPU_TRIANGLES, 0, 6);
+                    draw_range(0, 6);
                 }
                 bind_tex(&g_door, g_mat_ok);
                 { C3D_Mtx m; Mtx_Copy(&m, &view);
                   Mtx_Translate(&m, 4.5f, 1.15f, STORE_Z0 - 0.05f, true);
                   Mtx_Scale(&m, 2.6f, 2.3f, 1.0f);
                   C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
-                  C3D_DrawArrays(GPU_TRIANGLES, 0, 6); }
+                  draw_range(0, 6); }
             }
             if (g_store_ok) {                              /* name across the back wall */
                 bind_tex(&g_storesign, g_store_ok);
@@ -1627,7 +1645,7 @@ int main(void) {
                 Mtx_Translate(&m, 0.0f, 3.3f, STORE_Z0 - STORE_DEPTH + 0.06f, true);
                 Mtx_Scale(&m, 15.0f, 15.0f * (float)SIGN_H / (float)SIGN_W, 1.0f);
                 C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
-                C3D_DrawArrays(GPU_TRIANGLES, 0, 6);
+                draw_range(0, 6);
             }
             if (g_exit_ok) {                               /* over the door */
                 bind_tex(&g_exitsign, g_exit_ok);
@@ -1636,7 +1654,7 @@ int main(void) {
                 Mtx_RotateY(&m, C3D_Angle(0.5f), true);
                 Mtx_Scale(&m, 1.8f, 1.8f * (float)SIGN_H / (float)SIGN_W, 1.0f);
                 C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
-                C3D_DrawArrays(GPU_TRIANGLES, 0, 6);
+                draw_range(0, 6);
             }
 
             /* The shelves: every case is the SAME spine mesh with a different tint. No cover
@@ -1660,7 +1678,7 @@ int main(void) {
                 Mtx_RotateY(&m, g_pos[i].ay, true);
                 Mtx_Scale(&m, 0.20f, 0.56f, 1.0f);           /* an edge, not a face */
                 C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
-                C3D_DrawArrays(GPU_TRIANGLES, 0, 6);
+                draw_range(0, 6);
                 drawn++;
             }
 
@@ -1676,7 +1694,7 @@ int main(void) {
                 Mtx_Scale(&m, 0.40f, 0.40f * (float)DET_IMG_H / (float)DET_IMG_W, 1.0f);
                 C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
                 bind_tex((g_detail_ok && g_detail_for == sel) ? &g_detail : &g_spine[g_pos[sel].col], 1);
-                C3D_DrawArrays(GPU_TRIANGLES, 0, 6);
+                draw_range(0, 6);
             }
 
             /* The case in your hand, as a box with thickness.
@@ -1711,13 +1729,13 @@ int main(void) {
 
                 set_buf(g_boxvbo, 36);
                 bind_tex((g_detail_ok && g_detail_for == held) ? &g_detail : &g_spine[g_pos[held].col], 1);
-                C3D_DrawArrays(GPU_TRIANGLES, 0, 6);
+                draw_range(0, 6);
                 if (g_back_ok) {
                     bind_tex(&g_back, g_back_ok);                /* back: the printed card */
-                    C3D_DrawArrays(GPU_TRIANGLES, 6, 6);
+                    draw_range(6, 6);
                 }
                 bind_tex(&g_room, 1);                    /* the four edges */
-                C3D_DrawArrays(GPU_TRIANGLES, 12, 24);
+                draw_range(12, 24);
                 set_buf(g_quadvbo, 6);
             }
 
@@ -1736,7 +1754,7 @@ int main(void) {
                         Mtx_RotateY(&m, e ? C3D_Angle(0.25f) : C3D_Angle(-0.25f), true);
                         Mtx_Scale(&m, 0.62f, 0.62f * (float)IMG_H / (float)IMG_W, 1.0f);
                         C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
-                        C3D_DrawArrays(GPU_TRIANGLES, 0, 6);
+                        draw_range(0, 6);
                     }
                 }
                 /* on the walls, above the stock so they are not hidden by it */
@@ -1759,7 +1777,7 @@ int main(void) {
                     Mtx_RotateY(&m, WP[i][3], true);
                     Mtx_Scale(&m, 1.05f, 1.05f * (float)IMG_H / (float)IMG_W, 1.0f);
                     C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
-                    C3D_DrawArrays(GPU_TRIANGLES, 0, 6);
+                    draw_range(0, 6);
                 }
             }
 
@@ -1777,7 +1795,7 @@ int main(void) {
                     if (f) Mtx_RotateY(&m, C3D_Angle(0.5f), true);
                     Mtx_Scale(&m, 3.4f, 3.4f * (float)SIGN_H / (float)SIGN_W, 1.0f);
                     C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
-                    C3D_DrawArrays(GPU_TRIANGLES, 0, 6);
+                    draw_range(0, 6);
                 }
             }
         }
@@ -1810,10 +1828,10 @@ int main(void) {
             if (held >= 0) panel_fmt(24, " in hand");
         } else {
             panel_set(0, " MOFLEX STORE  (prototype)");
-            panel_fmt(2, " %d posters, %d with info", g_nposters, g_withinfo);
-            panel_fmt(3, " %d KB texture   %d built   %llums",
-                      (int)((g_nposters * TEX_BYTES) / 1024), built, (unsigned long long)t_load);
-            panel_fmt(4, " fps %2d   eyes %d", fps, (slider > 0.0f ? 2 : 1));
+            panel_fmt(2, " %d cases, %d with info", g_nposters, g_withinfo);
+            panel_fmt(3, " moviedata %d   art %d", g_from_data, g_from_art);
+            panel_fmt(4, " built %d   load %llums", built, (unsigned long long)t_load);
+            panel_fmt(5, " fps %2d   eyes %d", fps, (slider > 0.0f ? 2 : 1));
             panel_set(6, " walk up to a case for its info");
             panel_set(8, " sections");
             for (int i = 0; i < g_nsec && i < 8; i++)
