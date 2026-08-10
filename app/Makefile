@@ -34,7 +34,12 @@ export VPATH   := $(foreach dir,$(SOURCES),$(CURDIR)/$(dir))
 export DEPSDIR := $(CURDIR)/$(BUILD)
 export CFILES  := $(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.c)))
 export SFILES  := $(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.s)))
-export OFILES  := $(CFILES:.c=.o) $(SFILES:.s=.o)
+# PICA vertex shaders. citro2d ships its own, so the player never needed these; the 3D store
+# browser does. 3ds_rules already knows how to run picasso -- this only has to find the files
+# and turn the resulting .shbin into an object plus a header.
+export PICAFILES := $(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.v.pica)))
+export OFILES  := $(CFILES:.c=.o) $(SFILES:.s=.o) $(PICAFILES:.v.pica=.shbin.o)
+export HFILES  := $(PICAFILES:.v.pica=_shbin.h)
 export INCLUDE := $(foreach dir,$(LIBDIRS),-I$(dir)/include) -I$(CURDIR)/$(BUILD) \
 	-I$(CURDIR)/$(FF_INC) -I$(CURDIR)/$(FF_INC)/libavcodec -I$(CURDIR)/../decoder \
 	-I$(CURDIR)/../playback -I$(CURDIR)/../net -I$(CURDIR)/../ui \
@@ -59,5 +64,12 @@ else
 DEPENDS := $(OFILES:.o=.d)
 $(OUTPUT).3dsx: $(OUTPUT).elf $(OUTPUT).smdh
 $(OUTPUT).elf: $(OFILES)
+$(OFILES): $(HFILES)        # a shader header must exist before anything that includes it
+
+.PRECIOUS: %.shbin
+%.shbin.o %_shbin.h : %.shbin
+	$(SILENTMSG) $(notdir $<)
+	$(bin2o)
+
 -include $(DEPENDS)
 endif
