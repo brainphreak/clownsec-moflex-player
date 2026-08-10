@@ -1530,6 +1530,11 @@ int main(void) {
             C3D_RenderTargetClear(tgt, C3D_CLEAR_ALL, 0x101418FF, 0);
             C3D_FrameDrawOn(tgt);
             C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocProjection, &proj);
+            /* Start every eye at full white. The tint is only ASSIGNED inside the spine loop,
+             * so on the first frame it held whatever the uniform powers up as -- zero -- and
+             * every surface in the room was multiplied by it. A black screen that looked like
+             * a hang. Anything that does not want a tint must say so. */
+            set_tint(0xFFFF);
 
             /* the shell, three materials, three draws */
             set_buf(g_roomvbo, roomn);
