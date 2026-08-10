@@ -81,6 +81,12 @@
 #define SEC_COLS      3
 #define PER_ROW      46         /* spines along a 12-unit bay */
 #define SHELF_CAP    (3 * PER_ROW * 2)   /* 3 rows, both faces */
+/* How much of the shop is drawn at once. Every spine is its own draw call, and a shop full of
+ * them is thousands of commands a frame -- past what the command buffer holds, and a GPU fed a
+ * truncated command stream wedges the console. You cannot read a spine across the room anyway. */
+#define SPINE_COLOURS 10        /* one spine texture per colour */
+#define SPINE_VIEW   13.0f
+#define SPINE_BUDGET 220
 
 #define MAX_POSTERS 320         /* spines cost no texture; this is only metadata */
 #define ROOM_TEX 64
@@ -92,7 +98,7 @@ typedef struct {
      * a different colour per title -- so a title costs nothing but its metadata and the shelves
      * scale to a whole catalogue. Only the SELECTED one turns face-on and loads a real cover,
      * into the single detail texture, because there is only ever one. */
-    u16     tint;
+    int     col;                /* which spine texture, 0..SPINE_COLOURS-1 */
     int     ok;
     float   x, y, z;            /* centre, world space */
     float   ay;                 /* which way the case FACES, in radians. Was a +/-1 flag, which
@@ -249,9 +255,7 @@ static int scan_dir(const char *dir, int fixed_w, int fixed_h, int with_nfo, int
         p->src_w = sw; p->src_h = sh;
         { unsigned h = 2166136261u;                        /* spine colour from the title */
           for (const char *c = key; *c; c++) h = (h ^ (unsigned char)*c) * 16777619u;
-          static const u16 pal[10] = { 0xF9A6, 0xFB40, 0xFEA0, 0x9FE6, 0x2E8B,
-                                       0x4C9F, 0x9A9F, 0xF81F, 0xC618, 0xFD4C };
-          p->tint = pal[h % 10]; }
+          p->col = (int)(h % SPINE_COLOURS); }
         p->ok = 1;
         snprintf(p->key, sizeof p->key, "%s", key);
         pretty(e->d_name, p->name, sizeof p->name);
@@ -278,9 +282,7 @@ static int load_posters(int *built) {
 
 /* a placeholder poster so the prototype still runs on a console with no art cached */
 static void make_placeholder(Poster *p, int idx) {
-    static const u16 pal[10] = { 0xF9A6, 0xFB40, 0xFEA0, 0x9FE6, 0x2E8B,
-                                 0x4C9F, 0x9A9F, 0xF81F, 0xC618, 0xFD4C };
-    p->tint = pal[idx % 10];
+    p->col = idx % SPINE_COLOURS;
     p->ok = 1;
     snprintf(p->name, sizeof p->name, "Placeholder %d", idx + 1);
     if (0) {
@@ -728,28 +730,57 @@ static void make_materials(void) {
 /* The edge of a case: caps top and bottom, a label band near the top, and a shadow/highlight
  * pair down the sides so a row reads as separate objects rather than one striped wall. Drawn
  * white, because the per-title tint does the colouring. */
-static C3D_Tex g_spine;
+/* Ten spine textures, one per colour, instead of one texture and a tint uniform.
+ *
+ * The uniform meant touching the vertex shader, and that is the one change in this whole
+ * prototype that was never once seen working -- the console locked hard from the commit it
+ * arrived in. A texture bind costs the same as a uniform write and needs no shader at all, so
+ * this buys the same varied shelf with the shader left exactly as it was. Ten of them at
+ * 16x64 is 20 KB. */
+static C3D_Tex g_spine[SPINE_COLOURS];
 static int     g_spine_ok = 0;
 static void make_spine_tex(void) {
+    static const u16 pal[SPINE_COLOURS] = { 0xF9A6, 0xFB40, 0xFEA0, 0x9FE6, 0x2E8B,
+                                            0x4C9F, 0x9A9F, 0xF81F, 0xC618, 0xFD4C };
     const int W = 16, H = 64;
-    if (!C3D_TexInit(&g_spine, W, H, GPU_RGB565)) return;
     u16 *lin = (u16 *)malloc(W * H * 2);
     u16 *til = (u16 *)malloc(W * H * 2);
-    if (!lin || !til) { free(lin); free(til); C3D_TexDelete(&g_spine); return; }
-    for (int y = 0; y < H; y++)
-        for (int x = 0; x < W; x++) {
-            u16 v = 0xFFFF;
-            if (x <= 1)               v = 0x8410;           /* shadowed left edge */
-            if (y < 3 || y > H - 4)   v = 0x6B4D;           /* caps */
-            else if (y > 9 && y < 18) v = 0xD69A;           /* label band */
-            lin[y * W + x] = v;
-        }
-    tile_rgb565(lin, til, W, H);
-    memcpy(g_spine.data, til, W * H * 2);
-    C3D_TexFlush(&g_spine);
-    C3D_TexSetFilter(&g_spine, GPU_NEAREST, GPU_NEAREST);
+    if (!lin || !til) { free(lin); free(til); return; }
+    for (int c = 0; c < SPINE_COLOURS; c++) {
+        if (!C3D_TexInit(&g_spine[c], W, H, GPU_RGB565)) { free(lin); free(til); return; }
+        u16 body = pal[c];
+        u16 dark = (u16)((body >> 1) & 0x7BEF);
+        for (int y = 0; y < H; y++)
+            for (int x = 0; x < W; x++) {
+                u16 v = body;
+                if (x <= 1)               v = dark;          /* shadowed left edge */
+                if (y < 3 || y > H - 4)   v = dark;          /* caps */
+                else if (y > 9 && y < 18) v = 0xFFFF;        /* label band */
+                lin[y * W + x] = v;
+            }
+        tile_rgb565(lin, til, W, H);
+        memcpy(g_spine[c].data, til, W * H * 2);
+        C3D_TexFlush(&g_spine[c]);
+        C3D_TexSetFilter(&g_spine[c], GPU_NEAREST, GPU_NEAREST);
+    }
     free(lin); free(til);
     g_spine_ok = 1;
+}
+/* a plain white sheet for the light fittings and as a safe fallback */
+static C3D_Tex g_white;
+static int     g_white_ok = 0;
+static void make_white_tex(void) {
+    const int W = 8, H = 8;
+    if (!C3D_TexInit(&g_white, W, H, GPU_RGB565)) return;
+    u16 *lin = (u16 *)malloc(W * H * 2), *til = (u16 *)malloc(W * H * 2);
+    if (!lin || !til) { free(lin); free(til); C3D_TexDelete(&g_white); return; }
+    for (int i = 0; i < W * H; i++) lin[i] = 0xFFFF;
+    tile_rgb565(lin, til, W, H);
+    memcpy(g_white.data, til, W * H * 2);
+    C3D_TexFlush(&g_white);
+    C3D_TexSetFilter(&g_white, GPU_NEAREST, GPU_NEAREST);
+    free(lin); free(til);
+    g_white_ok = 1;
 }
 
 /* Framed posters: the walls and the ends of the units. Real covers from the shelves rather
@@ -982,7 +1013,7 @@ static void build_sections(void) {
             int m = g_nposters++;
             memset(&g_pos[m], 0, sizeof g_pos[m]);
             g_pos[m].ok = 1; g_pos[m].is_more = 1; g_pos[m].sect = k;
-            g_pos[m].tint = TH_YELLOW;
+            g_pos[m].col = 2;   /* yellow: the MORE case */
             snprintf(g_pos[m].name, sizeof g_pos[m].name, "MORE %s", g_sec[k].name);
             g_sec[k].more_idx = m;
         }
@@ -1236,7 +1267,7 @@ static void build_quad(void) {
 /* ---------------- main ---------------- */
 static DVLB_s *vsh_dvlb;
 static shaderProgram_s program;
-static int uLocProjection, uLocModelview, uLocTint;
+static int uLocProjection, uLocModelview;
 
 static void scene_init(void) {
     vsh_dvlb = DVLB_ParseFile((u32 *)vshader_shbin, vshader_shbin_size);
@@ -1245,7 +1276,6 @@ static void scene_init(void) {
     C3D_BindProgram(&program);
     uLocProjection = shaderInstanceGetUniformLocation(program.vertexShader, "projection");
     uLocModelview  = shaderInstanceGetUniformLocation(program.vertexShader, "modelView");
-    uLocTint       = shaderInstanceGetUniformLocation(program.vertexShader, "tint");
 
     C3D_AttrInfo *ai = C3D_GetAttrInfo();
     AttrInfo_Init(ai);
@@ -1268,11 +1298,6 @@ static void scene_init(void) {
     C3D_CullFace(GPU_CULL_NONE);
 }
 
-/* rgb565 -> the shader's tint uniform */
-static void set_tint(u16 c) {
-    float r = ((c >> 11) & 0x1F) / 31.0f, g = ((c >> 5) & 0x3F) / 63.0f, b = (c & 0x1F) / 31.0f;
-    C3D_FVUnifSet(GPU_VERTEX_SHADER, uLocTint, r, g, b, 1.0f);
-}
 static void set_buf(void *vbo, int nverts) {
     C3D_BufInfo *buf = C3D_GetBufInfo();
     BufInfo_Init(buf);
@@ -1308,6 +1333,7 @@ int main(void) {
     make_materials();
     make_covers_tex();
     make_spine_tex();
+    make_white_tex();
     make_sign_tex_col(&g_storesign, "3DS VIDEO RENTALS", TH_BLUE, TH_YELLOW, TH_YELLOW, 1);
     g_store_ok = 1;
     /* the exit board stays green: that one is a fire sign, not branding */
@@ -1556,12 +1582,6 @@ int main(void) {
             C3D_RenderTargetClear(tgt, C3D_CLEAR_ALL, 0x101418FF, 0);
             C3D_FrameDrawOn(tgt);
             C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocProjection, &proj);
-            /* Start every eye at full white. The tint is only ASSIGNED inside the spine loop,
-             * so on the first frame it held whatever the uniform powers up as -- zero -- and
-             * every surface in the room was multiplied by it. A black screen that looked like
-             * a hang. Anything that does not want a tint must say so. */
-            set_tint(0xFFFF);
-
             /* the shell, three materials, three draws */
             set_buf(g_roomvbo, roomn);
             C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &view);
@@ -1575,8 +1595,8 @@ int main(void) {
                 bind_tex(&g_covers, g_covers_ok);
                 C3D_DrawArrays(GPU_TRIANGLES, g_n_floor + g_n_shell + g_n_units, g_n_cover);
             }
-            if (g_spine_ok && g_n_light > 0) {          /* the spine sheet is plain white */
-                bind_tex(&g_spine, g_spine_ok);
+            if (g_n_light > 0) {
+                bind_tex(&g_white, g_white_ok);
                 C3D_DrawArrays(GPU_TRIANGLES,
                                g_n_floor + g_n_shell + g_n_units + g_n_cover, g_n_light);
             }
@@ -1624,19 +1644,25 @@ int main(void) {
              * and a ten-pixel spine could not show a title anyway. The selected one turns
              * face-on below and shows the real cover, because only ever one is selected. */
             set_buf(g_quadvbo, 6);
-            bind_tex(&g_spine, g_spine_ok);
+            int lastcol = -1, drawn = 0;
             for (int i = 0; i < g_nposters; i++) {
                 if (!g_pos[i].ok || !g_pos[i].shown || i == held || i == sel) continue;
+                float dxs = g_pos[i].x - cx, dzs = g_pos[i].z - cz;
+                if (dxs * dxs + dzs * dzs > SPINE_VIEW * SPINE_VIEW) continue;
+                if (drawn >= SPINE_BUDGET) break;
+                if (g_pos[i].col != lastcol) {                /* grouped by colour: fewer binds */
+                    bind_tex(&g_spine[g_pos[i].col], g_spine_ok);
+                    lastcol = g_pos[i].col;
+                }
                 C3D_Mtx m;
                 Mtx_Copy(&m, &view);
                 Mtx_Translate(&m, g_pos[i].x, g_pos[i].y, g_pos[i].z, true);
                 Mtx_RotateY(&m, g_pos[i].ay, true);
                 Mtx_Scale(&m, 0.20f, 0.56f, 1.0f);           /* an edge, not a face */
                 C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
-                set_tint(g_pos[i].tint);
                 C3D_DrawArrays(GPU_TRIANGLES, 0, 6);
+                drawn++;
             }
-            set_tint(0xFFFF);
 
             /* the selected case: proud of the shelf and turned to face you, wearing its real
              * cover. This is the whole reason spines are affordable -- you only ever need one */
@@ -1649,7 +1675,7 @@ int main(void) {
                 Mtx_RotateY(&m, yaw, true);                  /* square to the viewer */
                 Mtx_Scale(&m, 0.40f, 0.40f * (float)DET_IMG_H / (float)DET_IMG_W, 1.0f);
                 C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
-                bind_tex((g_detail_ok && g_detail_for == sel) ? &g_detail : &g_spine, 1);
+                bind_tex((g_detail_ok && g_detail_for == sel) ? &g_detail : &g_spine[g_pos[sel].col], 1);
                 C3D_DrawArrays(GPU_TRIANGLES, 0, 6);
             }
 
@@ -1684,7 +1710,7 @@ int main(void) {
                 C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
 
                 set_buf(g_boxvbo, 36);
-                bind_tex((g_detail_ok && g_detail_for == held) ? &g_detail : &g_spine, 1);
+                bind_tex((g_detail_ok && g_detail_for == held) ? &g_detail : &g_spine[g_pos[held].col], 1);
                 C3D_DrawArrays(GPU_TRIANGLES, 0, 6);
                 if (g_back_ok) {
                     bind_tex(&g_back, g_back_ok);                /* back: the printed card */
@@ -1815,7 +1841,8 @@ int main(void) {
     if (g_store_ok) C3D_TexDelete(&g_storesign);
     if (g_exit_ok)  C3D_TexDelete(&g_exitsign);
     if (g_covers_ok) C3D_TexDelete(&g_covers);
-    if (g_spine_ok)  C3D_TexDelete(&g_spine);
+    if (g_spine_ok) for (int i = 0; i < SPINE_COLOURS; i++) C3D_TexDelete(&g_spine[i]);
+    if (g_white_ok)  C3D_TexDelete(&g_white);
     for (int i = 0; i < WALLPOSTERS; i++) if (g_wall_ok[i]) C3D_TexDelete(&g_wall[i]);
     if (g_back_ok) C3D_TexDelete(&g_back);
     if (g_detail_ok) C3D_TexDelete(&g_detail);

@@ -7,7 +7,6 @@
 ; whole point on a GPU where fill rate is the scarce resource.
 
 .fvec projection[4], modelView[4]
-.fvec tint            ; per-draw colour, so one shared mesh can be many spines
 
 .constf myconst(0.0, 1.0, -1.0, 0.5)
 .alias  zeros myconst.xxxx
@@ -39,12 +38,8 @@
 	; texcoord straight through
 	mov outtc0, intex
 
-	; shade * tint -> rgb, alpha 1. The tint is what lets a single spine mesh stand in for a
-	; whole shelf of different titles without a texture each.
-	; (the uniform is copied into a register first: the PICA200 will not take a uniform as
-	;  the second source of a mul)
-	mov r3, tint
-	mul r2.xyz, inshd.xxx, r3
+	; shade -> rgb, alpha 1
+	mov r2.xyz, inshd.xxx
 	mov r2.w,   ones
 	mov outclr, r2
 
