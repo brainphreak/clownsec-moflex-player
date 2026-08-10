@@ -30,6 +30,7 @@
 #include <string.h>
 #include <math.h>
 #include <dirent.h>
+#include <stdarg.h>
 #include <sys/stat.h>
 
 #include "vshader_shbin.h"
@@ -283,6 +284,55 @@ static void make_placeholder(Poster *p, int idx) {
     free(lin); free(til);
     p->ok = 1;
     snprintf(p->name, sizeof p->name, "Placeholder %d", idx + 1);
+}
+
+/* The bottom screen is composed into a fixed block of lines and emitted in ONE pass from the
+ * home position, rather than addressed row by row with escape sequences. Absolute addressing
+ * kept going wrong -- rows landing under one another, the console scrolling once anything
+ * touched the last line -- and none of that can happen if the whole panel is simply reprinted
+ * from the top every frame, each line padded to a constant width so it needs no clearing. */
+#define PANEL_ROWS 28
+#define PANEL_COLS 39
+static char g_panel[PANEL_ROWS][PANEL_COLS + 1];
+static void panel_clear(void) {
+    for (int r = 0; r < PANEL_ROWS; r++) { memset(g_panel[r], ' ', PANEL_COLS); g_panel[r][PANEL_COLS] = 0; }
+}
+static void panel_set(int row, const char *t) {
+    if (row < 0 || row >= PANEL_ROWS) return;
+    int n = (int)strlen(t);
+    if (n > PANEL_COLS) n = PANEL_COLS;
+    memcpy(g_panel[row], t, n);
+}
+static void panel_fmt(int row, const char *fmt, ...) {
+    char b[128]; va_list ap; va_start(ap, fmt);
+    vsnprintf(b, sizeof b, fmt, ap); va_end(ap);
+    panel_set(row, b);
+}
+/* word-wrap into the panel; returns the row after the last one used */
+static int panel_wrap(int row, int maxrows, const char *t) {
+    int used = 0;
+    while (*t && used < maxrows) {
+        while (*t == ' ') t++;
+        if (!*t) break;
+        int n = (int)strlen(t);
+        if (n > PANEL_COLS - 1) {
+            n = PANEL_COLS - 1;
+            while (n > 0 && t[n] != ' ' && t[n] != 0) n--;
+            if (n <= 0) n = PANEL_COLS - 1;
+        }
+        char line[PANEL_COLS + 2];
+        snprintf(line, sizeof line, " %.*s", n, t);
+        panel_set(row + used, line);
+        t += n; used++;
+    }
+    return row + used;
+}
+static void panel_flush(void) {
+    printf("\x1b[1;1H");                      /* home, 1-based as ANSI actually specifies */
+    for (int r = 0; r < PANEL_ROWS; r++) {
+        fputs(g_panel[r], stdout);
+        if (r < PANEL_ROWS - 1) fputc('\n', stdout);   /* no newline on the last: never scroll */
+    }
 }
 
 /* Print `t` word-wrapped into `cols`, starting at console row `row`, at most `maxrows` lines.
@@ -671,7 +721,10 @@ static void build_sections(void) {
         int per_face = 24;                             /* 3 rows x 8 along the unit */
         int face = (sl / per_face) & 1;                /* front (+z) then back (-z) */
         int idx  = sl % per_face;
-        int row  = idx / 8, colp = idx % 8;
+        /* Fill from the TOP shelf down. Filling upward left a half-stocked section with
+         * everything on the floor row and bare shelves at eye level, which looks abandoned;
+         * the top row also sits nearest eye height, so the first titles are the visible ones. */
+        int row  = 2 - (idx / 8), colp = idx % 8;
         g_pos[i].x  = g_sec[k].cx + (colp - 3.5f) * 0.70f;
         g_pos[i].y  = 0.46f + row * 0.62f;
         g_pos[i].z  = g_sec[k].cz + (face ? -(UNIT_DEPTH * 0.5f + 0.02f)
@@ -982,6 +1035,10 @@ int main(void) {
 
         circlePosition cp; hidCircleRead(&cp);
         float fx = cp.dx / 156.0f, fy = cp.dy / 156.0f;
+        /* Deadzone. This went missing in an edit, and without it stick rest-drift never reads
+         * as zero -- so the held case slowly zoomed itself to a limit and the view crept. */
+        if (fabsf(fx) < 0.15f) fx = 0.0f;
+        if (fabsf(fy) < 0.15f) fy = 0.0f;
         if (held >= 0) {
             /* left/right turns the case over, up/down pulls it closer or pushes it away */
             spin += fx * 0.075f;
@@ -1225,40 +1282,34 @@ int main(void) {
         if (osGetTime() - t0 >= 1000) { fps = frames; frames = 0; t0 = osGetTime(); }
 
         /* The bottom screen is the info panel, the way the player shows a title -- not a second
-         * copy of the poster, which you are already looking at in 3D. It only falls back to the
+         * copy of the poster, which you are already looking at in 3D. */
+        panel_clear();
         if (sel >= 0) {
             Poster *q = &g_pos[sel];
-            printf("\x1b[0;0H\x1b[2K %.37s", q->name);
-            char sub[64]; sub[0] = 0;
-            if (q->year && q->runtime)      snprintf(sub, sizeof sub, "%d   %d min", q->year, q->runtime);
-            else if (q->year)               snprintf(sub, sizeof sub, "%d", q->year);
-            else if (q->runtime)            snprintf(sub, sizeof sub, "%d min", q->runtime);
-            printf("\x1b[1;0H\x1b[2K %s", sub);
-            printf("\x1b[2;0H\x1b[2K %.37s", q->genres);
-            if (q->desc[0]) wrap_print(4, 37, 19, q->desc);
-            else            wrap_print(4, 37, 19, q->hasinfo ? "(no description in the .nfo)"
-                                                             : "(no .nfo for this one - poster only)");
-            printf("\x1b[24;0H\x1b[2K %s", held >= 0 ? "[in hand]  B puts it back"
-                                                       : "A takes it off the shelf");
-            printf("\x1b[25;0H\x1b[2K");
+            panel_fmt(0, " %s", q->name);
+            if (q->year && q->runtime) panel_fmt(1, " %d   %d min", q->year, q->runtime);
+            else if (q->year)          panel_fmt(1, " %d", q->year);
+            else if (q->runtime)       panel_fmt(1, " %d min", q->runtime);
+            if (q->genres[0]) panel_fmt(2, " %s", q->genres);
+            if (q->desc[0]) panel_wrap(4, 19, q->desc);
+            else            panel_set(4, q->hasinfo ? " (no description in the .nfo)"
+                                                    : " (no .nfo for this one - poster only)");
+            panel_set(24, held >= 0 ? " [in hand]" : " A takes it off the shelf");
         } else {
-            printf("\x1b[0;0H\x1b[2K MOFLEX STORE  (prototype)");
-            printf("\x1b[1;0H\x1b[2K");
-            printf("\x1b[2;0H\x1b[2K %d posters, %d with info", g_nposters, g_withinfo);
-            printf("\x1b[3;0H\x1b[2K %d KB texture  %d built  %llums",
-                   (int)((g_nposters * TEX_BYTES) / 1024), built, (unsigned long long)t_load);
-            printf("\x1b[4;0H\x1b[2K fps %2d   eyes %d", fps, (slider > 0.0f ? 2 : 1));
-            printf("\x1b[6;0H\x1b[2K walk up to a case for its info");
-            printf("\x1b[8;0H\x1b[2K sections");
-            int r = 9;
-            for (int i = 0; i < g_nsec && i < 8; i++, r++)
-                printf("\x1b[%d;0H\x1b[2K   %-16s %d", r, g_sec[i].name, g_sec[i].n);
-            for (; r <= 25; r++) printf("\x1b[%d;0H\x1b[2K", r);
+            panel_set(0, " MOFLEX STORE  (prototype)");
+            panel_fmt(2, " %d posters, %d with info", g_nposters, g_withinfo);
+            panel_fmt(3, " %d KB texture   %d built   %llums",
+                      (int)((g_nposters * TEX_BYTES) / 1024), built, (unsigned long long)t_load);
+            panel_fmt(4, " fps %2d   eyes %d", fps, (slider > 0.0f ? 2 : 1));
+            panel_set(6, " walk up to a case for its info");
+            panel_set(8, " sections");
+            for (int i = 0; i < g_nsec && i < 8; i++)
+                panel_fmt(9 + i, "   %-16s %d", g_sec[i].name, g_sec[i].n);
         }
-        /* pinned to the bottom of the 30-row console, not floating in the middle */
-        printf("\x1b[27;0H\x1b[2K pad walk+look  L/R strafe  d-pad look");
-        if (held >= 0) printf("\x1b[28;0H\x1b[2K pad: turn / zoom   B put back");
-        else           printf("\x1b[28;0H\x1b[2K A take  X level  START exit");
+        panel_set(26, held >= 0 ? " pad: turn / zoom     B put back"
+                                : " pad walk+look   L/R strafe   d-pad look");
+        panel_set(27, held >= 0 ? "" : " A take   X level   START exit");
+        panel_flush();
     }
 
     for (int i = 0; i < g_nposters; i++) if (g_pos[i].ok) C3D_TexDelete(&g_pos[i].tex);
