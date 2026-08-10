@@ -1406,7 +1406,7 @@ static void sub_offset_menu(void) {
 static void sub_menu(const char *moviepath, int is3d) {
     int msel = 0;                       /* keep the cursor on the item you just changed */
     for (;;) {
-        char i0[28], i2[28], i3[28], i4[28], i5[28], i6[28], i7[28];
+        char i0[28], i2[28], i3[28], i4[28], i5[28], i6[28], i7[28], i8[40];
         snprintf(i0, sizeof i0, "Subtitles: %s", g_sub_on ? "ON" : "OFF");
         snprintf(i2, sizeof i2, "Size: %d / %d", g_sub_size, SUB_SIZE_MAX);
         int64_t da = g_sub_off < 0 ? -g_sub_off : g_sub_off;
@@ -1423,6 +1423,16 @@ static void sub_menu(const char *moviepath, int is3d) {
         items[n] = i3; act[n++] = 3;
         items[n] = i5; act[n++] = 6;                         /* text encoding (for non-UTF-8 SRTs) */
         if (is3d) { snprintf(i4, sizeof i4, "Depth (3D): %+d", g_sub_depth); items[n] = i4; act[n++] = 4; }
+        /* Built-in (SUPER MOFLEX) subtitles. This row did not exist here at all, so once an
+         * external .srt was loaded there was no way back to the ones inside the file. */
+        if (g_tra.sub_n > 0) {
+            snprintf(i8, sizeof i8, "Built-in: %s (%d/%d)%s",
+                     g_trsub_sel < g_tra.sub_n && g_tra.sub_lang[g_trsub_sel][0]
+                         ? g_tra.sub_lang[g_trsub_sel] : "---",
+                     g_trsub_sel + 1, g_tra.sub_n,
+                     strcmp(g_sub_file, EMB_SRT) ? " (A)" : "");
+            items[n] = i8; act[n++] = 8;
+        }
         items[n] = "Load SRT file..."; act[n++] = 5;
         int c = sub_modal("SUBTITLES", items, n, msel);
         if (c < 0) { subcfg_save(moviepath); return; }        /* B closes the menu -> persist for this movie */
@@ -1435,6 +1445,11 @@ static void sub_menu(const char *moviepath, int is3d) {
         else if (a == 5) sub_load_menu(moviepath);
         else if (a == 9) g_sub_font = !g_sub_font;
         else if (a == 10) sub_position_menu();
+        else if (a == 8 && g_tra.sub_n > 0) {   /* back to the file's own subtitles */
+            if (!strcmp(g_sub_file, EMB_SRT) && g_tra.sub_n > 1)
+                g_trsub_sel = (g_trsub_sel + 1) % g_tra.sub_n;   /* already showing: next language */
+            if (trsub_stash(moviepath, g_trsub_sel)) { subs_load(EMB_SRT); g_sub_on = 1; }
+        }
         else if (a == 6) { g_sub_enc = (g_sub_enc + 1) % 5;   /* re-decode the loaded SRT with the new codepage */
                            if (g_sub_file[0]) { char want[512]; snprintf(want, sizeof want, "%s", g_sub_file);
                                                 subs_load(want); } }   /* saved with the rest when the menu closes */
@@ -1783,7 +1798,10 @@ static char g_srt_names[SRT_MAX][128], g_srt_paths[SRT_MAX][512];
 static int submenu_actions(int is3d, int *act) {
     int n = 0;
     act[n++] = 0; act[n++] = 10; act[n++] = 2; act[n++] = 9; act[n++] = 3; act[n++] = 6;
-    if (g_tra.sub_n > 1) act[n++] = 8;   /* built-in subtitle track cycler */
+    /* Shown whenever the file HAS a built-in track, not only when it has several. With one
+     * track the row was hidden, so loading an external .srt was a one-way trip: nothing on
+     * screen could put the built-in subtitles back. */
+    if (g_tra.sub_n > 0) act[n++] = 8;   /* built-in subtitle track */
     if (is3d) act[n++] = 4;
     act[n++] = 5;
     return n;
@@ -1804,10 +1822,12 @@ static void submenu_label(int a, char *r, int cap) {
         case 10: snprintf(r, cap, "Position:  %d px up   (left/right)", g_sub_pos); break;
         case 4: snprintf(r, cap, "Depth (3D):  %+d", g_sub_depth); break;
         case 7: snprintf(r, cap, "Audio:  Track %d / %d", g_atrk_sel + 1, g_atrk_n); break;
-        case 8: snprintf(r, cap, "Sub Track:  %s (%d/%d)",
+        case 8: snprintf(r, cap, "Built-in:  %s (%d/%d)%s",
                          g_trsub_sel < g_tra.sub_n && g_tra.sub_lang[g_trsub_sel][0]
                              ? g_tra.sub_lang[g_trsub_sel] : "---",
-                         g_trsub_sel + 1, g_tra.sub_n); break;
+                         g_trsub_sel + 1, g_tra.sub_n,
+                         /* say how to come back when an external file is what is showing */
+                         strcmp(g_sub_file, EMB_SRT) ? "  (A loads)" : ""); break;
         default: snprintf(r, cap, "Load SRT file..."); break;
     }
 }
@@ -2200,8 +2220,13 @@ static int submenu_input(u32 kd, u32 kh, touchPosition tp, int is3d, const char 
         case 10: if (rep) { g_sub_pos += rep * sub_ramp(g_sub_rep);   /* left/down lower, right/up higher */
                             if (g_sub_pos < 0) g_sub_pos = 0;
                             if (g_sub_pos > SUB_POS_MAX) g_sub_pos = SUB_POS_MAX; } break;
-        case 8: if (press && g_tra.sub_n > 1) {
-                    g_trsub_sel = (g_trsub_sel + g_tra.sub_n + (press < 0 ? -1 : 1)) % g_tra.sub_n;
+        case 8: if (press && g_tra.sub_n > 0) {
+                    /* A on this row means "show the built-in subtitles". Only advance the
+                     * language when they are ALREADY what is showing -- otherwise the first
+                     * press after loading an external file would skip a language on the way
+                     * back in, and with a single track there would be nothing to skip to. */
+                    if (!strcmp(g_sub_file, EMB_SRT) && g_tra.sub_n > 1)
+                        g_trsub_sel = (g_trsub_sel + g_tra.sub_n + (press < 0 ? -1 : 1)) % g_tra.sub_n;
                     if (trsub_stash(moviepath, g_trsub_sel)) {
                         subs_load(EMB_SRT);
                         g_sub_on = 1;   /* picking a language implies wanting it shown */
