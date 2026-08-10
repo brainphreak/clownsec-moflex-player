@@ -69,11 +69,11 @@
 /* A store floor with freestanding units, not a corridor. The units are low enough to see
  * over (2.0 against a 1.55 eye height puts the sign of the next section in view from
  * anywhere), which is what makes the place read as a shop rather than a maze. */
-#define STORE_HX     22.0f      /* floor spans +/-STORE_HX in x */
+#define STORE_HX     18.0f      /* floor spans +/-STORE_HX in x */
 #define STORE_Z0      2.0f      /* and STORE_Z0 .. -STORE_DEPTH in z */
-#define STORE_DEPTH  34.0f
+#define STORE_DEPTH  30.0f
 #define CEIL_Y        4.2f
-#define UNIT_LEN      6.0f      /* shelf unit: long axis (x) */
+#define UNIT_LEN     12.0f      /* a bay: long enough to run from the wall to the walkway */
 #define UNIT_DEPTH    1.0f
 #define UNIT_H        2.0f
 #define SIGN_Y        3.35f
@@ -93,7 +93,9 @@ typedef struct {
     u16     tint;
     int     ok;
     float   x, y, z;            /* centre, world space */
-    float   ry;                 /* facing: +1 = normal points +x, -1 = -x */
+    float   ay;                 /* which way the case FACES, in radians. Was a +/-1 flag, which
+                                 * could only express four directions and fell apart the moment
+                                 * a unit sat at 45 degrees. */
     char    name[80];           /* title, or the filename when there is no .nfo */
     char    genres[80];
     char    desc[400];
@@ -106,6 +108,9 @@ typedef struct {
 typedef struct {
     char    name[24];
     float   cx, cz;             /* unit centre on the floor */
+    float   rot;                /* which way the unit runs. Islands all square to the room read
+                                 * as crates dropped on a floor; a couple set at an angle make
+                                 * it look laid out. */
     C3D_Tex sign;
     int     sign_ok;
     int     n;                  /* posters assigned */
@@ -905,35 +910,66 @@ static void build_sections(void) {
     snprintf(g_sec[g_nsec].name, 24, "GENERAL");
     g_nsec++;
 
-    /* grid: SEC_COLS across, rows going away from the door */
+    /* A FLOOR PLAN, not a grid. Evenly spaced islands square to the room leave a hall of empty
+     * carpet and read as crates; a real shop runs units in ranks with walking aisles between
+     * them and turns the back corners in to face you as you come down the room. */
+    /* Bays, the way a rental shop is actually laid out: units run OUT FROM THE WALLS with
+     * their far end against the wall, leaving a clear walkway up the middle of the room that
+     * reaches every section. Islands floating in open carpet read as crates; this reads as a
+     * shop you can navigate. The back corners turn in to close the room off. */
+    static const float PLAN[MAX_SECTIONS][3] = {   /* x, z, rotation */
+        { -11.6f,  -5.0f, 0.0f },   /* left wall, three bays */
+        { -11.6f, -12.0f, 0.0f },
+        { -11.6f, -19.0f, 0.0f },
+        {  11.6f,  -5.0f, 0.0f },   /* right wall, three bays */
+        {  11.6f, -12.0f, 0.0f },
+        {  11.6f, -19.0f, 0.0f },
+        {  -7.0f, -25.5f, 0.0f },   /* across the back */
+        {   7.0f, -25.5f, 0.0f },
+    };
     for (int i = 0; i < g_nsec; i++) {
-        int col = i % SEC_COLS, row = i / SEC_COLS;
-        g_sec[i].cx = (col - (SEC_COLS - 1) * 0.5f) * 13.0f;
-        g_sec[i].cz = -7.0f - row * 11.0f;
+        g_sec[i].cx  = PLAN[i][0];
+        g_sec[i].cz  = PLAN[i][1];
+        g_sec[i].rot = PLAN[i][2];
         make_sign_tex(&g_sec[i].sign, g_sec[i].name);
         g_sec[i].sign_ok = 1;
     }
 
-    /* place each poster on its section's unit: two rows, both faces, filling along the length */
+    /* Two passes, so a half-stocked section sits CENTRED on its unit rather than packed against
+     * one end with bare shelf beside it. */
+    int sect[MAX_POSTERS], slotof[MAX_POSTERS];
     int slot[MAX_SECTIONS]; memset(slot, 0, sizeof slot);
     for (int i = 0; i < g_nposters; i++) {
         char g[24]; first_genre(g_pos[i].genres, g, sizeof g);
         int k = g_nsec - 1;                            /* GENERAL unless a section matches */
         for (int j = 0; j < g_nsec; j++) if (!strcmp(g_sec[j].name, g)) { k = j; break; }
-        int sl = slot[k]++;
-        int per_face = 3 * 26;                         /* 3 rows, 26 spines to a row */
+        sect[i] = k; slotof[i] = slot[k]++;
+        g_sec[k].n++;
+    }
+    const int PER_ROW = 46;                            /* spines that fit along a 12-unit bay */
+    for (int i = 0; i < g_nposters; i++) {
+        int k = sect[i], sl = slotof[i];
+        int per_face = 3 * PER_ROW;
         int face = (sl / per_face) & 1;                /* front (+z) then back (-z) */
         int idx  = sl % per_face;
         /* Fill from the TOP shelf down. Filling upward left a half-stocked section with
          * everything on the floor row and bare shelves at eye level, which looks abandoned;
          * the top row also sits nearest eye height, so the first titles are the visible ones. */
-        int row  = 2 - (idx / 26), colp = idx % 26;
-        g_pos[i].x  = g_sec[k].cx + (colp - 12.5f) * 0.215f;
+        int row  = 2 - (idx / PER_ROW), colp = idx % PER_ROW;
+        /* how many are on this face, so the run can be centred */
+        int onface = g_sec[k].n - face * per_face;
+        if (onface > per_face) onface = per_face;
+        int inrow = onface - row * PER_ROW;            /* rows fill from the top */
+        if (inrow > PER_ROW) inrow = PER_ROW;
+        if (inrow < 1) inrow = 1;
+        /* laid out along the unit, then turned with it */
+        float lx = (colp - (inrow - 1) * 0.5f) * 0.235f;
+        float lz = face ? -(UNIT_DEPTH * 0.5f + 0.02f) : (UNIT_DEPTH * 0.5f + 0.02f);
+        float ca = cosf(g_sec[k].rot), sa = sinf(g_sec[k].rot);
+        g_pos[i].x  = g_sec[k].cx + lx * ca + lz * sa;
+        g_pos[i].z  = g_sec[k].cz - lx * sa + lz * ca;
         g_pos[i].y  = 0.46f + row * 0.62f;
-        g_pos[i].z  = g_sec[k].cz + (face ? -(UNIT_DEPTH * 0.5f + 0.02f)
-                                          :  (UNIT_DEPTH * 0.5f + 0.02f));
-        g_pos[i].ry = face ? -2.0f : 2.0f;             /* 2.0 marks "faces +/-z", see the draw */
-        g_sec[k].n++;
+        g_pos[i].ay = g_sec[k].rot + (face ? C3D_Angle(0.5f) : 0.0f);
     }
 }
 
@@ -956,10 +992,34 @@ static void push_quad(Vtx *v, int *n,
 }
 
 /* things you cannot walk through: the shelf units, plus the counter */
-typedef struct { float cx, cz, hx, hz; } Blocker;
-static Blocker g_block[MAX_SECTIONS + 4];
+typedef struct { float cx, cz, hx, hz, rot; } Blocker;
+/* sections + the L returns + the counter + the returns bin. Sized with room to spare: the
+ * L returns were added without growing this, which is one past the end. */
+static Blocker g_block[MAX_SECTIONS * 2 + 8];
 static int     g_nblock = 0;
 
+/* a box turned about its own centre */
+static void push_box_rot(Vtx *v, int *n, float cx, float cy, float cz,
+                         float hx, float hy, float hz, float rot,
+                         float ur, float vr, float sh) {
+    float ca = cosf(rot), sa = sinf(rot);
+    #define RX(lx, lz) (cx + (lx) * ca + (lz) * sa)
+    #define RZ(lx, lz) (cz - (lx) * sa + (lz) * ca)
+    float y0 = cy - hy, y1 = cy + hy;
+    /* the four uprights, then the top */
+    push_quad(v, n, RX(-hx,hz),y0,RZ(-hx,hz), RX(hx,hz),y0,RZ(hx,hz),
+                    RX(hx,hz),y1,RZ(hx,hz),   RX(-hx,hz),y1,RZ(-hx,hz), ur, vr, sh);
+    push_quad(v, n, RX(hx,-hz),y0,RZ(hx,-hz), RX(-hx,-hz),y0,RZ(-hx,-hz),
+                    RX(-hx,-hz),y1,RZ(-hx,-hz), RX(hx,-hz),y1,RZ(hx,-hz), ur, vr, sh);
+    push_quad(v, n, RX(-hx,-hz),y0,RZ(-hx,-hz), RX(-hx,hz),y0,RZ(-hx,hz),
+                    RX(-hx,hz),y1,RZ(-hx,hz),   RX(-hx,-hz),y1,RZ(-hx,-hz), 1, vr, sh * 0.86f);
+    push_quad(v, n, RX(hx,hz),y0,RZ(hx,hz), RX(hx,-hz),y0,RZ(hx,-hz),
+                    RX(hx,-hz),y1,RZ(hx,-hz), RX(hx,hz),y1,RZ(hx,hz), 1, vr, sh * 0.86f);
+    push_quad(v, n, RX(-hx,-hz),y1,RZ(-hx,-hz), RX(hx,-hz),y1,RZ(hx,-hz),
+                    RX(hx,hz),y1,RZ(hx,hz),     RX(-hx,hz),y1,RZ(-hx,hz), ur, 1, sh * 1.15f);
+    #undef RX
+    #undef RZ
+}
 static void push_box(Vtx *v, int *n, float cx, float cy, float cz,
                      float hx, float hy, float hz, float ur, float vr, float sh) {
     float x0 = cx - hx, x1 = cx + hx, y0 = cy - hy, y1 = cy + hy, z0 = cz - hz, z1 = cz + hz;
@@ -989,44 +1049,28 @@ static int build_room(void) {
     /* one shelf unit per section: a box you can see over, with a lighter top so it reads as a
      * surface rather than a wall */
     for (int i = 0; i < g_nsec; i++) {
-        float cx = g_sec[i].cx, cz = g_sec[i].cz;
-        float hx = UNIT_LEN * 0.5f, hz = UNIT_DEPTH * 0.5f, h = UNIT_H;
-        push_quad(g_roomv, &n, cx-hx,0,cz+hz, cx+hx,0,cz+hz, cx+hx,h,cz+hz, cx-hx,h,cz+hz, 3,1, 0.44f);
-        push_quad(g_roomv, &n, cx+hx,0,cz-hz, cx-hx,0,cz-hz, cx-hx,h,cz-hz, cx+hx,h,cz-hz, 3,1, 0.44f);
-        push_quad(g_roomv, &n, cx-hx,0,cz-hz, cx-hx,0,cz+hz, cx-hx,h,cz+hz, cx-hx,h,cz-hz, 1,1, 0.38f);
-        push_quad(g_roomv, &n, cx+hx,0,cz+hz, cx+hx,0,cz-hz, cx+hx,h,cz-hz, cx+hx,h,cz+hz, 1,1, 0.38f);
-        push_quad(g_roomv, &n, cx-hx,h,cz-hz, cx+hx,h,cz-hz, cx+hx,h,cz+hz, cx-hx,h,cz+hz, 3,1, 0.86f);
+        push_box_rot(g_roomv, &n, g_sec[i].cx, UNIT_H * 0.5f, g_sec[i].cz,
+                     UNIT_LEN * 0.5f, UNIT_H * 0.5f, UNIT_DEPTH * 0.5f, g_sec[i].rot,
+                     3, 1, 0.52f);
     }
     /* the counter: a long wood block by the door, a register on top, and a returns box */
     push_box(g_roomv, &n, -12.0f, 0.55f, -1.6f, 4.0f, 0.55f, 0.7f, 4, 1, 0.62f);
     push_box(g_roomv, &n, -13.6f, 1.28f, -1.6f, 0.6f, 0.18f, 0.45f, 1, 1, 0.40f);  /* register base */
     push_box(g_roomv, &n, -13.6f, 1.60f, -1.75f, 0.5f, 0.14f, 0.22f, 1, 1, 0.78f); /* its screen */
     push_box(g_roomv, &n,  -8.2f, 0.60f, -1.6f, 0.9f, 0.60f, 0.6f, 1, 1, 0.50f);   /* returns bin */
-    /* shelving against the walls: a board with a run of stock standing on it */
-    for (int w = 0; w < 3; w++)
-        for (int lvl = 0; lvl < 2; lvl++) {
-            float y = 0.75f + lvl * 1.15f;
-            if (w == 2) push_box(g_roomv, &n, 0, y - 0.06f, -STORE_DEPTH + STORE_Z0 + 0.45f,
-                                 STORE_HX - 1.0f, 0.06f, 0.45f, 14, 1, 0.66f);
-            else        push_box(g_roomv, &n, (w ? STORE_HX : -STORE_HX) + (w ? -0.45f : 0.45f),
-                                 y - 0.06f, -14.0f, 0.45f, 0.06f, 15.0f, 14, 1, 0.66f);
-        }
+    /* An L on the end of two bays: a short return that turns the corner, which is what stops a
+     * rank of units reading as a row of identical slabs. */
+    for (int i = 0; i < g_nsec && i < 6; i += 2) {
+        float ex = g_sec[i].cx + ((g_sec[i].cx < 0) ? UNIT_LEN * 0.5f : -UNIT_LEN * 0.5f);
+        push_box_rot(g_roomv, &n, ex, UNIT_H * 0.5f, g_sec[i].cz + 1.6f,
+                     UNIT_DEPTH * 0.5f, UNIT_H * 0.5f, 1.6f, 0.0f, 1, 1, 0.48f);
+    }
     g_n_units = n - g_n_floor - g_n_shell;
 
-    /* the stock itself, faced with the anonymous-cover strip */
-    for (int w = 0; w < 3; w++)
-        for (int lvl = 0; lvl < 2; lvl++) {
-            float y = 0.75f + lvl * 1.15f, h = 0.42f;
-            if (w == 2) {
-                float z = -STORE_DEPTH + STORE_Z0 + 0.30f, X = STORE_HX - 1.0f;
-                push_quad(g_roomv, &n, -X, y, z, X, y, z, X, y + h, z, -X, y + h, z, 16, 1, 0.80f);
-            } else {
-                float x = (w ? STORE_HX - 0.30f : -STORE_HX + 0.30f);
-                if (w) push_quad(g_roomv, &n, x, y, 1.0f, x, y, -29.0f, x, y+h, -29.0f, x, y+h, 1.0f, 16,1,0.80f);
-                else   push_quad(g_roomv, &n, x, y, -29.0f, x, y, 1.0f, x, y+h, 1.0f, x, y+h, -29.0f, 16,1,0.80f);
-            }
-        }
-    g_n_cover = n - g_n_floor - g_n_shell - g_n_units;
+    /* The strip of anonymous covers along the walls is gone. It was a stand-in for stock we
+     * could not afford to texture, and beside real spines on real units it read as wallpaper --
+     * the one thing in the room that looked painted on. The bays hold the stock now. */
+    g_n_cover = 0;
 
     /* Strip lights. Nothing is actually lit -- this GPU has no lights and the shading is baked
      * -- but a bright white fitting under the ceiling reads as one, and it is what stops the
@@ -1045,10 +1089,16 @@ static int build_room(void) {
     for (int i = 0; i < g_nsec; i++) {
         g_block[g_nblock].cx = g_sec[i].cx; g_block[g_nblock].cz = g_sec[i].cz;
         g_block[g_nblock].hx = UNIT_LEN * 0.5f + 0.42f;
-        g_block[g_nblock].hz = UNIT_DEPTH * 0.5f + 0.42f; g_nblock++;
+        g_block[g_nblock].hz = UNIT_DEPTH * 0.5f + 0.42f;
+        g_block[g_nblock].rot = g_sec[i].rot; g_nblock++;
     }
-    g_block[g_nblock++] = (Blocker){ -12.0f, -1.6f, 4.4f, 1.1f };
-    g_block[g_nblock++] = (Blocker){  -8.2f, -1.6f, 1.3f, 1.0f };
+    for (int i = 0; i < g_nsec && i < 6; i += 2) {
+        float ex = g_sec[i].cx + ((g_sec[i].cx < 0) ? UNIT_LEN * 0.5f : -UNIT_LEN * 0.5f);
+        g_block[g_nblock++] = (Blocker){ ex, g_sec[i].cz + 1.6f,
+                                         UNIT_DEPTH * 0.5f + 0.42f, 1.6f + 0.42f, 0.0f };
+    }
+    g_block[g_nblock++] = (Blocker){ -12.0f, -1.6f, 4.4f, 1.1f, 0.0f };
+    g_block[g_nblock++] = (Blocker){  -8.2f, -1.6f, 1.3f, 1.0f, 0.0f };
     return n;
 }
 
@@ -1371,12 +1421,18 @@ int main(void) {
         /* keep out of the shelf units: push to the nearest face of whichever box you are in.
          * Crude, but a box is a box and you cannot walk through one. */
         for (int i = 0; i < g_nblock; i++) {
-            float hx = g_block[i].hx, hz = g_block[i].hz;
+            /* test in the unit's OWN frame, so a turned unit blocks along its real sides
+             * rather than along an invisible square */
+            float ca = cosf(g_block[i].rot), sa = sinf(g_block[i].rot);
             float dx = cx - g_block[i].cx, dz = cz - g_block[i].cz;
-            if (fabsf(dx) < hx && fabsf(dz) < hz) {
-                float ox = hx - fabsf(dx), oz = hz - fabsf(dz);
-                if (ox < oz) cx = g_block[i].cx + (dx < 0 ? -hx : hx);
-                else         cz = g_block[i].cz + (dz < 0 ? -hz : hz);
+            float lx =  dx * ca - dz * sa, lz = dx * sa + dz * ca;
+            float hx = g_block[i].hx, hz = g_block[i].hz;
+            if (fabsf(lx) < hx && fabsf(lz) < hz) {
+                float ox = hx - fabsf(lx), oz = hz - fabsf(lz);
+                if (ox < oz) lx = (lx < 0 ? -hx : hx);
+                else         lz = (lz < 0 ? -hz : hz);
+                cx = g_block[i].cx + lx * ca + lz * sa;
+                cz = g_block[i].cz - lx * sa + lz * ca;
             }
         }
 
@@ -1489,14 +1545,10 @@ int main(void) {
             if (g_spine_ok) C3D_TexBind(0, &g_spine);
             for (int i = 0; i < g_nposters; i++) {
                 if (!g_pos[i].ok || i == held || i == sel) continue;
-                float ay;
-                if (fabsf(g_pos[i].ry) > 1.5f) ay = (g_pos[i].ry > 0) ? 0.0f : C3D_Angle(0.5f);
-                else                           ay = (g_pos[i].ry > 0) ? C3D_Angle(0.25f)
-                                                                     : C3D_Angle(-0.25f);
                 C3D_Mtx m;
                 Mtx_Copy(&m, &view);
                 Mtx_Translate(&m, g_pos[i].x, g_pos[i].y, g_pos[i].z, true);
-                Mtx_RotateY(&m, ay, true);
+                Mtx_RotateY(&m, g_pos[i].ay, true);
                 Mtx_Scale(&m, 0.20f, 0.56f, 1.0f);           /* an edge, not a face */
                 C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
                 set_tint(g_pos[i].tint);
@@ -1508,8 +1560,7 @@ int main(void) {
              * cover. This is the whole reason spines are affordable -- you only ever need one */
             if (sel >= 0 && sel != held && g_pos[sel].ok) {
                 Poster *q = &g_pos[sel];
-                float nx = (fabsf(q->ry) > 1.5f) ? 0.0f : (q->ry > 0 ? 1.0f : -1.0f);
-                float nz = (fabsf(q->ry) > 1.5f) ? (q->ry > 0 ? 1.0f : -1.0f) : 0.0f;
+                float nx = sinf(q->ay), nz = cosf(q->ay);     /* the way this case faces */
                 C3D_Mtx m;
                 Mtx_Copy(&m, &view);
                 Mtx_Translate(&m, q->x + nx * 0.22f, q->y, q->z + nz * 0.22f, true);
@@ -1533,9 +1584,7 @@ int main(void) {
                 const float D = hold_d;
                 /* where it is coming FROM: its slot on the shelf */
                 float sx = q->x, sy = q->y, sz = q->z;
-                float ay0;
-                if (fabsf(q->ry) > 1.5f) ay0 = (q->ry > 0) ? 0.0f : C3D_Angle(0.5f);
-                else                     ay0 = (q->ry > 0) ? C3D_Angle(0.25f) : C3D_Angle(-0.25f);
+                float ay0 = q->ay;
                 /* where it is going TO: arm's length down the view axis */
                 float hx = cx + f3x * D, hy = EYE + f3y * D, hz = cz + f3z * D;
                 float da = yaw - ay0;                       /* short way round, or it spins */
