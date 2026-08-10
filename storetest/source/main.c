@@ -326,9 +326,10 @@ static void draw_text(u16 *lin, int W, int H, int x, int y, int sc, u16 col, con
 }
 /* word-wrapped block; returns the y just past the last line */
 static int draw_wrap(u16 *lin, int W, int H, int x, int y, int sc, u16 col,
-                     const char *t, int cols, int maxlines) {
+                     const char *t, int cols, int maxlines, int *truncated) {
     char line[80];
     int used = 0;
+    if (truncated) *truncated = 0;
     while (*t && used < maxlines) {
         while (*t == ' ') t++;
         if (!*t) break;
@@ -340,6 +341,13 @@ static int draw_wrap(u16 *lin, int W, int H, int x, int y, int sc, u16 col,
         }
         if (n > (int)sizeof line - 1) n = (int)sizeof line - 1;
         snprintf(line, sizeof line, "%.*s", n, t);
+        /* last line with more still to come: elide, so it reads as a blurb and not a cut-off */
+        if (used == maxlines - 1 && t[n]) {
+            int k = (int)strlen(line);
+            while (k > 0 && k > cols - 3) line[--k] = 0;
+            snprintf(line + k, sizeof line - k, "...");
+            if (truncated) *truncated = 1;
+        }
         draw_text(lin, W, H, x, y + used * 9 * sc, sc, col, line);
         t += n; used++;
     }
@@ -417,37 +425,64 @@ static void rebuild_back(const Poster *q) {
     if (!lin || !til) { free(lin); free(til); return; }
     const u16 card = 0x2124, bar = 0x8000, ink = 0xFFFF, dim = 0xC618, edge = 0x630C;
 
+    /* Everything below is measured off these, so nothing can run past an edge or land on the
+     * footer -- both of which happened when the positions were hand-picked constants. */
+    const int M = 14;                       /* margin on every side */
+    const int TXT_W = BACK_W - 2 * M;
+    const int FOOT_H = 96;                  /* runtime + barcode + year live here */
+    const int FOOT_Y = BACK_USED - FOOT_H;
+
     for (int y = 0; y < BACK_USED; y++)
         for (int x = 0; x < BACK_W; x++) {
             int b = (x < 4 || x >= BACK_W - 4 || y < 4 || y >= BACK_USED - 4);
             lin[y * BACK_W + x] = b ? edge : card;
         }
-    /* title bar across the top, like a spine label */
-    for (int y = 10; y < 44; y++)
-        for (int x = 8; x < BACK_W - 8; x++) lin[y * BACK_W + x] = bar;
-    { char t[24]; snprintf(t, sizeof t, "%.15s", q->name);
-      draw_text(lin, BACK_W, BACK_H, 14, 18, 2, ink, t); }
+    for (int y = 10; y < 46; y++)                        /* title bar */
+        for (int x = M - 4; x < BACK_W - (M - 4); x++) lin[y * BACK_W + x] = bar;
+    { int cols = TXT_W / 16;                             /* 2x glyphs are 16 px wide */
+      char t[40]; snprintf(t, sizeof t, "%.*s", cols, q->name);
+      draw_text(lin, BACK_W, BACK_H, M, 18, 2, ink, t); }
 
     int y = 54;
-    if (q->genres[0]) { char g[40]; snprintf(g, sizeof g, "%.30s", q->genres);
-                        draw_text(lin, BACK_W, BACK_H, 12, y, 1, dim, g); y += 14; }
-    y += 4;
-    if (q->desc[0]) y = draw_wrap(lin, BACK_W, BACK_H, 12, y, 1, ink, q->desc, 30, 22);
-    else            draw_text(lin, BACK_W, BACK_H, 12, y, 1, dim, "No description on file.");
-
-    /* runtime + a barcode block, the two things every VHS back really had */
-    char rt[32];
-    if (q->runtime) snprintf(rt, sizeof rt, "RUNNING TIME  %d MIN", q->runtime);
-    else            snprintf(rt, sizeof rt, "RUNNING TIME  --");
-    draw_text(lin, BACK_W, BACK_H, 12, BACK_USED - 74, 1, dim, rt);
-    for (int x = 0; x < 92; x++) {
-        int w = ((x * 7919) >> 3) & 1;                 /* deterministic stripes */
-        if (!w) continue;
-        for (int yy = BACK_USED - 56; yy < BACK_USED - 20; yy++)
-            lin[yy * BACK_W + (12 + x)] = ink;
+    if (q->genres[0]) {
+        char g[48]; snprintf(g, sizeof g, "%.*s", TXT_W / 8, q->genres);
+        draw_text(lin, BACK_W, BACK_H, M, y, 1, dim, g);
+        y += 14;
     }
-    if (q->year) { char yr[16]; snprintf(yr, sizeof yr, "%d", q->year);
-                   draw_text(lin, BACK_W, BACK_H, BACK_W - 60, BACK_USED - 40, 2, dim, yr); }
+    y += 6;
+
+    /* The blurb at 2x. At 1x an 8-pixel glyph lands at roughly six screen pixels on a held
+     * case and is genuinely unreadable; 2x is about twelve and legible. The cost is fourteen
+     * characters a line, so what fits here is a blurb -- the bottom screen keeps the rest. */
+    { int cols  = TXT_W / 16;
+      int lines = (FOOT_Y - y) / 18;
+      int trunc = 0;
+      if (lines > 0) {
+          if (q->desc[0]) draw_wrap(lin, BACK_W, BACK_H, M, y, 2, ink, q->desc, cols, lines, &trunc);
+          else            draw_text(lin, BACK_W, BACK_H, M, y, 1, dim, "No description on file.");
+      } }
+
+    { char rt[32];
+      if (q->runtime) snprintf(rt, sizeof rt, "RUNNING TIME %d MIN", q->runtime);
+      else            snprintf(rt, sizeof rt, "RUNNING TIME --");
+      draw_text(lin, BACK_W, BACK_H, M, FOOT_Y + 6, 1, dim, rt); }
+
+    { int bw = 96, bx = M, by = FOOT_Y + 26, bh = 34;    /* barcode */
+      for (int x = 0; x < bw; x++) {
+          if (!(((x * 7919) >> 3) & 1)) continue;
+          for (int yy = by; yy < by + bh && yy < BACK_USED - 6; yy++)
+              lin[yy * BACK_W + (bx + x)] = ink;
+      } }
+
+    if (q->year) {                                       /* right-aligned FROM ITS OWN WIDTH --
+                                                          * a fixed x assumed four digits and
+                                                          * hung off the edge */
+        char yr[16]; snprintf(yr, sizeof yr, "%d", q->year);
+        int w = (int)strlen(yr) * 16;
+        int x = BACK_W - M - w;
+        if (x < M) x = M;
+        draw_text(lin, BACK_W, BACK_H, x, FOOT_Y + 30, 2, dim, yr);
+    }
 
     tile_rgb565(lin, til, BACK_W, BACK_H);
     memcpy(g_back.data, til, BACK_W * BACK_H * 2);
@@ -456,9 +491,9 @@ static void rebuild_back(const Poster *q) {
 }
 
 /* ---------------- materials ----------------
- * A shop is mostly told by its surfaces: red carpet underfoot, brown wood shelving, pale walls.
- * Each is a 64x64 repeating texture -- 8 KB apiece -- and the room is drawn as three ranges of
- * one vertex buffer so the whole shell still costs three draw calls. */
+ * A shop is mostly told by its surfaces: red carpet underfoot, brown wood shelving, painted
+ * walls. Each is a 64x64 repeating texture -- 8 KB apiece -- and the shell is drawn as ranges
+ * of one vertex buffer, so the whole room is still a handful of draws. */
 static C3D_Tex g_room;      /* walls + ceiling */
 static C3D_Tex g_carpet, g_wood, g_glass, g_door;
 static int     g_mat_ok = 0;
@@ -477,8 +512,7 @@ static void make_materials(void) {
     const int N = 64;
     u16 *lin = (u16 *)malloc(N * N * 2);
     if (!lin) return;
-    /* red carpet: deep red with a woven speckle and a faint border weave */
-    C3D_TexInit(&g_carpet, N, N, GPU_RGB565);
+    C3D_TexInit(&g_carpet, N, N, GPU_RGB565);          /* red carpet, woven speckle */
     for (int y = 0; y < N; y++) for (int x = 0; x < N; x++) {
         int n = ((x * 13 + y * 7) % 5) + ((x ^ y) & 1);
         int r = 11 + n, g = 1 + (n >> 2), b = 3 + (n >> 2);
@@ -486,36 +520,34 @@ static void make_materials(void) {
         lin[y * N + x] = (u16)((r << 11) | ((g * 2) << 5) | b);
     }
     upload_tex(&g_carpet, lin, N, N);
-    /* wood: brown with vertical grain */
-    C3D_TexInit(&g_wood, N, N, GPU_RGB565);
+    C3D_TexInit(&g_wood, N, N, GPU_RGB565);            /* brown planks with grain */
     for (int y = 0; y < N; y++) for (int x = 0; x < N; x++) {
         int grain = ((x * 5 + ((y >> 3) * 3)) % 11);
         int v = 9 + (grain > 8 ? 3 : grain > 5 ? 1 : 0);
         int r = v, g = (v * 2) / 3, b = v / 3;
-        if (x % 16 == 0) { r = 6; g = 4; b = 2; }            /* plank edges */
+        if (x % 16 == 0) { r = 6; g = 4; b = 2; }
         lin[y * N + x] = (u16)((r << 11) | ((g * 2) << 5) | b);
     }
     upload_tex(&g_wood, lin, N, N);
-    /* glass: night outside, with a frame */
-    C3D_TexInit(&g_glass, N, N, GPU_RGB565);
+    C3D_TexInit(&g_glass, N, N, GPU_RGB565);           /* night outside, framed */
     for (int y = 0; y < N; y++) for (int x = 0; x < N; x++) {
         int frame = (x < 3 || x >= N - 3 || y < 3 || y >= N - 3 || x == N / 2);
-        int glow = (y > N - 22 && ((x * 11) % 23) < 3) ? 8 : 0;   /* lights outside */
+        int glow = (y > N - 22 && ((x * 11) % 23) < 3) ? 8 : 0;
         lin[y * N + x] = frame ? 0x4208 : (u16)((glow << 11) | ((2 + glow) << 5) | (6 + glow));
     }
     upload_tex(&g_glass, lin, N, N);
-    /* door: panelled wood with a handle */
-    C3D_TexInit(&g_door, N, N, GPU_RGB565);
+    C3D_TexInit(&g_door, N, N, GPU_RGB565);            /* panelled door with a handle */
     for (int y = 0; y < N; y++) for (int x = 0; x < N; x++) {
         int panel = (x > 8 && x < N - 8 && ((y > 8 && y < 28) || (y > 36 && y < 56)));
         int v = panel ? 12 : 8;
         lin[y * N + x] = (u16)((v << 11) | (((v * 2) / 3 * 2) << 5) | (v / 3));
-        if (x > N - 16 && x < N - 11 && y > 30 && y < 36) lin[y * N + x] = 0xFFE0;  /* handle */
+        if (x > N - 16 && x < N - 11 && y > 30 && y < 36) lin[y * N + x] = 0xFFE0;
     }
     upload_tex(&g_door, lin, N, N);
     free(lin);
     g_mat_ok = 1;
 }
+
 /* PAINT, not a grid. The old one drew a line every 16 texels, which tiled into graph paper
  * across every wall in the shop. This is a flat warm colour with a little roller mottle -- the
  * mottle only exists so a large flat wall does not band. */
