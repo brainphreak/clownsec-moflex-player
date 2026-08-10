@@ -546,6 +546,11 @@ int main(void) {
     gfxInitDefault();
     gfxSet3D(true);                       /* the entire point */
     consoleInit(GFX_BOTTOM, NULL);
+    /* Single-buffer the bottom screen, exactly as the player does (mp4_play.c:328). The console
+     * writes into whichever back buffer is current, and this rewrites only the lines that
+     * changed -- so with two buffers the pair hold different text and alternate every frame.
+     * That is the dark band sweeping across and the letters fading in and out. */
+    gfxSetDoubleBuffering(GFX_BOTTOM, false);
     C3D_Init(C3D_DEFAULT_CMDBUF_SIZE);
 
     C3D_RenderTarget *tL = C3D_RenderTargetCreate(240, 400, GPU_RB_RGBA8, GPU_RB_DEPTH24_STENCIL8);
@@ -768,36 +773,38 @@ int main(void) {
 
         /* The bottom screen is the info panel, the way the player shows a title -- not a second
          * copy of the poster, which you are already looking at in 3D. It only falls back to the
-         * walking stats when nothing is in reach. */
         if (sel >= 0) {
             Poster *q = &g_pos[sel];
-            printf("\x1b[0;0H\x1b[2K %.38s", q->name);
+            printf("\x1b[0;0H\x1b[2K %.37s", q->name);
             char sub[64]; sub[0] = 0;
             if (q->year && q->runtime)      snprintf(sub, sizeof sub, "%d   %d min", q->year, q->runtime);
             else if (q->year)               snprintf(sub, sizeof sub, "%d", q->year);
             else if (q->runtime)            snprintf(sub, sizeof sub, "%d min", q->runtime);
             printf("\x1b[1;0H\x1b[2K %s", sub);
-            printf("\x1b[2;0H\x1b[2K %.38s", q->genres);
-            if (q->desc[0]) wrap_print(4, 38, 12, q->desc);
-            else            wrap_print(4, 38, 12, q->hasinfo ? "(no description in the .nfo)"
-                                                             : "(no .nfo for this one -- poster only)");
-            printf("\x1b[17;0H\x1b[2K %s", held >= 0 ? "[in hand]   B puts it back"
+            printf("\x1b[2;0H\x1b[2K %.37s", q->genres);
+            if (q->desc[0]) wrap_print(4, 37, 19, q->desc);
+            else            wrap_print(4, 37, 19, q->hasinfo ? "(no description in the .nfo)"
+                                                             : "(no .nfo for this one - poster only)");
+            printf("\x1b[24;0H\x1b[2K %s", held >= 0 ? "[in hand]  B puts it back"
                                                        : "A takes it off the shelf");
+            printf("\x1b[25;0H\x1b[2K");
         } else {
             printf("\x1b[0;0H\x1b[2K MOFLEX STORE  (prototype)");
             printf("\x1b[1;0H\x1b[2K");
-            printf("\x1b[2;0H\x1b[2K posters %d  (%d with info)", g_nposters, g_withinfo);
-            printf("\x1b[4;0H\x1b[2K cache built this run: %d   load %llums", built,
-                   (unsigned long long)t_load);
-            printf("\x1b[5;0H\x1b[2K texture: %d KB", (int)((g_nposters * TEX_BYTES) / 1024));
-            printf("\x1b[6;0H\x1b[2K fps %2d   eyes %d   slider %.2f", fps,
-                   (slider > 0.0f ? 2 : 1), slider);
-            for (int r = 7; r <= 17; r++) printf("\x1b[%d;0H\x1b[2K", r);
-            printf("\x1b[8;0H\x1b[2K walk up to a case to see its info");
-            printf("\x1b[10;0H\x1b[2K sections:");
-            for (int i = 0; i < g_nsec && i < 6; i++)
-                printf("\x1b[%d;0H\x1b[2K   %-14s %d", 11 + i, g_sec[i].name, g_sec[i].n);
+            printf("\x1b[2;0H\x1b[2K %d posters, %d with info", g_nposters, g_withinfo);
+            printf("\x1b[3;0H\x1b[2K %d KB texture  %d built  %llums",
+                   (int)((g_nposters * TEX_BYTES) / 1024), built, (unsigned long long)t_load);
+            printf("\x1b[4;0H\x1b[2K fps %2d   eyes %d", fps, (slider > 0.0f ? 2 : 1));
+            printf("\x1b[6;0H\x1b[2K walk up to a case for its info");
+            printf("\x1b[8;0H\x1b[2K sections");
+            int r = 9;
+            for (int i = 0; i < g_nsec && i < 8; i++, r++)
+                printf("\x1b[%d;0H\x1b[2K   %-16s %d", r, g_sec[i].name, g_sec[i].n);
+            for (; r <= 25; r++) printf("\x1b[%d;0H\x1b[2K", r);
         }
+        /* pinned to the bottom of the 30-row console, not floating in the middle */
+        printf("\x1b[27;0H\x1b[2K circle pad walk   d-pad look");
+        printf("\x1b[28;0H\x1b[2K A take  B back  X level  START exit");
     }
 
     for (int i = 0; i < g_nposters; i++) if (g_pos[i].ok) C3D_TexDelete(&g_pos[i].tex);
