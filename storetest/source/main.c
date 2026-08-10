@@ -288,6 +288,44 @@ static int wrap_print(int row, int cols, int maxrows, const char *t) {
     return used;
 }
 
+/* ---------------- text into a texture ---------------- */
+static void draw_glyph(u16 *lin, int W, int H, int x, int y, int sc, u16 col, unsigned c) {
+    if (c > 127) c = '?';
+    const char *g = font8x8_basic[c];
+    for (int r = 0; r < 8; r++)
+        for (int b = 0; b < 8; b++)
+            if (g[r] & (1 << b))
+                for (int sy = 0; sy < sc; sy++)
+                    for (int sx = 0; sx < sc; sx++) {
+                        int px = x + b * sc + sx, py = y + r * sc + sy;
+                        if (px >= 0 && px < W && py >= 0 && py < H) lin[py * W + px] = col;
+                    }
+}
+static void draw_text(u16 *lin, int W, int H, int x, int y, int sc, u16 col, const char *t) {
+    for (int i = 0; t[i]; i++) draw_glyph(lin, W, H, x + i * 8 * sc, y, sc, col, (unsigned char)t[i]);
+}
+/* word-wrapped block; returns the y just past the last line */
+static int draw_wrap(u16 *lin, int W, int H, int x, int y, int sc, u16 col,
+                     const char *t, int cols, int maxlines) {
+    char line[80];
+    int used = 0;
+    while (*t && used < maxlines) {
+        while (*t == ' ') t++;
+        if (!*t) break;
+        int n = (int)strlen(t);
+        if (n > cols) {
+            n = cols;
+            while (n > 0 && t[n] != ' ' && t[n] != 0) n--;
+            if (n <= 0) n = cols;
+        }
+        if (n > (int)sizeof line - 1) n = (int)sizeof line - 1;
+        snprintf(line, sizeof line, "%.*s", n, t);
+        draw_text(lin, W, H, x, y + used * 9 * sc, sc, col, line);
+        t += n; used++;
+    }
+    return y + used * 9 * sc;
+}
+
 /* ---------------- hanging section signs ----------------
  * A 256x64 texture with the genre name drawn at 2x from the 8x8 font, centred, on a dark
  * board. Built once at startup; there are only a handful of sections. */
@@ -325,6 +363,65 @@ static void make_sign_tex(C3D_Tex *t, const char *text) {
     memcpy(t->data, til, SIGN_W * SIGN_H * 2);
     C3D_TexFlush(t);
     C3D_TexSetFilter(t, GPU_LINEAR, GPU_LINEAR);
+    free(lin); free(til);
+}
+
+/* ---------------- the back of the case ----------------
+ * ONE texture, redrawn when you pick something up, because only one case is ever in your hand.
+ * That buys a big sheet (256x512, ~256 KB) for the cost of a single poster slot.
+ *
+ * It is a PROP, not a reading surface: a case filling half of a 400x240 screen gives about six
+ * pixels per character, so this is laid out like the back of a VHS box -- title bar, a blurb,
+ * runtime, a barcode strip -- while the bottom screen stays where the description is actually
+ * read. 256x364 of the sheet is used, which is the same 0.711 aspect as the poster front. */
+#define BACK_W 256
+#define BACK_H 512
+#define BACK_USED 364
+static C3D_Tex g_back;
+static int     g_back_ok = 0, g_back_for = -1;
+
+static void rebuild_back(const Poster *q) {
+    if (!g_back_ok) return;
+    u16 *lin = (u16 *)calloc(BACK_W * BACK_H, 2);
+    u16 *til = (u16 *)malloc(BACK_W * BACK_H * 2);
+    if (!lin || !til) { free(lin); free(til); return; }
+    const u16 card = 0x2124, bar = 0x8000, ink = 0xFFFF, dim = 0xC618, edge = 0x630C;
+
+    for (int y = 0; y < BACK_USED; y++)
+        for (int x = 0; x < BACK_W; x++) {
+            int b = (x < 4 || x >= BACK_W - 4 || y < 4 || y >= BACK_USED - 4);
+            lin[y * BACK_W + x] = b ? edge : card;
+        }
+    /* title bar across the top, like a spine label */
+    for (int y = 10; y < 44; y++)
+        for (int x = 8; x < BACK_W - 8; x++) lin[y * BACK_W + x] = bar;
+    { char t[24]; snprintf(t, sizeof t, "%.15s", q->name);
+      draw_text(lin, BACK_W, BACK_H, 14, 18, 2, ink, t); }
+
+    int y = 54;
+    if (q->genres[0]) { char g[40]; snprintf(g, sizeof g, "%.30s", q->genres);
+                        draw_text(lin, BACK_W, BACK_H, 12, y, 1, dim, g); y += 14; }
+    y += 4;
+    if (q->desc[0]) y = draw_wrap(lin, BACK_W, BACK_H, 12, y, 1, ink, q->desc, 30, 22);
+    else            draw_text(lin, BACK_W, BACK_H, 12, y, 1, dim, "No description on file.");
+
+    /* runtime + a barcode block, the two things every VHS back really had */
+    char rt[32];
+    if (q->runtime) snprintf(rt, sizeof rt, "RUNNING TIME  %d MIN", q->runtime);
+    else            snprintf(rt, sizeof rt, "RUNNING TIME  --");
+    draw_text(lin, BACK_W, BACK_H, 12, BACK_USED - 74, 1, dim, rt);
+    for (int x = 0; x < 92; x++) {
+        int w = ((x * 7919) >> 3) & 1;                 /* deterministic stripes */
+        if (!w) continue;
+        for (int yy = BACK_USED - 56; yy < BACK_USED - 20; yy++)
+            lin[yy * BACK_W + (12 + x)] = ink;
+    }
+    if (q->year) { char yr[16]; snprintf(yr, sizeof yr, "%d", q->year);
+                   draw_text(lin, BACK_W, BACK_H, BACK_W - 60, BACK_USED - 40, 2, dim, yr); }
+
+    tile_rgb565(lin, til, BACK_W, BACK_H);
+    memcpy(g_back.data, til, BACK_W * BACK_H * 2);
+    C3D_TexFlush(&g_back);
     free(lin); free(til);
 }
 
@@ -468,6 +565,39 @@ static int build_room(void) {
     return n;
 }
 
+/* The held case is a BOX, not a card: a VHS has thickness and you notice its absence the
+ * moment you turn one over. Laid out as three ranges in one buffer so each can take its own
+ * texture: front is the poster, back is the printed card, the four edges are plain.
+ *
+ * The back face's u runs the other way. Spin the case 180 degrees and world +x is on your
+ * LEFT, so without mirroring, every line of text on the back reads backwards. */
+#define BOX_T 0.055f
+static Vtx *g_boxv;
+static void *g_boxvbo;
+static void build_box(void) {
+    g_boxv = (Vtx *)linearAlloc(sizeof(Vtx) * 36);
+    const float h = 0.5f, t = BOX_T * 0.5f;
+    const float vlo = 1.0f - VMAX, vhi = 1.0f;
+    Vtx v[36] = {
+        /* front (+z): poster */
+        {-h,-h, t, 0,vlo,1.0f}, { h,-h, t, 1,vlo,1.0f}, { h, h, t, 1,vhi,1.0f},
+        {-h,-h, t, 0,vlo,1.0f}, { h, h, t, 1,vhi,1.0f}, {-h, h, t, 0,vhi,1.0f},
+        /* back (-z): printed card, u mirrored */
+        { h,-h,-t, 0,vlo,0.92f}, {-h,-h,-t, 1,vlo,0.92f}, {-h, h,-t, 1,vhi,0.92f},
+        { h,-h,-t, 0,vlo,0.92f}, {-h, h,-t, 1,vhi,0.92f}, { h, h,-t, 0,vhi,0.92f},
+        /* edges: left, right, top, bottom */
+        {-h,-h,-t, 0,0,0.55f}, {-h,-h, t, 1,0,0.55f}, {-h, h, t, 1,1,0.55f},
+        {-h,-h,-t, 0,0,0.55f}, {-h, h, t, 1,1,0.55f}, {-h, h,-t, 0,1,0.55f},
+        { h,-h, t, 0,0,0.55f}, { h,-h,-t, 1,0,0.55f}, { h, h,-t, 1,1,0.55f},
+        { h,-h, t, 0,0,0.55f}, { h, h,-t, 1,1,0.55f}, { h, h, t, 0,1,0.55f},
+        {-h, h, t, 0,0,0.72f}, { h, h, t, 1,0,0.72f}, { h, h,-t, 1,1,0.72f},
+        {-h, h, t, 0,0,0.72f}, { h, h,-t, 1,1,0.72f}, {-h, h,-t, 0,1,0.72f},
+        {-h,-h,-t, 0,0,0.40f}, { h,-h,-t, 1,0,0.40f}, { h,-h, t, 1,1,0.40f},
+        {-h,-h,-t, 0,0,0.40f}, { h,-h, t, 1,1,0.40f}, {-h,-h, t, 0,1,0.40f},
+    };
+    memcpy(g_boxv, v, sizeof v);
+}
+
 /* full-texture quad for the signs (the poster quad only maps the used part of its box) */
 static void build_signquad(void) {
     g_signv = (Vtx *)linearAlloc(sizeof(Vtx) * 6);
@@ -568,6 +698,10 @@ int main(void) {
     make_room_tex();
     build_quad();
     build_signquad();
+    build_box();
+    g_back_ok = C3D_TexInit(&g_back, BACK_W, BACK_H, GPU_RGB565);
+    if (g_back_ok) { C3D_TexSetFilter(&g_back, GPU_LINEAR, GPU_LINEAR);
+                     C3D_TexSetWrap(&g_back, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE); }
 
     int built = 0;
     u64 t_load0 = osGetTime();
@@ -583,7 +717,7 @@ int main(void) {
 
     build_sections();                       /* genres -> units -> poster positions */
     int roomn = build_room();               /* needs the unit positions */
-    g_roomvbo = g_roomv; g_quadvbo = g_quadv; g_signvbo = g_signv;
+    g_roomvbo = g_roomv; g_quadvbo = g_quadv; g_signvbo = g_signv; g_boxvbo = g_boxv;
 
     float cx = 0, cz = STORE_Z0 - 1.5f, yaw = 0, pitch = 0;
     const float EYE = 1.55f;
@@ -600,12 +734,16 @@ int main(void) {
      * and a case swinging out toward your face is the clearest demonstration of the stereo. */
     int   held = -1;
     float hold_t = 0.0f;
+    float spin   = 0.0f;      /* radians about the case's own y axis while it is in your hand */
 
     while (aptMainLoop()) {
         hidScanInput();
         u32 kd = hidKeysDown();
         if (kd & KEY_START) break;
-        if ((kd & KEY_A) && held < 0 && sel >= 0) held = sel;      /* take it off the shelf */
+        if ((kd & KEY_A) && held < 0 && sel >= 0) {                /* take it off the shelf */
+            held = sel; spin = 0.0f;
+            if (g_back_for != sel) { rebuild_back(&g_pos[sel]); g_back_for = sel; }
+        }
         if ((kd & KEY_B) && held >= 0)            held = -1;       /* put it back */
         hold_t += ((held >= 0) ? 0.14f : -0.14f);                  /* ~7 frames each way */
         if (hold_t > 1.0f) hold_t = 1.0f;
@@ -613,7 +751,16 @@ int main(void) {
 
         circlePosition cp; hidCircleRead(&cp);
         float fx = cp.dx / 156.0f, fy = cp.dy / 156.0f;
-        if (held >= 0) { fx = 0; fy = 0; }        /* hold still while you are reading a case */
+        if (held >= 0) {
+            /* the pad turns the case over instead of walking you around */
+            spin += fx * 0.075f;
+            if (fabsf(fx) < 0.15f) {                 /* let go and it settles to a face */
+                float snap = (spin < 0 ? -1.0f : 1.0f) * 3.14159265f
+                             * (float)((int)(fabsf(spin) / 3.14159265f + 0.5f));
+                spin += (snap - spin) * 0.18f;
+            }
+            fx = 0; fy = 0;
+        }
         /* The circle pad MOVES and the d-pad LOOKS. Turning used to be on the circle pad's x
          * axis, which meant you could not walk diagonally at all: pushing the pad at an angle
          * spun you instead of sliding you sideways. Movement is now purely translation in the
@@ -633,12 +780,15 @@ int main(void) {
         }
         if (fabsf(fx) < 0.15f) fx = 0;
         if (fabsf(fy) < 0.15f) fy = 0;
-        /* forward, and the vector 90 degrees to its right. Push the pad diagonally and you get
-         * a diagonal walk, because both axes are translation. */
+        /* Single-stick, the way the console's own games do it: the pad's x axis TURNS you and
+         * its y axis walks. Strafing is real but rare, so it sits on the shoulder buttons where
+         * it costs nothing to ignore. */
+        yaw -= fx * 0.045f;
         float fwx = FWD * -sinf(yaw), fwz = FWD * -cosf(yaw);
         float rgx =  cosf(yaw),       rgz = -sinf(yaw);
-        cx  += (fwx * fy + rgx * fx) * 0.09f;
-        cz  += (fwz * fy + rgz * fx) * 0.09f;
+        float strafe = ((kh & KEY_R) ? 1.0f : 0.0f) - ((kh & KEY_L) ? 1.0f : 0.0f);
+        cx  += (fwx * fy + rgx * strafe * 0.75f) * 0.09f;
+        cz  += (fwz * fy + rgz * strafe * 0.75f) * 0.09f;
         if (cx >  STORE_HX - 0.6f) cx =  STORE_HX - 0.6f;
         if (cx < -STORE_HX + 0.6f) cx = -STORE_HX + 0.6f;
         if (cz >  STORE_Z0 - 0.6f) cz =  STORE_Z0 - 0.6f;
@@ -705,47 +855,70 @@ int main(void) {
             C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &view);
             C3D_DrawArrays(GPU_TRIANGLES, 0, roomn);
 
-            /* posters: one draw each, unit quad + per-poster matrix */
+            /* posters on the shelves: one draw each, unit quad + per-poster matrix. Flat
+             * cards, because they sit flush against the unit and nobody can see their edges. */
             set_buf(g_quadvbo, 6);
             for (int i = 0; i < g_nposters; i++) {
-                if (!g_pos[i].ok) continue;
-                float pop = (i == sel && held < 0) ? 0.10f : 0.0f;   /* highlighted: steps out */
-                /* shelf pose */
+                if (!g_pos[i].ok || i == held) continue;      /* the held one is drawn below */
+                float pop = (i == sel && held < 0) ? 0.10f : 0.0f;
                 float nx = (fabsf(g_pos[i].ry) > 1.5f) ? 0.0f : (g_pos[i].ry > 0 ? 1.0f : -1.0f);
                 float nz = (fabsf(g_pos[i].ry) > 1.5f) ? (g_pos[i].ry > 0 ? 1.0f : -1.0f) : 0.0f;
-                float px = g_pos[i].x + nx * pop;
-                float py = g_pos[i].y, pz = g_pos[i].z + nz * pop;
-                /* |ry| == 2 means the case faces along z (a shelf unit); 1 means along x. */
                 float ay;
                 if (fabsf(g_pos[i].ry) > 1.5f) ay = (g_pos[i].ry > 0) ? 0.0f : C3D_Angle(0.5f);
                 else                           ay = (g_pos[i].ry > 0) ? C3D_Angle(0.25f)
                                                                      : C3D_Angle(-0.25f);
-                float sc = 0.62f;
-                if (i == sel && hold_t > 0.0f) {
-                    /* held pose: arm's length ahead, square to the camera. Smoothstep so it
-                     * eases rather than snapping -- a linear pull reads as a glitch in 3D. */
-                    float t = hold_t * hold_t * (3.0f - 2.0f * hold_t);
-                    float hx = cx - sinf(yaw) * 0.80f;
-                    float hz = cz - cosf(yaw) * 0.80f;
-                    float hy = EYE - 0.03f;
-                    /* face the camera: the quad normal is (sin a, 0, cos a), and it must point
-                     * back along the view direction, so a == the camera's yaw. Take the short
-                     * way round or it spins on the way out. */
-                    float da = yaw - ay;
-                    while (da >  3.14159265f) da -= 6.28318531f;
-                    while (da < -3.14159265f) da += 6.28318531f;
-                    px += (hx - px) * t; py += (hy - py) * t; pz += (hz - pz) * t;
-                    ay += da * t;
-                    sc += (0.42f - sc) * t;
-                }
                 C3D_Mtx m;
                 Mtx_Copy(&m, &view);
-                Mtx_Translate(&m, px, py, pz, true);
+                Mtx_Translate(&m, g_pos[i].x + nx * pop, g_pos[i].y, g_pos[i].z + nz * pop, true);
                 Mtx_RotateY(&m, ay, true);
-                Mtx_Scale(&m, sc, sc * (float)IMG_H / (float)IMG_W, 1.0f);
+                Mtx_Scale(&m, 0.62f, 0.62f * (float)IMG_H / (float)IMG_W, 1.0f);
                 C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
                 C3D_TexBind(0, &g_pos[i].tex);
                 C3D_DrawArrays(GPU_TRIANGLES, 0, 6);
+            }
+
+            /* The case in your hand, as a box with thickness.
+             *
+             * Placed RELATIVE TO THE CAMERA, including pitch, so it stays dead centre however
+             * you are looking. It used to sit at a fixed world point at eye height, which slid
+             * off the screen the moment you looked down. */
+            if (held >= 0 && hold_t > 0.0f && g_pos[held].ok) {
+                Poster *q = &g_pos[held];
+                float t = hold_t * hold_t * (3.0f - 2.0f * hold_t);
+                float cp_ = cosf(pitch);
+                float f3x = fwx * cp_, f3y = sinf(pitch), f3z = fwz * cp_;
+                const float D = 0.78f;
+                /* where it is coming FROM: its slot on the shelf */
+                float sx = q->x, sy = q->y, sz = q->z;
+                float ay0;
+                if (fabsf(q->ry) > 1.5f) ay0 = (q->ry > 0) ? 0.0f : C3D_Angle(0.5f);
+                else                     ay0 = (q->ry > 0) ? C3D_Angle(0.25f) : C3D_Angle(-0.25f);
+                /* where it is going TO: arm's length down the view axis */
+                float hx = cx + f3x * D, hy = EYE + f3y * D, hz = cz + f3z * D;
+                float da = yaw - ay0;                       /* short way round, or it spins */
+                while (da >  3.14159265f) da -= 6.28318531f;
+                while (da < -3.14159265f) da += 6.28318531f;
+
+                C3D_Mtx m;
+                Mtx_Copy(&m, &view);
+                Mtx_Translate(&m, sx + (hx - sx) * t, sy + (hy - sy) * t, sz + (hz - sz) * t, true);
+                Mtx_RotateY(&m, ay0 + da * t, true);
+                Mtx_RotateX(&m, pitch * t, true);           /* square to the view when held */
+                Mtx_RotateY(&m, spin * t, true);            /* turning it over */
+                float sc = 0.62f + (0.40f - 0.62f) * t;
+                Mtx_Scale(&m, sc, sc * (float)IMG_H / (float)IMG_W, 1.0f);
+                C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
+
+                set_buf(g_boxvbo, 36);
+                C3D_TexBind(0, &q->tex);                    /* front: the poster */
+                C3D_DrawArrays(GPU_TRIANGLES, 0, 6);
+                if (g_back_ok) {
+                    C3D_TexBind(0, &g_back);                /* back: the printed card */
+                    C3D_DrawArrays(GPU_TRIANGLES, 6, 6);
+                }
+                C3D_TexBind(0, &g_room);                    /* the four edges */
+                C3D_DrawArrays(GPU_TRIANGLES, 12, 24);
+                set_buf(g_quadvbo, 6);
             }
 
             /* section signs, hung over each unit. Two quads back to back so the name reads the
@@ -803,13 +976,14 @@ int main(void) {
             for (; r <= 25; r++) printf("\x1b[%d;0H\x1b[2K", r);
         }
         /* pinned to the bottom of the 30-row console, not floating in the middle */
-        printf("\x1b[27;0H\x1b[2K circle pad walk   d-pad look");
-        printf("\x1b[28;0H\x1b[2K A take  B back  X level  START exit");
+        printf("\x1b[27;0H\x1b[2K pad walk+look  L/R strafe  d-pad look");
+        printf("\x1b[28;0H\x1b[2K A take  B back(turn it: pad)  START exit");
     }
 
     for (int i = 0; i < g_nposters; i++) if (g_pos[i].ok) C3D_TexDelete(&g_pos[i].tex);
     for (int i = 0; i < g_nsec; i++) if (g_sec[i].sign_ok) C3D_TexDelete(&g_sec[i].sign);
     C3D_TexDelete(&g_room);
+    if (g_back_ok) C3D_TexDelete(&g_back);
     shaderProgramFree(&program);
     DVLB_Free(vsh_dvlb);
     C3D_Fini();
