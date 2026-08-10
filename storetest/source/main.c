@@ -119,7 +119,11 @@ static float g_depth = 24.0f;
  * five faces, two spines. Sixteen slots, nine of them face out. */
 #define FACEOUT_PATTERN "SSSFFFFSSFFFFFSS"
 #define FACEOUT_LEN     16
-#define COVER_POOL    8         /* covers held at once, 16 KB each */
+/* Covers held at once, 16 KB apiece. Eight was timid -- an earlier build gave every one of
+ * ninety-six cases its own texture and cost 1.5 MB, which this room has room for several times
+ * over. Thirty-two is half a megabyte and keeps most of what you can actually see in real art,
+ * with the blank clamshell behind the rest. */
+#define COVER_POOL   32
 
 #define MAX_POSTERS 320         /* spines cost no texture; this is only metadata */
 #define ROOM_TEX 64
@@ -2022,7 +2026,7 @@ int main(void) {
                 float d2 = dxs * dxs + dzs * dzs;
                 if (d2 > SPINE_VIEW * SPINE_VIEW) continue;
                 int slot = g_covers_on ? pool_find(i) : -1;
-                if (g_covers_on && slot < 0 && nkeep < COVER_POOL && d2 < 30.0f
+                if (g_covers_on && slot < 0 && nkeep < COVER_POOL && d2 < 42.0f
                     && g_pos[i].cover_state >= 0) keep[nkeep++] = i;
                 if (slot < 0) continue;                  /* no art yet: the blank front stands */
                 C3D_Mtx m;
@@ -2036,12 +2040,17 @@ int main(void) {
                 draw_range(0, 6);
             }
             if (eye == 0) g_drawn = drawn;
-            if (eye == 0 && g_covers_on && (frames & 3) == 0)   /* one every four frames */
-                for (int k = 0; k < nkeep; k++)
+            /* Two a frame while there is a backlog, so a pool this size fills in about a
+             * second of walking rather than half a minute -- but still never more than two,
+             * because building one means reading and rescaling a file. */
+            if (eye == 0 && g_covers_on) {
+                int loads = 0;
+                for (int k = 0; k < nkeep && loads < 2; k++)
                     if (pool_find(keep[k]) < 0) {
-                        pool_load(keep[k], &g_pos[keep[k]], keep, nkeep);
-                        break;
+                        if (pool_load(keep[k], &g_pos[keep[k]], keep, nkeep) >= 0) loads++;
+                        else break;
                     }
+            }
 
             /* the selected case: proud of the shelf and turned to face you, wearing its real
              * cover. This is the whole reason spines are affordable -- you only ever need one */
