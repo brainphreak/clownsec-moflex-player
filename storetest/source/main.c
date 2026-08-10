@@ -584,6 +584,14 @@ static C3D_Tex g_room;      /* walls + ceiling */
 static C3D_Tex g_carpet, g_wood, g_glass, g_door;
 static int     g_mat_ok = 0;
 
+/* Bind, but never hand the GPU a C3D_Tex that was never created. An uninitialised one is a
+ * garbage pointer, and the hardware does not fault on that -- it wedges, and the console goes
+ * with it: no HOME, no START, power cycle. Every bind goes through here now. */
+static C3D_Tex *g_lastgood = NULL;
+static void bind_tex(C3D_Tex *t, int ok) {
+    if (ok && t && t->data) { C3D_TexBind(0, t); g_lastgood = t; }
+    else if (g_lastgood)     C3D_TexBind(0, g_lastgood);
+}
 static void upload_tex(C3D_Tex *t, u16 *lin, int w, int h) {
     u16 *til = (u16 *)malloc((size_t)w * h * 2);
     if (!til) return;
@@ -689,6 +697,15 @@ static void make_materials(void) {
         lin[y * N + x] = (u16)((r << 11) | ((g * 2) << 5) | b);
     }
     upload_tex(&g_wood, lin, N, N);
+    C3D_TexInit(&g_glass, N, N, GPU_RGB565);           /* plain glass: the fallback, and it has
+                                                        * to EXIST -- it is bound whenever the
+                                                        * car park fails to build */
+    for (int y = 0; y < N; y++) for (int x = 0; x < N; x++) {
+        int frame = (x < 3 || x >= N - 3 || y < 3 || y >= N - 3 || x == N / 2);
+        int glow = (y > N - 22 && ((x * 11) % 23) < 3) ? 8 : 0;
+        lin[y * N + x] = frame ? 0x4208 : (u16)((glow << 11) | ((2 + glow) << 5) | (6 + glow));
+    }
+    upload_tex(&g_glass, lin, N, N);
     free(lin);
     make_outside_tex();                                /* the car park, drawn at its own size */
     lin = (u16 *)malloc(N * N * 2);
@@ -891,8 +908,9 @@ static void first_genre(const char *g, char *out, size_t cap) {
 
 static void place_section(int k);
 static void build_sections(void) {
-    char names[MAX_POSTERS][24];
-    int  count[MAX_POSTERS];
+    /* static: at 320 titles these are 9 KB, and a .3dsx main thread has little to spare */
+    static char names[MAX_POSTERS][24];
+    static int  count[MAX_POSTERS];
     int  uniq = 0;
     for (int i = 0; i < g_nposters; i++) {
         char g[24]; first_genre(g_pos[i].genres, g, sizeof g);
@@ -1017,10 +1035,15 @@ static void place_section(int k) {
 static Vtx *g_roomv, *g_quadv, *g_signv;
 static void *g_roomvbo, *g_quadvbo, *g_signvbo;
 
+/* Room geometry is pushed into a fixed buffer, and every new fitting adds to it. Running off
+ * the end writes into whatever linear memory follows and then hands it to the GPU, which is the
+ * other way to wedge the console. Refuse instead. */
+static int g_room_full = 0;
 static void push_quad(Vtx *v, int *n,
                       float ax, float ay, float az, float bx, float by, float bz,
                       float cx, float cy, float cz, float dx, float dy, float dz,
                       float ur, float vr, float shade) {
+    if (*n + 6 > ROOM_VTX) { g_room_full = 1; return; }
     /* two triangles, wound so the front face is toward the aisle */
     Vtx q[6] = {
         {ax, ay, az, 0,  0,  shade}, {bx, by, bz, ur, 0,  shade}, {cx, cy, cz, ur, vr, shade},
@@ -1122,6 +1145,9 @@ static int build_room(void) {
             push_box(g_roomv, &n, lx, CEIL_Y - 0.14f, lz, 7.0f, 0.055f, 0.30f, 1, 1, 1.0f);
         }
     g_n_light = n - g_n_floor - g_n_shell - g_n_units - g_n_cover;
+    if (g_room_full) {           /* say so rather than draw something that was never written */
+        g_n_light = 0;
+    }
 
     /* blockers: every unit, plus the counter and the returns bin */
     g_nblock = 0;
@@ -1539,18 +1565,18 @@ int main(void) {
             /* the shell, three materials, three draws */
             set_buf(g_roomvbo, roomn);
             C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &view);
-            C3D_TexBind(0, g_mat_ok ? &g_carpet : &g_room);
+            bind_tex(g_mat_ok ? &g_carpet : &g_room, 1);
             C3D_DrawArrays(GPU_TRIANGLES, 0, g_n_floor);
-            C3D_TexBind(0, &g_room);
+            bind_tex(&g_room, 1);
             C3D_DrawArrays(GPU_TRIANGLES, g_n_floor, g_n_shell);
-            C3D_TexBind(0, g_mat_ok ? &g_wood : &g_room);
+            bind_tex(g_mat_ok ? &g_wood : &g_room, 1);
             C3D_DrawArrays(GPU_TRIANGLES, g_n_floor + g_n_shell, g_n_units);
             if (g_covers_ok) {
-                C3D_TexBind(0, &g_covers);
+                bind_tex(&g_covers, g_covers_ok);
                 C3D_DrawArrays(GPU_TRIANGLES, g_n_floor + g_n_shell + g_n_units, g_n_cover);
             }
             if (g_spine_ok && g_n_light > 0) {          /* the spine sheet is plain white */
-                C3D_TexBind(0, &g_spine);
+                bind_tex(&g_spine, g_spine_ok);
                 C3D_DrawArrays(GPU_TRIANGLES,
                                g_n_floor + g_n_shell + g_n_units + g_n_cover, g_n_light);
             }
@@ -1558,7 +1584,7 @@ int main(void) {
             /* shopfront fittings: windows and a door on the near wall, signs above */
             set_buf(g_signvbo, 6);
             if (g_mat_ok) {
-                C3D_TexBind(0, g_outside_ok ? &g_outside : &g_glass);
+                bind_tex(g_outside_ok ? &g_outside : &g_glass, 1);
                 for (int w = 0; w < 4; w++) {
                     float wx = -13.5f + w * 9.0f;
                     if (w == 2) continue;                  /* the door goes in this gap */
@@ -1568,7 +1594,7 @@ int main(void) {
                     C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
                     C3D_DrawArrays(GPU_TRIANGLES, 0, 6);
                 }
-                C3D_TexBind(0, &g_door);
+                bind_tex(&g_door, g_mat_ok);
                 { C3D_Mtx m; Mtx_Copy(&m, &view);
                   Mtx_Translate(&m, 4.5f, 1.15f, STORE_Z0 - 0.05f, true);
                   Mtx_Scale(&m, 2.6f, 2.3f, 1.0f);
@@ -1576,7 +1602,7 @@ int main(void) {
                   C3D_DrawArrays(GPU_TRIANGLES, 0, 6); }
             }
             if (g_store_ok) {                              /* name across the back wall */
-                C3D_TexBind(0, &g_storesign);
+                bind_tex(&g_storesign, g_store_ok);
                 C3D_Mtx m; Mtx_Copy(&m, &view);
                 Mtx_Translate(&m, 0.0f, 3.3f, STORE_Z0 - STORE_DEPTH + 0.06f, true);
                 Mtx_Scale(&m, 15.0f, 15.0f * (float)SIGN_H / (float)SIGN_W, 1.0f);
@@ -1584,7 +1610,7 @@ int main(void) {
                 C3D_DrawArrays(GPU_TRIANGLES, 0, 6);
             }
             if (g_exit_ok) {                               /* over the door */
-                C3D_TexBind(0, &g_exitsign);
+                bind_tex(&g_exitsign, g_exit_ok);
                 C3D_Mtx m; Mtx_Copy(&m, &view);
                 Mtx_Translate(&m, 4.5f, 2.75f, STORE_Z0 - 0.10f, true);
                 Mtx_RotateY(&m, C3D_Angle(0.5f), true);
@@ -1598,7 +1624,7 @@ int main(void) {
              * and a ten-pixel spine could not show a title anyway. The selected one turns
              * face-on below and shows the real cover, because only ever one is selected. */
             set_buf(g_quadvbo, 6);
-            if (g_spine_ok) C3D_TexBind(0, &g_spine);
+            bind_tex(&g_spine, g_spine_ok);
             for (int i = 0; i < g_nposters; i++) {
                 if (!g_pos[i].ok || !g_pos[i].shown || i == held || i == sel) continue;
                 C3D_Mtx m;
@@ -1623,7 +1649,7 @@ int main(void) {
                 Mtx_RotateY(&m, yaw, true);                  /* square to the viewer */
                 Mtx_Scale(&m, 0.40f, 0.40f * (float)DET_IMG_H / (float)DET_IMG_W, 1.0f);
                 C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
-                C3D_TexBind(0, (g_detail_ok && g_detail_for == sel) ? &g_detail : &g_spine);
+                bind_tex((g_detail_ok && g_detail_for == sel) ? &g_detail : &g_spine, 1);
                 C3D_DrawArrays(GPU_TRIANGLES, 0, 6);
             }
 
@@ -1658,13 +1684,13 @@ int main(void) {
                 C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
 
                 set_buf(g_boxvbo, 36);
-                C3D_TexBind(0, (g_detail_ok && g_detail_for == held) ? &g_detail : &g_spine);
+                bind_tex((g_detail_ok && g_detail_for == held) ? &g_detail : &g_spine, 1);
                 C3D_DrawArrays(GPU_TRIANGLES, 0, 6);
                 if (g_back_ok) {
-                    C3D_TexBind(0, &g_back);                /* back: the printed card */
+                    bind_tex(&g_back, g_back_ok);                /* back: the printed card */
                     C3D_DrawArrays(GPU_TRIANGLES, 6, 6);
                 }
-                C3D_TexBind(0, &g_room);                    /* the four edges */
+                bind_tex(&g_room, 1);                    /* the four edges */
                 C3D_DrawArrays(GPU_TRIANGLES, 12, 24);
                 set_buf(g_quadvbo, 6);
             }
@@ -1677,7 +1703,7 @@ int main(void) {
                     for (int e = 0; e < 2; e++) {
                         int k = (w++) % WALLPOSTERS;
                         if (!g_wall_ok[k]) continue;
-                        C3D_TexBind(0, &g_wall[k]);
+                        bind_tex(&g_wall[k], g_wall_ok[k]);
                         C3D_Mtx m; Mtx_Copy(&m, &view);
                         Mtx_Translate(&m, g_sec[i].cx + (e ? 1 : -1) * (UNIT_LEN * 0.5f + 0.03f),
                                       1.30f, g_sec[i].cz, true);
@@ -1701,7 +1727,7 @@ int main(void) {
                 for (int i = 0; i < 8; i++) {
                     int k = i % WALLPOSTERS;
                     if (!g_wall_ok[k]) continue;
-                    C3D_TexBind(0, &g_wall[k]);
+                    bind_tex(&g_wall[k], g_wall_ok[k]);
                     C3D_Mtx m; Mtx_Copy(&m, &view);
                     Mtx_Translate(&m, WP[i][0], WP[i][1], WP[i][2], true);
                     Mtx_RotateY(&m, WP[i][3], true);
@@ -1717,7 +1743,7 @@ int main(void) {
             set_buf(g_signvbo, 6);
             for (int i = 0; i < g_nsec; i++) {
                 if (!g_sec[i].sign_ok) continue;
-                C3D_TexBind(0, &g_sec[i].sign);
+                bind_tex(&g_sec[i].sign, g_sec[i].sign_ok);
                 for (int f = 0; f < 2; f++) {
                     C3D_Mtx m;
                     Mtx_Copy(&m, &view);
