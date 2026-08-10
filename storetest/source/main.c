@@ -344,14 +344,25 @@ int main(void) {
     const float EYE = 1.55f;
     int frames = 0, fps = 0; u64 t0 = osGetTime();
     int sel = -1;
+    /* "grab": A pulls the highlighted case off the shelf and turns it to face you, B puts it
+     * back. hold_t runs 0..1 so both directions are the same animation played either way --
+     * and a case swinging out toward your face is the clearest demonstration of the stereo. */
+    int   held = -1;
+    float hold_t = 0.0f;
 
     while (aptMainLoop()) {
         hidScanInput();
         u32 kd = hidKeysDown();
         if (kd & KEY_START) break;
+        if ((kd & KEY_A) && held < 0 && sel >= 0) held = sel;      /* take it off the shelf */
+        if ((kd & KEY_B) && held >= 0)            held = -1;       /* put it back */
+        hold_t += ((held >= 0) ? 0.14f : -0.14f);                  /* ~7 frames each way */
+        if (hold_t > 1.0f) hold_t = 1.0f;
+        if (hold_t < 0.0f) hold_t = 0.0f;
 
         circlePosition cp; hidCircleRead(&cp);
         float fx = cp.dx / 156.0f, fy = cp.dy / 156.0f;
+        if (held >= 0) { fx = 0; fy = 0; }        /* hold still while you are reading a case */
         if (fabsf(fx) < 0.15f) fx = 0;
         if (fabsf(fy) < 0.15f) fy = 0;
         yaw -= fx * 0.045f;                                  /* turn, not strafe: gentler in stereo */
@@ -362,17 +373,21 @@ int main(void) {
         if (cz >  -0.3f)        cz = -0.3f;
         if (cz < -AISLE_LEN + 1.0f) cz = -AISLE_LEN + 1.0f;
 
-        /* what am I looking at? nearest poster ahead, within reach */
-        sel = -1; float best = 3.2f;
-        float vdx = -sinf(yaw), vdz = -cosf(yaw);
-        for (int i = 0; i < g_nposters; i++) {
-            float dx = g_pos[i].x - cx, dz = g_pos[i].z - cz;
-            float d = sqrtf(dx * dx + dz * dz);
-            if (d > best) continue;
-            float dy = g_pos[i].y - EYE;
-            if (fabsf(dy) > 1.1f) continue;
-            if ((dx * vdx + dz * vdz) / (d + 1e-4f) < 0.55f) continue;   /* must be in front */
-            best = d; sel = i;
+        /* what am I looking at? nearest poster ahead, within reach.
+         * Frozen while a case is held: the selection IS the held case until it goes back. */
+        if (held < 0) {
+            sel = -1;
+            float best = 3.2f;
+            float vdx = -sinf(yaw), vdz = -cosf(yaw);
+            for (int i = 0; i < g_nposters; i++) {
+                float dx = g_pos[i].x - cx, dz = g_pos[i].z - cz;
+                float d = sqrtf(dx * dx + dz * dz);
+                if (d > best) continue;
+                float dy = g_pos[i].y - EYE;
+                if (fabsf(dy) > 1.1f) continue;
+                if ((dx * vdx + dz * vdz) / (d + 1e-4f) < 0.55f) continue;   /* must be in front */
+                best = d; sel = i;
+            }
         }
 
         float slider = osGet3DSliderState();
@@ -406,12 +421,34 @@ int main(void) {
             set_buf(g_quadvbo, 6);
             for (int i = 0; i < g_nposters; i++) {
                 if (!g_pos[i].ok) continue;
-                float pop = (i == sel) ? 0.10f : 0.0f;     /* the highlighted one steps out */
+                float pop = (i == sel && held < 0) ? 0.10f : 0.0f;   /* highlighted: steps out */
+                /* shelf pose */
+                float px = g_pos[i].x + g_pos[i].ry * pop;
+                float py = g_pos[i].y, pz = g_pos[i].z;
+                float ay = (g_pos[i].ry > 0) ? C3D_Angle(0.25f) : C3D_Angle(-0.25f);
+                float sc = 0.62f;
+                if (i == sel && hold_t > 0.0f) {
+                    /* held pose: arm's length ahead, square to the camera. Smoothstep so it
+                     * eases rather than snapping -- a linear pull reads as a glitch in 3D. */
+                    float t = hold_t * hold_t * (3.0f - 2.0f * hold_t);
+                    float hx = cx - sinf(yaw) * 0.80f;
+                    float hz = cz - cosf(yaw) * 0.80f;
+                    float hy = EYE - 0.03f;
+                    /* face the camera: the quad normal is (sin a, 0, cos a), and it must point
+                     * back along the view direction, so a == the camera's yaw. Take the short
+                     * way round or it spins on the way out. */
+                    float da = yaw - ay;
+                    while (da >  3.14159265f) da -= 6.28318531f;
+                    while (da < -3.14159265f) da += 6.28318531f;
+                    px += (hx - px) * t; py += (hy - py) * t; pz += (hz - pz) * t;
+                    ay += da * t;
+                    sc += (0.42f - sc) * t;
+                }
                 C3D_Mtx m;
                 Mtx_Copy(&m, &view);
-                Mtx_Translate(&m, g_pos[i].x + g_pos[i].ry * pop, g_pos[i].y, g_pos[i].z, true);
-                Mtx_RotateY(&m, g_pos[i].ry > 0 ? C3D_Angle(0.25f) : C3D_Angle(-0.25f), true);
-                Mtx_Scale(&m, 0.62f, 0.62f * (float)IMG_H / (float)IMG_W, 1.0f);
+                Mtx_Translate(&m, px, py, pz, true);
+                Mtx_RotateY(&m, ay, true);
+                Mtx_Scale(&m, sc, sc * (float)IMG_H / (float)IMG_W, 1.0f);
                 C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
                 C3D_TexBind(0, &g_pos[i].tex);
                 C3D_DrawArrays(GPU_TRIANGLES, 0, 6);
@@ -431,10 +468,10 @@ int main(void) {
         printf("\x1b[6;0H\x1b[2K  fps %2d   eyes %d   slider %.2f", fps,
                (slider > 0.0f ? 2 : 1), slider);
         printf("\x1b[8;0H\x1b[2K  %s", sel >= 0 ? g_pos[sel].name : "(nothing in reach)");
+        printf("\x1b[10;0H\x1b[2K  %s", held >= 0 ? "  [in hand]  B puts it back"
+                                                    : (sel >= 0 ? "  A takes it off the shelf" : ""));
         printf("\x1b[12;0H\x1b[2K  circle pad: walk / turn");
         printf("\x1b[13;0H\x1b[2K  3D slider : depth      START: exit");
-        if ((kd & KEY_A) && sel >= 0)
-            printf("\x1b[10;0H\x1b[2K  >> selected: %s", g_pos[sel].name);
     }
 
     for (int i = 0; i < g_nposters; i++) if (g_pos[i].ok) C3D_TexDelete(&g_pos[i].tex);

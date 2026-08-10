@@ -227,3 +227,9 @@ $(OUTPUT).elf	:	$(OFILES)
 #---------------------------------------------------------------------------------------
 endif
 #---------------------------------------------------------------------------------------
+
+# Drop a copy where it is easy to find and copy to the SD card each build.
+all: downloads-copy
+downloads-copy: $(OUTPUT).3dsx
+	@cp -f $(OUTPUT).3dsx $(HOME)/Downloads/ && echo "copied $(TARGET).3dsx -> ~/Downloads"
+.PHONY: downloads-copy
