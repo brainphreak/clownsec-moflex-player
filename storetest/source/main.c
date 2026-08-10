@@ -392,7 +392,10 @@ int main(void) {
         u32 kh = hidKeysHeld();
         if (kh & KEY_DUP)    pitch += 0.035f;
         if (kh & KEY_DDOWN)  pitch -= 0.035f;
-        if (!(kh & (KEY_DUP | KEY_DDOWN))) pitch *= 0.90f;   /* eases back to level on its own */
+        /* Pitch STAYS where you put it. It used to spring back to level when the d-pad was
+         * released, which no first-person game does -- you look down at the bottom shelf and
+         * it drifts off it while you are still reading. X snaps back to level instead. */
+        if (kd & KEY_X) pitch = 0.0f;
         if (pitch >  0.55f) pitch =  0.55f;
         if (pitch < -0.55f) pitch = -0.55f;
         if (held < 0) {
@@ -516,7 +519,7 @@ int main(void) {
         printf("\x1b[10;0H\x1b[2K  %s", held >= 0 ? "  [in hand]  B puts it back"
                                                     : (sel >= 0 ? "  A takes it off the shelf" : ""));
         printf("\x1b[12;0H\x1b[2K  circle pad: walk + strafe   d-pad: look");
-        printf("\x1b[13;0H\x1b[2K  3D slider: depth   A: take   B: back   START: exit");
+        printf("\x1b[13;0H\x1b[2K  A take  B back  X level  START exit");
         printf("\x1b[15;0H\x1b[2K  yaw %+4.0f  pitch %+3.0f   fwd(%+.2f,%+.2f)",
                yaw * 57.2958f, pitch * 57.2958f, fwx, fwz);
         printf("\x1b[16;0H\x1b[2K  pos(%+.2f,%+.2f)", cx, cz);
