@@ -150,6 +150,11 @@ typedef struct {
     int     n;                  /* titles that belong here, not what fits */
     int     page, pages, cap;   /* a bay holds `cap`; the rest wait behind the MORE case */
     float   len;                /* built to fit what this section holds */
+    int     per_row;            /* cases across this bay -- from its own length, not a constant */
+    /* the L return: a short run turning the corner at the inner end. It is shelving too, and
+     * stood empty while the long side carried everything. */
+    float   Lx, Lz, Llen, Lay;
+    int     Lper_row, Lcap;
     int     part;               /* 0, or which unit of a split genre this is */
     float   facedir;            /* which side the stock is on: +1 or -1 in the unit's own z.
                                  * Alternated down the room so bays face each other across an
@@ -1114,7 +1119,13 @@ static void build_sections(void) {
                     g_sec[i].cz = PLAN[i][1]; }
         g_sec[i].rot = PLAN[i][2];
         g_sec[i].facedir = ((i / 3) % 2) ? -1.0f : 1.0f;   /* bays face each other in pairs */
-        g_sec[i].has_L   = (i < 6 && (i % 2) == 0);
+        g_sec[i].has_L   = (i < 6 && (i % 2) == 0) && !back;
+        /* the return runs along z at the inner end, facing the walkway */
+        float inner = g_sec[i].cx + ((g_sec[i].cx < 0) ? g_sec[i].len * 0.5f : -g_sec[i].len * 0.5f);
+        g_sec[i].Llen = 3.2f;
+        g_sec[i].Lx   = inner;
+        g_sec[i].Lz   = g_sec[i].cz + 1.6f;
+        g_sec[i].Lay  = (g_sec[i].cx < 0) ? C3D_Angle(0.25f) : C3D_Angle(-0.25f);
         make_sign_tex(&g_sec[i].sign, g_sec[i].name);
         g_sec[i].sign_ok = 1;
     }
@@ -1146,17 +1157,23 @@ static void build_sections(void) {
         if (need < UNIT_LEN_MIN) need = UNIT_LEN_MIN;
         if (need > UNIT_LEN)     need = UNIT_LEN;
         g_sec[k].len = need;
+        g_sec[k].per_row = (int)((need - 0.30f) / avg);
+        if (g_sec[k].per_row < 1) g_sec[k].per_row = 1;
+        if (g_sec[k].per_row > PER_ROW) g_sec[k].per_row = PER_ROW;
+        g_sec[k].Lper_row = (int)((3.2f - 0.30f) / avg);
+        g_sec[k].Lcap = 0;                          /* filled in once has_L is known */
     }
 
     /* A bay that cannot hold its whole genre gets a MORE case in the top-left slot: pick it up,
      * press the verb, and the shelf turns over to the next lot. Only where it is needed -- a
      * bay with room to spare should not carry a control nobody has to press. */
     for (int k = 0; k < g_nsec; k++) {
-        g_sec[k].cap = SHELF_CAP;
+        g_sec[k].Lcap = g_sec[k].has_L ? BAY_ROWS * g_sec[k].Lper_row : 0;
+        g_sec[k].cap = BAY_ROWS * g_sec[k].per_row + g_sec[k].Lcap;
         g_sec[k].more_idx = -1;
         g_sec[k].page = 0;
-        if (g_sec[k].n > SHELF_CAP && g_nposters < MAX_POSTERS) {
-            g_sec[k].cap = SHELF_CAP - 1;              /* the MORE case takes a slot */
+        if (g_sec[k].n > g_sec[k].cap && g_nposters < MAX_POSTERS) {
+            g_sec[k].cap -= 1;                         /* the MORE case takes a slot */
             int m = g_nposters++;
             memset(&g_pos[m], 0, sizeof g_pos[m]);
             g_pos[m].ok = 1; g_pos[m].is_more = 1; g_pos[m].sect = k;
@@ -1191,22 +1208,38 @@ static void place_section(int k) {
             sl = base + (p->order - first);
         }
         p->shown = 1;
-        int idx  = sl;
-        int row  = 2 - (idx / PER_ROW), colp = idx % PER_ROW;
-        if (row < 0) { p->shown = 0; continue; }
-        int inrow = total_slots - (2 - row) * PER_ROW;  /* rows fill from the top */
-        if (inrow > PER_ROW) inrow = PER_ROW;
-        if (inrow < 1) inrow = 1;
         /* every Nth one turns its face to the aisle */
         p->faceout = (!p->is_more && (sl % FACEOUT_EVERY) == 3);
-        float pitch_ = p->faceout ? 0.34f : 0.235f;
-        float lx = (colp - (inrow - 1) * 0.5f) * pitch_;
-        float lz = S->facedir * (UNIT_DEPTH * 0.5f + 0.02f);
-        float ca = cosf(S->rot), sa = sinf(S->rot);
-        p->x  = S->cx + lx * ca + lz * sa;
-        p->z  = S->cz - lx * sa + lz * ca;
-        p->y  = 0.46f + row * 0.62f;
-        p->ay = S->rot + ((S->facedir < 0) ? C3D_Angle(0.5f) : 0.0f);
+        float pitch_ = p->faceout ? PITCH_FACE : PITCH_SPINE;
+        int main_cap = BAY_ROWS * S->per_row;
+        if (sl < main_cap) {                          /* the long side */
+            int row  = 2 - (sl / S->per_row), colp = sl % S->per_row;
+            if (row < 0) { p->shown = 0; continue; }
+            int inrow = total_slots - (2 - row) * S->per_row;
+            if (inrow > S->per_row) inrow = S->per_row;
+            if (inrow < 1) inrow = 1;
+            float lx = (colp - (inrow - 1) * 0.5f) * pitch_;
+            float lz = S->facedir * (UNIT_DEPTH * 0.5f + 0.02f);
+            float ca = cosf(S->rot), sa = sinf(S->rot);
+            p->x  = S->cx + lx * ca + lz * sa;
+            p->z  = S->cz - lx * sa + lz * ca;
+            p->y  = 0.46f + row * 0.62f;
+            p->ay = S->rot + ((S->facedir < 0) ? C3D_Angle(0.5f) : 0.0f);
+        } else {                                      /* round the corner, onto the return */
+            if (!S->has_L) { p->shown = 0; continue; }
+            int t = sl - main_cap;
+            int row = 2 - (t / S->Lper_row), colp = t % S->Lper_row;
+            if (row < 0) { p->shown = 0; continue; }
+            int left = total_slots - main_cap - (2 - row) * S->Lper_row;
+            if (left > S->Lper_row) left = S->Lper_row;
+            if (left < 1) left = 1;
+            float along = (colp - (left - 1) * 0.5f) * pitch_;
+            float outn  = (UNIT_DEPTH * 0.5f + 0.02f) * ((S->cx < 0) ? 1.0f : -1.0f);
+            p->x  = S->Lx + outn;                     /* the return faces the walkway */
+            p->z  = S->Lz + along;
+            p->y  = 0.46f + row * 0.62f;
+            p->ay = S->Lay;
+        }
     }
 }
 
@@ -1302,10 +1335,10 @@ static int build_room(void) {
     push_box(g_roomv, &n,  -8.2f, 0.60f, -1.6f, 0.9f, 0.60f, 0.6f, 1, 1, 0.50f);   /* returns bin */
     /* An L on the end of two bays: a short return that turns the corner, which is what stops a
      * rank of units reading as a row of identical slabs. */
-    for (int i = 0; i < g_nsec && i < 6; i += 2) {
-        float ex = g_sec[i].cx + ((g_sec[i].cx < 0) ? g_sec[i].len * 0.5f : -g_sec[i].len * 0.5f);
-        push_box_rot(g_roomv, &n, ex, UNIT_H * 0.5f, g_sec[i].cz + 1.6f,
-                     UNIT_DEPTH * 0.5f, UNIT_H * 0.5f, 1.6f, 0.0f, 1, 1, 0.48f);
+    for (int i = 0; i < g_nsec; i++) {
+        if (!g_sec[i].has_L) continue;
+        push_box_rot(g_roomv, &n, g_sec[i].Lx, UNIT_H * 0.5f, g_sec[i].Lz,
+                     UNIT_DEPTH * 0.5f, UNIT_H * 0.5f, g_sec[i].Llen * 0.5f, 0.0f, 1, 1, 0.48f);
     }
     g_n_units = n - g_n_floor - g_n_shell;
 
@@ -1337,10 +1370,11 @@ static int build_room(void) {
         g_block[g_nblock].hz = UNIT_DEPTH * 0.5f + 0.42f;
         g_block[g_nblock].rot = g_sec[i].rot; g_nblock++;
     }
-    for (int i = 0; i < g_nsec && i < 6; i += 2) {
-        float ex = g_sec[i].cx + ((g_sec[i].cx < 0) ? g_sec[i].len * 0.5f : -g_sec[i].len * 0.5f);
-        g_block[g_nblock++] = (Blocker){ ex, g_sec[i].cz + 1.6f,
-                                         UNIT_DEPTH * 0.5f + 0.42f, 1.6f + 0.42f, 0.0f };
+    for (int i = 0; i < g_nsec; i++) {
+        if (!g_sec[i].has_L) continue;
+        g_block[g_nblock++] = (Blocker){ g_sec[i].Lx, g_sec[i].Lz,
+                                         UNIT_DEPTH * 0.5f + 0.42f,
+                                         g_sec[i].Llen * 0.5f + 0.42f, 0.0f };
     }
     g_block[g_nblock++] = (Blocker){ -12.0f, -1.6f, 4.4f, 1.1f, 0.0f };
     g_block[g_nblock++] = (Blocker){  -8.2f, -1.6f, 1.3f, 1.0f, 0.0f };
