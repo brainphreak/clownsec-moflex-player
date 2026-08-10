@@ -582,16 +582,90 @@ static void upload_tex(C3D_Tex *t, u16 *lin, int w, int h) {
     C3D_TexSetWrap(t, GPU_REPEAT, GPU_REPEAT);
     free(til);
 }
+/* What you can see through the shopfront: a car park at night. Drawn once at 256x128 -- big
+ * enough that a car reads as a car -- and shown whole on each window rather than tiled, so it
+ * is a view rather than wallpaper. */
+static C3D_Tex g_outside;
+static int     g_outside_ok = 0;
+static void px(u16 *l, int W, int H, int x, int y, u16 c) {
+    if (x >= 0 && x < W && y >= 0 && y < H) l[y * W + x] = c;
+}
+static void box2(u16 *l, int W, int H, int x0, int y0, int x1, int y1, u16 c) {
+    for (int y = y0; y <= y1; y++) for (int x = x0; x <= x1; x++) px(l, W, H, x, y, c);
+}
+static void make_outside_tex(void) {
+    const int W = 256, H = 128;
+    if (!C3D_TexInit(&g_outside, W, H, GPU_RGB565)) return;
+    u16 *lin = (u16 *)malloc(W * H * 2);
+    u16 *til = (u16 *)malloc(W * H * 2);
+    if (!lin || !til) { free(lin); free(til); C3D_TexDelete(&g_outside); return; }
+    const u16 sky = 0x0821, far_ = 0x18E3, lot = 0x2124, bay = 0x6B4D;
+    const u16 lampglow = 0xFF98, win = 0xFDA0;
+    const u16 carcol[4] = { 0x8000, 0x0011, 0x7BEF, 0xA145 };
+
+    for (int y = 0; y < H; y++)                              /* sky, darker toward the top */
+        for (int x = 0; x < W; x++)
+            lin[y * W + x] = (y < 52) ? (u16)(sky + ((y / 14) << 5)) : lot;
+    for (int i = 0; i < 40; i++) px(lin, W, H, (i * 6197) % W, (i * 977) % 44, 0x8410);  /* stars */
+
+    /* a low skyline with lit windows */
+    for (int b = 0; b < 7; b++) {
+        int bx = 4 + b * 36, bw = 18 + (b * 7) % 14, bh = 12 + (b * 11) % 20;
+        box2(lin, W, H, bx, 52 - bh, bx + bw, 51, far_);
+        for (int wy = 52 - bh + 3; wy < 50; wy += 5)
+            for (int wx = bx + 2; wx < bx + bw - 2; wx += 5)
+                if (((wx * 7 + wy * 3) % 5) < 2) box2(lin, W, H, wx, wy, wx + 1, wy + 2, win);
+    }
+    /* painted bays */
+    for (int i = 0; i < 9; i++) box2(lin, W, H, 10 + i * 28, 74, 11 + i * 28, 104, bay);
+    box2(lin, W, H, 0, 70, W - 1, 71, bay);
+
+    /* cars: body, cabin, wheels, and a pair of lights */
+    for (int c = 0; c < 4; c++) {
+        int cx = 18 + c * 62, cy = 84 + (c % 2) * 10;
+        u16 col = carcol[c % 4];
+        box2(lin, W, H, cx, cy, cx + 34, cy + 11, col);          /* body */
+        box2(lin, W, H, cx + 8, cy - 6, cx + 25, cy - 1, col);    /* cabin */
+        box2(lin, W, H, cx + 10, cy - 5, cx + 23, cy - 2, 0x2965);/* glass */
+        box2(lin, W, H, cx + 4, cy + 11, cx + 9, cy + 14, 0x1082);
+        box2(lin, W, H, cx + 25, cy + 11, cx + 30, cy + 14, 0x1082);
+        box2(lin, W, H, cx + 33, cy + 3, cx + 34, cy + 5, 0xFFE0);/* headlight */
+        box2(lin, W, H, cx, cy + 3, cx + 1, cy + 5, 0xF800);      /* tail light */
+    }
+    /* lamp posts with a pool of light */
+    for (int l = 0; l < 3; l++) {
+        int lx = 40 + l * 80;
+        box2(lin, W, H, lx, 30, lx + 1, 74, 0x39E7);
+        box2(lin, W, H, lx - 5, 28, lx + 6, 31, lampglow);
+        for (int r = 1; r < 16; r++)
+            for (int x = lx - r; x <= lx + r; x++)
+                if (((x + r) % 3) == 0) px(lin, W, H, x, 74 + r / 2, 0x4A69);
+    }
+    /* the window itself: frame and a centre mullion */
+    for (int y = 0; y < H; y++) { px(lin, W, H, 0, y, 0x4208); px(lin, W, H, 1, y, 0x4208);
+                                  px(lin, W, H, W-1, y, 0x4208); px(lin, W, H, W-2, y, 0x4208);
+                                  px(lin, W, H, W/2, y, 0x4208); px(lin, W, H, W/2+1, y, 0x4208); }
+    for (int x = 0; x < W; x++) { px(lin, W, H, x, 0, 0x4208); px(lin, W, H, x, 1, 0x4208);
+                                  px(lin, W, H, x, H-1, 0x4208); px(lin, W, H, x, H-2, 0x4208); }
+    tile_rgb565(lin, til, W, H);
+    memcpy(g_outside.data, til, W * H * 2);
+    C3D_TexFlush(&g_outside);
+    C3D_TexSetFilter(&g_outside, GPU_LINEAR, GPU_LINEAR);
+    C3D_TexSetWrap(&g_outside, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
+    free(lin); free(til);
+    g_outside_ok = 1;
+}
+
 static void make_materials(void) {
     const int N = 64;
     u16 *lin = (u16 *)malloc(N * N * 2);
     if (!lin) return;
-    C3D_TexInit(&g_carpet, N, N, GPU_RGB565);          /* red carpet, woven speckle */
+    C3D_TexInit(&g_carpet, N, N, GPU_RGB565);          /* blue-grey commercial carpet */
     for (int y = 0; y < N; y++) for (int x = 0; x < N; x++) {
         int n = ((x * 13 + y * 7) % 5) + ((x ^ y) & 1);
-        int r = 11 + n, g = 1 + (n >> 2), b = 3 + (n >> 2);
-        if (x % 32 == 0 || y % 32 == 0) { r = 15; g = 4; b = 5; }
-        lin[y * N + x] = (u16)((r << 11) | ((g * 2) << 5) | b);
+        int r = 7 + (n >> 1), g = 17 + n, b = 11 + (n >> 1);
+        if (x % 32 == 0 || y % 32 == 0) { r = 9; g = 21; b = 14; }   /* faint weave lines */
+        lin[y * N + x] = (u16)((r << 11) | (g << 5) | b);
     }
     upload_tex(&g_carpet, lin, N, N);
     C3D_TexInit(&g_wood, N, N, GPU_RGB565);            /* brown planks with grain */
@@ -603,13 +677,10 @@ static void make_materials(void) {
         lin[y * N + x] = (u16)((r << 11) | ((g * 2) << 5) | b);
     }
     upload_tex(&g_wood, lin, N, N);
-    C3D_TexInit(&g_glass, N, N, GPU_RGB565);           /* night outside, framed */
-    for (int y = 0; y < N; y++) for (int x = 0; x < N; x++) {
-        int frame = (x < 3 || x >= N - 3 || y < 3 || y >= N - 3 || x == N / 2);
-        int glow = (y > N - 22 && ((x * 11) % 23) < 3) ? 8 : 0;
-        lin[y * N + x] = frame ? 0x4208 : (u16)((glow << 11) | ((2 + glow) << 5) | (6 + glow));
-    }
-    upload_tex(&g_glass, lin, N, N);
+    free(lin);
+    make_outside_tex();                                /* the car park, drawn at its own size */
+    lin = (u16 *)malloc(N * N * 2);
+    if (!lin) return;
     C3D_TexInit(&g_door, N, N, GPU_RGB565);            /* panelled door with a handle */
     for (int y = 0; y < N; y++) for (int x = 0; x < N; x++) {
         int panel = (x > 8 && x < N - 8 && ((y > 8 && y < 28) || (y > 36 && y < 56)));
@@ -710,7 +781,7 @@ static void make_room_tex(void) {
     for (int y = 0; y < ROOM_TEX; y++)
         for (int x = 0; x < ROOM_TEX; x++) {
             int n = ((x * 37 + y * 17) % 7) + ((x * 5 ^ y * 3) % 3);   /* soft mottle */
-            int r = 20 + (n >> 2), g = 38 + (n >> 1), b = 17 + (n >> 2);
+            int r = 26 + (n >> 2), g = 52 + (n >> 1), b = 24 + (n >> 2);
             if (r > 31) r = 31; if (g > 63) g = 63; if (b > 31) b = 31;
             lin[y * ROOM_TEX + x] = (u16)((r << 11) | (g << 5) | b);
         }
@@ -899,20 +970,20 @@ static void push_box(Vtx *v, int *n, float cx, float cy, float cz,
     push_quad(v, n, x0,y1,z0, x1,y1,z0, x1,y1,z1, x0,y1,z1, ur, 1, sh * 1.15f);   /* top */
 }
 
-static int g_n_floor, g_n_shell, g_n_units, g_n_cover;
+static int g_n_floor, g_n_shell, g_n_units, g_n_cover, g_n_light;
 static int build_room(void) {
     g_roomv = (Vtx *)linearAlloc(sizeof(Vtx) * ROOM_VTX);
     int n = 0;
     const float X = STORE_HX, Z0 = STORE_Z0, Z1 = STORE_Z0 - STORE_DEPTH, H = CEIL_Y;
     /* group 1: the carpet */
-    push_quad(g_roomv, &n, -X, 0, Z0,  X, 0, Z0,  X, 0, Z1, -X, 0, Z1, 14, 12, 0.72f);
+    push_quad(g_roomv, &n, -X, 0, Z0,  X, 0, Z0,  X, 0, Z1, -X, 0, Z1, 14, 12, 0.88f);
     g_n_floor = n;
     /* group 2: ceiling + four walls */
-    push_quad(g_roomv, &n, -X, H, Z1,  X, H, Z1,  X, H, Z0, -X, H, Z0, 12, 10, 0.30f);
-    push_quad(g_roomv, &n, -X, 0, Z1, -X, 0, Z0, -X, H, Z0, -X, H, Z1, 10, 2, 0.62f);
-    push_quad(g_roomv, &n,  X, 0, Z0,  X, 0, Z1,  X, H, Z1,  X, H, Z0, 10, 2, 0.62f);
-    push_quad(g_roomv, &n, -X, 0, Z1,  X, 0, Z1,  X, H, Z1, -X, H, Z1, 12, 2, 0.58f);
-    push_quad(g_roomv, &n,  X, 0, Z0, -X, 0, Z0, -X, H, Z0,  X, H, Z0, 12, 2, 0.58f);
+    push_quad(g_roomv, &n, -X, H, Z1,  X, H, Z1,  X, H, Z0, -X, H, Z0, 12, 10, 0.78f);
+    push_quad(g_roomv, &n, -X, 0, Z1, -X, 0, Z0, -X, H, Z0, -X, H, Z1, 10, 2, 0.86f);
+    push_quad(g_roomv, &n,  X, 0, Z0,  X, 0, Z1,  X, H, Z1,  X, H, Z0, 10, 2, 0.86f);
+    push_quad(g_roomv, &n, -X, 0, Z1,  X, 0, Z1,  X, H, Z1, -X, H, Z1, 12, 2, 0.82f);
+    push_quad(g_roomv, &n,  X, 0, Z0, -X, 0, Z0, -X, H, Z0,  X, H, Z0, 12, 2, 0.82f);
     g_n_shell = n - g_n_floor;
 
     /* one shelf unit per section: a box you can see over, with a lighter top so it reads as a
@@ -956,6 +1027,18 @@ static int build_room(void) {
             }
         }
     g_n_cover = n - g_n_floor - g_n_shell - g_n_units;
+
+    /* Strip lights. Nothing is actually lit -- this GPU has no lights and the shading is baked
+     * -- but a bright white fitting under the ceiling reads as one, and it is what stops the
+     * room feeling like a basement. Their own group, so they get a white texture instead of
+     * the wood the shelving uses. */
+    for (int r = 0; r < 3; r++)
+        for (int c = 0; c < 2; c++) {
+            float lz = -3.0f - r * 11.0f;
+            float lx = (c ? 1.0f : -1.0f) * 9.0f;
+            push_box(g_roomv, &n, lx, CEIL_Y - 0.14f, lz, 7.0f, 0.055f, 0.30f, 1, 1, 1.0f);
+        }
+    g_n_light = n - g_n_floor - g_n_shell - g_n_units - g_n_cover;
 
     /* blockers: every unit, plus the counter and the returns bin */
     g_nblock = 0;
@@ -1354,11 +1437,16 @@ int main(void) {
                 C3D_TexBind(0, &g_covers);
                 C3D_DrawArrays(GPU_TRIANGLES, g_n_floor + g_n_shell + g_n_units, g_n_cover);
             }
+            if (g_spine_ok && g_n_light > 0) {          /* the spine sheet is plain white */
+                C3D_TexBind(0, &g_spine);
+                C3D_DrawArrays(GPU_TRIANGLES,
+                               g_n_floor + g_n_shell + g_n_units + g_n_cover, g_n_light);
+            }
 
             /* shopfront fittings: windows and a door on the near wall, signs above */
             set_buf(g_signvbo, 6);
             if (g_mat_ok) {
-                C3D_TexBind(0, &g_glass);
+                C3D_TexBind(0, g_outside_ok ? &g_outside : &g_glass);
                 for (int w = 0; w < 4; w++) {
                     float wx = -13.5f + w * 9.0f;
                     if (w == 2) continue;                  /* the door goes in this gap */
@@ -1583,6 +1671,7 @@ int main(void) {
     C3D_TexDelete(&g_room);
     if (g_mat_ok) { C3D_TexDelete(&g_carpet); C3D_TexDelete(&g_wood);
                     C3D_TexDelete(&g_glass);  C3D_TexDelete(&g_door); }
+    if (g_outside_ok) C3D_TexDelete(&g_outside);
     if (g_store_ok) C3D_TexDelete(&g_storesign);
     if (g_exit_ok)  C3D_TexDelete(&g_exitsign);
     if (g_covers_ok) C3D_TexDelete(&g_covers);
