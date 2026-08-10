@@ -80,13 +80,20 @@
 #define MAX_SECTIONS  8
 #define SEC_COLS      3
 #define PER_ROW      46         /* spines along a 12-unit bay */
-#define SHELF_CAP    (3 * PER_ROW * 2)   /* 3 rows, both faces */
+/* One side only. Stocking both faces doubled what had to be drawn, hid half of it behind the
+ * unit, and put titles on a face you have to walk round the bay to reach. A shop merchandises
+ * the side that faces the aisle. */
+#define SHELF_CAP    (3 * PER_ROW)
 /* How much of the shop is drawn at once. Every spine is its own draw call, and a shop full of
  * them is thousands of commands a frame -- past what the command buffer holds, and a GPU fed a
  * truncated command stream wedges the console. You cannot read a spine across the room anyway. */
 #define SPINE_COLOURS 10        /* one spine texture per colour */
-#define SPINE_VIEW   13.0f
-#define SPINE_BUDGET 220
+#define SPINE_VIEW    9.5f      /* a spine further off than this is a stripe anyway */
+#define SPINE_BUDGET 420
+/* Every Nth case stands face out, as a shop does: a run of spines, a cover, more spines. The
+ * covers are what make a shelf browsable; the spines are what make it a shop. */
+#define FACEOUT_EVERY 7
+#define COVER_POOL    8         /* covers held at once, 16 KB each */
 
 #define MAX_POSTERS 320         /* spines cost no texture; this is only metadata */
 #define ROOM_TEX 64
@@ -109,6 +116,7 @@ typedef struct {
     char    desc[400];
     int     year, runtime, hasinfo;
     int     shown;              /* on a shelf on the current page */
+    int     faceout;            /* stands face to the aisle rather than spine out */
     int     is_more;            /* the "MORE MOVIES" case that turns the section over */
     int     sect, order;        /* which bay, and where in that bay's run */
     char    key[96];            /* cache key, so the detail texture can be built on pickup */
@@ -126,6 +134,10 @@ typedef struct {
     int     sign_ok;
     int     n;                  /* titles that belong here, not what fits */
     int     page, pages, cap;   /* a bay holds `cap`; the rest wait behind the MORE case */
+    float   facedir;            /* which side the stock is on: +1 or -1 in the unit's own z.
+                                 * Alternated down the room so bays face each other across an
+                                 * aisle, the way a shop lays them out. */
+    int     has_L;              /* an L return on the inner end -- no poster fits there */
     int     more_idx;           /* the MORE case for this bay, -1 if it all fits */
 } Section;
 static Section g_sec[MAX_SECTIONS];
@@ -475,6 +487,60 @@ static void make_sign_tex(C3D_Tex *t, const char *text) {
 static C3D_Tex g_storesign, g_exitsign;
 static int     g_store_ok = 0, g_exit_ok = 0;
 
+/* Covers for the cases that stand face out.
+ *
+ * A shelf of nothing but spines is unbrowsable -- you want a run of edges, then a cover, then
+ * more edges, the way a shop merchandises. Every FACEOUT_EVERY'th case turns its face to the
+ * aisle, and the nearest few of those get a real cover from this pool. Eight at 64x128 is
+ * 128 KB, and one is loaded per frame so walking down an aisle never hitches. */
+static C3D_Tex g_pool[COVER_POOL];
+static int     g_pool_for[COVER_POOL];
+static int     g_pool_ok = 0;
+static void pool_init(void) {
+    for (int i = 0; i < COVER_POOL; i++) {
+        if (!C3D_TexInit(&g_pool[i], TEX_W, TEX_H, GPU_RGB565)) return;
+        C3D_TexSetFilter(&g_pool[i], GPU_LINEAR, GPU_LINEAR);
+        C3D_TexSetWrap(&g_pool[i], GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
+        g_pool_for[i] = -1;
+    }
+    g_pool_ok = 1;
+}
+/* which pool slot holds this title, or -1 */
+static int pool_find(int idx) {
+    for (int i = 0; i < COVER_POOL; i++) if (g_pool_for[i] == idx) return i;
+    return -1;
+}
+/* Put `idx` in the pool, replacing whichever slot is least useful. Returns the slot, or -1 if
+ * the art could not be read. */
+static int pool_load(int idx, const Poster *q, const int *keep, int nkeep) {
+    if (!g_pool_ok || !q->srcpath[0]) return -1;
+    int victim = -1;
+    for (int i = 0; i < COVER_POOL && victim < 0; i++) {
+        if (g_pool_for[i] < 0) victim = i;                  /* a free slot first */
+    }
+    for (int i = 0; i < COVER_POOL && victim < 0; i++) {    /* then one nobody can see */
+        int used = 0;
+        for (int k = 0; k < nkeep; k++) if (keep[k] == g_pool_for[i]) { used = 1; break; }
+        if (!used) victim = i;
+    }
+    if (victim < 0) return -1;
+    char small[400];
+    snprintf(small, sizeof small, "%s/%s.w565", CACHE_DIR, q->key);
+    FILE *f = fopen(small, "rb");
+    if (!f) {
+        if (!build_cache_entry_sz(q->srcpath, q->src_w, q->src_h, small,
+                                  TEX_W, TEX_H, IMG_W, IMG_H)) return -1;
+        f = fopen(small, "rb");
+        if (!f) return -1;
+    }
+    size_t got = fread(g_pool[victim].data, 1, (size_t)TEX_W * TEX_H * 2, f);
+    fclose(f);
+    if (got != (size_t)TEX_W * TEX_H * 2) return -1;
+    C3D_TexFlush(&g_pool[victim]);
+    g_pool_for[victim] = idx;
+    return victim;
+}
+
 /* The full-resolution front of whatever is in your hand. One texture, filled on pickup. */
 static C3D_Tex g_detail;
 static int     g_detail_ok = 0, g_detail_for = -1;
@@ -752,14 +818,26 @@ static void make_spine_tex(void) {
     if (!lin || !til) { free(lin); free(til); return; }
     for (int c = 0; c < SPINE_COLOURS; c++) {
         if (!C3D_TexInit(&g_spine[c], W, H, GPU_RGB565)) { free(lin); free(til); return; }
-        u16 body = pal[c];
-        u16 dark = (u16)((body >> 1) & 0x7BEF);
+        /* A tape is a BLACK case with a printed label, not a block of colour. The palette is
+         * an accent on the label and a band at the foot -- which is what a shelf of them
+         * actually looks like, and stops the shop reading as a rainbow. */
+        const u16 shell = 0x18E3, shellhi = 0x39E7, shelllo = 0x1082;
+        u16 accent = pal[c];
+        u16 paper  = 0xEF7D;
         for (int y = 0; y < H; y++)
             for (int x = 0; x < W; x++) {
-                u16 v = body;
-                if (x <= 1)               v = dark;          /* shadowed left edge */
-                if (y < 3 || y > H - 4)   v = dark;          /* caps */
-                else if (y > 9 && y < 18) v = 0xFFFF;        /* label band */
+                u16 v = shell;
+                if (x <= 1)                 v = shelllo;      /* shadowed edge */
+                else if (x >= W - 2)        v = shellhi;      /* lit edge */
+                if (y < 2 || y > H - 3)     v = shelllo;      /* top and bottom caps */
+                else if (y >= 6 && y < 30) {                  /* the printed label */
+                    v = paper;
+                    if (x <= 2 || x >= W - 3) v = shell;      /* label inset from the edges */
+                    else if (y >= 8 && y <= 10)  v = accent;  /* title rule */
+                    else if (y >= 13 && y <= 14) v = 0x8410;  /* lines of small print */
+                    else if (y >= 16 && y <= 17) v = 0x8410;
+                    else if (y >= 19 && y <= 20) v = 0xA514;
+                } else if (y >= 44 && y < 50) v = accent;     /* a band at the foot */
                 lin[y * W + x] = v;
             }
         tile_rgb565(lin, til, W, H);
@@ -793,7 +871,9 @@ static void make_white_tex(void) {
  *
  * If you later want fixed art up there instead, this is the hook: drop a 132x188 .p565 in as
  * store/wallN.p565 and it will be used in preference to a title from the shelves. */
-#define WALLPOSTERS 6
+/* Enough distinct titles that the same face does not stare back at you from three walls. There
+ * are up to ~20 places a poster can hang, so a few still repeat -- but never side by side. */
+#define WALLPOSTERS 16
 static C3D_Tex g_wall[WALLPOSTERS];
 static int     g_wall_ok[WALLPOSTERS];
 static int     g_wall_n = 0;
@@ -992,6 +1072,8 @@ static void build_sections(void) {
         g_sec[i].cx  = PLAN[i][0];
         g_sec[i].cz  = PLAN[i][1];
         g_sec[i].rot = PLAN[i][2];
+        g_sec[i].facedir = ((i / 3) % 2) ? -1.0f : 1.0f;   /* bays face each other in pairs */
+        g_sec[i].has_L   = (i < 6 && (i % 2) == 0);
         make_sign_tex(&g_sec[i].sign, g_sec[i].name);
         g_sec[i].sign_ok = 1;
     }
@@ -1048,20 +1130,22 @@ static void place_section(int k) {
             sl = base + (p->order - first);
         }
         p->shown = 1;
-        int per_face = 3 * PER_ROW;
-        int face = (sl / per_face) & 1;
-        int idx  = sl % per_face;
+        int idx  = sl;
         int row  = 2 - (idx / PER_ROW), colp = idx % PER_ROW;
+        if (row < 0) { p->shown = 0; continue; }
         int inrow = total_slots - (2 - row) * PER_ROW;  /* rows fill from the top */
         if (inrow > PER_ROW) inrow = PER_ROW;
         if (inrow < 1) inrow = 1;
-        float lx = (colp - (inrow - 1) * 0.5f) * 0.235f;
-        float lz = face ? -(UNIT_DEPTH * 0.5f + 0.02f) : (UNIT_DEPTH * 0.5f + 0.02f);
+        /* every Nth one turns its face to the aisle */
+        p->faceout = (!p->is_more && (sl % FACEOUT_EVERY) == 3);
+        float pitch_ = p->faceout ? 0.34f : 0.235f;
+        float lx = (colp - (inrow - 1) * 0.5f) * pitch_;
+        float lz = S->facedir * (UNIT_DEPTH * 0.5f + 0.02f);
         float ca = cosf(S->rot), sa = sinf(S->rot);
         p->x  = S->cx + lx * ca + lz * sa;
         p->z  = S->cz - lx * sa + lz * ca;
         p->y  = 0.46f + row * 0.62f;
-        p->ay = S->rot + (face ? C3D_Angle(0.5f) : 0.0f);
+        p->ay = S->rot + ((S->facedir < 0) ? C3D_Angle(0.5f) : 0.0f);
     }
 }
 
@@ -1357,6 +1441,7 @@ int main(void) {
     build_quad();
     build_signquad();
     build_box();
+    pool_init();
     g_detail_ok = C3D_TexInit(&g_detail, DET_W, DET_H, GPU_RGB565);
     if (g_detail_ok) { C3D_TexSetFilter(&g_detail, GPU_LINEAR, GPU_LINEAR);
                        C3D_TexSetWrap(&g_detail, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE); }
@@ -1663,24 +1748,43 @@ int main(void) {
              * face-on below and shows the real cover, because only ever one is selected. */
             set_buf(g_quadvbo, 6);
             int lastcol = -1, drawn = 0;
+            int keep[COVER_POOL]; int nkeep = 0;      /* face-out cases in view, for the pool */
             for (int i = 0; i < g_nposters; i++) {
                 if (!g_pos[i].ok || !g_pos[i].shown || i == held || i == sel) continue;
                 float dxs = g_pos[i].x - cx, dzs = g_pos[i].z - cz;
-                if (dxs * dxs + dzs * dzs > SPINE_VIEW * SPINE_VIEW) continue;
-                if (drawn >= SPINE_BUDGET) break;
-                if (g_pos[i].col != lastcol) {                /* grouped by colour: fewer binds */
-                    bind_tex(&g_spine[g_pos[i].col], g_spine_ok);
-                    lastcol = g_pos[i].col;
-                }
+                float d2 = dxs * dxs + dzs * dzs;
+                if (d2 > SPINE_VIEW * SPINE_VIEW) continue;
+                if (drawn >= SPINE_BUDGET) continue;   /* skip, do NOT stop: breaking here spent
+                                                        * the whole budget on the nearest run
+                                                        * and left the rest of the bay empty */
                 C3D_Mtx m;
                 Mtx_Copy(&m, &view);
                 Mtx_Translate(&m, g_pos[i].x, g_pos[i].y, g_pos[i].z, true);
                 Mtx_RotateY(&m, g_pos[i].ay, true);
-                Mtx_Scale(&m, 0.20f, 0.56f, 1.0f);           /* an edge, not a face */
-                C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
+                if (g_pos[i].faceout) {
+                    int slot = pool_find(i);
+                    if (slot < 0 && nkeep < COVER_POOL) { /* remember it; one is loaded a frame */
+                        keep[nkeep++] = i;
+                    }
+                    Mtx_Scale(&m, 0.30f, 0.30f * (float)IMG_H / (float)IMG_W, 1.0f);
+                    C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
+                    if (slot >= 0) bind_tex(&g_pool[slot], g_pool_ok);
+                    else           bind_tex(&g_spine[g_pos[i].col], g_spine_ok);
+                    lastcol = -1;                     /* the spine bind is no longer current */
+                } else {
+                    if (g_pos[i].col != lastcol) {    /* grouped by colour: fewer binds */
+                        bind_tex(&g_spine[g_pos[i].col], g_spine_ok);
+                        lastcol = g_pos[i].col;
+                    }
+                    Mtx_Scale(&m, 0.20f, 0.56f, 1.0f);   /* an edge, not a face */
+                    C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
+                }
                 draw_range(0, 6);
                 drawn++;
             }
+            /* one cover a frame: walking an aisle fills them in without ever hitching */
+            if (eye == 0) for (int k = 0; k < nkeep; k++)
+                if (pool_find(keep[k]) < 0) { pool_load(keep[k], &g_pos[keep[k]], keep, nkeep); break; }
 
             /* the selected case: proud of the shelf and turned to face you, wearing its real
              * cover. This is the whole reason spines are affordable -- you only ever need one */
@@ -1745,6 +1849,10 @@ int main(void) {
                 int w = 0;
                 for (int i = 0; i < g_nsec; i++) {
                     for (int e = 0; e < 2; e++) {
+                        /* the inner end of a bay with an L return is up against the return --
+                         * a poster there is half-buried by it */
+                        int inner = (g_sec[i].cx < 0) ? 1 : 0;
+                        if (g_sec[i].has_L && e == inner) continue;
                         int k = (w++) % WALLPOSTERS;
                         if (!g_wall_ok[k]) continue;
                         bind_tex(&g_wall[k], g_wall_ok[k]);
@@ -1769,7 +1877,7 @@ int main(void) {
                     {  16.0f, 2.70f, STORE_Z0 - STORE_DEPTH + 0.08f, 0.0f },
                 };
                 for (int i = 0; i < 8; i++) {
-                    int k = i % WALLPOSTERS;
+                    int k = (w++) % WALLPOSTERS;
                     if (!g_wall_ok[k]) continue;
                     bind_tex(&g_wall[k], g_wall_ok[k]);
                     C3D_Mtx m; Mtx_Copy(&m, &view);
@@ -1861,6 +1969,7 @@ int main(void) {
     if (g_covers_ok) C3D_TexDelete(&g_covers);
     if (g_spine_ok) for (int i = 0; i < SPINE_COLOURS; i++) C3D_TexDelete(&g_spine[i]);
     if (g_white_ok)  C3D_TexDelete(&g_white);
+    if (g_pool_ok) for (int i = 0; i < COVER_POOL; i++) C3D_TexDelete(&g_pool[i]);
     for (int i = 0; i < WALLPOSTERS; i++) if (g_wall_ok[i]) C3D_TexDelete(&g_wall[i]);
     if (g_back_ok) C3D_TexDelete(&g_back);
     if (g_detail_ok) C3D_TexDelete(&g_detail);
