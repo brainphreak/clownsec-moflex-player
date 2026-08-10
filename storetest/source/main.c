@@ -188,6 +188,7 @@ static int    g_from_data = 0, g_from_art = 0;
 enum { STORE_LIBRARY = 0, STORE_CATALOG = 1 };
 static int    g_mode = STORE_LIBRARY;
 static int    g_drawn = 0;      /* cases actually drawn last frame */
+static float  g_doorx = 0.0f;   /* where the door ended up, so the EXIT board follows it */
 static int    g_covers_on = 1;  /* SELECT: face-out covers on/off, to isolate the stutter */
 static const char *verb(void) { return g_mode == STORE_CATALOG ? "QUEUE" : "PLAY"; }
 
@@ -1118,7 +1119,7 @@ static void build_sections(void) {
         float maxlen = UNIT_LEN_MIN;
         for (int k = 0; k < g_nsec; k++) if (g_sec[k].len > maxlen) maxlen = g_sec[k].len;
         g_hx = maxlen + 2.4f;                       /* bay + half the walkway */
-        if (g_hx < 6.0f)  g_hx = 6.0f;
+        if (g_hx < 8.5f)  g_hx = 8.5f;              /* narrower than this is a corridor */
         int side = g_nsec < 6 ? g_nsec : 6;
         int rows = (side + 1) / 2;                  /* they fill in left/right pairs */
         if (rows < 1) rows = 1;
@@ -1851,35 +1852,45 @@ int main(void) {
             /* shopfront fittings: windows and a door on the near wall, signs above */
             set_buf(g_signvbo, 6);
             if (g_mat_ok) {
+                /* The front wall is divided into four equal bays and each fitting is built to
+                 * one of them. They used to be fixed at six units wide whatever the room, so
+                 * once the shop shrank the windows overlapped each other and the door. */
+                const int FRONT_BAYS = 4, DOOR_BAY = 2;
+                float bw = (STORE_HX * 2.0f) / (float)FRONT_BAYS;
                 bind_tex(g_outside_ok ? &g_outside : &g_glass, 1);
-                for (int w = 0; w < 4; w++) {
-                    float wx = -STORE_HX * 0.75f + w * (STORE_HX * 0.5f);
-                    if (w == 2) continue;                  /* the door goes in this gap */
+                for (int w = 0; w < FRONT_BAYS; w++) {
+                    if (w == DOOR_BAY) continue;
+                    float wx = -STORE_HX + bw * ((float)w + 0.5f);
                     C3D_Mtx m; Mtx_Copy(&m, &view);
-                    Mtx_Translate(&m, wx, 1.9f, STORE_Z0 - 0.05f, true);
-                    Mtx_Scale(&m, 6.0f, 2.6f, 1.0f);
+                    Mtx_Translate(&m, wx, 1.95f, STORE_Z0 - 0.05f, true);
+                    Mtx_Scale(&m, bw * 0.88f, 2.4f, 1.0f);
                     C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
                     draw_range(0, 6);
                 }
+                float dx = -STORE_HX + bw * ((float)DOOR_BAY + 0.5f);
+                float dw = bw * 0.55f; if (dw > 2.4f) dw = 2.4f;
                 bind_tex(&g_door, g_mat_ok);
                 { C3D_Mtx m; Mtx_Copy(&m, &view);
-                  Mtx_Translate(&m, STORE_HX * 0.33f, 1.15f, STORE_Z0 - 0.05f, true);
-                  Mtx_Scale(&m, 2.6f, 2.3f, 1.0f);
+                  Mtx_Translate(&m, dx, 1.15f, STORE_Z0 - 0.05f, true);
+                  Mtx_Scale(&m, dw, 2.3f, 1.0f);
                   C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
                   draw_range(0, 6); }
+                g_doorx = dx;                              /* the exit board hangs over it */
             }
             if (g_store_ok) {                              /* name across the back wall */
                 bind_tex(&g_storesign, g_store_ok);
                 C3D_Mtx m; Mtx_Copy(&m, &view);
                 Mtx_Translate(&m, 0.0f, 3.3f, STORE_Z0 - STORE_DEPTH + 0.06f, true);
-                Mtx_Scale(&m, 15.0f, 15.0f * (float)SIGN_H / (float)SIGN_W, 1.0f);
+                float nw = STORE_HX * 1.3f;                /* fits the back wall it hangs on */
+                if (nw > 15.0f) nw = 15.0f;
+                Mtx_Scale(&m, nw, nw * (float)SIGN_H / (float)SIGN_W, 1.0f);
                 C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
                 draw_range(0, 6);
             }
             if (g_exit_ok) {                               /* over the door */
                 bind_tex(&g_exitsign, g_exit_ok);
                 C3D_Mtx m; Mtx_Copy(&m, &view);
-                Mtx_Translate(&m, STORE_HX * 0.33f, 2.75f, STORE_Z0 - 0.10f, true);
+                Mtx_Translate(&m, g_doorx, 2.75f, STORE_Z0 - 0.10f, true);
                 Mtx_RotateY(&m, C3D_Angle(0.5f), true);
                 Mtx_Scale(&m, 1.8f, 1.8f * (float)SIGN_H / (float)SIGN_W, 1.0f);
                 C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
