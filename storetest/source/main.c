@@ -69,17 +69,29 @@
 /* A store floor with freestanding units, not a corridor. The units are low enough to see
  * over (2.0 against a 1.55 eye height puts the sign of the next section in view from
  * anywhere), which is what makes the place read as a shop rather than a maze. */
-#define STORE_HX     18.0f      /* floor spans +/-STORE_HX in x */
+#define STORE_HX     13.5f      /* floor spans +/-STORE_HX in x */
 #define STORE_Z0      2.0f      /* and STORE_Z0 .. -STORE_DEPTH in z */
-#define STORE_DEPTH  30.0f
+#define STORE_DEPTH  24.0f
 #define CEIL_Y        4.2f
-#define UNIT_LEN     12.0f      /* a bay: long enough to run from the wall to the walkway */
+/* A bay is BUILT TO ITS SECTION now, not to a fixed size: a quiet genre gets a short unit, a
+ * busy one a long one. That is what a shop looks like, and it is the only way to have every
+ * shelf full instead of a hall of half-empty carpet. These are the limits. */
+#define UNIT_LEN      9.0f
+#define UNIT_LEN_MIN  3.0f
 #define UNIT_DEPTH    1.0f
 #define UNIT_H        2.0f
 #define SIGN_Y        3.35f
 #define MAX_SECTIONS  8
 #define SEC_COLS      3
-#define PER_ROW      46         /* spines along a 12-unit bay */
+#define BAY_ROWS      3
+#define PITCH_SPINE   0.235f
+#define PITCH_FACE    0.34f
+/* A genre with fewer than this is not worth a unit -- a bay holding five films reads as a shop
+ * closing down -- so it merges into OTHER. One with more than BAY_MAX gets a SECOND unit
+ * instead of hiding the rest behind a MORE case. */
+#define BAY_MIN       6
+#define BAY_MAX      78
+#define PER_ROW      34         /* the most spines a full-length bay can hold in a row */
 /* One side only. Stocking both faces doubled what had to be drawn, hid half of it behind the
  * unit, and put titles on a face you have to walk round the bay to reach. A shop merchandises
  * the side that faces the aisle. */
@@ -87,7 +99,10 @@
 /* How much of the shop is drawn at once. Every spine is its own draw call, and a shop full of
  * them is thousands of commands a frame -- past what the command buffer holds, and a GPU fed a
  * truncated command stream wedges the console. You cannot read a spine across the room anyway. */
-#define SPINE_COLOURS 10        /* one spine texture per colour */
+/* THREE cases, not ten colours. A rental shop did not shelve publisher packaging -- every tape
+ * went into the shop's own clamshell, so a shelf was uniform white and blue with the odd black
+ * case among it. A rainbow is the most artificial thing you can put on a shelf. */
+#define SPINE_COLOURS 3
 #define SPINE_VIEW    9.5f      /* a spine further off than this is a stripe anyway */
 #define SPINE_BUDGET 420
 /* Every Nth case stands face out, as a shop does: a run of spines, a cover, more spines. The
@@ -134,6 +149,8 @@ typedef struct {
     int     sign_ok;
     int     n;                  /* titles that belong here, not what fits */
     int     page, pages, cap;   /* a bay holds `cap`; the rest wait behind the MORE case */
+    float   len;                /* built to fit what this section holds */
+    int     part;               /* 0, or which unit of a split genre this is */
     float   facedir;            /* which side the stock is on: +1 or -1 in the unit's own z.
                                  * Alternated down the room so bays face each other across an
                                  * aisle, the way a shop lays them out. */
@@ -271,7 +288,9 @@ static int scan_dir(const char *dir, int fixed_w, int fixed_h, int with_nfo, int
         p->src_w = sw; p->src_h = sh;
         { unsigned h = 2166136261u;                        /* spine colour from the title */
           for (const char *c = key; *c; c++) h = (h ^ (unsigned char)*c) * 16777619u;
-          p->col = (int)(h % SPINE_COLOURS); }
+          /* mostly the house case, a few black, the odd grey -- not an even spread */
+          unsigned r = h % 10;
+          p->col = (r < 7) ? 0 : (r < 9) ? 1 : 2; }
         p->ok = 1;
         snprintf(p->key, sizeof p->key, "%s", key);
         pretty(e->d_name, p->name, sizeof p->name);
@@ -298,7 +317,7 @@ static int load_posters(int *built) {
 
 /* a placeholder poster so the prototype still runs on a console with no art cached */
 static void make_placeholder(Poster *p, int idx) {
-    p->col = idx % SPINE_COLOURS;
+    p->col = (idx % 10 < 7) ? 0 : (idx % 10 < 9) ? 1 : 2;
     p->ok = 1;
     snprintf(p->name, sizeof p->name, "Placeholder %d", idx + 1);
     if (0) {
@@ -810,34 +829,36 @@ static void make_materials(void) {
 static C3D_Tex g_spine[SPINE_COLOURS];
 static int     g_spine_ok = 0;
 static void make_spine_tex(void) {
-    static const u16 pal[SPINE_COLOURS] = { 0xF9A6, 0xFB40, 0xFEA0, 0x9FE6, 0x2E8B,
-                                            0x4C9F, 0x9A9F, 0xF81F, 0xC618, 0xFD4C };
     const int W = 16, H = 64;
     u16 *lin = (u16 *)malloc(W * H * 2);
     u16 *til = (u16 *)malloc(W * H * 2);
     if (!lin || !til) { free(lin); free(til); return; }
     for (int c = 0; c < SPINE_COLOURS; c++) {
         if (!C3D_TexInit(&g_spine[c], W, H, GPU_RGB565)) { free(lin); free(til); return; }
-        /* A tape is a BLACK case with a printed label, not a block of colour. The palette is
-         * an accent on the label and a band at the foot -- which is what a shelf of them
-         * actually looks like, and stops the shop reading as a rainbow. */
-        const u16 shell = 0x18E3, shellhi = 0x39E7, shelllo = 0x1082;
-        u16 accent = pal[c];
-        u16 paper  = 0xEF7D;
+        /* 0: the house case, white with a blue head and foot -- most of the shelf
+         * 1: a black case, the ones that never got re-cased
+         * 2: a grey case, slightly worn */
+        u16 shell   = (c == 0) ? 0xE73C : (c == 1) ? 0x18E3 : 0x8410;
+        u16 shellhi = (c == 0) ? 0xFFFF : (c == 1) ? 0x39E7 : 0xAD55;
+        u16 shelllo = (c == 0) ? 0xAD55 : (c == 1) ? 0x1082 : 0x630C;
+        u16 band    = (c == 0) ? TH_BLUE : (c == 1) ? 0x4208 : 0x39E7;
+        u16 paper   = (c == 1) ? 0xC618 : 0xFFFF;
+        u16 ink     = (c == 1) ? 0x8410 : 0x6B4D;
         for (int y = 0; y < H; y++)
             for (int x = 0; x < W; x++) {
                 u16 v = shell;
                 if (x <= 1)                 v = shelllo;      /* shadowed edge */
                 else if (x >= W - 2)        v = shellhi;      /* lit edge */
-                if (y < 2 || y > H - 3)     v = shelllo;      /* top and bottom caps */
-                else if (y >= 6 && y < 30) {                  /* the printed label */
+                if (y < 2 || y > H - 3)     v = shelllo;      /* caps */
+                else if (y < 9)             v = band;         /* head band */
+                else if (y > H - 12)        v = band;         /* foot band */
+                else if (y >= 12 && y < 34) {                 /* the printed label */
                     v = paper;
-                    if (x <= 2 || x >= W - 3) v = shell;      /* label inset from the edges */
-                    else if (y >= 8 && y <= 10)  v = accent;  /* title rule */
-                    else if (y >= 13 && y <= 14) v = 0x8410;  /* lines of small print */
-                    else if (y >= 16 && y <= 17) v = 0x8410;
-                    else if (y >= 19 && y <= 20) v = 0xA514;
-                } else if (y >= 44 && y < 50) v = accent;     /* a band at the foot */
+                    if (x <= 2 || x >= W - 3)    v = shell;
+                    else if (y >= 15 && y <= 16) v = ink;      /* lines of title */
+                    else if (y >= 19 && y <= 20) v = ink;
+                    else if (y >= 24 && y <= 24) v = ink;
+                }
                 lin[y * W + x] = v;
             }
         tile_rgb565(lin, til, W, H);
@@ -848,6 +869,7 @@ static void make_spine_tex(void) {
     free(lin); free(til);
     g_spine_ok = 1;
 }
+
 /* a plain white sheet for the light fittings and as a safe fallback */
 static C3D_Tex g_white;
 static int     g_white_ok = 0;
@@ -1042,18 +1064,32 @@ static void build_sections(void) {
                 char tmp[24]; memcpy(tmp, names[a], 24); memcpy(names[a], names[b], 24);
                 memcpy(names[b], tmp, 24);
             }
-    int want = uniq < (MAX_SECTIONS - 1) ? uniq : (MAX_SECTIONS - 1);
-    for (int i = 0; i < want; i++) {
-        if (count[i] < 2) break;                       /* not worth a whole unit */
-        snprintf(g_sec[g_nsec].name, 24, "%s", names[i]);
-        g_nsec++;
+    /* Build the section list from what is actually there.
+     *
+     * A genre too small for a unit merges into OTHER; one too big takes a second unit rather
+     * than hiding half of itself behind a MORE case. Then each bay is built to the length its
+     * contents need. The shop ends up the size of the library instead of the library rattling
+     * around inside a fixed shop. */
+    int spare = MAX_SECTIONS;
+    int other = 0;
+    for (int i = 0; i < uniq && spare > 1; i++) {
+        if (count[i] < BAY_MIN) { other += count[i]; continue; }
+        int units = (count[i] + BAY_MAX - 1) / BAY_MAX;
+        if (units > spare - 1) units = spare - 1;
+        for (int u = 0; u < units; u++) {
+            int share = count[i] / units + ((u < count[i] % units) ? 1 : 0);
+            if (units > 1) snprintf(g_sec[g_nsec].name, 24, "%.14s %d", names[i], u + 1);
+            else           snprintf(g_sec[g_nsec].name, 24, "%s", names[i]);
+            g_sec[g_nsec].part = u;
+            g_sec[g_nsec].n    = share;      /* provisional: the real tally follows below */
+            g_nsec++; spare--;
+        }
     }
-    snprintf(g_sec[g_nsec].name, 24, "GENERAL");
+    for (int i = 0; i < uniq; i++) if (count[i] >= BAY_MIN) continue; else (void)0;
+    snprintf(g_sec[g_nsec].name, 24, "%s", other ? "OTHER" : "GENERAL");
     g_nsec++;
+    for (int k = 0; k < g_nsec; k++) g_sec[k].n = 0;   /* recounted when titles are assigned */
 
-    /* A FLOOR PLAN, not a grid. Evenly spaced islands square to the room leave a hall of empty
-     * carpet and read as crates; a real shop runs units in ranks with walking aisles between
-     * them and turns the back corners in to face you as you come down the room. */
     /* Bays, the way a rental shop is actually laid out: units run OUT FROM THE WALLS with
      * their far end against the wall, leaving a clear walkway up the middle of the room that
      * reaches every section. Islands floating in open carpet read as crates; this reads as a
@@ -1069,8 +1105,13 @@ static void build_sections(void) {
         {   7.0f, -25.5f, 0.0f },
     };
     for (int i = 0; i < g_nsec; i++) {
-        g_sec[i].cx  = PLAN[i][0];
-        g_sec[i].cz  = PLAN[i][1];
+        /* the far end sits against the wall; the near end reaches toward the walkway by
+         * however long this bay needs to be */
+        float side = (PLAN[i][0] < 0) ? -1.0f : 1.0f;
+        int   back = (PLAN[i][1] < -20.0f);
+        if (back) { g_sec[i].cx = PLAN[i][0]; g_sec[i].cz = STORE_Z0 - STORE_DEPTH + 1.2f; }
+        else      { g_sec[i].cx = side * (STORE_HX - g_sec[i].len * 0.5f - 0.15f);
+                    g_sec[i].cz = PLAN[i][1]; }
         g_sec[i].rot = PLAN[i][2];
         g_sec[i].facedir = ((i / 3) % 2) ? -1.0f : 1.0f;   /* bays face each other in pairs */
         g_sec[i].has_L   = (i < 6 && (i % 2) == 0);
@@ -1078,13 +1119,33 @@ static void build_sections(void) {
         g_sec[i].sign_ok = 1;
     }
 
-    /* Which bay each title belongs to, and where in that bay's run. */
+    /* Which bay each title belongs to. A split genre has several units named "COMEDY 1",
+     * "COMEDY 2" -- match on the genre and take whichever of its units is emptiest, so the
+     * pair fill evenly rather than one being full and one bare. */
     for (int i = 0; i < g_nposters; i++) {
         char g[24]; first_genre(g_pos[i].genres, g, sizeof g);
-        int k = g_nsec - 1;                            /* GENERAL unless a section matches */
-        for (int j = 0; j < g_nsec; j++) if (!strcmp(g_sec[j].name, g)) { k = j; break; }
+        size_t gl = strlen(g);
+        int k = g_nsec - 1;                            /* OTHER unless a section matches */
+        int best = -1;
+        for (int j = 0; j < g_nsec; j++) {
+            if (strncmp(g_sec[j].name, g, gl)) continue;
+            char t = g_sec[j].name[gl];
+            if (t != 0 && t != ' ') continue;           /* "COMEDY" must not match "COMEDYDRAMA" */
+            if (best < 0 || g_sec[j].n < g_sec[best].n) best = j;
+        }
+        if (best >= 0) k = best;
         g_pos[i].sect  = k;
         g_pos[i].order = g_sec[k].n++;
+    }
+
+    /* Build each bay to its contents. A row holds `len / pitch` cases; three rows, and one in
+     * FACEOUT_EVERY takes the wider pitch of a cover. */
+    for (int k = 0; k < g_nsec; k++) {
+        float avg = PITCH_SPINE + (PITCH_FACE - PITCH_SPINE) / (float)FACEOUT_EVERY;
+        float need = ((float)g_sec[k].n / (float)BAY_ROWS) * avg + 0.5f;
+        if (need < UNIT_LEN_MIN) need = UNIT_LEN_MIN;
+        if (need > UNIT_LEN)     need = UNIT_LEN;
+        g_sec[k].len = need;
     }
 
     /* A bay that cannot hold its whole genre gets a MORE case in the top-left slot: pick it up,
@@ -1099,7 +1160,7 @@ static void build_sections(void) {
             int m = g_nposters++;
             memset(&g_pos[m], 0, sizeof g_pos[m]);
             g_pos[m].ok = 1; g_pos[m].is_more = 1; g_pos[m].sect = k;
-            g_pos[m].col = 2;   /* yellow: the MORE case */
+            g_pos[m].col = 1;   /* a black case: the MORE marker stands out on a white run */
             snprintf(g_pos[m].name, sizeof g_pos[m].name, "MORE %s", g_sec[k].name);
             g_sec[k].more_idx = m;
         }
@@ -1231,7 +1292,7 @@ static int build_room(void) {
      * surface rather than a wall */
     for (int i = 0; i < g_nsec; i++) {
         push_box_rot(g_roomv, &n, g_sec[i].cx, UNIT_H * 0.5f, g_sec[i].cz,
-                     UNIT_LEN * 0.5f, UNIT_H * 0.5f, UNIT_DEPTH * 0.5f, g_sec[i].rot,
+                     g_sec[i].len * 0.5f, UNIT_H * 0.5f, UNIT_DEPTH * 0.5f, g_sec[i].rot,
                      3, 1, 0.52f);
     }
     /* the counter: a long wood block by the door, a register on top, and a returns box */
@@ -1242,7 +1303,7 @@ static int build_room(void) {
     /* An L on the end of two bays: a short return that turns the corner, which is what stops a
      * rank of units reading as a row of identical slabs. */
     for (int i = 0; i < g_nsec && i < 6; i += 2) {
-        float ex = g_sec[i].cx + ((g_sec[i].cx < 0) ? UNIT_LEN * 0.5f : -UNIT_LEN * 0.5f);
+        float ex = g_sec[i].cx + ((g_sec[i].cx < 0) ? g_sec[i].len * 0.5f : -g_sec[i].len * 0.5f);
         push_box_rot(g_roomv, &n, ex, UNIT_H * 0.5f, g_sec[i].cz + 1.6f,
                      UNIT_DEPTH * 0.5f, UNIT_H * 0.5f, 1.6f, 0.0f, 1, 1, 0.48f);
     }
@@ -1272,12 +1333,12 @@ static int build_room(void) {
     g_nblock = 0;
     for (int i = 0; i < g_nsec; i++) {
         g_block[g_nblock].cx = g_sec[i].cx; g_block[g_nblock].cz = g_sec[i].cz;
-        g_block[g_nblock].hx = UNIT_LEN * 0.5f + 0.42f;
+        g_block[g_nblock].hx = g_sec[i].len * 0.5f + 0.42f;
         g_block[g_nblock].hz = UNIT_DEPTH * 0.5f + 0.42f;
         g_block[g_nblock].rot = g_sec[i].rot; g_nblock++;
     }
     for (int i = 0; i < g_nsec && i < 6; i += 2) {
-        float ex = g_sec[i].cx + ((g_sec[i].cx < 0) ? UNIT_LEN * 0.5f : -UNIT_LEN * 0.5f);
+        float ex = g_sec[i].cx + ((g_sec[i].cx < 0) ? g_sec[i].len * 0.5f : -g_sec[i].len * 0.5f);
         g_block[g_nblock++] = (Blocker){ ex, g_sec[i].cz + 1.6f,
                                          UNIT_DEPTH * 0.5f + 0.42f, 1.6f + 0.42f, 0.0f };
     }
@@ -1857,7 +1918,7 @@ int main(void) {
                         if (!g_wall_ok[k]) continue;
                         bind_tex(&g_wall[k], g_wall_ok[k]);
                         C3D_Mtx m; Mtx_Copy(&m, &view);
-                        Mtx_Translate(&m, g_sec[i].cx + (e ? 1 : -1) * (UNIT_LEN * 0.5f + 0.03f),
+                        Mtx_Translate(&m, g_sec[i].cx + (e ? 1 : -1) * (g_sec[i].len * 0.5f + 0.03f),
                                       1.30f, g_sec[i].cz, true);
                         Mtx_RotateY(&m, e ? C3D_Angle(0.25f) : C3D_Angle(-0.25f), true);
                         Mtx_Scale(&m, 0.62f, 0.62f * (float)IMG_H / (float)IMG_W, 1.0f);
