@@ -1067,6 +1067,7 @@ static void first_genre(const char *g, char *out, size_t cap) {
 }
 
 static void place_section(int k);
+static void bake_spines(void);
 static void build_sections(void) {
     /* static: at 320 titles these are 9 KB, and a .3dsx main thread has little to spare */
     static char names[MAX_POSTERS][24];
@@ -1224,6 +1225,7 @@ static void build_sections(void) {
         if (g_sec[k].pages < 1) g_sec[k].pages = 1;
     }
     for (int k = 0; k < g_nsec; k++) place_section(k);
+    bake_spines();
 }
 
 /* Position one bay's stock for its current page. Called again when the MORE case is used. */
@@ -1478,8 +1480,45 @@ static void build_signquad(void) {
  * that is, the TOP of the image data -- so in texture coordinates it lives between
  * 1-VMAX and 1, not between 0 and VMAX. Getting that backwards samples the black padding for
  * the lower half of the quad and shows the poster flipped and shifted up into the rest. */
+/* All the spines, baked into ONE buffer in world space and grouped by case colour.
+ *
+ * A case is a fixed thing on a fixed shelf, so there is no reason to send the GPU a matrix and
+ * a draw call for each one. Six vertices per case are transformed once, on the CPU, when the
+ * shelf is laid out; a frame then draws each colour as a single range. Three draws instead of
+ * a hundred and seventy, and no per-case matrix work at all -- which is what the stutter was.
+ * Rebuilt only when a shelf is restocked. */
+static Vtx *g_spinev;
+static int  g_spine_first[SPINE_COLOURS], g_spine_count[SPINE_COLOURS];
+
+/* transform the unit quad by a case's matrix and append it, in world space */
+static void bake_case(Vtx *dst, int *n, const C3D_Mtx *m, const Vtx *src) {
+    for (int k = 0; k < 6; k++) {
+        float x = src[k].x, y = src[k].y, z = src[k].z;
+        Vtx *o = &dst[(*n)++];
+        o->x = m->r[0].x * x + m->r[0].y * y + m->r[0].z * z + m->r[0].w;
+        o->y = m->r[1].x * x + m->r[1].y * y + m->r[1].z * z + m->r[1].w;
+        o->z = m->r[2].x * x + m->r[2].y * y + m->r[2].z * z + m->r[2].w;
+        o->u = src[k].u; o->v = src[k].v; o->s = src[k].s;
+    }
+}
+static void bake_spines(void) {
+    if (!g_spinev || !g_quadv) return;
+    int n = 0;
+    for (int c = 0; c < SPINE_COLOURS; c++) {
+        g_spine_first[c] = n;
+        for (int i = 0; i < g_nposters; i++) {
+            Poster *p = &g_pos[i];
+            if (!p->ok || !p->shown || p->faceout || p->col != c) continue;
+            if (n + 6 > MAX_POSTERS * 6) break;
+            bake_case(g_spinev, &n, &p->model, g_quadv);
+        }
+        g_spine_count[c] = n - g_spine_first[c];
+    }
+}
+
 static void build_quad(void) {
-    g_quadv = (Vtx *)linearAlloc(sizeof(Vtx) * 6);
+    g_quadv  = (Vtx *)linearAlloc(sizeof(Vtx) * 6);
+    g_spinev = (Vtx *)linearAlloc(sizeof(Vtx) * MAX_POSTERS * 6);
     const float vlo = 1.0f - VMAX;      /* quad bottom  -> last row of the image */
     const float vhi = 1.0f;             /* quad top     -> first row of the image */
     Vtx q[6] = {
@@ -1653,6 +1692,7 @@ int main(void) {
             int k = g_pos[held].sect;
             g_sec[k].page = (g_sec[k].page + 1) % g_sec[k].pages;
             place_section(k);
+            bake_spines();                       /* the shelf changed: rebuild the batch */
             int lo = g_sec[k].page * g_sec[k].cap + 1;
             int hi = lo + g_sec[k].cap - 1;
             if (hi > g_sec[k].n) hi = g_sec[k].n;
@@ -1901,37 +1941,40 @@ int main(void) {
              * textures at all, which is what lets a whole catalogue stand on these shelves --
              * and a ten-pixel spine could not show a title anyway. The selected one turns
              * face-on below and shows the real cover, because only ever one is selected. */
+            /* Every spine in the shop, in three draws. They are baked in world space, so the
+             * model matrix is just the view -- no per-case matrix, no per-case draw. */
+            C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &view);
+            set_buf(g_spinev, MAX_POSTERS * 6);
+            int drawn = 0;
+            for (int c = 0; c < SPINE_COLOURS; c++) {
+                if (g_spine_count[c] <= 0) continue;
+                bind_tex(&g_spine[c], g_spine_ok);
+                draw_range(g_spine_first[c], g_spine_count[c]);
+                drawn += g_spine_count[c] / 6;
+            }
+
+            /* The face-out cases: these each wear their own cover, so they cannot share a
+             * batch. There are only one in FACEOUT_EVERY of them, and only the near ones hold
+             * a texture. */
             set_buf(g_quadvbo, 6);
-            int lastcol = -1, drawn = 0;
-            int keep[COVER_POOL]; int nkeep = 0;      /* face-out cases in view, for the pool */
+            int keep[COVER_POOL]; int nkeep = 0;
             for (int i = 0; i < g_nposters; i++) {
-                if (!g_pos[i].ok || !g_pos[i].shown || i == held || i == sel) continue;
+                if (!g_pos[i].ok || !g_pos[i].shown || !g_pos[i].faceout) continue;
+                if (i == held || i == sel) continue;
                 float dxs = g_pos[i].x - cx, dzs = g_pos[i].z - cz;
                 float d2 = dxs * dxs + dzs * dzs;
                 if (d2 > SPINE_VIEW * SPINE_VIEW) continue;
-                if (drawn >= SPINE_BUDGET) continue;   /* skip, do NOT stop: breaking here spent
-                                                        * the whole budget on the nearest run
-                                                        * and left the rest of the bay empty */
+                int slot = g_covers_on ? pool_find(i) : -1;
+                if (g_covers_on && slot < 0 && nkeep < COVER_POOL && d2 < 30.0f
+                    && g_pos[i].cover_state >= 0) keep[nkeep++] = i;
                 C3D_Mtx m;
-                Mtx_Multiply(&m, &view, &g_pos[i].model);   /* one multiply, not four builds */
-                if (g_pos[i].faceout && g_covers_on) {
-                    int slot = pool_find(i);
-                    /* only the ones close enough to read compete for a slot -- otherwise the
-                     * pool churned as you walked, evicting and reloading every frame */
-                    if (slot < 0 && nkeep < COVER_POOL && d2 < 30.0f && g_pos[i].cover_state >= 0)
-                        keep[nkeep++] = i;
-                    if (slot >= 0) bind_tex(&g_pool[slot], g_pool_ok);
-                    else           bind_tex(&g_spine[g_pos[i].col], g_spine_ok);
-                    lastcol = -1;                     /* the spine bind is no longer current */
-                } else if (g_pos[i].col != lastcol) { /* grouped by colour: fewer binds */
-                    bind_tex(&g_spine[g_pos[i].col], g_spine_ok);
-                    lastcol = g_pos[i].col;
-                }
+                Mtx_Multiply(&m, &view, &g_pos[i].model);
                 C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
+                if (slot >= 0) bind_tex(&g_pool[slot], g_pool_ok);
+                else           bind_tex(&g_spine[g_pos[i].col], g_spine_ok);
                 draw_range(0, 6);
                 drawn++;
             }
-            /* one cover a frame: walking an aisle fills them in without ever hitching */
             if (eye == 0) g_drawn = drawn;
             if (eye == 0 && g_covers_on && (frames & 3) == 0)   /* one every four frames */
                 for (int k = 0; k < nkeep; k++)
