@@ -79,6 +79,8 @@
 #define SIGN_Y        3.35f
 #define MAX_SECTIONS  8
 #define SEC_COLS      3
+#define PER_ROW      46         /* spines along a 12-unit bay */
+#define SHELF_CAP    (3 * PER_ROW * 2)   /* 3 rows, both faces */
 
 #define MAX_POSTERS 320         /* spines cost no texture; this is only metadata */
 #define ROOM_TEX 64
@@ -100,6 +102,9 @@ typedef struct {
     char    genres[80];
     char    desc[400];
     int     year, runtime, hasinfo;
+    int     shown;              /* on a shelf on the current page */
+    int     is_more;            /* the "MORE MOVIES" case that turns the section over */
+    int     sect, order;        /* which bay, and where in that bay's run */
     char    key[96];            /* cache key, so the detail texture can be built on pickup */
     char    srcpath[400];       /* the .p565 it came from, for that lazy build */
     int     src_w, src_h;
@@ -113,7 +118,9 @@ typedef struct {
                                  * it look laid out. */
     C3D_Tex sign;
     int     sign_ok;
-    int     n;                  /* posters assigned */
+    int     n;                  /* titles that belong here, not what fits */
+    int     page, pages, cap;   /* a bay holds `cap`; the rest wait behind the MORE case */
+    int     more_idx;           /* the MORE case for this bay, -1 if it all fits */
 } Section;
 static Section g_sec[MAX_SECTIONS];
 static int     g_nsec = 0;
@@ -847,7 +854,7 @@ static int step_sel(int cur, float dirx, float diry, float dirz, float cx, float
     float ox = g_pos[cur].x, oy = g_pos[cur].y, oz = g_pos[cur].z;
     int best = cur; float bestscore = 1e9f;
     for (int i = 0; i < g_nposters; i++) {
-        if (i == cur || !g_pos[i].ok) continue;
+        if (i == cur || !g_pos[i].ok || !g_pos[i].shown) continue;
         float dx = g_pos[i].x - ox, dy = g_pos[i].y - oy, dz = g_pos[i].z - oz;
         float along = dx * dirx + dy * diry + dz * dirz;
         if (along < 0.05f) continue;                       /* must be in the pressed direction */
@@ -882,6 +889,7 @@ static void first_genre(const char *g, char *out, size_t cap) {
     if (!out[0]) snprintf(out, cap, "GENERAL");
 }
 
+static void place_section(int k);
 static void build_sections(void) {
     char names[MAX_POSTERS][24];
     int  count[MAX_POSTERS];
@@ -935,41 +943,72 @@ static void build_sections(void) {
         g_sec[i].sign_ok = 1;
     }
 
-    /* Two passes, so a half-stocked section sits CENTRED on its unit rather than packed against
-     * one end with bare shelf beside it. */
-    int sect[MAX_POSTERS], slotof[MAX_POSTERS];
-    int slot[MAX_SECTIONS]; memset(slot, 0, sizeof slot);
+    /* Which bay each title belongs to, and where in that bay's run. */
     for (int i = 0; i < g_nposters; i++) {
         char g[24]; first_genre(g_pos[i].genres, g, sizeof g);
         int k = g_nsec - 1;                            /* GENERAL unless a section matches */
         for (int j = 0; j < g_nsec; j++) if (!strcmp(g_sec[j].name, g)) { k = j; break; }
-        sect[i] = k; slotof[i] = slot[k]++;
-        g_sec[k].n++;
+        g_pos[i].sect  = k;
+        g_pos[i].order = g_sec[k].n++;
     }
-    const int PER_ROW = 46;                            /* spines that fit along a 12-unit bay */
+
+    /* A bay that cannot hold its whole genre gets a MORE case in the top-left slot: pick it up,
+     * press the verb, and the shelf turns over to the next lot. Only where it is needed -- a
+     * bay with room to spare should not carry a control nobody has to press. */
+    for (int k = 0; k < g_nsec; k++) {
+        g_sec[k].cap = SHELF_CAP;
+        g_sec[k].more_idx = -1;
+        g_sec[k].page = 0;
+        if (g_sec[k].n > SHELF_CAP && g_nposters < MAX_POSTERS) {
+            g_sec[k].cap = SHELF_CAP - 1;              /* the MORE case takes a slot */
+            int m = g_nposters++;
+            memset(&g_pos[m], 0, sizeof g_pos[m]);
+            g_pos[m].ok = 1; g_pos[m].is_more = 1; g_pos[m].sect = k;
+            g_pos[m].tint = TH_YELLOW;
+            snprintf(g_pos[m].name, sizeof g_pos[m].name, "MORE %s", g_sec[k].name);
+            g_sec[k].more_idx = m;
+        }
+        int cap = g_sec[k].cap > 0 ? g_sec[k].cap : 1;
+        g_sec[k].pages = (g_sec[k].n + cap - 1) / cap;
+        if (g_sec[k].pages < 1) g_sec[k].pages = 1;
+    }
+    for (int k = 0; k < g_nsec; k++) place_section(k);
+}
+
+/* Position one bay's stock for its current page. Called again when the MORE case is used. */
+static void place_section(int k) {
+    Section *S = &g_sec[k];
+    int first = S->page * S->cap, last = first + S->cap;
+    int base = (S->more_idx >= 0) ? 1 : 0;             /* the MORE case owns the top-left */
+    int onshow = S->n - first;
+    if (onshow > S->cap) onshow = S->cap;
+    if (onshow < 0) onshow = 0;
+    int total_slots = onshow + base;
+
     for (int i = 0; i < g_nposters; i++) {
-        int k = sect[i], sl = slotof[i];
+        Poster *p = &g_pos[i];
+        if (!p->ok || p->sect != k) continue;
+        int sl;
+        if (p->is_more) sl = 0;
+        else {
+            if (p->order < first || p->order >= last) { p->shown = 0; continue; }
+            sl = base + (p->order - first);
+        }
+        p->shown = 1;
         int per_face = 3 * PER_ROW;
-        int face = (sl / per_face) & 1;                /* front (+z) then back (-z) */
+        int face = (sl / per_face) & 1;
         int idx  = sl % per_face;
-        /* Fill from the TOP shelf down. Filling upward left a half-stocked section with
-         * everything on the floor row and bare shelves at eye level, which looks abandoned;
-         * the top row also sits nearest eye height, so the first titles are the visible ones. */
         int row  = 2 - (idx / PER_ROW), colp = idx % PER_ROW;
-        /* how many are on this face, so the run can be centred */
-        int onface = g_sec[k].n - face * per_face;
-        if (onface > per_face) onface = per_face;
-        int inrow = onface - row * PER_ROW;            /* rows fill from the top */
+        int inrow = total_slots - (2 - row) * PER_ROW;  /* rows fill from the top */
         if (inrow > PER_ROW) inrow = PER_ROW;
         if (inrow < 1) inrow = 1;
-        /* laid out along the unit, then turned with it */
         float lx = (colp - (inrow - 1) * 0.5f) * 0.235f;
         float lz = face ? -(UNIT_DEPTH * 0.5f + 0.02f) : (UNIT_DEPTH * 0.5f + 0.02f);
-        float ca = cosf(g_sec[k].rot), sa = sinf(g_sec[k].rot);
-        g_pos[i].x  = g_sec[k].cx + lx * ca + lz * sa;
-        g_pos[i].z  = g_sec[k].cz - lx * sa + lz * ca;
-        g_pos[i].y  = 0.46f + row * 0.62f;
-        g_pos[i].ay = g_sec[k].rot + (face ? C3D_Angle(0.5f) : 0.0f);
+        float ca = cosf(S->rot), sa = sinf(S->rot);
+        p->x  = S->cx + lx * ca + lz * sa;
+        p->z  = S->cz - lx * sa + lz * ca;
+        p->y  = 0.46f + row * 0.62f;
+        p->ay = S->rot + (face ? C3D_Angle(0.5f) : 0.0f);
     }
 }
 
@@ -1312,7 +1351,18 @@ int main(void) {
             load_detail(&g_pos[sel], sel);          /* small on the shelf, full in the hand */
         }
         if ((kd & KEY_B) && held >= 0)            held = -1;       /* put it back, no consequence */
-        if ((kd & KEY_Y) && held >= 0) {
+        if ((kd & KEY_Y) && held >= 0 && g_pos[held].is_more) {
+            /* restock this bay with the next lot */
+            int k = g_pos[held].sect;
+            g_sec[k].page = (g_sec[k].page + 1) % g_sec[k].pages;
+            place_section(k);
+            int lo = g_sec[k].page * g_sec[k].cap + 1;
+            int hi = lo + g_sec[k].cap - 1;
+            if (hi > g_sec[k].n) hi = g_sec[k].n;
+            snprintf(toast, sizeof toast, "%s  %d-%d of %d", g_sec[k].name, lo, hi, g_sec[k].n);
+            toast_t = 150;
+            held = -1; sel = -1; aim_lock = 0;
+        } else if ((kd & KEY_Y) && held >= 0) {
             /* the commitment. In the player this queues the download (catalogue) or starts
              * playback (library); here it just reports what it would do. */
             snprintf(toast, sizeof toast, "%s  %.24s", verb(), g_pos[held].name);
@@ -1449,6 +1499,7 @@ int main(void) {
             float ax = fwx * cp_, ay = sinf(pitch), az = fwz * cp_;
             float bestscore = 0.80f;                 /* minimum cos(angle) to count as "aimed at" */
             for (int i = 0; i < g_nposters; i++) {
+                if (!g_pos[i].shown) continue;
                 float dx = g_pos[i].x - cx, dy = g_pos[i].y - EYE, dz = g_pos[i].z - cz;
                 float d = sqrtf(dx * dx + dy * dy + dz * dz);
                 if (d > 3.2f || d < 1e-4f) continue;
@@ -1544,7 +1595,7 @@ int main(void) {
             set_buf(g_quadvbo, 6);
             if (g_spine_ok) C3D_TexBind(0, &g_spine);
             for (int i = 0; i < g_nposters; i++) {
-                if (!g_pos[i].ok || i == held || i == sel) continue;
+                if (!g_pos[i].ok || !g_pos[i].shown || i == held || i == sel) continue;
                 C3D_Mtx m;
                 Mtx_Copy(&m, &view);
                 Mtx_Translate(&m, g_pos[i].x, g_pos[i].y, g_pos[i].z, true);
@@ -1688,7 +1739,15 @@ int main(void) {
             else if (q->year)          panel_fmt(1, " %d", q->year);
             else if (q->runtime)       panel_fmt(1, " %d min", q->runtime);
             if (q->genres[0]) panel_fmt(2, " %s", q->genres);
-            if (q->desc[0]) panel_wrap(4, 19, q->desc);
+            if (q->is_more) {
+                Section *S = &g_sec[q->sect];
+                int lo = S->page * S->cap + 1, hi = lo + S->cap - 1;
+                if (hi > S->n) hi = S->n;
+                panel_fmt(1, " showing %d-%d of %d", lo, hi, S->n);
+                panel_fmt(2, " page %d of %d", S->page + 1, S->pages);
+                panel_set(4, " Take this one and press the button");
+                panel_set(5, " to restock the shelf with the next.");
+            } else if (q->desc[0]) panel_wrap(4, 19, q->desc);
             else            panel_set(4, q->hasinfo ? " (no description in the .nfo)"
                                                     : " (no .nfo for this one - poster only)");
             if (held >= 0) panel_fmt(24, " in hand");
@@ -1705,7 +1764,8 @@ int main(void) {
         }
         if (held >= 0) {
             panel_set(26, " pad turn/zoom   d-pad next");
-            panel_fmt(27, " %s: Y    put back: B", verb());
+            panel_fmt(27, " %s: Y    put back: B",
+                      g_pos[held].is_more ? "MORE" : verb());
         } else {
             panel_set(26, sel >= 0 ? " pad walk/turn   d-pad pick"
                                    : " pad walk/turn   d-pad look");
