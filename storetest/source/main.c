@@ -69,9 +69,15 @@
 /* A store floor with freestanding units, not a corridor. The units are low enough to see
  * over (2.0 against a 1.55 eye height puts the sign of the next section in view from
  * anywhere), which is what makes the place read as a shop rather than a maze. */
-#define STORE_HX     13.5f      /* floor spans +/-STORE_HX in x */
-#define STORE_Z0      2.0f      /* and STORE_Z0 .. -STORE_DEPTH in z */
-#define STORE_DEPTH  24.0f
+/* The ROOM is measured from the fixtures, not the other way round. These are only the starting
+ * guesses -- g_hx and g_depth below are what the shop is actually built to, worked out once the
+ * bays know their own lengths. A fixed room with variable bays left a hall of empty carpet up
+ * the middle. */
+#define STORE_Z0      2.0f
+static float g_hx    = 13.5f;
+static float g_depth = 24.0f;
+#define STORE_HX     g_hx
+#define STORE_DEPTH  g_depth
 #define CEIL_Y        4.2f
 /* A bay is BUILT TO ITS SECTION now, not to a fixed size: a quiet genre gets a short unit, a
  * busy one a long one. That is what a shop looks like, and it is the only way to have every
@@ -132,6 +138,8 @@ typedef struct {
     int     year, runtime, hasinfo;
     int     shown;              /* on a shelf on the current page */
     int     faceout;            /* stands face to the aisle rather than spine out */
+    int     cover_state;        /* 0 untried, 1 cached and ready, -1 no art -- so a title with
+                                 * no cover is not retried on every single frame */
     int     is_more;            /* the "MORE MOVIES" case that turns the section over */
     int     sect, order;        /* which bay, and where in that bay's run */
     char    key[96];            /* cache key, so the detail texture can be built on pickup */
@@ -536,8 +544,8 @@ static int pool_find(int idx) {
 }
 /* Put `idx` in the pool, replacing whichever slot is least useful. Returns the slot, or -1 if
  * the art could not be read. */
-static int pool_load(int idx, const Poster *q, const int *keep, int nkeep) {
-    if (!g_pool_ok || !q->srcpath[0]) return -1;
+static int pool_load(int idx, Poster *q, const int *keep, int nkeep) {
+    if (!g_pool_ok || !q->srcpath[0] || q->cover_state < 0) return -1;
     int victim = -1;
     for (int i = 0; i < COVER_POOL && victim < 0; i++) {
         if (g_pool_for[i] < 0) victim = i;                  /* a free slot first */
@@ -552,14 +560,18 @@ static int pool_load(int idx, const Poster *q, const int *keep, int nkeep) {
     snprintf(small, sizeof small, "%s/%s.w565", CACHE_DIR, q->key);
     FILE *f = fopen(small, "rb");
     if (!f) {
+        /* Building the scaled copy means reading the source, rescaling and writing a file.
+         * Doing that inside the walk loop is what made walking stutter -- and a title with no
+         * art was retried every frame forever. Build once, remember the answer. */
         if (!build_cache_entry_sz(q->srcpath, q->src_w, q->src_h, small,
-                                  TEX_W, TEX_H, IMG_W, IMG_H)) return -1;
+                                  TEX_W, TEX_H, IMG_W, IMG_H)) { q->cover_state = -1; return -1; }
         f = fopen(small, "rb");
-        if (!f) return -1;
+        if (!f) { q->cover_state = -1; return -1; }
     }
     size_t got = fread(g_pool[victim].data, 1, (size_t)TEX_W * TEX_H * 2, f);
     fclose(f);
-    if (got != (size_t)TEX_W * TEX_H * 2) return -1;
+    if (got != (size_t)TEX_W * TEX_H * 2) { q->cover_state = -1; return -1; }
+    q->cover_state = 1;
     C3D_TexFlush(&g_pool[victim]);
     g_pool_for[victim] = idx;
     return victim;
@@ -1095,26 +1107,45 @@ static void build_sections(void) {
     g_nsec++;
     for (int k = 0; k < g_nsec; k++) g_sec[k].n = 0;   /* recounted when titles are assigned */
 
+    /* Fit the room to the fixtures. The walkway wants about four metres between the two runs
+     * of bays; the depth follows from how many rows of bays there are. */
+    {
+        float maxlen = UNIT_LEN_MIN;
+        for (int k = 0; k < g_nsec; k++) if (g_sec[k].len > maxlen) maxlen = g_sec[k].len;
+        g_hx = maxlen + 2.4f;                       /* bay + half the walkway */
+        if (g_hx < 6.0f)  g_hx = 6.0f;
+        int side_rows = 0;
+        for (int k = 0; k < g_nsec && k < 6; k++) side_rows++;
+        int rows = (side_rows + 1) / 2;             /* they come in left/right pairs */
+        if (rows < 1) rows = 1;
+        g_depth = 5.0f + rows * 6.5f + 4.0f;        /* door end + aisles + the back run */
+        if (g_depth < 14.0f) g_depth = 14.0f;
+    }
+
     /* Bays, the way a rental shop is actually laid out: units run OUT FROM THE WALLS with
      * their far end against the wall, leaving a clear walkway up the middle of the room that
      * reaches every section. Islands floating in open carpet read as crates; this reads as a
      * shop you can navigate. The back corners turn in to close the room off. */
-    static const float PLAN[MAX_SECTIONS][3] = {   /* x, z, rotation */
-        { -11.6f,  -5.0f, 0.0f },   /* left wall, three bays */
-        { -11.6f, -12.0f, 0.0f },
-        { -11.6f, -19.0f, 0.0f },
-        {  11.6f,  -5.0f, 0.0f },   /* right wall, three bays */
-        {  11.6f, -12.0f, 0.0f },
-        {  11.6f, -19.0f, 0.0f },
-        {  -7.0f, -25.5f, 0.0f },   /* across the back */
-        {   7.0f, -25.5f, 0.0f },
+    /* left column, right column, then a pair across the back -- spaced to the room's depth */
+    float rowz[3];
+    for (int r = 0; r < 3; r++) rowz[r] = -5.0f - r * 6.5f;
+    const float PLAN[MAX_SECTIONS][3] = {          /* x sign, z, rotation */
+        { -1.0f, rowz[0], 0.0f },
+        { -1.0f, rowz[1], 0.0f },
+        { -1.0f, rowz[2], 0.0f },
+        {  1.0f, rowz[0], 0.0f },
+        {  1.0f, rowz[1], 0.0f },
+        {  1.0f, rowz[2], 0.0f },
+        { -1.0f, -99.0f, 0.0f },                   /* -99 marks the back wall run */
+        {  1.0f, -99.0f, 0.0f },
     };
     for (int i = 0; i < g_nsec; i++) {
         /* the far end sits against the wall; the near end reaches toward the walkway by
          * however long this bay needs to be */
-        float side = (PLAN[i][0] < 0) ? -1.0f : 1.0f;
-        int   back = (PLAN[i][1] < -20.0f);
-        if (back) { g_sec[i].cx = PLAN[i][0]; g_sec[i].cz = STORE_Z0 - STORE_DEPTH + 1.2f; }
+        float side = PLAN[i][0];
+        int   back = (PLAN[i][1] < -90.0f);
+        if (back) { g_sec[i].cx = side * (g_sec[i].len * 0.5f + 1.4f);
+                    g_sec[i].cz = STORE_Z0 - STORE_DEPTH + 1.2f; }
         else      { g_sec[i].cx = side * (STORE_HX - g_sec[i].len * 0.5f - 0.15f);
                     g_sec[i].cz = PLAN[i][1]; }
         g_sec[i].rot = PLAN[i][2];
@@ -1329,10 +1360,11 @@ static int build_room(void) {
                      3, 1, 0.52f);
     }
     /* the counter: a long wood block by the door, a register on top, and a returns box */
-    push_box(g_roomv, &n, -12.0f, 0.55f, -1.6f, 4.0f, 0.55f, 0.7f, 4, 1, 0.62f);
-    push_box(g_roomv, &n, -13.6f, 1.28f, -1.6f, 0.6f, 0.18f, 0.45f, 1, 1, 0.40f);  /* register base */
-    push_box(g_roomv, &n, -13.6f, 1.60f, -1.75f, 0.5f, 0.14f, 0.22f, 1, 1, 0.78f); /* its screen */
-    push_box(g_roomv, &n,  -8.2f, 0.60f, -1.6f, 0.9f, 0.60f, 0.6f, 1, 1, 0.50f);   /* returns bin */
+    { float ccx = -STORE_HX * 0.55f;                    /* the counter sits by the door */
+      push_box(g_roomv, &n, ccx, 0.55f, -1.6f, 2.6f, 0.55f, 0.7f, 4, 1, 0.62f);
+      push_box(g_roomv, &n, ccx - 1.0f, 1.28f, -1.6f, 0.6f, 0.18f, 0.45f, 1, 1, 0.40f);
+      push_box(g_roomv, &n, ccx - 1.0f, 1.60f, -1.75f, 0.5f, 0.14f, 0.22f, 1, 1, 0.78f);
+      push_box(g_roomv, &n, ccx + 3.6f, 0.60f, -1.6f, 0.9f, 0.60f, 0.6f, 1, 1, 0.50f); }
     /* An L on the end of two bays: a short return that turns the corner, which is what stops a
      * rank of units reading as a row of identical slabs. */
     for (int i = 0; i < g_nsec; i++) {
@@ -1376,8 +1408,9 @@ static int build_room(void) {
                                          UNIT_DEPTH * 0.5f + 0.42f,
                                          g_sec[i].Llen * 0.5f + 0.42f, 0.0f };
     }
-    g_block[g_nblock++] = (Blocker){ -12.0f, -1.6f, 4.4f, 1.1f, 0.0f };
-    g_block[g_nblock++] = (Blocker){  -8.2f, -1.6f, 1.3f, 1.0f, 0.0f };
+    { float ccx = -STORE_HX * 0.55f;
+      g_block[g_nblock++] = (Blocker){ ccx,        -1.6f, 3.0f, 1.1f, 0.0f };
+      g_block[g_nblock++] = (Blocker){ ccx + 3.6f, -1.6f, 1.3f, 1.0f, 0.0f }; }
     return n;
 }
 
@@ -1804,7 +1837,7 @@ int main(void) {
             if (g_mat_ok) {
                 bind_tex(g_outside_ok ? &g_outside : &g_glass, 1);
                 for (int w = 0; w < 4; w++) {
-                    float wx = -13.5f + w * 9.0f;
+                    float wx = -STORE_HX * 0.75f + w * (STORE_HX * 0.5f);
                     if (w == 2) continue;                  /* the door goes in this gap */
                     C3D_Mtx m; Mtx_Copy(&m, &view);
                     Mtx_Translate(&m, wx, 1.9f, STORE_Z0 - 0.05f, true);
@@ -1814,7 +1847,7 @@ int main(void) {
                 }
                 bind_tex(&g_door, g_mat_ok);
                 { C3D_Mtx m; Mtx_Copy(&m, &view);
-                  Mtx_Translate(&m, 4.5f, 1.15f, STORE_Z0 - 0.05f, true);
+                  Mtx_Translate(&m, STORE_HX * 0.33f, 1.15f, STORE_Z0 - 0.05f, true);
                   Mtx_Scale(&m, 2.6f, 2.3f, 1.0f);
                   C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
                   draw_range(0, 6); }
@@ -1830,7 +1863,7 @@ int main(void) {
             if (g_exit_ok) {                               /* over the door */
                 bind_tex(&g_exitsign, g_exit_ok);
                 C3D_Mtx m; Mtx_Copy(&m, &view);
-                Mtx_Translate(&m, 4.5f, 2.75f, STORE_Z0 - 0.10f, true);
+                Mtx_Translate(&m, STORE_HX * 0.33f, 2.75f, STORE_Z0 - 0.10f, true);
                 Mtx_RotateY(&m, C3D_Angle(0.5f), true);
                 Mtx_Scale(&m, 1.8f, 1.8f * (float)SIGN_H / (float)SIGN_W, 1.0f);
                 C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
@@ -1858,9 +1891,10 @@ int main(void) {
                 Mtx_RotateY(&m, g_pos[i].ay, true);
                 if (g_pos[i].faceout) {
                     int slot = pool_find(i);
-                    if (slot < 0 && nkeep < COVER_POOL) { /* remember it; one is loaded a frame */
+                    /* only the ones close enough to read compete for a slot -- otherwise the
+                     * pool churned as you walked, evicting and reloading every frame */
+                    if (slot < 0 && nkeep < COVER_POOL && d2 < 30.0f && g_pos[i].cover_state >= 0)
                         keep[nkeep++] = i;
-                    }
                     Mtx_Scale(&m, 0.30f, 0.30f * (float)IMG_H / (float)IMG_W, 1.0f);
                     C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
                     if (slot >= 0) bind_tex(&g_pool[slot], g_pool_ok);
@@ -1878,8 +1912,12 @@ int main(void) {
                 drawn++;
             }
             /* one cover a frame: walking an aisle fills them in without ever hitching */
-            if (eye == 0) for (int k = 0; k < nkeep; k++)
-                if (pool_find(keep[k]) < 0) { pool_load(keep[k], &g_pos[keep[k]], keep, nkeep); break; }
+            if (eye == 0 && (frames & 3) == 0)          /* at most one every four frames */
+                for (int k = 0; k < nkeep; k++)
+                    if (pool_find(keep[k]) < 0) {
+                        pool_load(keep[k], &g_pos[keep[k]], keep, nkeep);
+                        break;
+                    }
 
             /* the selected case: proud of the shelf and turned to face you, wearing its real
              * cover. This is the whole reason spines are affordable -- you only ever need one */
@@ -1961,15 +1999,16 @@ int main(void) {
                     }
                 }
                 /* on the walls, above the stock so they are not hidden by it */
-                static const float WP[8][4] = {   /* x, y, z, facing (radians about y) */
-                    { -STORE_HX + 0.08f, 2.70f,  -6.0f,  1.5708f },
-                    { -STORE_HX + 0.08f, 2.70f, -18.0f,  1.5708f },
-                    {  STORE_HX - 0.08f, 2.70f,  -6.0f, -1.5708f },
-                    {  STORE_HX - 0.08f, 2.70f, -18.0f, -1.5708f },
-                    { -7.0f, 2.70f, STORE_Z0 - STORE_DEPTH + 0.08f, 0.0f },
-                    {  7.0f, 2.70f, STORE_Z0 - STORE_DEPTH + 0.08f, 0.0f },
-                    { -16.0f, 2.70f, STORE_Z0 - STORE_DEPTH + 0.08f, 0.0f },
-                    {  16.0f, 2.70f, STORE_Z0 - STORE_DEPTH + 0.08f, 0.0f },
+                /* not static: these hang off the walls, and the walls move with the room */
+                const float WP[8][4] = {          /* x, y, z, facing (radians about y) */
+                    { -STORE_HX + 0.08f, 2.70f, STORE_Z0 - STORE_DEPTH * 0.25f,  1.5708f },
+                    { -STORE_HX + 0.08f, 2.70f, STORE_Z0 - STORE_DEPTH * 0.70f,  1.5708f },
+                    {  STORE_HX - 0.08f, 2.70f, STORE_Z0 - STORE_DEPTH * 0.25f, -1.5708f },
+                    {  STORE_HX - 0.08f, 2.70f, STORE_Z0 - STORE_DEPTH * 0.70f, -1.5708f },
+                    { -STORE_HX * 0.55f, 2.70f, STORE_Z0 - STORE_DEPTH + 0.08f, 0.0f },
+                    {  STORE_HX * 0.55f, 2.70f, STORE_Z0 - STORE_DEPTH + 0.08f, 0.0f },
+                    { -STORE_HX * 0.20f, 2.70f, STORE_Z0 - STORE_DEPTH + 0.08f, 0.0f },
+                    {  STORE_HX * 0.20f, 2.70f, STORE_Z0 - STORE_DEPTH + 0.08f, 0.0f },
                 };
                 for (int i = 0; i < 8; i++) {
                     int k = (w++) % WALLPOSTERS;
