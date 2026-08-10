@@ -149,6 +149,11 @@ typedef struct {
     int     faceout;            /* stands face to the aisle rather than spine out */
     int     cover_state;        /* 0 untried, 1 cached and ready, -1 no art -- so a title with
                                  * no cover is not retried on every single frame */
+    unsigned vis_frame;         /* last frame this was in view. A stamp rather than a list:
+                                 * the list had a fixed size, so standing close enough to see
+                                 * more covers than it held made the ones past the end look
+                                 * unused, and the pool started evicting what was on screen
+                                 * again -- the same fault in a new place. */
     int     is_more;            /* the "MORE MOVIES" case that turns the section over */
     int     sect, order;        /* which bay, and where in that bay's run */
     C3D_Mtx model;              /* built once when it is placed. Rebuilding a translate, a
@@ -569,20 +574,17 @@ static int pool_find(int idx) {
 }
 /* Put `idx` in the pool, replacing whichever slot is least useful. Returns the slot, or -1 if
  * the art could not be read. */
-static int pool_load(int idx, Poster *q, const int *keep, int nkeep) {
+static unsigned g_frame = 0;
+static int pool_load(int idx, Poster *q) {
     if (!g_pool_ok || !q->srcpath[0] || q->cover_state < 0) return -1;
     int victim = -1;
     for (int i = 0; i < COVER_POOL && victim < 0; i++) {
         if (g_pool_for[i] < 0) victim = i;                  /* a free slot first */
     }
-    /* then one nobody can see. `keep` MUST be every visible cover, not merely the ones still
-     * waiting for a slot -- listing only the waiting ones meant no held slot ever matched, so
-     * this evicted a cover that was on screen every frame and reloaded it forever. Two file
-     * reads a frame, permanently: that was the five-frames-a-second. */
+    /* then one nobody can see this frame */
     for (int i = 0; i < COVER_POOL && victim < 0; i++) {
-        int used = 0;
-        for (int k = 0; k < nkeep; k++) if (keep[k] == g_pool_for[i]) { used = 1; break; }
-        if (!used) victim = i;
+        int who = g_pool_for[i];
+        if (who < 0 || g_pos[who].vis_frame != g_frame) victim = i;
     }
     if (victim < 0) return -1;
     char small[400];
@@ -609,20 +611,22 @@ static int pool_load(int idx, Poster *q, const int *keep, int nkeep) {
 /* The full-resolution front of whatever is in your hand. One texture, filled on pickup. */
 static C3D_Tex g_detail;
 static int     g_detail_ok = 0, g_detail_for = -1;
-static void load_detail(const Poster *q, int idx) {
-    if (!g_detail_ok || g_detail_for == idx) return;
+static void load_detail(Poster *q, int idx) {
+    /* cover_state < 0 means the art could not be built. Without that test this retries the
+     * whole read-rescale-write every frame, and the selection scan calls it every frame. */
+    if (!g_detail_ok || g_detail_for == idx || q->cover_state < 0) return;
     char big[400];
     snprintf(big, sizeof big, "%s/%s.t565", CACHE_DIR, q->key);
     FILE *f = fopen(big, "rb");
     if (!f) {                                   /* built once, the first time you look at it */
         if (!build_cache_entry_sz(q->srcpath, q->src_w, q->src_h, big,
-                                  DET_W, DET_H, DET_IMG_W, DET_IMG_H)) return;
+                                  DET_W, DET_H, DET_IMG_W, DET_IMG_H)) { q->cover_state = -1; return; }
         f = fopen(big, "rb");
     }
-    if (!f) return;
+    if (!f) { q->cover_state = -1; return; }
     size_t got = fread(g_detail.data, 1, (size_t)DET_W * DET_H * 2, f);
     fclose(f);
-    if (got != (size_t)DET_W * DET_H * 2) return;
+    if (got != (size_t)DET_W * DET_H * 2) { q->cover_state = -1; return; }
     C3D_TexFlush(&g_detail);
     g_detail_for = idx;
 }
@@ -1288,6 +1292,28 @@ static void build_sections(void) {
 }
 
 /* Position one bay's stock for its current page. Called again when the MORE case is used. */
+/* Where each slot sits along a row.
+ *
+ * Multiplying a slot's index by ITS OWN pitch only works if every case is the same width. Once
+ * a row mixes spines at 0.235 and covers at 0.34, slot five is in a different place depending
+ * on which kind of case you ask -- which is why the faces sat on top of the spines. Walk the
+ * row and accumulate the widths instead, then centre the whole run. */
+static float g_slotx[1024];
+static void row_offsets(int first_slot, int count) {
+    float total = 0.0f;
+    for (int i = 0; i < count; i++) {
+        int sl = first_slot + i;
+        total += (FACEOUT_PATTERN[sl % FACEOUT_LEN] == 'F') ? PITCH_FACE : PITCH_SPINE;
+    }
+    float x = -total * 0.5f;
+    for (int i = 0; i < count && i < 1024; i++) {
+        int sl = first_slot + i;
+        float w = (FACEOUT_PATTERN[sl % FACEOUT_LEN] == 'F') ? PITCH_FACE : PITCH_SPINE;
+        g_slotx[i] = x + w * 0.5f;
+        x += w;
+    }
+}
+
 static void place_section(int k) {
     Section *S = &g_sec[k];
     int first = S->page * S->cap, last = first + S->cap;
@@ -1314,10 +1340,12 @@ static void place_section(int k) {
         if (sl < main_cap) {                          /* the long side */
             int row  = 2 - (sl / S->per_row), colp = sl % S->per_row;
             if (row < 0) { p->shown = 0; continue; }
-            int inrow = total_slots - (2 - row) * S->per_row;
+            int rowfirst = (2 - row) * S->per_row;
+            int inrow = total_slots - rowfirst;
             if (inrow > S->per_row) inrow = S->per_row;
             if (inrow < 1) inrow = 1;
-            float lx = (colp - (inrow - 1) * 0.5f) * pitch_;
+            row_offsets(rowfirst, inrow);
+            float lx = g_slotx[colp];
             float lz = S->facedir * (UNIT_DEPTH * 0.5f + 0.02f);
             float ca = cosf(S->rot), sa = sinf(S->rot);
             p->x  = S->cx + lx * ca + lz * sa;
@@ -1329,10 +1357,12 @@ static void place_section(int k) {
             int t = sl - main_cap;
             int row = 2 - (t / S->Lper_row), colp = t % S->Lper_row;
             if (row < 0) { p->shown = 0; continue; }
-            int left = total_slots - main_cap - (2 - row) * S->Lper_row;
+            int rowfirst = main_cap + (2 - row) * S->Lper_row;
+            int left = total_slots - rowfirst;
             if (left > S->Lper_row) left = S->Lper_row;
             if (left < 1) left = 1;
-            float along = (colp - (left - 1) * 0.5f) * pitch_;
+            row_offsets(rowfirst, left);
+            float along = g_slotx[colp];
             float outn  = (UNIT_DEPTH * 0.5f + 0.02f) * ((S->cx < 0) ? 1.0f : -1.0f);
             p->x  = S->Lx + outn;                     /* the return faces the walkway */
             p->z  = S->Lz + along;
@@ -1745,6 +1775,7 @@ int main(void) {
 
     while (aptMainLoop()) {
         hidScanInput();
+        g_frame++;
         u32 kd = hidKeysDown();
         if (kd & KEY_START) break;
         /* SELECT turns the face-out covers off. They are the only thing in this room that
@@ -1918,6 +1949,9 @@ int main(void) {
                 if (dot < bestscore) continue;
                 bestscore = dot; sel = i;            /* the best-aimed case wins, not the nearest */
             }
+            /* Aiming with the stick has to load the cover as well. Only the d-pad path did, so
+             * a case picked out with the stick turned face-on wearing the blank clamshell. */
+            if (sel >= 0 && !g_pos[sel].is_more) load_detail(&g_pos[sel], sel);
         }
 
         float slider = osGet3DSliderState();
@@ -2035,8 +2069,7 @@ int main(void) {
             set_buf(g_quadvbo, 6);
             /* vis: every face-out case in view, held or not -- what the pool must not evict.
              * need: the ones still without a slot. */
-            int vis[COVER_POOL * 3]; int nvis = 0;
-            int need[COVER_POOL];    int nneed = 0;
+            int need[COVER_POOL]; int nneed = 0;
             for (int i = 0; i < g_nposters; i++) {
                 if (!g_pos[i].ok || !g_pos[i].shown || !g_pos[i].faceout) continue;
                 if (i == held || i == sel) continue;
@@ -2045,7 +2078,7 @@ int main(void) {
                 if (d2 > SPINE_VIEW * SPINE_VIEW) continue;
                 int slot = g_covers_on ? pool_find(i) : -1;
                 if (g_covers_on && d2 < 42.0f && g_pos[i].cover_state >= 0) {
-                    if (nvis < (int)(sizeof vis / sizeof vis[0])) vis[nvis++] = i;
+                    g_pos[i].vis_frame = g_frame;         /* protected from eviction */
                     if (slot < 0 && nneed < COVER_POOL) need[nneed++] = i;
                 }
                 if (slot < 0) continue;                  /* no art yet: the blank front stands */
@@ -2067,7 +2100,7 @@ int main(void) {
                 int loads = 0;
                 for (int k = 0; k < nneed && loads < 2; k++)
                     if (pool_find(need[k]) < 0) {
-                        if (pool_load(need[k], &g_pos[need[k]], vis, nvis) >= 0) loads++;
+                        if (pool_load(need[k], &g_pos[need[k]]) >= 0) loads++;
                         else break;              /* nothing evictable: leave it for next frame */
                     }
             }
