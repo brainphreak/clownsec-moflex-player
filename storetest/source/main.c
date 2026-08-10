@@ -516,16 +516,19 @@ static void make_materials(void) {
     free(lin);
     g_mat_ok = 1;
 }
+/* PAINT, not a grid. The old one drew a line every 16 texels, which tiled into graph paper
+ * across every wall in the shop. This is a flat warm colour with a little roller mottle -- the
+ * mottle only exists so a large flat wall does not band. */
 static void make_room_tex(void) {
     C3D_TexInit(&g_room, ROOM_TEX, ROOM_TEX, GPU_RGB565);
     u16 *lin = (u16 *)malloc(ROOM_TEX * ROOM_TEX * 2);
     u16 *til = (u16 *)malloc(ROOM_TEX * ROOM_TEX * 2);
     for (int y = 0; y < ROOM_TEX; y++)
         for (int x = 0; x < ROOM_TEX; x++) {
-            int line = (x % 16 == 0) || (y % 16 == 0);
-            int n = ((x * 7 + y * 13) % 5);           /* cheap speckle so it is not flat */
-            int c = line ? 7 : 13 + n;
-            lin[y * ROOM_TEX + x] = (u16)(((c & 0x1F) << 11) | (((c + 1) * 2 & 0x3F) << 5) | (c & 0x1F));
+            int n = ((x * 37 + y * 17) % 7) + ((x * 5 ^ y * 3) % 3);   /* soft mottle */
+            int r = 20 + (n >> 2), g = 38 + (n >> 1), b = 17 + (n >> 2);
+            if (r > 31) r = 31; if (g > 63) g = 63; if (b > 31) b = 31;
+            lin[y * ROOM_TEX + x] = (u16)((r << 11) | (g << 5) | b);
         }
     tile_rgb565(lin, til, ROOM_TEX, ROOM_TEX);
     memcpy(g_room.data, til, ROOM_TEX * ROOM_TEX * 2);
@@ -533,6 +536,43 @@ static void make_room_tex(void) {
     C3D_TexSetFilter(&g_room, GPU_LINEAR, GPU_LINEAR);
     C3D_TexSetWrap(&g_room, GPU_REPEAT, GPU_REPEAT);
     free(lin); free(til);
+}
+
+/* A row of anonymous cases, for the shelves against the walls.
+ *
+ * There is no point spending a texture slot on a title nobody can read from across the room --
+ * this one strip, repeated, reads as a wall of stock at any distance you would actually see it
+ * from. The real titles live on the units you can walk up to. */
+static C3D_Tex g_covers;
+static int     g_covers_ok = 0;
+static void make_covers_tex(void) {
+    const int W = 128, H = 64;
+    if (!C3D_TexInit(&g_covers, W, H, GPU_RGB565)) return;
+    u16 *lin = (u16 *)calloc(W * H, 2);
+    u16 *til = (u16 *)malloc(W * H * 2);
+    if (!lin || !til) { free(lin); free(til); C3D_TexDelete(&g_covers); return; }
+    for (int i = 0; i < W * H; i++) lin[i] = 0x1082;              /* shadowed gap behind */
+    const u16 pal[8] = { 0xF800, 0xFD20, 0xFFE0, 0x07E0, 0x04FF, 0x781F, 0xFB56, 0xAD55 };
+    int x = 2;
+    for (int c = 0; x < W - 4; c++) {
+        int w = 7 + (c * 5) % 4;                                   /* varied spine widths */
+        u16 col = pal[(c * 3) % 8];
+        u16 dark = (u16)((col >> 1) & 0x7BEF);
+        for (int yy = 6; yy < H - 4; yy++)
+            for (int xx = x; xx < x + w && xx < W; xx++) {
+                int edge = (xx == x || xx == x + w - 1 || yy == 6 || yy == H - 5);
+                int band = (yy < 14);                              /* a title band on each */
+                lin[yy * W + xx] = edge ? dark : (band ? 0xFFFF : col);
+            }
+        x += w + 2;
+    }
+    tile_rgb565(lin, til, W, H);
+    memcpy(g_covers.data, til, W * H * 2);
+    C3D_TexFlush(&g_covers);
+    C3D_TexSetFilter(&g_covers, GPU_LINEAR, GPU_LINEAR);
+    C3D_TexSetWrap(&g_covers, GPU_REPEAT, GPU_REPEAT);
+    free(lin); free(til);
+    g_covers_ok = 1;
 }
 
 /* ---------------- sections ----------------
@@ -610,7 +650,7 @@ static void build_sections(void) {
 }
 
 /* ---------------- geometry ---------------- */
-#define ROOM_VTX     (6 * 6 + MAX_SECTIONS * 5 * 6)   /* shell + a box per unit */
+#define ROOM_VTX     1200        /* shell + units + counter + wall shelving */
 static Vtx *g_roomv, *g_quadv, *g_signv;
 static void *g_roomvbo, *g_quadvbo, *g_signvbo;
 
@@ -627,7 +667,22 @@ static void push_quad(Vtx *v, int *n,
     *n += 6;
 }
 
-static int g_n_floor, g_n_shell, g_n_units;
+/* things you cannot walk through: the shelf units, plus the counter */
+typedef struct { float cx, cz, hx, hz; } Blocker;
+static Blocker g_block[MAX_SECTIONS + 4];
+static int     g_nblock = 0;
+
+static void push_box(Vtx *v, int *n, float cx, float cy, float cz,
+                     float hx, float hy, float hz, float ur, float vr, float sh) {
+    float x0 = cx - hx, x1 = cx + hx, y0 = cy - hy, y1 = cy + hy, z0 = cz - hz, z1 = cz + hz;
+    push_quad(v, n, x0,y0,z1, x1,y0,z1, x1,y1,z1, x0,y1,z1, ur, vr, sh);          /* +z */
+    push_quad(v, n, x1,y0,z0, x0,y0,z0, x0,y1,z0, x1,y1,z0, ur, vr, sh);          /* -z */
+    push_quad(v, n, x0,y0,z0, x0,y0,z1, x0,y1,z1, x0,y1,z0, 1, vr, sh * 0.86f);   /* -x */
+    push_quad(v, n, x1,y0,z1, x1,y0,z0, x1,y1,z0, x1,y1,z1, 1, vr, sh * 0.86f);   /* +x */
+    push_quad(v, n, x0,y1,z0, x1,y1,z0, x1,y1,z1, x0,y1,z1, ur, 1, sh * 1.15f);   /* top */
+}
+
+static int g_n_floor, g_n_shell, g_n_units, g_n_cover;
 static int build_room(void) {
     g_roomv = (Vtx *)linearAlloc(sizeof(Vtx) * ROOM_VTX);
     int n = 0;
@@ -654,7 +709,46 @@ static int build_room(void) {
         push_quad(g_roomv, &n, cx+hx,0,cz+hz, cx+hx,0,cz-hz, cx+hx,h,cz-hz, cx+hx,h,cz+hz, 1,1, 0.38f);
         push_quad(g_roomv, &n, cx-hx,h,cz-hz, cx+hx,h,cz-hz, cx+hx,h,cz+hz, cx-hx,h,cz+hz, 3,1, 0.86f);
     }
+    /* the counter: a long wood block by the door, a register on top, and a returns box */
+    push_box(g_roomv, &n, -12.0f, 0.55f, -1.6f, 4.0f, 0.55f, 0.7f, 4, 1, 0.62f);
+    push_box(g_roomv, &n, -13.6f, 1.28f, -1.6f, 0.6f, 0.18f, 0.45f, 1, 1, 0.40f);  /* register base */
+    push_box(g_roomv, &n, -13.6f, 1.60f, -1.75f, 0.5f, 0.14f, 0.22f, 1, 1, 0.78f); /* its screen */
+    push_box(g_roomv, &n,  -8.2f, 0.60f, -1.6f, 0.9f, 0.60f, 0.6f, 1, 1, 0.50f);   /* returns bin */
+    /* shelving against the walls: a board with a run of stock standing on it */
+    for (int w = 0; w < 3; w++)
+        for (int lvl = 0; lvl < 2; lvl++) {
+            float y = 0.75f + lvl * 1.15f;
+            if (w == 2) push_box(g_roomv, &n, 0, y - 0.06f, -STORE_DEPTH + STORE_Z0 + 0.45f,
+                                 STORE_HX - 1.0f, 0.06f, 0.45f, 14, 1, 0.66f);
+            else        push_box(g_roomv, &n, (w ? STORE_HX : -STORE_HX) + (w ? -0.45f : 0.45f),
+                                 y - 0.06f, -14.0f, 0.45f, 0.06f, 15.0f, 14, 1, 0.66f);
+        }
     g_n_units = n - g_n_floor - g_n_shell;
+
+    /* the stock itself, faced with the anonymous-cover strip */
+    for (int w = 0; w < 3; w++)
+        for (int lvl = 0; lvl < 2; lvl++) {
+            float y = 0.75f + lvl * 1.15f, h = 0.42f;
+            if (w == 2) {
+                float z = -STORE_DEPTH + STORE_Z0 + 0.30f, X = STORE_HX - 1.0f;
+                push_quad(g_roomv, &n, -X, y, z, X, y, z, X, y + h, z, -X, y + h, z, 16, 1, 0.80f);
+            } else {
+                float x = (w ? STORE_HX - 0.30f : -STORE_HX + 0.30f);
+                if (w) push_quad(g_roomv, &n, x, y, 1.0f, x, y, -29.0f, x, y+h, -29.0f, x, y+h, 1.0f, 16,1,0.80f);
+                else   push_quad(g_roomv, &n, x, y, -29.0f, x, y, 1.0f, x, y+h, 1.0f, x, y+h, -29.0f, 16,1,0.80f);
+            }
+        }
+    g_n_cover = n - g_n_floor - g_n_shell - g_n_units;
+
+    /* blockers: every unit, plus the counter and the returns bin */
+    g_nblock = 0;
+    for (int i = 0; i < g_nsec; i++) {
+        g_block[g_nblock].cx = g_sec[i].cx; g_block[g_nblock].cz = g_sec[i].cz;
+        g_block[g_nblock].hx = UNIT_LEN * 0.5f + 0.42f;
+        g_block[g_nblock].hz = UNIT_DEPTH * 0.5f + 0.42f; g_nblock++;
+    }
+    g_block[g_nblock++] = (Blocker){ -12.0f, -1.6f, 4.4f, 1.1f };
+    g_block[g_nblock++] = (Blocker){  -8.2f, -1.6f, 1.3f, 1.0f };
     return n;
 }
 
@@ -790,6 +884,7 @@ int main(void) {
     scene_init();
     make_room_tex();
     make_materials();
+    make_covers_tex();
     make_sign_tex_col(&g_storesign, "3DS VIDEO RENTALS", 0x300A, 0xFFE0, 0xFFE0, 1); g_store_ok = 1;
     make_sign_tex_col(&g_exitsign,  "EXIT",              0x0140, 0x07E0, 0xFFFF, 2); g_exit_ok = 1;
     build_quad();
@@ -895,13 +990,13 @@ int main(void) {
         if (cz < STORE_Z0 - STORE_DEPTH + 0.6f) cz = STORE_Z0 - STORE_DEPTH + 0.6f;
         /* keep out of the shelf units: push to the nearest face of whichever box you are in.
          * Crude, but a box is a box and you cannot walk through one. */
-        for (int i = 0; i < g_nsec; i++) {
-            float hx = UNIT_LEN * 0.5f + 0.42f, hz = UNIT_DEPTH * 0.5f + 0.42f;
-            float dx = cx - g_sec[i].cx, dz = cz - g_sec[i].cz;
+        for (int i = 0; i < g_nblock; i++) {
+            float hx = g_block[i].hx, hz = g_block[i].hz;
+            float dx = cx - g_block[i].cx, dz = cz - g_block[i].cz;
             if (fabsf(dx) < hx && fabsf(dz) < hz) {
                 float ox = hx - fabsf(dx), oz = hz - fabsf(dz);
-                if (ox < oz) cx = g_sec[i].cx + (dx < 0 ? -hx : hx);
-                else         cz = g_sec[i].cz + (dz < 0 ? -hz : hz);
+                if (ox < oz) cx = g_block[i].cx + (dx < 0 ? -hx : hx);
+                else         cz = g_block[i].cz + (dz < 0 ? -hz : hz);
             }
         }
 
@@ -958,6 +1053,10 @@ int main(void) {
             C3D_DrawArrays(GPU_TRIANGLES, g_n_floor, g_n_shell);
             C3D_TexBind(0, g_mat_ok ? &g_wood : &g_room);
             C3D_DrawArrays(GPU_TRIANGLES, g_n_floor + g_n_shell, g_n_units);
+            if (g_covers_ok) {
+                C3D_TexBind(0, &g_covers);
+                C3D_DrawArrays(GPU_TRIANGLES, g_n_floor + g_n_shell + g_n_units, g_n_cover);
+            }
 
             /* shopfront fittings: windows and a door on the near wall, signs above */
             set_buf(g_signvbo, 6);
@@ -1129,6 +1228,7 @@ int main(void) {
                     C3D_TexDelete(&g_glass);  C3D_TexDelete(&g_door); }
     if (g_store_ok) C3D_TexDelete(&g_storesign);
     if (g_exit_ok)  C3D_TexDelete(&g_exitsign);
+    if (g_covers_ok) C3D_TexDelete(&g_covers);
     if (g_back_ok) C3D_TexDelete(&g_back);
     if (g_detail_ok) C3D_TexDelete(&g_detail);
     shaderProgramFree(&program);
