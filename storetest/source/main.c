@@ -961,13 +961,17 @@ int main(void) {
     int   held = -1;
     float hold_t = 0.0f;
     float spin   = 0.0f;      /* radians about the case's own y axis while it is in your hand */
+    /* How far down the view axis the held case sits. Pulling it closer is the zoom, and it is
+     * also what makes the printed back legible: the same texture over more screen pixels. */
+    float hold_d = 0.78f;
+    const float HOLD_NEAR = 0.34f, HOLD_FAR = 1.15f;
 
     while (aptMainLoop()) {
         hidScanInput();
         u32 kd = hidKeysDown();
         if (kd & KEY_START) break;
         if ((kd & KEY_A) && held < 0 && sel >= 0) {                /* take it off the shelf */
-            held = sel; spin = 0.0f;
+            held = sel; spin = 0.0f; hold_d = 0.78f;
             if (g_back_for != sel) { rebuild_back(&g_pos[sel]); g_back_for = sel; }
             load_detail(&g_pos[sel], sel);          /* small on the shelf, full in the hand */
         }
@@ -979,14 +983,17 @@ int main(void) {
         circlePosition cp; hidCircleRead(&cp);
         float fx = cp.dx / 156.0f, fy = cp.dy / 156.0f;
         if (held >= 0) {
-            /* the pad turns the case over instead of walking you around */
+            /* left/right turns the case over, up/down pulls it closer or pushes it away */
             spin += fx * 0.075f;
             if (fabsf(fx) < 0.15f) {                 /* let go and it settles to a face */
                 float snap = (spin < 0 ? -1.0f : 1.0f) * 3.14159265f
                              * (float)((int)(fabsf(spin) / 3.14159265f + 0.5f));
                 spin += (snap - spin) * 0.18f;
             }
-            fx = 0; fy = 0;
+            hold_d -= fy * 0.020f;
+            if (hold_d < HOLD_NEAR) hold_d = HOLD_NEAR;
+            if (hold_d > HOLD_FAR)  hold_d = HOLD_FAR;
+            fx = 0; fy = 0;                          /* neither axis walks you while holding */
         }
         /* The circle pad MOVES and the d-pad LOOKS. Turning used to be on the circle pad's x
          * axis, which meant you could not walk diagonally at all: pushing the pad at an angle
@@ -1160,7 +1167,7 @@ int main(void) {
                 float t = hold_t * hold_t * (3.0f - 2.0f * hold_t);
                 float cp_ = cosf(pitch);
                 float f3x = fwx * cp_, f3y = sinf(pitch), f3z = fwz * cp_;
-                const float D = 0.78f;
+                const float D = hold_d;
                 /* where it is coming FROM: its slot on the shelf */
                 float sx = q->x, sy = q->y, sz = q->z;
                 float ay0;
@@ -1250,7 +1257,8 @@ int main(void) {
         }
         /* pinned to the bottom of the 30-row console, not floating in the middle */
         printf("\x1b[27;0H\x1b[2K pad walk+look  L/R strafe  d-pad look");
-        printf("\x1b[28;0H\x1b[2K A take  B back(turn it: pad)  START exit");
+        if (held >= 0) printf("\x1b[28;0H\x1b[2K pad: turn / zoom   B put back");
+        else           printf("\x1b[28;0H\x1b[2K A take  X level  START exit");
     }
 
     for (int i = 0; i < g_nposters; i++) if (g_pos[i].ok) C3D_TexDelete(&g_pos[i].tex);
