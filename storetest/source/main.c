@@ -113,7 +113,12 @@ static float g_depth = 24.0f;
 #define SPINE_BUDGET 170
 /* Every Nth case stands face out, as a shop does: a run of spines, a cover, more spines. The
  * covers are what make a shelf browsable; the spines are what make it a shop. */
-#define FACEOUT_EVERY 7
+/* How a shelf is merchandised. Face out is what a shop WANTS -- a cover sells, a spine does
+ * not -- and spines are what it falls back to when the run outgrows the shelf. So the pattern
+ * is mostly F, in blocks, with runs of spines between: three spines, four faces, two spines,
+ * five faces, two spines. Sixteen slots, nine of them face out. */
+#define FACEOUT_PATTERN "SSSFFFFSSFFFFFSS"
+#define FACEOUT_LEN     16
 #define COVER_POOL    8         /* covers held at once, 16 KB each */
 
 #define MAX_POSTERS 320         /* spines cost no texture; this is only metadata */
@@ -893,6 +898,40 @@ static void make_spine_tex(void) {
     g_spine_ok = 1;
 }
 
+/* The front of the house clamshell, blank.
+ *
+ * Most of a shelf faces out now, and only eight cases can hold a real cover at once. A face-out
+ * case beyond reading distance wears this instead: the shop's own case seen from the front,
+ * which is what you actually see across a room. The real art arrives as you walk up to it.
+ * Same LOD idea as the spines, one step closer. */
+static C3D_Tex g_front;
+static int     g_front_ok = 0;
+static void make_front_tex(void) {
+    const int W = 32, H = 64;
+    if (!C3D_TexInit(&g_front, W, H, GPU_RGB565)) return;
+    u16 *lin = (u16 *)malloc(W * H * 2), *til = (u16 *)malloc(W * H * 2);
+    if (!lin || !til) { free(lin); free(til); C3D_TexDelete(&g_front); return; }
+    const u16 shell = 0xE73C, edge = 0xAD55, band = TH_BLUE, paper = 0xFFFF, ink = 0xC618;
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++) {
+            u16 v = shell;
+            if (x < 2 || x >= W - 2 || y < 2 || y >= H - 2) v = edge;
+            else if (y < 12)            v = band;             /* head */
+            else if (y > H - 14)        v = band;             /* foot */
+            else if (x > 4 && x < W - 5 && y > 16 && y < H - 18) {
+                v = paper;                                    /* the art window, blank */
+                if (((x * 3 + y * 5) % 17) < 2) v = ink;       /* a hint of print */
+            }
+            lin[y * W + x] = v;
+        }
+    tile_rgb565(lin, til, W, H);
+    memcpy(g_front.data, til, W * H * 2);
+    C3D_TexFlush(&g_front);
+    C3D_TexSetFilter(&g_front, GPU_LINEAR, GPU_LINEAR);
+    free(lin); free(til);
+    g_front_ok = 1;
+}
+
 /* a plain white sheet for the light fittings and as a safe fallback */
 static C3D_Tex g_white;
 static int     g_white_ok = 0;
@@ -1191,7 +1230,8 @@ static void build_sections(void) {
     /* Build each bay to its contents. A row holds `len / pitch` cases; three rows, and one in
      * FACEOUT_EVERY takes the wider pitch of a cover. */
     for (int k = 0; k < g_nsec; k++) {
-        float avg = PITCH_SPINE + (PITCH_FACE - PITCH_SPINE) / (float)FACEOUT_EVERY;
+        /* a face takes more shelf than a spine, so the mix decides how much a bay holds */
+        float avg = (7.0f * PITCH_SPINE + 9.0f * PITCH_FACE) / 16.0f;
         float need = ((float)g_sec[k].n / (float)BAY_ROWS) * avg + 0.5f;
         if (need < UNIT_LEN_MIN) need = UNIT_LEN_MIN;
         if (need > UNIT_LEN)     need = UNIT_LEN;
@@ -1249,7 +1289,7 @@ static void place_section(int k) {
         }
         p->shown = 1;
         /* every Nth one turns its face to the aisle */
-        p->faceout = (!p->is_more && (sl % FACEOUT_EVERY) == 3);
+        p->faceout = (!p->is_more && FACEOUT_PATTERN[sl % FACEOUT_LEN] == 'F');
         float pitch_ = p->faceout ? PITCH_FACE : PITCH_SPINE;
         int main_cap = BAY_ROWS * S->per_row;
         if (sl < main_cap) {                          /* the long side */
@@ -1489,6 +1529,7 @@ static void build_signquad(void) {
  * Rebuilt only when a shelf is restocked. */
 static Vtx *g_spinev;
 static int  g_spine_first[SPINE_COLOURS], g_spine_count[SPINE_COLOURS];
+static int  g_front_first, g_front_count;      /* the face-out cases, blank fronts */
 
 /* transform the unit quad by a case's matrix and append it, in world space */
 static void bake_case(Vtx *dst, int *n, const C3D_Mtx *m, const Vtx *src) {
@@ -1514,6 +1555,15 @@ static void bake_spines(void) {
         }
         g_spine_count[c] = n - g_spine_first[c];
     }
+    /* and the faces, as one more range */
+    g_front_first = n;
+    for (int i = 0; i < g_nposters; i++) {
+        Poster *p = &g_pos[i];
+        if (!p->ok || !p->shown || !p->faceout) continue;
+        if (n + 6 > MAX_POSTERS * 6) break;
+        bake_case(g_spinev, &n, &p->model, g_quadv);
+    }
+    g_front_count = n - g_front_first;
 }
 
 static void build_quad(void) {
@@ -1613,6 +1663,7 @@ int main(void) {
     make_covers_tex();
     make_spine_tex();
     make_white_tex();
+    make_front_tex();
     make_sign_tex_col(&g_storesign, "3DS VIDEO RENTALS", TH_BLUE, TH_YELLOW, TH_YELLOW, 1);
     g_store_ok = 1;
     /* the exit board stays green: that one is a fire sign, not branding */
@@ -1953,9 +2004,15 @@ int main(void) {
                 drawn += g_spine_count[c] / 6;
             }
 
-            /* The face-out cases: these each wear their own cover, so they cannot share a
-             * batch. There are only one in FACEOUT_EVERY of them, and only the near ones hold
-             * a texture. */
+            /* Every face-out case, blank, in one draw. The near ones are redrawn just proud
+             * of these with their real cover on. */
+            if (g_front_count > 0) {
+                bind_tex(&g_front, g_front_ok);
+                draw_range(g_front_first, g_front_count);
+                drawn += g_front_count / 6;
+            }
+
+            /* the ones close enough to read: their actual art, a hair in front */
             set_buf(g_quadvbo, 6);
             int keep[COVER_POOL]; int nkeep = 0;
             for (int i = 0; i < g_nposters; i++) {
@@ -1967,13 +2024,16 @@ int main(void) {
                 int slot = g_covers_on ? pool_find(i) : -1;
                 if (g_covers_on && slot < 0 && nkeep < COVER_POOL && d2 < 30.0f
                     && g_pos[i].cover_state >= 0) keep[nkeep++] = i;
+                if (slot < 0) continue;                  /* no art yet: the blank front stands */
                 C3D_Mtx m;
                 Mtx_Multiply(&m, &view, &g_pos[i].model);
+                /* A hair toward the camera so it sits on top of the blank one. Nudged in VIEW
+                 * space -- after the multiply the translation is already in the camera's
+                 * frame, so a world-space offset here would push it sideways instead. */
+                m.r[2].w += 0.010f;
                 C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
-                if (slot >= 0) bind_tex(&g_pool[slot], g_pool_ok);
-                else           bind_tex(&g_spine[g_pos[i].col], g_spine_ok);
+                bind_tex(&g_pool[slot], g_pool_ok);
                 draw_range(0, 6);
-                drawn++;
             }
             if (eye == 0) g_drawn = drawn;
             if (eye == 0 && g_covers_on && (frames & 3) == 0)   /* one every four frames */
@@ -2174,6 +2234,7 @@ int main(void) {
     if (g_covers_ok) C3D_TexDelete(&g_covers);
     if (g_spine_ok) for (int i = 0; i < SPINE_COLOURS; i++) C3D_TexDelete(&g_spine[i]);
     if (g_white_ok)  C3D_TexDelete(&g_white);
+    if (g_front_ok)  C3D_TexDelete(&g_front);
     if (g_pool_ok) for (int i = 0; i < COVER_POOL; i++) C3D_TexDelete(&g_pool[i]);
     for (int i = 0; i < WALLPOSTERS; i++) if (g_wall_ok[i]) C3D_TexDelete(&g_wall[i]);
     if (g_back_ok) C3D_TexDelete(&g_back);
