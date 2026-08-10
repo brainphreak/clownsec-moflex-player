@@ -187,6 +187,8 @@ static int    g_from_data = 0, g_from_art = 0;
  * Library: take one off the shelf and play it. Catalogue: take one and queue the download. */
 enum { STORE_LIBRARY = 0, STORE_CATALOG = 1 };
 static int    g_mode = STORE_LIBRARY;
+static int    g_drawn = 0;      /* cases actually drawn last frame */
+static int    g_covers_on = 1;  /* SELECT: face-out covers on/off, to isolate the stutter */
 static const char *verb(void) { return g_mode == STORE_CATALOG ? "QUEUE" : "PLAY"; }
 
 /* ---------------- 3DS texture tiling ----------------
@@ -1635,6 +1637,10 @@ int main(void) {
         hidScanInput();
         u32 kd = hidKeysDown();
         if (kd & KEY_START) break;
+        /* SELECT turns the face-out covers off. They are the only thing in this room that
+         * touches the SD card while you walk, so the frame rate either jumps when they are off
+         * -- the stutter is the cover pool -- or it does not, and it is draw volume. */
+        if (kd & KEY_SELECT) g_covers_on = !g_covers_on;
         if ((kd & KEY_A) && held < 0 && sel >= 0) {                /* take it off the shelf */
             held = sel; spin = 0.0f; hold_d = 0.78f;
             if (g_back_for != sel) { rebuild_back(&g_pos[sel]); g_back_for = sel; }
@@ -1897,7 +1903,7 @@ int main(void) {
                                                         * and left the rest of the bay empty */
                 C3D_Mtx m;
                 Mtx_Multiply(&m, &view, &g_pos[i].model);   /* one multiply, not four builds */
-                if (g_pos[i].faceout) {
+                if (g_pos[i].faceout && g_covers_on) {
                     int slot = pool_find(i);
                     /* only the ones close enough to read compete for a slot -- otherwise the
                      * pool churned as you walked, evicting and reloading every frame */
@@ -1915,7 +1921,8 @@ int main(void) {
                 drawn++;
             }
             /* one cover a frame: walking an aisle fills them in without ever hitching */
-            if (eye == 0 && (frames & 3) == 0)          /* at most one every four frames */
+            if (eye == 0) g_drawn = drawn;
+            if (eye == 0 && g_covers_on && (frames & 3) == 0)   /* one every four frames */
                 for (int k = 0; k < nkeep; k++)
                     if (pool_find(keep[k]) < 0) {
                         pool_load(keep[k], &g_pos[keep[k]], keep, nkeep);
@@ -2088,10 +2095,12 @@ int main(void) {
                 panel_fmt(9 + i, "   %-16s %d", g_sec[i].name, g_sec[i].n);
         }
         if (held >= 0) {
+            panel_fmt(25, " fps %2d  drawn %d  covers %s", fps, g_drawn, g_covers_on ? "on" : "OFF");
             panel_set(26, " pad turn/zoom   d-pad next");
             panel_fmt(27, " %s: Y    put back: B",
                       g_pos[held].is_more ? "MORE" : verb());
         } else {
+            panel_fmt(25, " fps %2d  drawn %d  covers %s", fps, g_drawn, g_covers_on ? "on" : "OFF");
             panel_set(26, sel >= 0 ? " pad walk/turn   d-pad pick"
                                    : " pad walk/turn   d-pad look");
             panel_set(27, sel >= 0 ? " take: A   let go: B   exit: START"
