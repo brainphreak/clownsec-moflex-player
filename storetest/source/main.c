@@ -210,7 +210,10 @@ static void make_room_tex(void) {
 }
 
 /* ---------------- geometry ---------------- */
-#define AISLE_HALF   2.0f       /* wall at +/- this in x */
+#define AISLE_HALF   3.2f       /* wall at +/- this in x. At 2.0 the aisle was 4
+                                 * units across and the wall clamp caught you before any
+                                 * diagonal movement showed -- it read as "forward only goes
+                                 * straight down the hall". */
 #define AISLE_LEN    24.0f
 #define ROOM_VTX     24
 static Vtx *g_roomv, *g_quadv;
@@ -382,19 +385,28 @@ int main(void) {
         circlePosition cp; hidCircleRead(&cp);
         float fx = cp.dx / 156.0f, fy = cp.dy / 156.0f;
         if (held >= 0) { fx = 0; fy = 0; }        /* hold still while you are reading a case */
-        /* look up/down: the shelves have rows, and without this the bottom row is unreachable */
+        /* The circle pad MOVES and the d-pad LOOKS. Turning used to be on the circle pad's x
+         * axis, which meant you could not walk diagonally at all: pushing the pad at an angle
+         * spun you instead of sliding you sideways. Movement is now purely translation in the
+         * direction you are facing, which is what "walk toward what I am looking at" means. */
         u32 kh = hidKeysHeld();
-        if (kh & KEY_DUP)   pitch += 0.035f;
-        if (kh & KEY_DDOWN) pitch -= 0.035f;
+        if (kh & KEY_DUP)    pitch += 0.035f;
+        if (kh & KEY_DDOWN)  pitch -= 0.035f;
         if (!(kh & (KEY_DUP | KEY_DDOWN))) pitch *= 0.90f;   /* eases back to level on its own */
         if (pitch >  0.55f) pitch =  0.55f;
         if (pitch < -0.55f) pitch = -0.55f;
+        if (held < 0) {
+            if (kh & KEY_DRIGHT) yaw -= 0.040f;              /* turning right lowers yaw */
+            if (kh & KEY_DLEFT)  yaw += 0.040f;
+        }
         if (fabsf(fx) < 0.15f) fx = 0;
         if (fabsf(fy) < 0.15f) fy = 0;
-        yaw -= fx * 0.045f;                                  /* turn, not strafe: gentler in stereo */
+        /* forward, and the vector 90 degrees to its right. Push the pad diagonally and you get
+         * a diagonal walk, because both axes are translation. */
         float fwx = FWD * -sinf(yaw), fwz = FWD * -cosf(yaw);
-        cx  += fwx * fy * 0.09f;
-        cz  += fwz * fy * 0.09f;
+        float rgx =  cosf(yaw),       rgz = -sinf(yaw);
+        cx  += (fwx * fy + rgx * fx) * 0.09f;
+        cz  += (fwz * fy + rgz * fx) * 0.09f;
         if (cx >  AISLE_HALF - 0.45f) cx =  AISLE_HALF - 0.45f;
         if (cx < -AISLE_HALF + 0.45f) cx = -AISLE_HALF + 0.45f;
         if (cz >  -0.3f)        cz = -0.3f;
@@ -503,8 +515,11 @@ int main(void) {
         printf("\x1b[8;0H\x1b[2K  %s", sel >= 0 ? g_pos[sel].name : "(nothing in reach)");
         printf("\x1b[10;0H\x1b[2K  %s", held >= 0 ? "  [in hand]  B puts it back"
                                                     : (sel >= 0 ? "  A takes it off the shelf" : ""));
-        printf("\x1b[12;0H\x1b[2K  circle pad: walk / turn   d-pad up/down: look");
-        printf("\x1b[13;0H\x1b[2K  3D slider : depth      START: exit");
+        printf("\x1b[12;0H\x1b[2K  circle pad: walk + strafe   d-pad: look");
+        printf("\x1b[13;0H\x1b[2K  3D slider: depth   A: take   B: back   START: exit");
+        printf("\x1b[15;0H\x1b[2K  yaw %+4.0f  pitch %+3.0f   fwd(%+.2f,%+.2f)",
+               yaw * 57.2958f, pitch * 57.2958f, fwx, fwz);
+        printf("\x1b[16;0H\x1b[2K  pos(%+.2f,%+.2f)", cx, cz);
     }
 
     for (int i = 0; i < g_nposters; i++) if (g_pos[i].ok) C3D_TexDelete(&g_pos[i].tex);
