@@ -243,13 +243,26 @@ static int build_room(void) {
     return n;
 }
 
-/* unit quad in the XY plane, reused for every poster */
+/* Unit quad in the XY plane, reused for every poster.
+ *
+ * Written out rather than pushed through push_quad because of the V axis: on the PICA200 v=0
+ * is the BOTTOM of the texture, not the top. The poster occupies texture rows 0..IMG_H-1 --
+ * that is, the TOP of the image data -- so in texture coordinates it lives between
+ * 1-VMAX and 1, not between 0 and VMAX. Getting that backwards samples the black padding for
+ * the lower half of the quad and shows the poster flipped and shifted up into the rest. */
 static void build_quad(void) {
     g_quadv = (Vtx *)linearAlloc(sizeof(Vtx) * 6);
-    int n = 0;
-    push_quad(g_quadv, &n, -0.5f, -0.5f, 0,  0.5f, -0.5f, 0,
-                            0.5f,  0.5f, 0, -0.5f,  0.5f, 0,  1.0f, VMAX, 1.0f);
-    /* v is flipped below by the model matrix; texture rows start at the poster's top */
+    const float vlo = 1.0f - VMAX;      /* quad bottom  -> last row of the image */
+    const float vhi = 1.0f;             /* quad top     -> first row of the image */
+    Vtx q[6] = {
+        {-0.5f, -0.5f, 0, 0.0f, vlo, 1.0f},
+        { 0.5f, -0.5f, 0, 1.0f, vlo, 1.0f},
+        { 0.5f,  0.5f, 0, 1.0f, vhi, 1.0f},
+        {-0.5f, -0.5f, 0, 0.0f, vlo, 1.0f},
+        { 0.5f,  0.5f, 0, 1.0f, vhi, 1.0f},
+        {-0.5f,  0.5f, 0, 0.0f, vhi, 1.0f},
+    };
+    memcpy(g_quadv, q, sizeof q);
 }
 
 /* ---------------- main ---------------- */
@@ -340,8 +353,14 @@ int main(void) {
         g_pos[i].ry = side ? -1.0f : 1.0f;
     }
 
-    float cx = 0, cz = -0.5f, yaw = 0;
+    float cx = 0, cz = -0.5f, yaw = 0, pitch = 0;
     const float EYE = 1.55f;
+    /* Which way "forward" is, in one place, read by BOTH movement and picking so they cannot
+     * disagree again -- which is exactly what went wrong: movement used (+sin, -cos) while
+     * picking used (-sin, -cos). The x terms were opposite. Walking down the aisle hides it
+     * completely, because at yaw 0 the x term is zero; it only shows when you face a wall,
+     * where forward and back swap over. */
+    const float FWD = 1.0f;
     int frames = 0, fps = 0; u64 t0 = osGetTime();
     int sel = -1;
     /* "grab": A pulls the highlighted case off the shelf and turns it to face you, B puts it
@@ -363,11 +382,19 @@ int main(void) {
         circlePosition cp; hidCircleRead(&cp);
         float fx = cp.dx / 156.0f, fy = cp.dy / 156.0f;
         if (held >= 0) { fx = 0; fy = 0; }        /* hold still while you are reading a case */
+        /* look up/down: the shelves have rows, and without this the bottom row is unreachable */
+        u32 kh = hidKeysHeld();
+        if (kh & KEY_DUP)   pitch += 0.035f;
+        if (kh & KEY_DDOWN) pitch -= 0.035f;
+        if (!(kh & (KEY_DUP | KEY_DDOWN))) pitch *= 0.90f;   /* eases back to level on its own */
+        if (pitch >  0.55f) pitch =  0.55f;
+        if (pitch < -0.55f) pitch = -0.55f;
         if (fabsf(fx) < 0.15f) fx = 0;
         if (fabsf(fy) < 0.15f) fy = 0;
         yaw -= fx * 0.045f;                                  /* turn, not strafe: gentler in stereo */
-        cx  += sinf(yaw) * fy * 0.09f;
-        cz  -= cosf(yaw) * fy * 0.09f;
+        float fwx = FWD * -sinf(yaw), fwz = FWD * -cosf(yaw);
+        cx  += fwx * fy * 0.09f;
+        cz  += fwz * fy * 0.09f;
         if (cx >  AISLE_HALF - 0.45f) cx =  AISLE_HALF - 0.45f;
         if (cx < -AISLE_HALF + 0.45f) cx = -AISLE_HALF + 0.45f;
         if (cz >  -0.3f)        cz = -0.3f;
@@ -376,17 +403,22 @@ int main(void) {
         /* what am I looking at? nearest poster ahead, within reach.
          * Frozen while a case is held: the selection IS the held case until it goes back. */
         if (held < 0) {
+            /* Pick in THREE dimensions. Distance used to ignore y entirely, so the two rows of
+             * a shelf were exactly equidistant and the first one in the array always won --
+             * the bottom row could never be selected however you stood. Now the aim direction
+             * carries pitch and the score is the angle to the case, so looking down picks the
+             * lower row the way you would expect. */
             sel = -1;
-            float best = 3.2f;
-            float vdx = -sinf(yaw), vdz = -cosf(yaw);
+            float cp_ = cosf(pitch);
+            float ax = fwx * cp_, ay = sinf(pitch), az = fwz * cp_;
+            float bestscore = 0.80f;                 /* minimum cos(angle) to count as "aimed at" */
             for (int i = 0; i < g_nposters; i++) {
-                float dx = g_pos[i].x - cx, dz = g_pos[i].z - cz;
-                float d = sqrtf(dx * dx + dz * dz);
-                if (d > best) continue;
-                float dy = g_pos[i].y - EYE;
-                if (fabsf(dy) > 1.1f) continue;
-                if ((dx * vdx + dz * vdz) / (d + 1e-4f) < 0.55f) continue;   /* must be in front */
-                best = d; sel = i;
+                float dx = g_pos[i].x - cx, dy = g_pos[i].y - EYE, dz = g_pos[i].z - cz;
+                float d = sqrtf(dx * dx + dy * dy + dz * dz);
+                if (d > 3.2f || d < 1e-4f) continue;
+                float dot = (dx * ax + dy * ay + dz * az) / d;
+                if (dot < bestscore) continue;
+                bestscore = dot; sel = i;            /* the best-aimed case wins, not the nearest */
             }
         }
 
@@ -395,6 +427,7 @@ int main(void) {
 
         C3D_Mtx view;
         Mtx_Identity(&view);
+        Mtx_RotateX(&view, -pitch * FWD, true);
         Mtx_RotateY(&view, -yaw, true);
         Mtx_Translate(&view, -cx, -EYE, -cz, true);
 
@@ -470,7 +503,7 @@ int main(void) {
         printf("\x1b[8;0H\x1b[2K  %s", sel >= 0 ? g_pos[sel].name : "(nothing in reach)");
         printf("\x1b[10;0H\x1b[2K  %s", held >= 0 ? "  [in hand]  B puts it back"
                                                     : (sel >= 0 ? "  A takes it off the shelf" : ""));
-        printf("\x1b[12;0H\x1b[2K  circle pad: walk / turn");
+        printf("\x1b[12;0H\x1b[2K  circle pad: walk / turn   d-pad up/down: look");
         printf("\x1b[13;0H\x1b[2K  3D slider : depth      START: exit");
     }
 
