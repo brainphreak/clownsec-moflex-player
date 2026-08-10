@@ -417,12 +417,22 @@ static int panel_wrap(int row, int maxrows, const char *t) {
     }
     return row + used;
 }
+/* Only the rows that CHANGED.
+ *
+ * Reprinting the whole block every frame was 1092 glyphs, and libctru draws each one 8x8 pixels
+ * at a time on the CPU -- about four million pixel writes a second, which is real money at
+ * 268 MHz and was most of the stutter. Almost nothing on this panel changes between frames;
+ * the two lines that do are the frame rate and the count. Rows are addressed one at a time and
+ * never end in a newline, so nothing can scroll. */
+static char g_shown_panel[PANEL_ROWS][PANEL_MAXC + 1];
+static int  g_panel_primed = 0;
 static void panel_flush(void) {
-    printf("\x1b[1;1H");                      /* home, 1-based as ANSI actually specifies */
     for (int r = 0; r < PANEL_ROWS; r++) {
-        fputs(g_panel[r], stdout);
-        if (r < PANEL_ROWS - 1) fputc('\n', stdout);   /* no newline on the last: never scroll */
+        if (g_panel_primed && !memcmp(g_shown_panel[r], g_panel[r], g_cols)) continue;
+        printf("\x1b[%d;1H%s", r + 1, g_panel[r]);     /* 1-based, as ANSI specifies */
+        memcpy(g_shown_panel[r], g_panel[r], g_cols + 1);
     }
+    g_panel_primed = 1;
 }
 
 /* Print `t` word-wrapped into `cols`, starting at console row `row`, at most `maxrows` lines.
@@ -565,7 +575,11 @@ static int pool_load(int idx, Poster *q, const int *keep, int nkeep) {
     for (int i = 0; i < COVER_POOL && victim < 0; i++) {
         if (g_pool_for[i] < 0) victim = i;                  /* a free slot first */
     }
-    for (int i = 0; i < COVER_POOL && victim < 0; i++) {    /* then one nobody can see */
+    /* then one nobody can see. `keep` MUST be every visible cover, not merely the ones still
+     * waiting for a slot -- listing only the waiting ones meant no held slot ever matched, so
+     * this evicted a cover that was on screen every frame and reloaded it forever. Two file
+     * reads a frame, permanently: that was the five-frames-a-second. */
+    for (int i = 0; i < COVER_POOL && victim < 0; i++) {
         int used = 0;
         for (int k = 0; k < nkeep; k++) if (keep[k] == g_pool_for[i]) { used = 1; break; }
         if (!used) victim = i;
@@ -1157,6 +1171,22 @@ static void build_sections(void) {
     g_nsec++;
     for (int k = 0; k < g_nsec; k++) g_sec[k].n = 0;   /* recounted when titles are assigned */
 
+    /* Build each bay to its contents. A row holds `len / pitch` cases; three rows, and one in
+     * FACEOUT_EVERY takes the wider pitch of a cover. */
+    for (int k = 0; k < g_nsec; k++) {
+        /* a face takes more shelf than a spine, so the mix decides how much a bay holds */
+        float avg = (7.0f * PITCH_SPINE + 9.0f * PITCH_FACE) / 16.0f;
+        float need = ((float)g_sec[k].n / (float)BAY_ROWS) * avg + 0.5f;
+        if (need < UNIT_LEN_MIN) need = UNIT_LEN_MIN;
+        if (need > UNIT_LEN)     need = UNIT_LEN;
+        g_sec[k].len = need;
+        g_sec[k].per_row = (int)((need - 0.30f) / avg);
+        if (g_sec[k].per_row < 1) g_sec[k].per_row = 1;
+        if (g_sec[k].per_row > PER_ROW) g_sec[k].per_row = PER_ROW;
+        g_sec[k].Lper_row = (int)((3.2f - 0.30f) / avg);
+        g_sec[k].Lcap = 0;                          /* filled in once has_L is known */
+    }
+
     /* Fit the room to the fixtures. The walkway wants about four metres between the two runs
      * of bays; the depth follows from how many rows of bays there are. */
     {
@@ -1231,21 +1261,6 @@ static void build_sections(void) {
         g_pos[i].order = g_sec[k].n++;
     }
 
-    /* Build each bay to its contents. A row holds `len / pitch` cases; three rows, and one in
-     * FACEOUT_EVERY takes the wider pitch of a cover. */
-    for (int k = 0; k < g_nsec; k++) {
-        /* a face takes more shelf than a spine, so the mix decides how much a bay holds */
-        float avg = (7.0f * PITCH_SPINE + 9.0f * PITCH_FACE) / 16.0f;
-        float need = ((float)g_sec[k].n / (float)BAY_ROWS) * avg + 0.5f;
-        if (need < UNIT_LEN_MIN) need = UNIT_LEN_MIN;
-        if (need > UNIT_LEN)     need = UNIT_LEN;
-        g_sec[k].len = need;
-        g_sec[k].per_row = (int)((need - 0.30f) / avg);
-        if (g_sec[k].per_row < 1) g_sec[k].per_row = 1;
-        if (g_sec[k].per_row > PER_ROW) g_sec[k].per_row = PER_ROW;
-        g_sec[k].Lper_row = (int)((3.2f - 0.30f) / avg);
-        g_sec[k].Lcap = 0;                          /* filled in once has_L is known */
-    }
 
     /* A bay that cannot hold its whole genre gets a MORE case in the top-left slot: pick it up,
      * press the verb, and the shelf turns over to the next lot. Only where it is needed -- a
@@ -2018,7 +2033,10 @@ int main(void) {
 
             /* the ones close enough to read: their actual art, a hair in front */
             set_buf(g_quadvbo, 6);
-            int keep[COVER_POOL]; int nkeep = 0;
+            /* vis: every face-out case in view, held or not -- what the pool must not evict.
+             * need: the ones still without a slot. */
+            int vis[COVER_POOL * 3]; int nvis = 0;
+            int need[COVER_POOL];    int nneed = 0;
             for (int i = 0; i < g_nposters; i++) {
                 if (!g_pos[i].ok || !g_pos[i].shown || !g_pos[i].faceout) continue;
                 if (i == held || i == sel) continue;
@@ -2026,8 +2044,10 @@ int main(void) {
                 float d2 = dxs * dxs + dzs * dzs;
                 if (d2 > SPINE_VIEW * SPINE_VIEW) continue;
                 int slot = g_covers_on ? pool_find(i) : -1;
-                if (g_covers_on && slot < 0 && nkeep < COVER_POOL && d2 < 42.0f
-                    && g_pos[i].cover_state >= 0) keep[nkeep++] = i;
+                if (g_covers_on && d2 < 42.0f && g_pos[i].cover_state >= 0) {
+                    if (nvis < (int)(sizeof vis / sizeof vis[0])) vis[nvis++] = i;
+                    if (slot < 0 && nneed < COVER_POOL) need[nneed++] = i;
+                }
                 if (slot < 0) continue;                  /* no art yet: the blank front stands */
                 C3D_Mtx m;
                 Mtx_Multiply(&m, &view, &g_pos[i].model);
@@ -2045,10 +2065,10 @@ int main(void) {
              * because building one means reading and rescaling a file. */
             if (eye == 0 && g_covers_on) {
                 int loads = 0;
-                for (int k = 0; k < nkeep && loads < 2; k++)
-                    if (pool_find(keep[k]) < 0) {
-                        if (pool_load(keep[k], &g_pos[keep[k]], keep, nkeep) >= 0) loads++;
-                        else break;
+                for (int k = 0; k < nneed && loads < 2; k++)
+                    if (pool_find(need[k]) < 0) {
+                        if (pool_load(need[k], &g_pos[need[k]], vis, nvis) >= 0) loads++;
+                        else break;              /* nothing evictable: leave it for next frame */
                     }
             }
 
