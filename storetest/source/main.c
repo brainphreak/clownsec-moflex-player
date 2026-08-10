@@ -33,6 +33,7 @@
 #include <sys/stat.h>
 
 #include "vshader_shbin.h"
+#include "font8x8_basic.h"
 
 /* ---------------- poster texture geometry ----------------
  * 128x256 is the smallest power-of-two box that holds a poster at a sane size; the image
@@ -53,6 +54,20 @@
 #define SRC_W 132
 #define SRC_H 188
 
+/* A store floor with freestanding units, not a corridor. The units are low enough to see
+ * over (2.0 against a 1.55 eye height puts the sign of the next section in view from
+ * anywhere), which is what makes the place read as a shop rather than a maze. */
+#define STORE_HX     22.0f      /* floor spans +/-STORE_HX in x */
+#define STORE_Z0      2.0f      /* and STORE_Z0 .. -STORE_DEPTH in z */
+#define STORE_DEPTH  34.0f
+#define CEIL_Y        4.2f
+#define UNIT_LEN      6.0f      /* shelf unit: long axis (x) */
+#define UNIT_DEPTH    1.0f
+#define UNIT_H        2.0f
+#define SIGN_Y        3.35f
+#define MAX_SECTIONS  8
+#define SEC_COLS      3
+
 #define MAX_POSTERS 48          /* one aisle; the real thing would stream */
 #define ROOM_TEX 64
 
@@ -68,6 +83,16 @@ typedef struct {
     char    desc[400];
     int     year, runtime, hasinfo;
 } Poster;
+
+typedef struct {
+    char    name[24];
+    float   cx, cz;             /* unit centre on the floor */
+    C3D_Tex sign;
+    int     sign_ok;
+    int     n;                  /* posters assigned */
+} Section;
+static Section g_sec[MAX_SECTIONS];
+static int     g_nsec = 0;
 
 static Poster g_pos[MAX_POSTERS];
 static int    g_nposters = 0;
@@ -263,6 +288,46 @@ static int wrap_print(int row, int cols, int maxrows, const char *t) {
     return used;
 }
 
+/* ---------------- hanging section signs ----------------
+ * A 256x64 texture with the genre name drawn at 2x from the 8x8 font, centred, on a dark
+ * board. Built once at startup; there are only a handful of sections. */
+#define SIGN_W 256
+#define SIGN_H 64
+static void make_sign_tex(C3D_Tex *t, const char *text) {
+    if (!C3D_TexInit(t, SIGN_W, SIGN_H, GPU_RGB565)) return;
+    u16 *lin = (u16 *)calloc(SIGN_W * SIGN_H, 2);
+    u16 *til = (u16 *)malloc(SIGN_W * SIGN_H * 2);
+    if (!lin || !til) { free(lin); free(til); C3D_TexDelete(t); return; }
+    const u16 board = 0x1082, edge = 0x4208, ink = 0xFFFF;
+    for (int y = 0; y < SIGN_H; y++)
+        for (int x = 0; x < SIGN_W; x++) {
+            int b = (x < 3 || x >= SIGN_W - 3 || y < 3 || y >= SIGN_H - 3);
+            lin[y * SIGN_W + x] = b ? edge : board;
+        }
+    int len = (int)strlen(text);
+    if (len > 15) len = 15;                       /* 15 chars at 2x is 240 of 256 px */
+    int tw = len * 16, x0 = (SIGN_W - tw) / 2, y0 = (SIGN_H - 16) / 2;
+    for (int i = 0; i < len; i++) {
+        unsigned c = (unsigned char)text[i];
+        if (c > 127) c = '?';
+        const char *g = font8x8_basic[c];
+        for (int r = 0; r < 8; r++)
+            for (int b = 0; b < 8; b++)
+                if (g[r] & (1 << b))
+                    for (int sy = 0; sy < 2; sy++)
+                        for (int sx = 0; sx < 2; sx++) {
+                            int px = x0 + i * 16 + b * 2 + sx, py = y0 + r * 2 + sy;
+                            if (px >= 0 && px < SIGN_W && py >= 0 && py < SIGN_H)
+                                lin[py * SIGN_W + px] = ink;
+                        }
+    }
+    tile_rgb565(lin, til, SIGN_W, SIGN_H);
+    memcpy(t->data, til, SIGN_W * SIGN_H * 2);
+    C3D_TexFlush(t);
+    C3D_TexSetFilter(t, GPU_LINEAR, GPU_LINEAR);
+    free(lin); free(til);
+}
+
 /* ---------------- room texture: one small repeating pattern, one draw call ---------------- */
 static C3D_Tex g_room;
 static void make_room_tex(void) {
@@ -284,15 +349,84 @@ static void make_room_tex(void) {
     free(lin); free(til);
 }
 
+/* ---------------- sections ----------------
+ * The first genre named in a title's .nfo decides its section. The most populous genres get a
+ * unit each; whatever is left over goes to a general section, because a shop with a shelf
+ * holding one film looks broken. */
+static void first_genre(const char *g, char *out, size_t cap) {
+    if (!g || !g[0]) { snprintf(out, cap, "GENERAL"); return; }
+    size_t j = 0;
+    for (const char *p = g; *p && *p != ',' && j + 1 < cap; p++) {
+        char c = *p;
+        if (c >= 'a' && c <= 'z') c -= 32;
+        out[j++] = c;
+    }
+    out[j] = 0;
+    while (j > 0 && out[j - 1] == ' ') out[--j] = 0;
+    if (!out[0]) snprintf(out, cap, "GENERAL");
+}
+
+static void build_sections(void) {
+    char names[MAX_POSTERS][24];
+    int  count[MAX_POSTERS];
+    int  uniq = 0;
+    for (int i = 0; i < g_nposters; i++) {
+        char g[24]; first_genre(g_pos[i].genres, g, sizeof g);
+        int k = -1;
+        for (int j = 0; j < uniq; j++) if (!strcmp(names[j], g)) { k = j; break; }
+        if (k < 0 && uniq < MAX_POSTERS) { k = uniq++; snprintf(names[k], 24, "%s", g); count[k] = 0; }
+        if (k >= 0) count[k]++;
+    }
+    /* biggest genres first, capped at MAX_SECTIONS-1 so there is always room for GENERAL */
+    for (int a = 0; a < uniq; a++)
+        for (int b = a + 1; b < uniq; b++)
+            if (count[b] > count[a]) {
+                int t = count[a]; count[a] = count[b]; count[b] = t;
+                char tmp[24]; memcpy(tmp, names[a], 24); memcpy(names[a], names[b], 24);
+                memcpy(names[b], tmp, 24);
+            }
+    int want = uniq < (MAX_SECTIONS - 1) ? uniq : (MAX_SECTIONS - 1);
+    for (int i = 0; i < want; i++) {
+        if (count[i] < 2) break;                       /* not worth a whole unit */
+        snprintf(g_sec[g_nsec].name, 24, "%s", names[i]);
+        g_nsec++;
+    }
+    snprintf(g_sec[g_nsec].name, 24, "GENERAL");
+    g_nsec++;
+
+    /* grid: SEC_COLS across, rows going away from the door */
+    for (int i = 0; i < g_nsec; i++) {
+        int col = i % SEC_COLS, row = i / SEC_COLS;
+        g_sec[i].cx = (col - (SEC_COLS - 1) * 0.5f) * 13.0f;
+        g_sec[i].cz = -7.0f - row * 11.0f;
+        make_sign_tex(&g_sec[i].sign, g_sec[i].name);
+        g_sec[i].sign_ok = 1;
+    }
+
+    /* place each poster on its section's unit: two rows, both faces, filling along the length */
+    int slot[MAX_SECTIONS]; memset(slot, 0, sizeof slot);
+    for (int i = 0; i < g_nposters; i++) {
+        char g[24]; first_genre(g_pos[i].genres, g, sizeof g);
+        int k = g_nsec - 1;                            /* GENERAL unless a section matches */
+        for (int j = 0; j < g_nsec; j++) if (!strcmp(g_sec[j].name, g)) { k = j; break; }
+        int sl = slot[k]++;
+        int per_face = 12;                             /* 2 rows x 6 along the unit */
+        int face = (sl / per_face) & 1;                /* front (+z) then back (-z) */
+        int idx  = sl % per_face;
+        int row  = idx / 6, colp = idx % 6;
+        g_pos[i].x  = g_sec[k].cx + (colp - 2.5f) * 0.92f;
+        g_pos[i].y  = row ? 1.52f : 0.72f;
+        g_pos[i].z  = g_sec[k].cz + (face ? -(UNIT_DEPTH * 0.5f + 0.02f)
+                                          :  (UNIT_DEPTH * 0.5f + 0.02f));
+        g_pos[i].ry = face ? -2.0f : 2.0f;             /* 2.0 marks "faces +/-z", see the draw */
+        g_sec[k].n++;
+    }
+}
+
 /* ---------------- geometry ---------------- */
-#define AISLE_HALF   3.2f       /* wall at +/- this in x. At 2.0 the aisle was 4
-                                 * units across and the wall clamp caught you before any
-                                 * diagonal movement showed -- it read as "forward only goes
-                                 * straight down the hall". */
-#define AISLE_LEN    24.0f
-#define ROOM_VTX     24
-static Vtx *g_roomv, *g_quadv;
-static void *g_roomvbo, *g_quadvbo;
+#define ROOM_VTX     (6 * 6 + MAX_SECTIONS * 5 * 6)   /* shell + a box per unit */
+static Vtx *g_roomv, *g_quadv, *g_signv;
+static void *g_roomvbo, *g_quadvbo, *g_signvbo;
 
 static void push_quad(Vtx *v, int *n,
                       float ax, float ay, float az, float bx, float by, float bz,
@@ -308,17 +442,41 @@ static void push_quad(Vtx *v, int *n,
 }
 
 static int build_room(void) {
-    g_roomv = (Vtx *)linearAlloc(sizeof(Vtx) * ROOM_VTX * 2);
+    g_roomv = (Vtx *)linearAlloc(sizeof(Vtx) * ROOM_VTX);
     int n = 0;
-    const float L = AISLE_LEN, H = 3.0f, W = AISLE_HALF;
-    /* floor */
-    push_quad(g_roomv, &n, -W, 0, 0,  W, 0, 0,  W, 0, -L, -W, 0, -L,  4, L / 2, 0.50f);
-    /* ceiling (darker: nothing up there deserves attention) */
-    push_quad(g_roomv, &n, -W, H, -L, W, H, -L, W, H, 0,  -W, H, 0,   4, L / 2, 0.30f);
-    /* left wall, right wall */
-    push_quad(g_roomv, &n, -W, 0, -L, -W, 0, 0,  -W, H, 0,  -W, H, -L, L / 2, 2, 0.62f);
-    push_quad(g_roomv, &n,  W, 0, 0,   W, 0, -L,  W, H, -L,  W, H, 0,  L / 2, 2, 0.62f);
+    const float X = STORE_HX, Z0 = STORE_Z0, Z1 = STORE_Z0 - STORE_DEPTH, H = CEIL_Y;
+    /* floor and ceiling */
+    push_quad(g_roomv, &n, -X, 0, Z0,  X, 0, Z0,  X, 0, Z1, -X, 0, Z1, 12, 10, 0.52f);
+    push_quad(g_roomv, &n, -X, H, Z1,  X, H, Z1,  X, H, Z0, -X, H, Z0, 12, 10, 0.28f);
+    /* four walls */
+    push_quad(g_roomv, &n, -X, 0, Z1, -X, 0, Z0, -X, H, Z0, -X, H, Z1, 10, 2, 0.60f);
+    push_quad(g_roomv, &n,  X, 0, Z0,  X, 0, Z1,  X, H, Z1,  X, H, Z0, 10, 2, 0.60f);
+    push_quad(g_roomv, &n, -X, 0, Z1,  X, 0, Z1,  X, H, Z1, -X, H, Z1, 12, 2, 0.56f);
+    push_quad(g_roomv, &n,  X, 0, Z0, -X, 0, Z0, -X, H, Z0,  X, H, Z0, 12, 2, 0.56f);
+
+    /* one shelf unit per section: a box you can see over, with a lighter top so it reads as a
+     * surface rather than a wall */
+    for (int i = 0; i < g_nsec; i++) {
+        float cx = g_sec[i].cx, cz = g_sec[i].cz;
+        float hx = UNIT_LEN * 0.5f, hz = UNIT_DEPTH * 0.5f, h = UNIT_H;
+        push_quad(g_roomv, &n, cx-hx,0,cz+hz, cx+hx,0,cz+hz, cx+hx,h,cz+hz, cx-hx,h,cz+hz, 3,1, 0.44f);
+        push_quad(g_roomv, &n, cx+hx,0,cz-hz, cx-hx,0,cz-hz, cx-hx,h,cz-hz, cx+hx,h,cz-hz, 3,1, 0.44f);
+        push_quad(g_roomv, &n, cx-hx,0,cz-hz, cx-hx,0,cz+hz, cx-hx,h,cz+hz, cx-hx,h,cz-hz, 1,1, 0.38f);
+        push_quad(g_roomv, &n, cx+hx,0,cz+hz, cx+hx,0,cz-hz, cx+hx,h,cz-hz, cx+hx,h,cz+hz, 1,1, 0.38f);
+        push_quad(g_roomv, &n, cx-hx,h,cz-hz, cx+hx,h,cz-hz, cx+hx,h,cz+hz, cx-hx,h,cz+hz, 3,1, 0.70f);
+    }
     return n;
+}
+
+/* full-texture quad for the signs (the poster quad only maps the used part of its box) */
+static void build_signquad(void) {
+    g_signv = (Vtx *)linearAlloc(sizeof(Vtx) * 6);
+    Vtx q[6] = {
+        {-0.5f, -0.5f, 0, 0.0f, 0.0f, 1.0f}, { 0.5f, -0.5f, 0, 1.0f, 0.0f, 1.0f},
+        { 0.5f,  0.5f, 0, 1.0f, 1.0f, 1.0f}, {-0.5f, -0.5f, 0, 0.0f, 0.0f, 1.0f},
+        { 0.5f,  0.5f, 0, 1.0f, 1.0f, 1.0f}, {-0.5f,  0.5f, 0, 0.0f, 1.0f, 1.0f},
+    };
+    memcpy(g_signv, q, sizeof q);
 }
 
 /* Unit quad in the XY plane, reused for every poster.
@@ -403,9 +561,8 @@ int main(void) {
 
     scene_init();
     make_room_tex();
-    int roomn = build_room();
     build_quad();
-    g_roomvbo = g_roomv; g_quadvbo = g_quadv;
+    build_signquad();
 
     int built = 0;
     u64 t_load0 = osGetTime();
@@ -419,19 +576,11 @@ int main(void) {
         }
     }
 
-    /* lay the posters along both walls, two rows */
-    for (int i = 0; i < g_nposters; i++) {
-        int side = i & 1;                                  /* alternate walls */
-        int idx  = i >> 1;
-        int row  = idx & 1;
-        int col  = idx >> 1;
-        g_pos[i].x  = side ? (AISLE_HALF - 0.02f) : -(AISLE_HALF - 0.02f);
-        g_pos[i].y  = row ? 1.95f : 1.05f;
-        g_pos[i].z  = -1.5f - col * 1.15f;
-        g_pos[i].ry = side ? -1.0f : 1.0f;
-    }
+    build_sections();                       /* genres -> units -> poster positions */
+    int roomn = build_room();               /* needs the unit positions */
+    g_roomvbo = g_roomv; g_quadvbo = g_quadv; g_signvbo = g_signv;
 
-    float cx = 0, cz = -0.5f, yaw = 0, pitch = 0;
+    float cx = 0, cz = STORE_Z0 - 1.5f, yaw = 0, pitch = 0;
     const float EYE = 1.55f;
     /* Which way "forward" is, in one place, read by BOTH movement and picking so they cannot
      * disagree again -- which is exactly what went wrong: movement used (+sin, -cos) while
@@ -485,10 +634,21 @@ int main(void) {
         float rgx =  cosf(yaw),       rgz = -sinf(yaw);
         cx  += (fwx * fy + rgx * fx) * 0.09f;
         cz  += (fwz * fy + rgz * fx) * 0.09f;
-        if (cx >  AISLE_HALF - 0.45f) cx =  AISLE_HALF - 0.45f;
-        if (cx < -AISLE_HALF + 0.45f) cx = -AISLE_HALF + 0.45f;
-        if (cz >  -0.3f)        cz = -0.3f;
-        if (cz < -AISLE_LEN + 1.0f) cz = -AISLE_LEN + 1.0f;
+        if (cx >  STORE_HX - 0.6f) cx =  STORE_HX - 0.6f;
+        if (cx < -STORE_HX + 0.6f) cx = -STORE_HX + 0.6f;
+        if (cz >  STORE_Z0 - 0.6f) cz =  STORE_Z0 - 0.6f;
+        if (cz < STORE_Z0 - STORE_DEPTH + 0.6f) cz = STORE_Z0 - STORE_DEPTH + 0.6f;
+        /* keep out of the shelf units: push to the nearest face of whichever box you are in.
+         * Crude, but a box is a box and you cannot walk through one. */
+        for (int i = 0; i < g_nsec; i++) {
+            float hx = UNIT_LEN * 0.5f + 0.42f, hz = UNIT_DEPTH * 0.5f + 0.42f;
+            float dx = cx - g_sec[i].cx, dz = cz - g_sec[i].cz;
+            if (fabsf(dx) < hx && fabsf(dz) < hz) {
+                float ox = hx - fabsf(dx), oz = hz - fabsf(dz);
+                if (ox < oz) cx = g_sec[i].cx + (dx < 0 ? -hx : hx);
+                else         cz = g_sec[i].cz + (dz < 0 ? -hz : hz);
+            }
+        }
 
         /* what am I looking at? nearest poster ahead, within reach.
          * Frozen while a case is held: the selection IS the held case until it goes back. */
@@ -546,9 +706,15 @@ int main(void) {
                 if (!g_pos[i].ok) continue;
                 float pop = (i == sel && held < 0) ? 0.10f : 0.0f;   /* highlighted: steps out */
                 /* shelf pose */
-                float px = g_pos[i].x + g_pos[i].ry * pop;
-                float py = g_pos[i].y, pz = g_pos[i].z;
-                float ay = (g_pos[i].ry > 0) ? C3D_Angle(0.25f) : C3D_Angle(-0.25f);
+                float nx = (fabsf(g_pos[i].ry) > 1.5f) ? 0.0f : (g_pos[i].ry > 0 ? 1.0f : -1.0f);
+                float nz = (fabsf(g_pos[i].ry) > 1.5f) ? (g_pos[i].ry > 0 ? 1.0f : -1.0f) : 0.0f;
+                float px = g_pos[i].x + nx * pop;
+                float py = g_pos[i].y, pz = g_pos[i].z + nz * pop;
+                /* |ry| == 2 means the case faces along z (a shelf unit); 1 means along x. */
+                float ay;
+                if (fabsf(g_pos[i].ry) > 1.5f) ay = (g_pos[i].ry > 0) ? 0.0f : C3D_Angle(0.5f);
+                else                           ay = (g_pos[i].ry > 0) ? C3D_Angle(0.25f)
+                                                                     : C3D_Angle(-0.25f);
                 float sc = 0.62f;
                 if (i == sel && hold_t > 0.0f) {
                     /* held pose: arm's length ahead, square to the camera. Smoothstep so it
@@ -575,6 +741,24 @@ int main(void) {
                 C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
                 C3D_TexBind(0, &g_pos[i].tex);
                 C3D_DrawArrays(GPU_TRIANGLES, 0, 6);
+            }
+
+            /* section signs, hung over each unit. Two quads back to back so the name reads the
+             * right way round from both sides -- one quad with culling off shows its text
+             * mirrored from behind. */
+            set_buf(g_signvbo, 6);
+            for (int i = 0; i < g_nsec; i++) {
+                if (!g_sec[i].sign_ok) continue;
+                C3D_TexBind(0, &g_sec[i].sign);
+                for (int f = 0; f < 2; f++) {
+                    C3D_Mtx m;
+                    Mtx_Copy(&m, &view);
+                    Mtx_Translate(&m, g_sec[i].cx, SIGN_Y, g_sec[i].cz + (f ? -0.03f : 0.03f), true);
+                    if (f) Mtx_RotateY(&m, C3D_Angle(0.5f), true);
+                    Mtx_Scale(&m, 3.4f, 3.4f * (float)SIGN_H / (float)SIGN_W, 1.0f);
+                    C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
+                    C3D_DrawArrays(GPU_TRIANGLES, 0, 6);
+                }
             }
         }
         C3D_FrameEnd(0);
@@ -610,13 +794,14 @@ int main(void) {
                    (slider > 0.0f ? 2 : 1), slider);
             for (int r = 7; r <= 17; r++) printf("\x1b[%d;0H\x1b[2K", r);
             printf("\x1b[8;0H\x1b[2K walk up to a case to see its info");
-            printf("\x1b[15;0H\x1b[2K yaw %+4.0f  pitch %+3.0f  fwd(%+.2f,%+.2f)",
-                   yaw * 57.2958f, pitch * 57.2958f, fwx, fwz);
-            printf("\x1b[16;0H\x1b[2K pos(%+.2f,%+.2f)", cx, cz);
+            printf("\x1b[10;0H\x1b[2K sections:");
+            for (int i = 0; i < g_nsec && i < 6; i++)
+                printf("\x1b[%d;0H\x1b[2K   %-14s %d", 11 + i, g_sec[i].name, g_sec[i].n);
         }
     }
 
     for (int i = 0; i < g_nposters; i++) if (g_pos[i].ok) C3D_TexDelete(&g_pos[i].tex);
+    for (int i = 0; i < g_nsec; i++) if (g_sec[i].sign_ok) C3D_TexDelete(&g_sec[i].sign);
     C3D_TexDelete(&g_room);
     shaderProgramFree(&program);
     DVLB_Free(vsh_dvlb);
