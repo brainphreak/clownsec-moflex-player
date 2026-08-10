@@ -444,8 +444,14 @@ static void make_sign_tex_col(C3D_Tex *t, const char *text, u16 board, u16 edge,
     C3D_TexSetFilter(t, GPU_LINEAR, GPU_LINEAR);
     free(lin); free(til);
 }
+/* The house colours: a deep blue board with a yellow rule and yellow type. Two colours do more
+ * for "this is a video shop" than any amount of geometry -- and they are one constant each, so
+ * a theme setting could swap the whole place over later. */
+#define TH_BLUE   0x0193      /* deep blue board */
+#define TH_YELLOW 0xFEA0      /* signage yellow */
+#define TH_WHITE  0xFFFF
 static void make_sign_tex(C3D_Tex *t, const char *text) {
-    make_sign_tex_col(t, text, 0x1082, 0x4208, 0xFFFF, 2);
+    make_sign_tex_col(t, text, TH_BLUE, TH_YELLOW, TH_YELLOW, 2);
 }
 /* store name and fire-exit board */
 static C3D_Tex g_storesign, g_exitsign;
@@ -1104,8 +1110,11 @@ int main(void) {
     make_materials();
     make_covers_tex();
     make_spine_tex();
-    make_sign_tex_col(&g_storesign, "3DS VIDEO RENTALS", 0x300A, 0xFFE0, 0xFFE0, 1); g_store_ok = 1;
-    make_sign_tex_col(&g_exitsign,  "EXIT",              0x0140, 0x07E0, 0xFFFF, 2); g_exit_ok = 1;
+    make_sign_tex_col(&g_storesign, "3DS VIDEO RENTALS", TH_BLUE, TH_YELLOW, TH_YELLOW, 1);
+    g_store_ok = 1;
+    /* the exit board stays green: that one is a fire sign, not branding */
+    make_sign_tex_col(&g_exitsign,  "EXIT",              0x0140, 0x07E0, TH_WHITE, 2);
+    g_exit_ok = 1;
     build_quad();
     build_signquad();
     build_box();
@@ -1212,8 +1221,26 @@ int main(void) {
         if (kd & KEY_X) { pitch = 0.0f; aim_lock = 0; }
         if (pitch >  0.55f) pitch =  0.55f;
         if (pitch < -0.55f) pitch = -0.55f;
-        /* d-pad steps the SELECTION; the camera then eases round to centre it. Turning stays on
-         * the analog stick, so the two never fight over the same axis. */
+        /* Walk away and the shelf lets go, so the d-pad goes back to looking around. Without
+         * this the selection stayed latched from across the room and there was no way to tilt
+         * up at the signs or the ceiling. */
+        if (held < 0 && sel >= 0) {
+            float dx = g_pos[sel].x - cx, dz = g_pos[sel].z - cz;
+            if (dx * dx + dz * dz > 16.0f) { sel = -1; aim_lock = 0; }
+        }
+        if (held < 0 && (kd & KEY_B) && sel >= 0) { sel = -1; aim_lock = 0; }  /* let go on purpose */
+
+        /* NOTHING SELECTED: the d-pad is a head. Look up at the signs, round the room. */
+        if (sel < 0 && held < 0) {
+            if (kh & KEY_DUP)    pitch += 0.030f;
+            if (kh & KEY_DDOWN)  pitch -= 0.030f;
+            if (kh & KEY_DLEFT)  yaw   += 0.035f;
+            if (kh & KEY_DRIGHT) yaw   -= 0.035f;
+            if (pitch >  0.75f) pitch =  0.75f;
+            if (pitch < -0.60f) pitch = -0.60f;
+        }
+        /* SOMETHING SELECTED: the d-pad steps along the shelf and the camera eases onto it.
+         * Turning stays on the analog stick, so the two never fight over an axis. */
         if (sel >= 0 && (kd & (KEY_DLEFT | KEY_DRIGHT | KEY_DUP | KEY_DDOWN))) {
             float rx = cosf(yaw), rz = -sinf(yaw);        /* camera right, on the floor plane */
             int nsel = sel;
@@ -1543,8 +1570,10 @@ int main(void) {
             panel_set(26, " pad turn/zoom   d-pad next");
             panel_fmt(27, " %s: Y    put back: B", verb());
         } else {
-            panel_set(26, " pad walk/turn   d-pad pick");
-            panel_set(27, " take: A   strafe: L/R   exit: START");
+            panel_set(26, sel >= 0 ? " pad walk/turn   d-pad pick"
+                                   : " pad walk/turn   d-pad look");
+            panel_set(27, sel >= 0 ? " take: A   let go: B   exit: START"
+                                   : " strafe: L/R   level: X   exit: START");
         }
         if (toast_t > 0) panel_fmt(22, " %s", toast);
         panel_flush();
