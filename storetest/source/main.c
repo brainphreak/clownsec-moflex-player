@@ -38,10 +38,21 @@
 /* ---------------- poster texture geometry ----------------
  * 128x256 is the smallest power-of-two box that holds a poster at a sane size; the image
  * occupies 128x182 of it, which is the source 132x188 aspect to within half a percent. */
-#define TEX_W   128
-#define TEX_H   256
-#define IMG_W   128
-#define IMG_H   182
+/* SHELF size. A case three metres away covers about forty screen pixels, so 128x256 was four
+ * times the texture anyone could see. At 64x128 the same 3 MB of texture holds four times as
+ * many titles -- which is what buys three rows and a fuller shop.
+ *
+ * The case you PICK UP is the one that needs detail, and there is only ever one, so it gets a
+ * single 128x256 texture of its own (g_detail), filled from the big cache on pickup. That is
+ * the whole LOD scheme: small on the shelf, full in the hand. */
+#define TEX_W   64
+#define TEX_H   128
+#define IMG_W   64
+#define IMG_H   91
+#define DET_W   128
+#define DET_H   256
+#define DET_IMG_W 128
+#define DET_IMG_H 182
 #define TEX_BYTES (TEX_W * TEX_H * 2)
 #define VMAX    ((float)IMG_H / (float)TEX_H)
 
@@ -68,7 +79,7 @@
 #define MAX_SECTIONS  8
 #define SEC_COLS      3
 
-#define MAX_POSTERS 48          /* one aisle; the real thing would stream */
+#define MAX_POSTERS 96          /* 96 x 16 KB = 1.5 MB of shelf texture */
 #define ROOM_TEX 64
 
 typedef struct { float x, y, z, u, v, s; } Vtx;
@@ -82,6 +93,7 @@ typedef struct {
     char    genres[80];
     char    desc[400];
     int     year, runtime, hasinfo;
+    char    key[96];            /* cache key, so the detail texture can be built on pickup */
 } Poster;
 
 typedef struct {
@@ -118,7 +130,8 @@ static void tile_rgb565(const u16 *lin, u16 *out, int w, int h) {
 /* ---------------- poster cache ----------------
  * Source: the player's own art cache, "<key>_<W>x<H>.p565", raw linear RGB565.
  * Destination: "<key>.t565", TEX_W x TEX_H, already tiled. */
-static int build_cache_entry(const char *artpath, int sw, int sh, const char *dst) {
+static int build_cache_entry_sz(const char *artpath, int sw, int sh, const char *dst,
+                                int tw, int th, int iw, int ih) {
     FILE *f = fopen(artpath, "rb");
     if (!f) return 0;
     size_t need = (size_t)sw * sh * 2;
@@ -128,17 +141,18 @@ static int build_cache_entry(const char *artpath, int sw, int sh, const char *ds
     fclose(f);
     if (rd != need) { free(src); return 0; }
 
-    u16 *lin = (u16 *)calloc(TEX_W * TEX_H, 2);
-    u16 *til = (u16 *)malloc(TEX_BYTES);
+    u16 *lin = (u16 *)calloc((size_t)tw * th, 2);
+    u16 *til = (u16 *)malloc((size_t)tw * th * 2);
     if (!lin || !til) { free(src); free(lin); free(til); return 0; }
-    for (int j = 0; j < IMG_H; j++) {              /* nearest scale into the used sub-rect */
-        const u16 *row = src + (size_t)(j * sh / IMG_H) * sw;
-        u16 *d = lin + (size_t)j * TEX_W;
-        for (int i = 0; i < IMG_W; i++) d[i] = row[i * sw / IMG_W];
+    for (int j = 0; j < ih; j++) {                 /* nearest scale into the used sub-rect */
+        const u16 *row = src + (size_t)(j * sh / ih) * sw;
+        u16 *d = lin + (size_t)j * tw;
+        for (int i = 0; i < iw; i++) d[i] = row[i * sw / iw];
     }
-    tile_rgb565(lin, til, TEX_W, TEX_H);
+    tile_rgb565(lin, til, tw, th);
     FILE *o = fopen(dst, "wb");
-    int ok = o && fwrite(til, 1, TEX_BYTES, o) == TEX_BYTES;
+    size_t nb = (size_t)tw * th * 2;
+    int ok = o && fwrite(til, 1, nb, o) == nb;
     if (o) fclose(o);
     free(src); free(lin); free(til);
     return ok;
@@ -195,17 +209,22 @@ static int scan_dir(const char *dir, int fixed_w, int fixed_h, int with_nfo, int
         char key[160];
         snprintf(key, sizeof key, "%.*s", (int)(L - 5), e->d_name);
 
-        char cache[400], src[400];
-        snprintf(cache, sizeof cache, "%s/%s.t565", CACHE_DIR, key);
+        char cache[400], big[400], src[400];
+        snprintf(cache, sizeof cache, "%s/%s.s565", CACHE_DIR, key);   /* shelf: 64x128  */
+        snprintf(big,   sizeof big,   "%s/%s.t565", CACHE_DIR, key);   /* detail: 128x256 */
         snprintf(src,   sizeof src,   "%s/%s", dir, e->d_name);
 
         FILE *cf = fopen(cache, "rb");
         if (!cf) {
-            if (!build_cache_entry(src, sw, sh, cache)) continue;
+            if (!build_cache_entry_sz(src, sw, sh, cache, TEX_W, TEX_H, IMG_W, IMG_H)) continue;
             (*built)++;
             cf = fopen(cache, "rb");
             if (!cf) continue;
         }
+        { FILE *bf = fopen(big, "rb");        /* the full-res one, made once, read on pickup */
+          if (bf) fclose(bf);
+          else if (build_cache_entry_sz(src, sw, sh, big, DET_W, DET_H, DET_IMG_W, DET_IMG_H))
+              (*built)++; }
         Poster *p = &g_pos[g_nposters];
         memset(p, 0, sizeof *p);
         if (!C3D_TexInit(&p->tex, TEX_W, TEX_H, GPU_RGB565)) { fclose(cf); break; }  /* out of VRAM */
@@ -217,6 +236,7 @@ static int scan_dir(const char *dir, int fixed_w, int fixed_h, int with_nfo, int
         C3D_TexSetFilter(&p->tex, GPU_LINEAR, GPU_LINEAR);
         C3D_TexSetWrap(&p->tex, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
         p->ok = 1;
+        snprintf(p->key, sizeof p->key, "%s", key);
         pretty(e->d_name, p->name, sizeof p->name);
         if (with_nfo) {
             char nfo[400];
@@ -331,39 +351,49 @@ static int draw_wrap(u16 *lin, int W, int H, int x, int y, int sc, u16 col,
  * board. Built once at startup; there are only a handful of sections. */
 #define SIGN_W 256
 #define SIGN_H 64
-static void make_sign_tex(C3D_Tex *t, const char *text) {
+static void make_sign_tex_col(C3D_Tex *t, const char *text, u16 board, u16 edge, u16 ink, int sc) {
     if (!C3D_TexInit(t, SIGN_W, SIGN_H, GPU_RGB565)) return;
     u16 *lin = (u16 *)calloc(SIGN_W * SIGN_H, 2);
     u16 *til = (u16 *)malloc(SIGN_W * SIGN_H * 2);
     if (!lin || !til) { free(lin); free(til); C3D_TexDelete(t); return; }
-    const u16 board = 0x1082, edge = 0x4208, ink = 0xFFFF;
     for (int y = 0; y < SIGN_H; y++)
         for (int x = 0; x < SIGN_W; x++) {
             int b = (x < 3 || x >= SIGN_W - 3 || y < 3 || y >= SIGN_H - 3);
             lin[y * SIGN_W + x] = b ? edge : board;
         }
     int len = (int)strlen(text);
-    if (len > 15) len = 15;                       /* 15 chars at 2x is 240 of 256 px */
-    int tw = len * 16, x0 = (SIGN_W - tw) / 2, y0 = (SIGN_H - 16) / 2;
-    for (int i = 0; i < len; i++) {
-        unsigned c = (unsigned char)text[i];
-        if (c > 127) c = '?';
-        const char *g = font8x8_basic[c];
-        for (int r = 0; r < 8; r++)
-            for (int b = 0; b < 8; b++)
-                if (g[r] & (1 << b))
-                    for (int sy = 0; sy < 2; sy++)
-                        for (int sx = 0; sx < 2; sx++) {
-                            int px = x0 + i * 16 + b * 2 + sx, py = y0 + r * 2 + sy;
-                            if (px >= 0 && px < SIGN_W && py >= 0 && py < SIGN_H)
-                                lin[py * SIGN_W + px] = ink;
-                        }
-    }
+    int maxc = (SIGN_W - 16) / (8 * sc);
+    if (len > maxc) len = maxc;
+    int x0 = (SIGN_W - len * 8 * sc) / 2, y0 = (SIGN_H - 8 * sc) / 2;
+    for (int i = 0; i < len; i++)
+        draw_glyph(lin, SIGN_W, SIGN_H, x0 + i * 8 * sc, y0, sc, ink, (unsigned char)text[i]);
     tile_rgb565(lin, til, SIGN_W, SIGN_H);
     memcpy(t->data, til, SIGN_W * SIGN_H * 2);
     C3D_TexFlush(t);
     C3D_TexSetFilter(t, GPU_LINEAR, GPU_LINEAR);
     free(lin); free(til);
+}
+static void make_sign_tex(C3D_Tex *t, const char *text) {
+    make_sign_tex_col(t, text, 0x1082, 0x4208, 0xFFFF, 2);
+}
+/* store name and fire-exit board */
+static C3D_Tex g_storesign, g_exitsign;
+static int     g_store_ok = 0, g_exit_ok = 0;
+
+/* The full-resolution front of whatever is in your hand. One texture, filled on pickup. */
+static C3D_Tex g_detail;
+static int     g_detail_ok = 0, g_detail_for = -1;
+static void load_detail(const Poster *q, int idx) {
+    if (!g_detail_ok || g_detail_for == idx) return;
+    char big[400];
+    snprintf(big, sizeof big, "%s/%s.t565", CACHE_DIR, q->key);
+    FILE *f = fopen(big, "rb");
+    if (!f) return;
+    size_t got = fread(g_detail.data, 1, (size_t)DET_W * DET_H * 2, f);
+    fclose(f);
+    if (got != (size_t)DET_W * DET_H * 2) return;
+    C3D_TexFlush(&g_detail);
+    g_detail_for = idx;
 }
 
 /* ---------------- the back of the case ----------------
@@ -425,8 +455,67 @@ static void rebuild_back(const Poster *q) {
     free(lin); free(til);
 }
 
-/* ---------------- room texture: one small repeating pattern, one draw call ---------------- */
-static C3D_Tex g_room;
+/* ---------------- materials ----------------
+ * A shop is mostly told by its surfaces: red carpet underfoot, brown wood shelving, pale walls.
+ * Each is a 64x64 repeating texture -- 8 KB apiece -- and the room is drawn as three ranges of
+ * one vertex buffer so the whole shell still costs three draw calls. */
+static C3D_Tex g_room;      /* walls + ceiling */
+static C3D_Tex g_carpet, g_wood, g_glass, g_door;
+static int     g_mat_ok = 0;
+
+static void upload_tex(C3D_Tex *t, u16 *lin, int w, int h) {
+    u16 *til = (u16 *)malloc((size_t)w * h * 2);
+    if (!til) return;
+    tile_rgb565(lin, til, w, h);
+    memcpy(t->data, til, (size_t)w * h * 2);
+    C3D_TexFlush(t);
+    C3D_TexSetFilter(t, GPU_LINEAR, GPU_LINEAR);
+    C3D_TexSetWrap(t, GPU_REPEAT, GPU_REPEAT);
+    free(til);
+}
+static void make_materials(void) {
+    const int N = 64;
+    u16 *lin = (u16 *)malloc(N * N * 2);
+    if (!lin) return;
+    /* red carpet: deep red with a woven speckle and a faint border weave */
+    C3D_TexInit(&g_carpet, N, N, GPU_RGB565);
+    for (int y = 0; y < N; y++) for (int x = 0; x < N; x++) {
+        int n = ((x * 13 + y * 7) % 5) + ((x ^ y) & 1);
+        int r = 11 + n, g = 1 + (n >> 2), b = 3 + (n >> 2);
+        if (x % 32 == 0 || y % 32 == 0) { r = 15; g = 4; b = 5; }
+        lin[y * N + x] = (u16)((r << 11) | ((g * 2) << 5) | b);
+    }
+    upload_tex(&g_carpet, lin, N, N);
+    /* wood: brown with vertical grain */
+    C3D_TexInit(&g_wood, N, N, GPU_RGB565);
+    for (int y = 0; y < N; y++) for (int x = 0; x < N; x++) {
+        int grain = ((x * 5 + ((y >> 3) * 3)) % 11);
+        int v = 9 + (grain > 8 ? 3 : grain > 5 ? 1 : 0);
+        int r = v, g = (v * 2) / 3, b = v / 3;
+        if (x % 16 == 0) { r = 6; g = 4; b = 2; }            /* plank edges */
+        lin[y * N + x] = (u16)((r << 11) | ((g * 2) << 5) | b);
+    }
+    upload_tex(&g_wood, lin, N, N);
+    /* glass: night outside, with a frame */
+    C3D_TexInit(&g_glass, N, N, GPU_RGB565);
+    for (int y = 0; y < N; y++) for (int x = 0; x < N; x++) {
+        int frame = (x < 3 || x >= N - 3 || y < 3 || y >= N - 3 || x == N / 2);
+        int glow = (y > N - 22 && ((x * 11) % 23) < 3) ? 8 : 0;   /* lights outside */
+        lin[y * N + x] = frame ? 0x4208 : (u16)((glow << 11) | ((2 + glow) << 5) | (6 + glow));
+    }
+    upload_tex(&g_glass, lin, N, N);
+    /* door: panelled wood with a handle */
+    C3D_TexInit(&g_door, N, N, GPU_RGB565);
+    for (int y = 0; y < N; y++) for (int x = 0; x < N; x++) {
+        int panel = (x > 8 && x < N - 8 && ((y > 8 && y < 28) || (y > 36 && y < 56)));
+        int v = panel ? 12 : 8;
+        lin[y * N + x] = (u16)((v << 11) | (((v * 2) / 3 * 2) << 5) | (v / 3));
+        if (x > N - 16 && x < N - 11 && y > 30 && y < 36) lin[y * N + x] = 0xFFE0;  /* handle */
+    }
+    upload_tex(&g_door, lin, N, N);
+    free(lin);
+    g_mat_ok = 1;
+}
 static void make_room_tex(void) {
     C3D_TexInit(&g_room, ROOM_TEX, ROOM_TEX, GPU_RGB565);
     u16 *lin = (u16 *)malloc(ROOM_TEX * ROOM_TEX * 2);
@@ -507,12 +596,12 @@ static void build_sections(void) {
         int k = g_nsec - 1;                            /* GENERAL unless a section matches */
         for (int j = 0; j < g_nsec; j++) if (!strcmp(g_sec[j].name, g)) { k = j; break; }
         int sl = slot[k]++;
-        int per_face = 12;                             /* 2 rows x 6 along the unit */
+        int per_face = 24;                             /* 3 rows x 8 along the unit */
         int face = (sl / per_face) & 1;                /* front (+z) then back (-z) */
         int idx  = sl % per_face;
-        int row  = idx / 6, colp = idx % 6;
-        g_pos[i].x  = g_sec[k].cx + (colp - 2.5f) * 0.92f;
-        g_pos[i].y  = row ? 1.52f : 0.72f;
+        int row  = idx / 8, colp = idx % 8;
+        g_pos[i].x  = g_sec[k].cx + (colp - 3.5f) * 0.70f;
+        g_pos[i].y  = 0.46f + row * 0.62f;
         g_pos[i].z  = g_sec[k].cz + (face ? -(UNIT_DEPTH * 0.5f + 0.02f)
                                           :  (UNIT_DEPTH * 0.5f + 0.02f));
         g_pos[i].ry = face ? -2.0f : 2.0f;             /* 2.0 marks "faces +/-z", see the draw */
@@ -538,18 +627,21 @@ static void push_quad(Vtx *v, int *n,
     *n += 6;
 }
 
+static int g_n_floor, g_n_shell, g_n_units;
 static int build_room(void) {
     g_roomv = (Vtx *)linearAlloc(sizeof(Vtx) * ROOM_VTX);
     int n = 0;
     const float X = STORE_HX, Z0 = STORE_Z0, Z1 = STORE_Z0 - STORE_DEPTH, H = CEIL_Y;
-    /* floor and ceiling */
-    push_quad(g_roomv, &n, -X, 0, Z0,  X, 0, Z0,  X, 0, Z1, -X, 0, Z1, 12, 10, 0.52f);
-    push_quad(g_roomv, &n, -X, H, Z1,  X, H, Z1,  X, H, Z0, -X, H, Z0, 12, 10, 0.28f);
-    /* four walls */
-    push_quad(g_roomv, &n, -X, 0, Z1, -X, 0, Z0, -X, H, Z0, -X, H, Z1, 10, 2, 0.60f);
-    push_quad(g_roomv, &n,  X, 0, Z0,  X, 0, Z1,  X, H, Z1,  X, H, Z0, 10, 2, 0.60f);
-    push_quad(g_roomv, &n, -X, 0, Z1,  X, 0, Z1,  X, H, Z1, -X, H, Z1, 12, 2, 0.56f);
-    push_quad(g_roomv, &n,  X, 0, Z0, -X, 0, Z0, -X, H, Z0,  X, H, Z0, 12, 2, 0.56f);
+    /* group 1: the carpet */
+    push_quad(g_roomv, &n, -X, 0, Z0,  X, 0, Z0,  X, 0, Z1, -X, 0, Z1, 14, 12, 0.72f);
+    g_n_floor = n;
+    /* group 2: ceiling + four walls */
+    push_quad(g_roomv, &n, -X, H, Z1,  X, H, Z1,  X, H, Z0, -X, H, Z0, 12, 10, 0.30f);
+    push_quad(g_roomv, &n, -X, 0, Z1, -X, 0, Z0, -X, H, Z0, -X, H, Z1, 10, 2, 0.62f);
+    push_quad(g_roomv, &n,  X, 0, Z0,  X, 0, Z1,  X, H, Z1,  X, H, Z0, 10, 2, 0.62f);
+    push_quad(g_roomv, &n, -X, 0, Z1,  X, 0, Z1,  X, H, Z1, -X, H, Z1, 12, 2, 0.58f);
+    push_quad(g_roomv, &n,  X, 0, Z0, -X, 0, Z0, -X, H, Z0,  X, H, Z0, 12, 2, 0.58f);
+    g_n_shell = n - g_n_floor;
 
     /* one shelf unit per section: a box you can see over, with a lighter top so it reads as a
      * surface rather than a wall */
@@ -560,8 +652,9 @@ static int build_room(void) {
         push_quad(g_roomv, &n, cx+hx,0,cz-hz, cx-hx,0,cz-hz, cx-hx,h,cz-hz, cx+hx,h,cz-hz, 3,1, 0.44f);
         push_quad(g_roomv, &n, cx-hx,0,cz-hz, cx-hx,0,cz+hz, cx-hx,h,cz+hz, cx-hx,h,cz-hz, 1,1, 0.38f);
         push_quad(g_roomv, &n, cx+hx,0,cz+hz, cx+hx,0,cz-hz, cx+hx,h,cz-hz, cx+hx,h,cz+hz, 1,1, 0.38f);
-        push_quad(g_roomv, &n, cx-hx,h,cz-hz, cx+hx,h,cz-hz, cx+hx,h,cz+hz, cx-hx,h,cz+hz, 3,1, 0.70f);
+        push_quad(g_roomv, &n, cx-hx,h,cz-hz, cx+hx,h,cz-hz, cx+hx,h,cz+hz, cx-hx,h,cz+hz, 3,1, 0.86f);
     }
+    g_n_units = n - g_n_floor - g_n_shell;
     return n;
 }
 
@@ -696,9 +789,15 @@ int main(void) {
 
     scene_init();
     make_room_tex();
+    make_materials();
+    make_sign_tex_col(&g_storesign, "3DS VIDEO RENTALS", 0x300A, 0xFFE0, 0xFFE0, 1); g_store_ok = 1;
+    make_sign_tex_col(&g_exitsign,  "EXIT",              0x0140, 0x07E0, 0xFFFF, 2); g_exit_ok = 1;
     build_quad();
     build_signquad();
     build_box();
+    g_detail_ok = C3D_TexInit(&g_detail, DET_W, DET_H, GPU_RGB565);
+    if (g_detail_ok) { C3D_TexSetFilter(&g_detail, GPU_LINEAR, GPU_LINEAR);
+                       C3D_TexSetWrap(&g_detail, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE); }
     g_back_ok = C3D_TexInit(&g_back, BACK_W, BACK_H, GPU_RGB565);
     if (g_back_ok) { C3D_TexSetFilter(&g_back, GPU_LINEAR, GPU_LINEAR);
                      C3D_TexSetWrap(&g_back, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE); }
@@ -743,6 +842,7 @@ int main(void) {
         if ((kd & KEY_A) && held < 0 && sel >= 0) {                /* take it off the shelf */
             held = sel; spin = 0.0f;
             if (g_back_for != sel) { rebuild_back(&g_pos[sel]); g_back_for = sel; }
+            load_detail(&g_pos[sel], sel);          /* small on the shelf, full in the hand */
         }
         if ((kd & KEY_B) && held >= 0)            held = -1;       /* put it back */
         hold_t += ((held >= 0) ? 0.14f : -0.14f);                  /* ~7 frames each way */
@@ -849,11 +949,53 @@ int main(void) {
             C3D_FrameDrawOn(tgt);
             C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocProjection, &proj);
 
-            /* room: one texture, one draw */
-            C3D_TexBind(0, &g_room);
+            /* the shell, three materials, three draws */
             set_buf(g_roomvbo, roomn);
             C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &view);
-            C3D_DrawArrays(GPU_TRIANGLES, 0, roomn);
+            C3D_TexBind(0, g_mat_ok ? &g_carpet : &g_room);
+            C3D_DrawArrays(GPU_TRIANGLES, 0, g_n_floor);
+            C3D_TexBind(0, &g_room);
+            C3D_DrawArrays(GPU_TRIANGLES, g_n_floor, g_n_shell);
+            C3D_TexBind(0, g_mat_ok ? &g_wood : &g_room);
+            C3D_DrawArrays(GPU_TRIANGLES, g_n_floor + g_n_shell, g_n_units);
+
+            /* shopfront fittings: windows and a door on the near wall, signs above */
+            set_buf(g_signvbo, 6);
+            if (g_mat_ok) {
+                C3D_TexBind(0, &g_glass);
+                for (int w = 0; w < 4; w++) {
+                    float wx = -13.5f + w * 9.0f;
+                    if (w == 2) continue;                  /* the door goes in this gap */
+                    C3D_Mtx m; Mtx_Copy(&m, &view);
+                    Mtx_Translate(&m, wx, 1.9f, STORE_Z0 - 0.05f, true);
+                    Mtx_Scale(&m, 6.0f, 2.6f, 1.0f);
+                    C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
+                    C3D_DrawArrays(GPU_TRIANGLES, 0, 6);
+                }
+                C3D_TexBind(0, &g_door);
+                { C3D_Mtx m; Mtx_Copy(&m, &view);
+                  Mtx_Translate(&m, 4.5f, 1.15f, STORE_Z0 - 0.05f, true);
+                  Mtx_Scale(&m, 2.6f, 2.3f, 1.0f);
+                  C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
+                  C3D_DrawArrays(GPU_TRIANGLES, 0, 6); }
+            }
+            if (g_store_ok) {                              /* name across the back wall */
+                C3D_TexBind(0, &g_storesign);
+                C3D_Mtx m; Mtx_Copy(&m, &view);
+                Mtx_Translate(&m, 0.0f, 3.3f, STORE_Z0 - STORE_DEPTH + 0.06f, true);
+                Mtx_Scale(&m, 15.0f, 15.0f * (float)SIGN_H / (float)SIGN_W, 1.0f);
+                C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
+                C3D_DrawArrays(GPU_TRIANGLES, 0, 6);
+            }
+            if (g_exit_ok) {                               /* over the door */
+                C3D_TexBind(0, &g_exitsign);
+                C3D_Mtx m; Mtx_Copy(&m, &view);
+                Mtx_Translate(&m, 4.5f, 2.75f, STORE_Z0 - 0.10f, true);
+                Mtx_RotateY(&m, C3D_Angle(0.5f), true);
+                Mtx_Scale(&m, 1.8f, 1.8f * (float)SIGN_H / (float)SIGN_W, 1.0f);
+                C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
+                C3D_DrawArrays(GPU_TRIANGLES, 0, 6);
+            }
 
             /* posters on the shelves: one draw each, unit quad + per-poster matrix. Flat
              * cards, because they sit flush against the unit and nobody can see their edges. */
@@ -871,7 +1013,7 @@ int main(void) {
                 Mtx_Copy(&m, &view);
                 Mtx_Translate(&m, g_pos[i].x + nx * pop, g_pos[i].y, g_pos[i].z + nz * pop, true);
                 Mtx_RotateY(&m, ay, true);
-                Mtx_Scale(&m, 0.62f, 0.62f * (float)IMG_H / (float)IMG_W, 1.0f);
+                Mtx_Scale(&m, 0.42f, 0.42f * (float)IMG_H / (float)IMG_W, 1.0f);
                 C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
                 C3D_TexBind(0, &g_pos[i].tex);
                 C3D_DrawArrays(GPU_TRIANGLES, 0, 6);
@@ -905,12 +1047,12 @@ int main(void) {
                 Mtx_RotateY(&m, ay0 + da * t, true);
                 Mtx_RotateX(&m, pitch * t, true);           /* square to the view when held */
                 Mtx_RotateY(&m, spin * t, true);            /* turning it over */
-                float sc = 0.62f + (0.40f - 0.62f) * t;
+                float sc = 0.42f + (0.40f - 0.42f) * t;
                 Mtx_Scale(&m, sc, sc * (float)IMG_H / (float)IMG_W, 1.0f);
                 C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
 
                 set_buf(g_boxvbo, 36);
-                C3D_TexBind(0, &q->tex);                    /* front: the poster */
+                C3D_TexBind(0, (g_detail_ok && g_detail_for == held) ? &g_detail : &q->tex);
                 C3D_DrawArrays(GPU_TRIANGLES, 0, 6);
                 if (g_back_ok) {
                     C3D_TexBind(0, &g_back);                /* back: the printed card */
@@ -983,7 +1125,12 @@ int main(void) {
     for (int i = 0; i < g_nposters; i++) if (g_pos[i].ok) C3D_TexDelete(&g_pos[i].tex);
     for (int i = 0; i < g_nsec; i++) if (g_sec[i].sign_ok) C3D_TexDelete(&g_sec[i].sign);
     C3D_TexDelete(&g_room);
+    if (g_mat_ok) { C3D_TexDelete(&g_carpet); C3D_TexDelete(&g_wood);
+                    C3D_TexDelete(&g_glass);  C3D_TexDelete(&g_door); }
+    if (g_store_ok) C3D_TexDelete(&g_storesign);
+    if (g_exit_ok)  C3D_TexDelete(&g_exitsign);
     if (g_back_ok) C3D_TexDelete(&g_back);
+    if (g_detail_ok) C3D_TexDelete(&g_detail);
     shaderProgramFree(&program);
     DVLB_Free(vsh_dvlb);
     C3D_Fini();
