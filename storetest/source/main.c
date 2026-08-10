@@ -646,6 +646,57 @@ static void make_spine_tex(void) {
     g_spine_ok = 1;
 }
 
+/* Framed posters: the walls and the ends of the units. Real covers from the shelves rather
+ * than invented art -- a video shop advertises what it has in stock. Six of them at 64x128 is
+ * 96 KB, which is the whole decorating budget.
+ *
+ * If you later want fixed art up there instead, this is the hook: drop a 132x188 .p565 in as
+ * store/wallN.p565 and it will be used in preference to a title from the shelves. */
+#define WALLPOSTERS 6
+static C3D_Tex g_wall[WALLPOSTERS];
+static int     g_wall_ok[WALLPOSTERS];
+static int     g_wall_n = 0;
+
+static void make_wall_posters(void) {
+    for (int i = 0; i < WALLPOSTERS; i++) {
+        /* Your own art first: store/wallN.p565, a 132x188 raw like the player's own caches.
+         * It is only ever READ -- the scaled copy goes to a separate file, so dropping art in
+         * here can never destroy it. */
+        char user[400], small[400];
+        snprintf(user,  sizeof user,  "%s/wall%d.p565", CACHE_DIR, i);
+        snprintf(small, sizeof small, "%s/wall%d.w565", CACHE_DIR, i);
+        int from_user = 0;
+        { FILE *uf = fopen(user, "rb");
+          if (uf) { fclose(uf); from_user = 1; } }
+        Poster *q = NULL;
+        if (!from_user) {
+            /* otherwise borrow a title from the shelves, spread across the catalogue */
+            if (g_nposters <= 0) return;
+            int pick = (int)((long)i * g_nposters / WALLPOSTERS);
+            if (pick >= g_nposters) pick = g_nposters - 1;
+            q = &g_pos[pick];
+            if (!q->srcpath[0]) continue;
+            snprintf(small, sizeof small, "%s/%s.w565", CACHE_DIR, q->key);
+        }
+        FILE *cf = fopen(small, "rb");
+        if (!cf) {
+            const char *src = from_user ? user : q->srcpath;
+            int sw = from_user ? SRC_W : q->src_w, sh = from_user ? SRC_H : q->src_h;
+            if (!build_cache_entry_sz(src, sw, sh, small, TEX_W, TEX_H, IMG_W, IMG_H)) continue;
+            cf = fopen(small, "rb");
+            if (!cf) continue;
+        }
+        if (!C3D_TexInit(&g_wall[i], TEX_W, TEX_H, GPU_RGB565)) { fclose(cf); continue; }
+        size_t got = fread(g_wall[i].data, 1, (size_t)TEX_W * TEX_H * 2, cf);
+        fclose(cf);
+        if (got != (size_t)TEX_W * TEX_H * 2) { C3D_TexDelete(&g_wall[i]); continue; }
+        C3D_TexFlush(&g_wall[i]);
+        C3D_TexSetFilter(&g_wall[i], GPU_LINEAR, GPU_LINEAR);
+        C3D_TexSetWrap(&g_wall[i], GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
+        g_wall_ok[i] = 1; g_wall_n++;
+    }
+}
+
 static void make_room_tex(void) {
     C3D_TexInit(&g_room, ROOM_TEX, ROOM_TEX, GPU_RGB565);
     u16 *lin = (u16 *)malloc(ROOM_TEX * ROOM_TEX * 2);
@@ -1078,6 +1129,7 @@ int main(void) {
     }
 
     build_sections();                       /* genres -> units -> poster positions */
+    make_wall_posters();                    /* decorate: unit ends and the bare walls */
     int roomn = build_room();               /* needs the unit positions */
     g_roomvbo = g_roomv; g_quadvbo = g_quadv; g_signvbo = g_signv; g_boxvbo = g_boxv;
 
@@ -1397,6 +1449,48 @@ int main(void) {
                 set_buf(g_quadvbo, 6);
             }
 
+            /* framed posters: an end cap on each unit, and a few around the walls */
+            if (g_wall_n > 0) {
+                set_buf(g_signvbo, 6);
+                int w = 0;
+                for (int i = 0; i < g_nsec; i++) {
+                    for (int e = 0; e < 2; e++) {
+                        int k = (w++) % WALLPOSTERS;
+                        if (!g_wall_ok[k]) continue;
+                        C3D_TexBind(0, &g_wall[k]);
+                        C3D_Mtx m; Mtx_Copy(&m, &view);
+                        Mtx_Translate(&m, g_sec[i].cx + (e ? 1 : -1) * (UNIT_LEN * 0.5f + 0.03f),
+                                      1.30f, g_sec[i].cz, true);
+                        Mtx_RotateY(&m, e ? C3D_Angle(0.25f) : C3D_Angle(-0.25f), true);
+                        Mtx_Scale(&m, 0.62f, 0.62f * (float)IMG_H / (float)IMG_W, 1.0f);
+                        C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
+                        C3D_DrawArrays(GPU_TRIANGLES, 0, 6);
+                    }
+                }
+                /* on the walls, above the stock so they are not hidden by it */
+                static const float WP[8][4] = {   /* x, y, z, facing (radians about y) */
+                    { -STORE_HX + 0.08f, 2.70f,  -6.0f,  1.5708f },
+                    { -STORE_HX + 0.08f, 2.70f, -18.0f,  1.5708f },
+                    {  STORE_HX - 0.08f, 2.70f,  -6.0f, -1.5708f },
+                    {  STORE_HX - 0.08f, 2.70f, -18.0f, -1.5708f },
+                    { -7.0f, 2.70f, STORE_Z0 - STORE_DEPTH + 0.08f, 0.0f },
+                    {  7.0f, 2.70f, STORE_Z0 - STORE_DEPTH + 0.08f, 0.0f },
+                    { -16.0f, 2.70f, STORE_Z0 - STORE_DEPTH + 0.08f, 0.0f },
+                    {  16.0f, 2.70f, STORE_Z0 - STORE_DEPTH + 0.08f, 0.0f },
+                };
+                for (int i = 0; i < 8; i++) {
+                    int k = i % WALLPOSTERS;
+                    if (!g_wall_ok[k]) continue;
+                    C3D_TexBind(0, &g_wall[k]);
+                    C3D_Mtx m; Mtx_Copy(&m, &view);
+                    Mtx_Translate(&m, WP[i][0], WP[i][1], WP[i][2], true);
+                    Mtx_RotateY(&m, WP[i][3], true);
+                    Mtx_Scale(&m, 1.05f, 1.05f * (float)IMG_H / (float)IMG_W, 1.0f);
+                    C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
+                    C3D_DrawArrays(GPU_TRIANGLES, 0, 6);
+                }
+            }
+
             /* section signs, hung over each unit. Two quads back to back so the name reads the
              * right way round from both sides -- one quad with culling off shows its text
              * mirrored from behind. */
@@ -1464,6 +1558,7 @@ int main(void) {
     if (g_exit_ok)  C3D_TexDelete(&g_exitsign);
     if (g_covers_ok) C3D_TexDelete(&g_covers);
     if (g_spine_ok)  C3D_TexDelete(&g_spine);
+    for (int i = 0; i < WALLPOSTERS; i++) if (g_wall_ok[i]) C3D_TexDelete(&g_wall[i]);
     if (g_back_ok) C3D_TexDelete(&g_back);
     if (g_detail_ok) C3D_TexDelete(&g_detail);
     shaderProgramFree(&program);
