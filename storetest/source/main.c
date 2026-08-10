@@ -109,8 +109,8 @@ static float g_depth = 24.0f;
  * went into the shop's own clamshell, so a shelf was uniform white and blue with the odd black
  * case among it. A rainbow is the most artificial thing you can put on a shelf. */
 #define SPINE_COLOURS 3
-#define SPINE_VIEW    9.5f      /* a spine further off than this is a stripe anyway */
-#define SPINE_BUDGET 420
+#define SPINE_VIEW    7.0f      /* a spine further off than this is a stripe anyway */
+#define SPINE_BUDGET 170
 /* Every Nth case stands face out, as a shop does: a run of spines, a cover, more spines. The
  * covers are what make a shelf browsable; the spines are what make it a shop. */
 #define FACEOUT_EVERY 7
@@ -142,6 +142,9 @@ typedef struct {
                                  * no cover is not retried on every single frame */
     int     is_more;            /* the "MORE MOVIES" case that turns the section over */
     int     sect, order;        /* which bay, and where in that bay's run */
+    C3D_Mtx model;              /* built once when it is placed. Rebuilding a translate, a
+                                 * rotate and a scale for every case, every eye, every frame
+                                 * was most of the cost of walking. */
     char    key[96];            /* cache key, so the detail texture can be built on pickup */
     char    srcpath[400];       /* the .p565 it came from, for that lazy build */
     int     src_w, src_h;
@@ -1114,9 +1117,8 @@ static void build_sections(void) {
         for (int k = 0; k < g_nsec; k++) if (g_sec[k].len > maxlen) maxlen = g_sec[k].len;
         g_hx = maxlen + 2.4f;                       /* bay + half the walkway */
         if (g_hx < 6.0f)  g_hx = 6.0f;
-        int side_rows = 0;
-        for (int k = 0; k < g_nsec && k < 6; k++) side_rows++;
-        int rows = (side_rows + 1) / 2;             /* they come in left/right pairs */
+        int side = g_nsec < 6 ? g_nsec : 6;
+        int rows = (side + 1) / 2;                  /* they fill in left/right pairs */
         if (rows < 1) rows = 1;
         g_depth = 5.0f + rows * 6.5f + 4.0f;        /* door end + aisles + the back run */
         if (g_depth < 14.0f) g_depth = 14.0f;
@@ -1129,12 +1131,14 @@ static void build_sections(void) {
     /* left column, right column, then a pair across the back -- spaced to the room's depth */
     float rowz[3];
     for (int r = 0; r < 3; r++) rowz[r] = -5.0f - r * 6.5f;
+    /* left, right, left, right... A column-at-a-time order put the first three bays all on
+     * one wall, so a shop with three sections had a bare side. */
     const float PLAN[MAX_SECTIONS][3] = {          /* x sign, z, rotation */
         { -1.0f, rowz[0], 0.0f },
-        { -1.0f, rowz[1], 0.0f },
-        { -1.0f, rowz[2], 0.0f },
         {  1.0f, rowz[0], 0.0f },
+        { -1.0f, rowz[1], 0.0f },
         {  1.0f, rowz[1], 0.0f },
+        { -1.0f, rowz[2], 0.0f },
         {  1.0f, rowz[2], 0.0f },
         { -1.0f, -99.0f, 0.0f },                   /* -99 marks the back wall run */
         {  1.0f, -99.0f, 0.0f },
@@ -1150,7 +1154,7 @@ static void build_sections(void) {
                     g_sec[i].cz = PLAN[i][1]; }
         g_sec[i].rot = PLAN[i][2];
         g_sec[i].facedir = ((i / 3) % 2) ? -1.0f : 1.0f;   /* bays face each other in pairs */
-        g_sec[i].has_L   = (i < 6 && (i % 2) == 0) && !back;
+        g_sec[i].has_L   = (i < 6) && (g_sec[i].len > UNIT_LEN_MIN + 1.0f) && !back;
         /* the return runs along z at the inner end, facing the walkway */
         float inner = g_sec[i].cx + ((g_sec[i].cx < 0) ? g_sec[i].len * 0.5f : -g_sec[i].len * 0.5f);
         g_sec[i].Llen = 3.2f;
@@ -1271,6 +1275,12 @@ static void place_section(int k) {
             p->y  = 0.46f + row * 0.62f;
             p->ay = S->Lay;
         }
+        /* bake the model matrix now */
+        Mtx_Identity(&p->model);
+        Mtx_Translate(&p->model, p->x, p->y, p->z, true);
+        Mtx_RotateY(&p->model, p->ay, true);
+        if (p->faceout) Mtx_Scale(&p->model, 0.30f, 0.30f * (float)IMG_H / (float)IMG_W, 1.0f);
+        else            Mtx_Scale(&p->model, 0.20f, 0.56f, 1.0f);
     }
 }
 
@@ -1886,28 +1896,21 @@ int main(void) {
                                                         * the whole budget on the nearest run
                                                         * and left the rest of the bay empty */
                 C3D_Mtx m;
-                Mtx_Copy(&m, &view);
-                Mtx_Translate(&m, g_pos[i].x, g_pos[i].y, g_pos[i].z, true);
-                Mtx_RotateY(&m, g_pos[i].ay, true);
+                Mtx_Multiply(&m, &view, &g_pos[i].model);   /* one multiply, not four builds */
                 if (g_pos[i].faceout) {
                     int slot = pool_find(i);
                     /* only the ones close enough to read compete for a slot -- otherwise the
                      * pool churned as you walked, evicting and reloading every frame */
                     if (slot < 0 && nkeep < COVER_POOL && d2 < 30.0f && g_pos[i].cover_state >= 0)
                         keep[nkeep++] = i;
-                    Mtx_Scale(&m, 0.30f, 0.30f * (float)IMG_H / (float)IMG_W, 1.0f);
-                    C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
                     if (slot >= 0) bind_tex(&g_pool[slot], g_pool_ok);
                     else           bind_tex(&g_spine[g_pos[i].col], g_spine_ok);
                     lastcol = -1;                     /* the spine bind is no longer current */
-                } else {
-                    if (g_pos[i].col != lastcol) {    /* grouped by colour: fewer binds */
-                        bind_tex(&g_spine[g_pos[i].col], g_spine_ok);
-                        lastcol = g_pos[i].col;
-                    }
-                    Mtx_Scale(&m, 0.20f, 0.56f, 1.0f);   /* an edge, not a face */
-                    C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
+                } else if (g_pos[i].col != lastcol) { /* grouped by colour: fewer binds */
+                    bind_tex(&g_spine[g_pos[i].col], g_spine_ok);
+                    lastcol = g_pos[i].col;
                 }
+                C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
                 draw_range(0, 6);
                 drawn++;
             }
@@ -2035,7 +2038,12 @@ int main(void) {
                     Mtx_Copy(&m, &view);
                     Mtx_Translate(&m, g_sec[i].cx, SIGN_Y, g_sec[i].cz + (f ? -0.03f : 0.03f), true);
                     if (f) Mtx_RotateY(&m, C3D_Angle(0.5f), true);
-                    Mtx_Scale(&m, 3.4f, 3.4f * (float)SIGN_H / (float)SIGN_W, 1.0f);
+                    /* as wide as its bay, never wider: a fixed 3.4 hung past the end of a
+                     * short unit and straight through the wall behind it */
+                    float sw = g_sec[i].len * 0.85f;
+                    if (sw > 3.4f) sw = 3.4f;
+                    if (sw < 1.6f) sw = 1.6f;
+                    Mtx_Scale(&m, sw, sw * (float)SIGN_H / (float)SIGN_W, 1.0f);
                     C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
                     draw_range(0, 6);
                 }
