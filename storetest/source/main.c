@@ -657,6 +657,36 @@ static void make_covers_tex(void) {
     g_covers_ok = 1;
 }
 
+/* Step the selection to the next case in a screen direction.
+ *
+ * Scored in the CAMERA's frame, not the shelf's, so "right" always means right on screen no
+ * matter which side of a unit you are standing on. Aiming an analog stick at a case is fiddly
+ * -- and would be hopeless once these are spines ten pixels wide -- so the d-pad walks the
+ * shelf discretely instead. */
+static int step_sel(int cur, float dirx, float diry, float dirz, float cx, float cz, float eye);
+static int step_sel(int cur, float dirx, float diry, float dirz, float cx, float cz, float eye) {
+    if (cur < 0 || cur >= g_nposters) return cur;
+    float ox = g_pos[cur].x, oy = g_pos[cur].y, oz = g_pos[cur].z;
+    int best = cur; float bestscore = 1e9f;
+    for (int i = 0; i < g_nposters; i++) {
+        if (i == cur || !g_pos[i].ok) continue;
+        float dx = g_pos[i].x - ox, dy = g_pos[i].y - oy, dz = g_pos[i].z - oz;
+        float along = dx * dirx + dy * diry + dz * dirz;
+        if (along < 0.05f) continue;                       /* must be in the pressed direction */
+        float px = dx - along * dirx, py = dy - along * diry, pz = dz - along * dirz;
+        float perp = sqrtf(px * px + py * py + pz * pz);
+        if (perp > 0.75f) continue;                        /* not on this run of shelf */
+        /* nearest along the axis, penalising drift off it */
+        float score = along + perp * 2.5f;
+        /* and stay on the face you are actually looking at */
+        float fx = g_pos[i].x - cx, fz = g_pos[i].z - cz;
+        if (fx * fx + fz * fz > 36.0f) continue;
+        (void)eye;
+        if (score < bestscore) { bestscore = score; best = i; }
+    }
+    return best;
+}
+
 /* ---------------- sections ----------------
  * The first genre named in a title's .nfo decides its section. The most populous genres get a
  * unit each; whatever is left over goes to a general section, because a shop with a shelf
@@ -1018,6 +1048,12 @@ int main(void) {
      * also what makes the printed back legible: the same texture over more screen pixels. */
     float hold_d = 0.78f;
     const float HOLD_NEAR = 0.34f, HOLD_FAR = 1.15f;
+    int   aim_lock = 0;       /* the d-pad picked something: ease the view onto it */
+    /* Picking a case up is LOOKING, and must stay free of consequences -- you turn it over,
+     * read the back, and put it back. The verb is a separate deliberate press while it is in
+     * your hand: rent it in the catalogue store, play it in the library store. Y rather than a
+     * second A, so a stray double-tap cannot commit anything. */
+    char  toast[48] = ""; int toast_t = 0;
 
     while (aptMainLoop()) {
         hidScanInput();
@@ -1028,7 +1064,15 @@ int main(void) {
             if (g_back_for != sel) { rebuild_back(&g_pos[sel]); g_back_for = sel; }
             load_detail(&g_pos[sel], sel);          /* small on the shelf, full in the hand */
         }
-        if ((kd & KEY_B) && held >= 0)            held = -1;       /* put it back */
+        if ((kd & KEY_B) && held >= 0)            held = -1;       /* put it back, no consequence */
+        if ((kd & KEY_Y) && held >= 0) {
+            /* the commitment. In the player this queues the download (catalogue) or starts
+             * playback (library); here it just reports what it would do. */
+            snprintf(toast, sizeof toast, "RENTED  %.28s", g_pos[held].name);
+            toast_t = 150;
+            held = -1;
+        }
+        if (toast_t > 0) toast_t--;
         hold_t += ((held >= 0) ? 0.14f : -0.14f);                  /* ~7 frames each way */
         if (hold_t > 1.0f) hold_t = 1.0f;
         if (hold_t < 0.0f) hold_t = 0.0f;
@@ -1057,24 +1101,42 @@ int main(void) {
          * spun you instead of sliding you sideways. Movement is now purely translation in the
          * direction you are facing, which is what "walk toward what I am looking at" means. */
         u32 kh = hidKeysHeld();
-        if (kh & KEY_DUP)    pitch += 0.035f;
-        if (kh & KEY_DDOWN)  pitch -= 0.035f;
         /* Pitch STAYS where you put it. It used to spring back to level when the d-pad was
          * released, which no first-person game does -- you look down at the bottom shelf and
          * it drifts off it while you are still reading. X snaps back to level instead. */
-        if (kd & KEY_X) pitch = 0.0f;
+        if (kd & KEY_X) { pitch = 0.0f; aim_lock = 0; }
         if (pitch >  0.55f) pitch =  0.55f;
         if (pitch < -0.55f) pitch = -0.55f;
-        if (held < 0) {
-            if (kh & KEY_DRIGHT) yaw -= 0.040f;              /* turning right lowers yaw */
-            if (kh & KEY_DLEFT)  yaw += 0.040f;
+        /* d-pad steps the SELECTION; the camera then eases round to centre it. Turning stays on
+         * the analog stick, so the two never fight over the same axis. */
+        if (held < 0 && sel >= 0 && (kd & (KEY_DLEFT | KEY_DRIGHT | KEY_DUP | KEY_DDOWN))) {
+            float rx = cosf(yaw), rz = -sinf(yaw);        /* camera right, on the floor plane */
+            int nsel = sel;
+            if (kd & KEY_DRIGHT) nsel = step_sel(sel,  rx, 0,  rz, cx, cz, EYE);
+            if (kd & KEY_DLEFT)  nsel = step_sel(sel, -rx, 0, -rz, cx, cz, EYE);
+            if (kd & KEY_DUP)    nsel = step_sel(sel, 0,  1, 0, cx, cz, EYE);
+            if (kd & KEY_DDOWN)  nsel = step_sel(sel, 0, -1, 0, cx, cz, EYE);
+            if (nsel != sel) { sel = nsel; aim_lock = 1; }
         }
         if (fabsf(fx) < 0.15f) fx = 0;
         if (fabsf(fy) < 0.15f) fy = 0;
         /* Single-stick, the way the console's own games do it: the pad's x axis TURNS you and
          * its y axis walks. Strafing is real but rare, so it sits on the shoulder buttons where
          * it costs nothing to ignore. */
+        if (fx != 0.0f) aim_lock = 0;                    /* touch the stick and you take over */
         yaw -= fx * 0.045f;
+        if (aim_lock && sel >= 0) {
+            /* ease onto the selected case rather than snapping: a snap in stereo is jarring */
+            float dx = g_pos[sel].x - cx, dz = g_pos[sel].z - cz;
+            float dy = g_pos[sel].y - EYE;
+            float want_yaw = atan2f(-dx, -dz);
+            float dyaw = want_yaw - yaw;
+            while (dyaw >  3.14159265f) dyaw -= 6.28318531f;
+            while (dyaw < -3.14159265f) dyaw += 6.28318531f;
+            yaw += dyaw * 0.22f;
+            float want_pitch = atan2f(dy, sqrtf(dx * dx + dz * dz));
+            pitch += (want_pitch - pitch) * 0.22f;
+        }
         float fwx = FWD * -sinf(yaw), fwz = FWD * -cosf(yaw);
         float rgx =  cosf(yaw),       rgz = -sinf(yaw);
         float strafe = ((kh & KEY_R) ? 1.0f : 0.0f) - ((kh & KEY_L) ? 1.0f : 0.0f);
@@ -1098,7 +1160,7 @@ int main(void) {
 
         /* what am I looking at? nearest poster ahead, within reach.
          * Frozen while a case is held: the selection IS the held case until it goes back. */
-        if (held < 0) {
+        if (held < 0 && !aim_lock) {
             /* Pick in THREE dimensions. Distance used to ignore y entirely, so the two rows of
              * a shelf were exactly equidistant and the first one in the array always won --
              * the bottom row could never be selected however you stood. Now the aim direction
@@ -1294,7 +1356,8 @@ int main(void) {
             if (q->desc[0]) panel_wrap(4, 19, q->desc);
             else            panel_set(4, q->hasinfo ? " (no description in the .nfo)"
                                                     : " (no .nfo for this one - poster only)");
-            panel_set(24, held >= 0 ? " [in hand]" : " A takes it off the shelf");
+            panel_set(24, held >= 0 ? " [in hand]   Y rents it   B puts it back"
+                                    : " A takes it off the shelf");
         } else {
             panel_set(0, " MOFLEX STORE  (prototype)");
             panel_fmt(2, " %d posters, %d with info", g_nposters, g_withinfo);
@@ -1306,9 +1369,10 @@ int main(void) {
             for (int i = 0; i < g_nsec && i < 8; i++)
                 panel_fmt(9 + i, "   %-16s %d", g_sec[i].name, g_sec[i].n);
         }
-        panel_set(26, held >= 0 ? " pad: turn / zoom     B put back"
-                                : " pad walk+look   L/R strafe   d-pad look");
-        panel_set(27, held >= 0 ? "" : " A take   X level   START exit");
+        panel_set(26, held >= 0 ? " pad: turn / zoom      Y rent   B back"
+                                : " pad walk+turn   d-pad: pick a case");
+        panel_set(27, held >= 0 ? "" : " A take   L/R strafe   X level   START exit");
+        if (toast_t > 0) panel_fmt(22, " %s", toast);
         panel_flush();
     }
 
