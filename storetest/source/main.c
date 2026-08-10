@@ -44,8 +44,14 @@
 #define TEX_BYTES (TEX_W * TEX_H * 2)
 #define VMAX    ((float)IMG_H / (float)TEX_H)
 
+/* moviedata/ holds BOTH a decoded poster and the description, under the same key:
+ *   <name>.p565  132x188 RGB565      <name>.nfo  "key: value" title/year/genres/desc
+ * art/ is the catalogue's poster cache -- posters only, no text -- so it is the fallback. */
+#define DATA_DIR  "sdmc:/moflex_player/moviedata"
 #define ART_DIR   "sdmc:/moflex_player/art"
 #define CACHE_DIR "sdmc:/moflex_player/store"
+#define SRC_W 132
+#define SRC_H 188
 
 #define MAX_POSTERS 48          /* one aisle; the real thing would stream */
 #define ROOM_TEX 64
@@ -57,11 +63,15 @@ typedef struct {
     int     ok;
     float   x, y, z;            /* centre, world space */
     float   ry;                 /* facing: +1 = normal points +x, -1 = -x */
-    char    name[64];
+    char    name[80];           /* title, or the filename when there is no .nfo */
+    char    genres[80];
+    char    desc[400];
+    int     year, runtime, hasinfo;
 } Poster;
 
 static Poster g_pos[MAX_POSTERS];
 static int    g_nposters = 0;
+static int    g_withinfo = 0;    /* how many came with a description */
 
 /* ---------------- 3DS texture tiling ----------------
  * Textures are stored in 8x8 tiles, and within a tile the pixels are in Morton (z-order):
@@ -109,6 +119,28 @@ static int build_cache_entry(const char *artpath, int sw, int sh, const char *ds
     return ok;
 }
 
+/* the player's own .nfo shape: plain "key: value" lines */
+static void read_nfo(const char *path, Poster *p) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return;
+    char line[512];
+    while (fgets(line, sizeof line, f)) {
+        char *nl = strpbrk(line, "\r\n"); if (nl) *nl = 0;
+        char *c = strchr(line, ':');
+        if (!c) continue;
+        *c = 0;
+        const char *k = line, *v = c + 1;
+        while (*v == ' ' || *v == '\t') v++;
+        if      (!strcasecmp(k, "title"))   snprintf(p->name,   sizeof p->name,   "%s", v);
+        else if (!strcasecmp(k, "genres"))  snprintf(p->genres, sizeof p->genres, "%s", v);
+        else if (!strcasecmp(k, "desc"))    snprintf(p->desc,   sizeof p->desc,   "%s", v);
+        else if (!strcasecmp(k, "year"))    p->year    = atoi(v);
+        else if (!strcasecmp(k, "runtime")) p->runtime = atoi(v);
+    }
+    fclose(f);
+    p->hasinfo = 1;
+}
+
 /* pretty name from "Some_Movie_2011_132x188.p565" */
 static void pretty(const char *fn, char *out, size_t cap) {
     char t[128];
@@ -119,34 +151,39 @@ static void pretty(const char *fn, char *out, size_t cap) {
     snprintf(out, cap, "%s", t);
 }
 
-static int load_posters(int *built) {
-    mkdir(CACHE_DIR, 0777);
-    DIR *d = opendir(ART_DIR);
+/* Scan one directory of .p565 posters. moviedata/ files are a fixed 132x188 and carry a sibling
+ * .nfo; art/ files put their size in the filename and have no text. */
+static int scan_dir(const char *dir, int fixed_w, int fixed_h, int with_nfo, int *built) {
+    DIR *d = opendir(dir);
     if (!d) return 0;
     struct dirent *e;
+    int added = 0;
     while ((e = readdir(d)) && g_nposters < MAX_POSTERS) {
         size_t L = strlen(e->d_name);
         if (L < 6 || strcmp(e->d_name + L - 5, ".p565")) continue;
-        int sw = 0, sh = 0;
-        const char *u = strrchr(e->d_name, '_');
-        if (!u || sscanf(u + 1, "%dx%d.p565", &sw, &sh) != 2) continue;
-        if (sw <= 0 || sh <= 0 || sw > 1024 || sh > 1024) continue;
-
-        char key[128];
+        int sw = fixed_w, sh = fixed_h;
+        if (!sw) {                                   /* art/: "<key>_<W>x<H>.p565" */
+            const char *u = strrchr(e->d_name, '_');
+            if (!u || sscanf(u + 1, "%dx%d.p565", &sw, &sh) != 2) continue;
+            if (sw <= 0 || sh <= 0 || sw > 1024 || sh > 1024) continue;
+        }
+        char key[160];
         snprintf(key, sizeof key, "%.*s", (int)(L - 5), e->d_name);
-        char cache[256], art[256];
+
+        char cache[400], src[400];
         snprintf(cache, sizeof cache, "%s/%s.t565", CACHE_DIR, key);
-        snprintf(art,   sizeof art,   "%s/%s", ART_DIR, e->d_name);
+        snprintf(src,   sizeof src,   "%s/%s", dir, e->d_name);
 
         FILE *cf = fopen(cache, "rb");
         if (!cf) {
-            if (!build_cache_entry(art, sw, sh, cache)) continue;
+            if (!build_cache_entry(src, sw, sh, cache)) continue;
             (*built)++;
             cf = fopen(cache, "rb");
             if (!cf) continue;
         }
         Poster *p = &g_pos[g_nposters];
-        if (!C3D_TexInit(&p->tex, TEX_W, TEX_H, GPU_RGB565)) { fclose(cf); continue; }
+        memset(p, 0, sizeof *p);
+        if (!C3D_TexInit(&p->tex, TEX_W, TEX_H, GPU_RGB565)) { fclose(cf); break; }  /* out of VRAM */
         /* straight into texture memory -- this is the whole reason the cache is pre-tiled */
         size_t got = fread(p->tex.data, 1, TEX_BYTES, cf);
         fclose(cf);
@@ -156,9 +193,24 @@ static int load_posters(int *built) {
         C3D_TexSetWrap(&p->tex, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
         p->ok = 1;
         pretty(e->d_name, p->name, sizeof p->name);
-        g_nposters++;
+        if (with_nfo) {
+            char nfo[400];
+            snprintf(nfo, sizeof nfo, "%s/%s.nfo", dir, key);
+            read_nfo(nfo, p);
+        }
+        if (p->hasinfo) g_withinfo++;
+        g_nposters++; added++;
     }
     closedir(d);
+    return added;
+}
+
+static int load_posters(int *built) {
+    mkdir(CACHE_DIR, 0777);
+    /* moviedata first: those entries come with a description, which is what the info panel
+     * is for. art/ only tops up the shelf when there is room left. */
+    scan_dir(DATA_DIR, SRC_W, SRC_H, 1, built);
+    scan_dir(ART_DIR,  0,     0,     0, built);
     return g_nposters;
 }
 
@@ -186,6 +238,29 @@ static void make_placeholder(Poster *p, int idx) {
     free(lin); free(til);
     p->ok = 1;
     snprintf(p->name, sizeof p->name, "Placeholder %d", idx + 1);
+}
+
+/* Print `t` word-wrapped into `cols`, starting at console row `row`, at most `maxrows` lines.
+ * The console is 40 columns on the bottom screen; a 400-character description is about ten
+ * lines, so it fits without scrolling. */
+static int wrap_print(int row, int cols, int maxrows, const char *t) {
+    char line[64];
+    int used = 0;
+    while (*t && used < maxrows) {
+        while (*t == ' ') t++;
+        if (!*t) break;
+        int n = (int)strlen(t);
+        if (n > cols) {
+            n = cols;
+            while (n > 0 && t[n] != ' ' && t[n] != 0) n--;   /* back up to a space */
+            if (n <= 0) n = cols;                            /* one long word: hard break */
+        }
+        snprintf(line, sizeof line, "%.*s", n, t);
+        printf("\x1b[%d;0H\x1b[2K %s", row + used, line);
+        t += n; used++;
+    }
+    for (int i = used; i < maxrows; i++) printf("\x1b[%d;0H\x1b[2K", row + i);
+    return used;
 }
 
 /* ---------------- room texture: one small repeating pattern, one draw call ---------------- */
@@ -507,22 +582,38 @@ int main(void) {
         frames++;
         if (osGetTime() - t0 >= 1000) { fps = frames; frames = 0; t0 = osGetTime(); }
 
-        printf("\x1b[0;0H\x1b[2K  MOFLEX STORE  (prototype)");
-        printf("\x1b[2;0H\x1b[2K  posters %d  (%d from art, %d placeholder)", g_nposters,
-               g_nposters - placeheld, placeheld);
-        printf("\x1b[3;0H\x1b[2K  cache built this run: %d   load %llums", built,
-               (unsigned long long)t_load);
-        printf("\x1b[4;0H\x1b[2K  VRAM tex: %d KB", (int)((g_nposters * TEX_BYTES) / 1024));
-        printf("\x1b[6;0H\x1b[2K  fps %2d   eyes %d   slider %.2f", fps,
-               (slider > 0.0f ? 2 : 1), slider);
-        printf("\x1b[8;0H\x1b[2K  %s", sel >= 0 ? g_pos[sel].name : "(nothing in reach)");
-        printf("\x1b[10;0H\x1b[2K  %s", held >= 0 ? "  [in hand]  B puts it back"
-                                                    : (sel >= 0 ? "  A takes it off the shelf" : ""));
-        printf("\x1b[12;0H\x1b[2K  circle pad: walk + strafe   d-pad: look");
-        printf("\x1b[13;0H\x1b[2K  A take  B back  X level  START exit");
-        printf("\x1b[15;0H\x1b[2K  yaw %+4.0f  pitch %+3.0f   fwd(%+.2f,%+.2f)",
-               yaw * 57.2958f, pitch * 57.2958f, fwx, fwz);
-        printf("\x1b[16;0H\x1b[2K  pos(%+.2f,%+.2f)", cx, cz);
+        /* The bottom screen is the info panel, the way the player shows a title -- not a second
+         * copy of the poster, which you are already looking at in 3D. It only falls back to the
+         * walking stats when nothing is in reach. */
+        if (sel >= 0) {
+            Poster *q = &g_pos[sel];
+            printf("\x1b[0;0H\x1b[2K %.38s", q->name);
+            char sub[64]; sub[0] = 0;
+            if (q->year && q->runtime)      snprintf(sub, sizeof sub, "%d   %d min", q->year, q->runtime);
+            else if (q->year)               snprintf(sub, sizeof sub, "%d", q->year);
+            else if (q->runtime)            snprintf(sub, sizeof sub, "%d min", q->runtime);
+            printf("\x1b[1;0H\x1b[2K %s", sub);
+            printf("\x1b[2;0H\x1b[2K %.38s", q->genres);
+            if (q->desc[0]) wrap_print(4, 38, 12, q->desc);
+            else            wrap_print(4, 38, 12, q->hasinfo ? "(no description in the .nfo)"
+                                                             : "(no .nfo for this one -- poster only)");
+            printf("\x1b[17;0H\x1b[2K %s", held >= 0 ? "[in hand]   B puts it back"
+                                                       : "A takes it off the shelf");
+        } else {
+            printf("\x1b[0;0H\x1b[2K MOFLEX STORE  (prototype)");
+            printf("\x1b[1;0H\x1b[2K");
+            printf("\x1b[2;0H\x1b[2K posters %d  (%d with info)", g_nposters, g_withinfo);
+            printf("\x1b[4;0H\x1b[2K cache built this run: %d   load %llums", built,
+                   (unsigned long long)t_load);
+            printf("\x1b[5;0H\x1b[2K texture: %d KB", (int)((g_nposters * TEX_BYTES) / 1024));
+            printf("\x1b[6;0H\x1b[2K fps %2d   eyes %d   slider %.2f", fps,
+                   (slider > 0.0f ? 2 : 1), slider);
+            for (int r = 7; r <= 17; r++) printf("\x1b[%d;0H\x1b[2K", r);
+            printf("\x1b[8;0H\x1b[2K walk up to a case to see its info");
+            printf("\x1b[15;0H\x1b[2K yaw %+4.0f  pitch %+3.0f  fwd(%+.2f,%+.2f)",
+                   yaw * 57.2958f, pitch * 57.2958f, fwx, fwz);
+            printf("\x1b[16;0H\x1b[2K pos(%+.2f,%+.2f)", cx, cz);
+        }
     }
 
     for (int i = 0; i < g_nposters; i++) if (g_pos[i].ok) C3D_TexDelete(&g_pos[i].tex);
