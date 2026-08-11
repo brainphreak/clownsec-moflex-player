@@ -91,14 +91,14 @@ static float g_depth = 24.0f;
 #define UNIT_DEPTH    1.0f
 #define UNIT_H        2.0f
 #define SIGN_Y        2.62f     /* hung low enough to clear the name across the back wall */
-#define ROW_Y0        0.60f     /* centre of the bottom row */
-#define ROW_DY        0.58f     /* row to row -- a case is 0.47 tall, so this is a shelf gap */
-#define CASE_W        0.33f     /* a case on the shelf; PITCH_FACE is this plus the gap */
+#define ROW_Y0        0.74f     /* centre of the bottom row */
+#define ROW_DY        0.68f     /* row to row -- a case is 0.47 tall, so this is a shelf gap */
+#define CASE_W        0.40f     /* a case on the shelf; PITCH_FACE is this plus the gap */
 #define MAX_SECTIONS  8
 #define SEC_COLS      3
 #define BAY_ROWS      2
 #define PITCH_SPINE   0.235f
-#define PITCH_FACE    0.35f
+#define PITCH_FACE    0.42f
 /* A genre with fewer than this is not worth a unit -- a bay holding five films reads as a shop
  * closing down -- so it merges into OTHER. One with more than BAY_MAX gets a SECOND unit
  * instead of hiding the rest behind a MORE case. */
@@ -219,7 +219,7 @@ enum { STORE_LIBRARY = 0, STORE_CATALOG = 1 };
 static int    g_mode = STORE_LIBRARY;
 static int    g_drawn = 0;      /* cases actually drawn last frame */
 static float  g_doorx = 0.0f;   /* where the door ended up, so the EXIT board follows it */
-static float  g_jukex = 0.0f, g_jukez = 0.0f;  /* the jukebox: stand beside it and press A */
+static float  g_jukex = 0.0f, g_jukez = 0.0f, g_jukerot = 0.0f;  /* stand beside it, press A */
 static int    g_covers_on = 1;  /* SELECT: face-out covers on/off, to isolate the stutter */
 static const char *verb(void) { return g_mode == STORE_CATALOG ? "QUEUE" : "PLAY"; }
 
@@ -1160,6 +1160,7 @@ static void make_white_tex(void) {
 #define WALLPOSTERS 16
 static C3D_Tex g_wall[WALLPOSTERS];
 static int     g_wall_ok[WALLPOSTERS];
+static int     g_wall_user[WALLPOSTERS];   /* 1 = supplied art, 0 = a cover borrowed off a shelf */
 static int     g_wall_n = 0;
 
 static void make_wall_posters(void) {
@@ -1199,7 +1200,7 @@ static void make_wall_posters(void) {
         C3D_TexFlush(&g_wall[i]);
         C3D_TexSetFilter(&g_wall[i], GPU_LINEAR, GPU_LINEAR);
         C3D_TexSetWrap(&g_wall[i], GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
-        g_wall_ok[i] = 1; g_wall_n++;
+        g_wall_ok[i] = 1; g_wall_user[i] = from_user; g_wall_n++;
     }
 }
 
@@ -1282,7 +1283,7 @@ static int step_sel(int cur, float dirx, float diry, float dirz, float cx, float
         float score = along + perp * 2.5f;
         /* and stay on the face you are actually looking at */
         float fx = g_pos[i].x - cx, fz = g_pos[i].z - cz;
-        if (fx * fx + fz * fz > 36.0f) continue;
+        if (fx * fx + fz * fz > 9.0f) continue;
         /* and on the side of the unit you are standing on: a case faces along its own ay, so
          * only one turned toward you may be taken. Reaching through the back of a bay and
          * lifting a case off the far side is not something a shop allows. */
@@ -1421,7 +1422,7 @@ static void build_sections(void) {
         int side = g_nsec < 6 ? g_nsec : 6;
         int rows = (side + 1) / 2;                  /* they fill in left/right pairs */
         if (rows < 1) rows = 1;
-        g_depth = 4.2f + rows * ROW_PITCH + 3.4f;   /* door end + aisles + the back run */
+        g_depth = 6.0f + rows * ROW_PITCH + 3.4f;   /* door end + aisles + the back run */
         if (g_depth < 13.0f) g_depth = 13.0f;
     }
 
@@ -1431,7 +1432,7 @@ static void build_sections(void) {
      * shop you can navigate. The back corners turn in to close the room off. */
     /* left column, right column, then a pair across the back -- spaced to the room's depth */
     float rowz[3];
-    for (int r = 0; r < 3; r++) rowz[r] = -4.6f - r * ROW_PITCH;
+    for (int r = 0; r < 3; r++) rowz[r] = -6.4f - r * ROW_PITCH;
     g_gapz[0] = (rowz[0] + rowz[1]) * 0.5f;   /* midway between rows: where wall art hangs */
     g_gapz[1] = (rowz[1] + rowz[2]) * 0.5f;
     /* left, right, left, right... A column-at-a-time order put the first three bays all on
@@ -1729,9 +1730,10 @@ static int build_room(void) {
     }
     /* The jukebox, opposite the counter. A cabinet with a lit arch on the front -- it is a
      * prop, so it is two boxes and a panel, but it is a landmark you can walk to and press. */
-    {   g_jukex = STORE_HX * 0.60f; g_jukez = -1.8f;
-        push_box(g_roomv, &n, g_jukex, 0.62f, g_jukez, 0.55f, 0.62f, 0.40f, 1, 1, 0.44f);
-        push_box(g_roomv, &n, g_jukex, 1.34f, g_jukez, 0.50f, 0.16f, 0.36f, 1, 1, 0.66f); }
+    {   g_jukex = STORE_HX - 1.05f; g_jukez = STORE_Z0 - 1.35f;   /* the front-right corner */
+        g_jukerot = -0.7854f;                                     /* turned in to the room */
+        push_box_rot(g_roomv, &n, g_jukex, 0.62f, g_jukez, 0.55f, 0.62f, 0.40f, g_jukerot, 1, 1, 0.44f);
+        push_box_rot(g_roomv, &n, g_jukex, 1.34f, g_jukez, 0.50f, 0.16f, 0.36f, g_jukerot, 1, 1, 0.66f); }
 
     /* the counter: a long wood block by the door, a register on top, and a returns box */
     { float ccx = -STORE_HX * 0.55f;                    /* the counter sits by the door */
@@ -1757,7 +1759,8 @@ static int build_room(void) {
      * -- but a bright white fitting under the ceiling reads as one, and it is what stops the
      * room feeling like a basement. Their own group, so they get a white texture instead of
      * the wood the shelving uses. */
-    push_box(g_roomv, &n, g_jukex, 1.10f, g_jukez - 0.42f, 0.34f, 0.26f, 0.03f, 1, 1, 1.0f);
+    push_box_rot(g_roomv, &n, g_jukex + sinf(g_jukerot) * 0.42f, 1.10f,
+                 g_jukez + cosf(g_jukerot) * 0.42f, 0.34f, 0.26f, 0.03f, g_jukerot, 1, 1, 1.0f);
     for (int r = 0; r < 3; r++)
         for (int c = 0; c < 2; c++) {
             float lz = -3.0f - r * 11.0f;
@@ -1773,7 +1776,7 @@ static int build_room(void) {
     g_nblock = 0;
     g_block[g_nblock].cx = g_jukex; g_block[g_nblock].cz = g_jukez;
     g_block[g_nblock].hx = 0.95f;   g_block[g_nblock].hz = 0.80f;
-    g_block[g_nblock].rot = 0.0f;   g_nblock++;
+    g_block[g_nblock].rot = g_jukerot; g_nblock++;
     for (int i = 0; i < g_nsec; i++) {
         g_block[g_nblock].cx = g_sec[i].cx; g_block[g_nblock].cz = g_sec[i].cz;
         g_block[g_nblock].hx = g_sec[i].len * 0.5f + 0.42f;
@@ -1878,11 +1881,19 @@ static void bake_spines(void) {
         }
         g_spine_count[c] = n - g_spine_first[c];
     }
-    /* and the faces, as one more range */
+    /* The blank clamshell, for the faces that have NO art of their own.
+     *
+     * It used to be baked for every face and the real cover drawn 0.01 in front of it. A fixed
+     * view-space nudge is not a fixed depth-buffer nudge -- the further off and the shallower
+     * the angle, the smaller the gap becomes -- so at a sharp angle down a shelf the two
+     * z-fought and the blank one won. That is the white. Anything with a cover is not drawn
+     * twice any more, which fixes it and saves the vertices. */
     g_front_first = n;
     for (int i = 0; i < g_nposters; i++) {
         Poster *p = &g_pos[i];
         if (!p->ok || !p->shown || !p->faceout) continue;
+        if (p->is_more) { if (g_restock_ok) continue; }
+        else { int ti = p->copy_of >= 0 ? p->copy_of : i; if (g_pos[ti].tex_ok) continue; }
         if (n + 6 > MAX_POSTERS * 6) break;
         bake_case(g_spinev, &n, &p->model, g_quadv);
     }
@@ -2016,8 +2027,8 @@ int main(void) {
 
     printf("\x1b[6;1H  MOFLEX STORE");
     prebuild_covers(&built);                /* the slow part, done where you are standing still */
+    load_restock();                         /* BEFORE: the bake needs to know it has art */
     build_sections();                       /* genres -> units -> poster positions */
-    load_restock();                         /* after: the restock cases are made in there */
     int music_n = music_init(MUSIC_DIR);    /* quiet if the folder is empty or dsp is missing */
     for (int i = 0; i < BANNERS; i++) load_banner(i);
     make_wall_posters();                    /* decorate: unit ends and the bare walls */
@@ -2225,8 +2236,13 @@ int main(void) {
                 if (!g_pos[i].shown) continue;
                 float dx = g_pos[i].x - cx, dy = g_pos[i].y - EYE, dz = g_pos[i].z - cz;
                 float d = sqrtf(dx * dx + dy * dy + dz * dz);
-                if (d > 3.2f || d < 1e-4f) continue;
-                if (sinf(g_pos[i].ay) * dx + cosf(g_pos[i].ay) * dz > 0.0f) continue;  /* front only */
+                if (d > 2.0f || d < 1e-4f) continue;
+                /* In FRONT of the bay, not merely on the right side of it. Out in the middle
+                 * of the aisle you are about 2.2 from a face, so this asks you to step up to
+                 * the shelf before anything locks on -- otherwise cases lit up as you walked
+                 * past a whole run of them. */
+                float fnx = sinf(g_pos[i].ay), fnz = cosf(g_pos[i].ay);
+                if (-(fnx * dx + fnz * dz) / d < 0.55f) continue;
                 float dot = (dx * ax + dy * ay + dz * az) / d;
                 if (dot < bestscore) continue;
                 bestscore = dot; sel = i;            /* the best-aimed case wins, not the nearest */
@@ -2372,23 +2388,26 @@ int main(void) {
                 /* A hair toward the camera so it sits on top of the blank one. Nudged in VIEW
                  * space -- after the multiply the translation is already in the camera's
                  * frame, so a world-space offset here would push it sideways instead. */
-                m.r[2].w += 0.010f;
+                m.r[2].w += 0.004f;   /* nothing to fight with now; just off the woodwork */
                 C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
                 bind_tex(more ? &g_restock : &g_pos[ti].tex, more ? g_restock_ok : g_pos[ti].tex_ok);
                 draw_range(0, 6);
                 drawn++;
             }
             if (eye == 0) g_drawn = drawn;
-            /* the selected case: proud of the shelf and turned to face you, wearing its real
-             * cover. This is the whole reason spines are affordable -- you only ever need one */
+            /* The highlighted case: eased forward a few millimetres and a touch larger, and
+             * that is all. It used to come 22 cm off the shelf and swing square to the camera,
+             * which reads as picking it up -- and picking it up is a button, not a glance. A
+             * highlight only has to say WHICH one, so it stays in the plane of the shelf. */
             if (sel >= 0 && sel != held && g_pos[sel].ok) {
                 Poster *q = &g_pos[sel];
                 float nx = sinf(q->ay), nz = cosf(q->ay);     /* the way this case faces */
                 C3D_Mtx m;
                 Mtx_Copy(&m, &view);
-                Mtx_Translate(&m, q->x + nx * 0.22f, q->y, q->z + nz * 0.22f, true);
-                Mtx_RotateY(&m, yaw, true);                  /* square to the viewer */
-                Mtx_Scale(&m, 0.40f, 0.40f * (float)DET_IMG_H / (float)DET_IMG_W, 1.0f);
+                Mtx_Translate(&m, q->x + nx * 0.035f, q->y, q->z + nz * 0.035f, true);
+                Mtx_RotateY(&m, q->ay, true);                /* stays square to the SHELF */
+                Mtx_Scale(&m, CASE_W * 1.10f,
+                          CASE_W * 1.10f * (float)IMG_H / (float)IMG_W, 1.0f);
                 C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
                 /* Its pool cover, which is already in hand -- NOT a fresh detail texture.
                  * Sweeping the stick changes the selection almost every frame, and loading the
@@ -2448,20 +2467,29 @@ int main(void) {
                 /* Every frame takes the NEXT unused poster and stops when they run out, rather
                  * than wrapping -- wrapping is why the same art turned up on a bay end and on
                  * the wall beside it. */
-                int wl[WALLPOSTERS], wn = 0;
-                for (int i = 0; i < WALLPOSTERS; i++) if (g_wall_ok[i]) wl[wn++] = i;
+                /* Two lists, because they are not interchangeable. Art someone went and made
+                 * belongs on a wall where it is looked at; a cover borrowed off a shelf is
+                 * filler and belongs on the end of a bay. Mixing them is how a poster ended up
+                 * on a bay end and again on the wall beside it. */
+                int wlU[WALLPOSTERS], wnU = 0, wlB[WALLPOSTERS], wnB = 0;
+                for (int i = 0; i < WALLPOSTERS; i++) {
+                    if (!g_wall_ok[i]) continue;
+                    if (g_wall_user[i]) wlU[wnU++] = i; else wlB[wnB++] = i;
+                }
+                int wu = 0, wb = 0;
                 /* the POSTER quad, not the sign quad: a cover fills only the top IMG_H of its
                  * texture box, so a full 0..1 quad shows it squashed up top over a black band */
                 set_buf(g_quadvbo, 6);
-                int w = 0;
                 for (int i = 0; i < g_nsec; i++) {
                     for (int e = 0; e < 2; e++) {
                         /* the inner end of a bay with an L return is up against the return --
                          * a poster there is half-buried by it */
                         int inner = (g_sec[i].cx < 0) ? 1 : 0;
                         if (g_sec[i].has_L && e == inner) continue;
-                        if (w >= wn) continue;
-                        int k = wl[w++];
+                        int k;                                   /* bay ends: borrowed first */
+                        if (wb < wnB)      k = wlB[wb++];
+                        else if (wu < wnU) k = wlU[wu++];
+                        else continue;
                         bind_tex(&g_wall[k], g_wall_ok[k]);
                         C3D_Mtx m; Mtx_Copy(&m, &view);
                         Mtx_Translate(&m, g_sec[i].cx + (e ? 1 : -1) * (g_sec[i].len * 0.5f + 0.03f),
@@ -2490,8 +2518,10 @@ int main(void) {
                 for (int i = 0; i < 6; i++) {
                     /* the back wall is only bare when there is no run of bays against it */
                     if (i >= 4 && g_nsec > 6) continue;
-                    if (w >= wn) continue;
-                    int k = wl[w++];
+                    int k;                                       /* walls: the supplied art */
+                    if (wu < wnU)      k = wlU[wu++];
+                    else if (wb < wnB) k = wlB[wb++];
+                    else continue;
                     bind_tex(&g_wall[k], g_wall_ok[k]);
                     C3D_Mtx m; Mtx_Copy(&m, &view);
                     Mtx_Translate(&m, WP[i][0], WP[i][1], WP[i][2], true);
@@ -2502,9 +2532,12 @@ int main(void) {
                 }
                 /* the wide ones: back wall below the name, and over the door on the way out */
                 {
-                    const float BN[BANNERS][4] = {   /* x, y, z, facing */
-                        { 0.0f, 1.72f, STORE_Z0 - STORE_DEPTH + 0.08f, 0.0f },
-                        { 0.0f, 2.95f, STORE_Z0 - 0.10f,               3.14159f },
+                    /* One low across the back, well under the name -- it used to run up into
+                     * it. One high on a side wall, above the bays where nothing else goes; it
+                     * was over the shopfront before, straight across the door and windows. */
+                    const float BN[BANNERS][5] = {   /* x, y, z, facing, half-width */
+                        { 0.0f,             1.18f, STORE_Z0 - STORE_DEPTH + 0.08f, 0.0f,    4.3f },
+                        { -STORE_HX + 0.10f, 2.90f, g_gapz[0],                     1.5708f, 3.6f },
                     };
                     int any = 0;
                     for (int i = 0; i < BANNERS; i++) if (g_banner_ok[i]) any = 1;
@@ -2512,7 +2545,8 @@ int main(void) {
                     for (int i = 0; i < BANNERS; i++) {
                         if (!g_banner_ok[i]) continue;
                         bind_tex(&g_banner[i], g_banner_ok[i]);
-                        float bw = STORE_HX * 0.62f; if (bw > 6.2f) bw = 6.2f;
+                        float bw = BN[i][4];
+                        if (bw > STORE_HX * 0.55f) bw = STORE_HX * 0.55f;
                         C3D_Mtx m; Mtx_Copy(&m, &view);
                         Mtx_Translate(&m, BN[i][0], BN[i][1], BN[i][2], true);
                         Mtx_RotateY(&m, BN[i][3], true);
