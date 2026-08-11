@@ -1675,6 +1675,49 @@ static void build_sections(void) {
         g_sec[k].cap  = BAY_ROWS * g_sec[k].per_row + g_sec[k].Lcap;
     }
 
+    /* An empty bay is given to whichever genre has the most it cannot show.
+     *
+     * The catch-all earns this regularly now that a film can be filed under any genre it
+     * lists: there is often nothing left over for it. Rather than stand there with a lit sign
+     * and no stock -- or vanish and leave a hole in the floor plan -- it becomes a second bay
+     * for whatever is most overflowing, taking the stock that was behind that bay's restock.
+     * The shop keeps its shape and one more genre stops needing a restock to be seen. */
+    for (int k = 0; k < g_nsec; k++) {
+        if (k == g_new_idx || g_sec[k].n > 0) continue;
+        int src = -1;
+        for (int j = 0; j < g_nsec; j++) {
+            if (j == k || j == g_new_idx || g_sec[j].n <= g_sec[j].cap) continue;
+            if (src < 0 || (g_sec[j].n - g_sec[j].cap) > (g_sec[src].n - g_sec[src].cap)) src = j;
+        }
+        if (src < 0) continue;                     /* nothing is overflowing: it will be hidden */
+        int moved = 0;
+        for (int i = 0; i < g_nposters && moved < g_sec[k].cap; i++) {
+            if (g_pos[i].is_more || g_pos[i].sect != src) continue;
+            if (g_pos[i].order < g_sec[src].cap) continue;   /* page one stays where it is */
+            g_pos[i].sect = k;
+            moved++;
+        }
+        if (!moved) continue;
+        g_sec[src].n = 0; g_sec[k].n = 0;          /* both runs renumber from the start */
+        for (int i = 0; i < g_nposters; i++) {
+            if (g_pos[i].is_more) continue;
+            if      (g_pos[i].sect == src) g_pos[i].order = g_sec[src].n++;
+            else if (g_pos[i].sect == k)   g_pos[i].order = g_sec[k].n++;
+        }
+        /* "HORROR" and "HORROR 2", however many times it has already happened */
+        char base[24]; snprintf(base, sizeof base, "%s", g_sec[src].name);
+        { size_t b = strlen(base);
+          while (b > 2 && base[b-1] >= '0' && base[b-1] <= '9') b--;
+          if (b > 1 && base[b-1] == ' ') base[b-1] = 0; }
+        int nth = 1;
+        for (int j = 0; j < g_nsec; j++)
+            if (j != k && !strncmp(g_sec[j].name, base, strlen(base))) nth++;
+        snprintf(g_sec[k].name, 24, "%.16s %d", base, nth);
+        if (g_sec[k].sign_ok) C3D_TexDelete(&g_sec[k].sign);   /* it said OTHER a moment ago */
+        make_sign_tex(&g_sec[k].sign, g_sec[k].name);
+        g_sec[k].sign_ok = 1;
+    }
+
     /* The new-releases rack takes the highest years first. Not a release date -- nothing on
      * the card carries one -- but the year is what a shop would have gone by anyway. */
     if (g_new_idx >= 0) {
