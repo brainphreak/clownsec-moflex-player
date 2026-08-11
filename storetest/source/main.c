@@ -89,7 +89,7 @@ static float g_depth = 24.0f;
 #define SIGN_Y        3.35f
 #define MAX_SECTIONS  8
 #define SEC_COLS      3
-#define BAY_ROWS      3
+#define BAY_ROWS      2
 #define PITCH_SPINE   0.235f
 #define PITCH_FACE    0.34f
 /* A genre with fewer than this is not worth a unit -- a bay holding five films reads as a shop
@@ -117,7 +117,14 @@ static float g_depth = 24.0f;
  * not -- and spines are what it falls back to when the run outgrows the shelf. So the pattern
  * is mostly F, in blocks, with short runs of spines between where the shelf ran out of room.
  * Twelve of sixteen face out. */
-#define FACEOUT_PATTERN "SSFFFFFFSSFFFFFF"   /* twelve of sixteen face out */
+/* Every case faces the aisle.
+ *
+ * The spines went. They were there to fit more titles into a bay for no texture cost, but a
+ * spine tells you nothing -- you have to turn it face-on to know what it is, which loads the
+ * cover anyway, so the saving was never real once you were browsing rather than walking past.
+ * A shelf of covers is what a rental shop looks like and it is what reads at a glance. The
+ * cost is fewer titles a bay, which is what the MORE case at the end of a section is for. */
+#define FACEOUT_PATTERN "F"
 #define FACEOUT_LEN     16
 /* Covers held at once, 16 KB apiece. Eight was timid -- an earlier build gave every one of
  * ninety-six cases its own texture and cost 1.5 MB, which this room has room for several times
@@ -558,6 +565,23 @@ static int     g_store_ok = 0, g_exit_ok = 0;
 static C3D_Tex g_pool[COVER_POOL];
 static int     g_pool_for[COVER_POOL];
 static int     g_pool_ok = 0;
+
+/* Every cover, tiled and ready, sitting in main RAM.
+ *
+ * This is the one that mattered. Opening a file on the SD card costs milliseconds -- not the
+ * microseconds an fread costs once it is open -- and the walk loop was paying that twice a
+ * frame. A 16 ms frame cannot afford even one. It is why the old build that loaded everything
+ * at startup walked smoothly and every streaming version since has not: the rescaling was
+ * never the problem, the open was.
+ *
+ * 16 KB a title, so the whole catalogue is a couple of megabytes. Past the budget a title
+ * falls back to reading from disk, so a catalogue too big to hold still works -- it just
+ * hitches the way it used to. */
+#define COVER_BYTES ((size_t)TEX_W * TEX_H * 2)
+#define RAM_BUDGET  (12u << 20)
+static unsigned char *g_ram = NULL;
+static int g_ram_of[MAX_POSTERS];       /* poster -> its slab in g_ram, or -1 */
+static int g_ram_n = 0;
 static void pool_init(void) {
     for (int i = 0; i < COVER_POOL; i++) {
         if (!C3D_TexInit(&g_pool[i], TEX_W, TEX_H, GPU_RGB565)) return;
@@ -587,6 +611,13 @@ static int pool_load(int idx, Poster *q) {
         if (who < 0 || g_pos[who].vis_frame != g_frame) victim = i;
     }
     if (victim < 0) return -1;
+    if (g_ram && g_ram_of[idx] >= 0) {              /* resident: a memcpy, and no file touched */
+        memcpy(g_pool[victim].data, g_ram + (size_t)g_ram_of[idx] * COVER_BYTES, COVER_BYTES);
+        q->cover_state = 1;
+        C3D_TexFlush(&g_pool[victim]);
+        g_pool_for[victim] = idx;
+        return victim;
+    }
     char small[400];
     snprintf(small, sizeof small, "%s/%s.w565", CACHE_DIR, q->key);
     FILE *f = fopen(small, "rb");
@@ -599,9 +630,9 @@ static int pool_load(int idx, Poster *q) {
         f = fopen(small, "rb");
         if (!f) { q->cover_state = -1; return -1; }
     }
-    size_t got = fread(g_pool[victim].data, 1, (size_t)TEX_W * TEX_H * 2, f);
+    size_t got = fread(g_pool[victim].data, 1, COVER_BYTES, f);
     fclose(f);
-    if (got != (size_t)TEX_W * TEX_H * 2) { q->cover_state = -1; return -1; }
+    if (got != COVER_BYTES) { q->cover_state = -1; return -1; }
     q->cover_state = 1;
     C3D_TexFlush(&g_pool[victim]);
     g_pool_for[victim] = idx;
@@ -617,20 +648,34 @@ static int pool_load(int idx, Poster *q) {
  * them all and skips straight through. */
 static void prebuild_covers(int *built) {
     char path[400];
+    for (int i = 0; i < MAX_POSTERS; i++) g_ram_of[i] = -1;
+    size_t cap = RAM_BUDGET / COVER_BYTES;
+    if (cap > (size_t)g_nposters) cap = (size_t)g_nposters;
+    g_ram = cap ? malloc(cap * COVER_BYTES) : NULL;
+    if (!g_ram) cap = 0;                          /* no room: fall back to reading from disk */
+    size_t used = 0;
+
     for (int i = 0; i < g_nposters; i++) {
         Poster *q = &g_pos[i];
         if (!q->ok || q->is_more || !q->srcpath[0]) continue;
         snprintf(path, sizeof path, "%s/%s.w565", CACHE_DIR, q->key);
         FILE *f = fopen(path, "rb");
-        if (f) { fclose(f); continue; }
-        if (build_cache_entry_sz(q->srcpath, q->src_w, q->src_h, path,
-                                 TEX_W, TEX_H, IMG_W, IMG_H)) (*built)++;
-        else q->cover_state = -1;
+        if (!f) {
+            if (!build_cache_entry_sz(q->srcpath, q->src_w, q->src_h, path,
+                                      TEX_W, TEX_H, IMG_W, IMG_H)) { q->cover_state = -1; continue; }
+            (*built)++;
+            f = fopen(path, "rb");
+            if (!f) { q->cover_state = -1; continue; }
+        }
+        if (used < cap && fread(g_ram + used * COVER_BYTES, 1, COVER_BYTES, f) == COVER_BYTES)
+            g_ram_of[i] = (int)used++;
+        fclose(f);
         if ((i & 7) == 0) {                       /* say what it is doing; this takes a while */
             printf("\x1b[8;1H  preparing covers  %d / %d   ", i + 1, g_nposters);
             gfxFlushBuffers(); gspWaitForVBlank();
         }
     }
+    g_ram_n = (int)used;
 }
 
 /* The full-resolution front of whatever is in your hand. One texture, filled on pickup. */
@@ -1204,7 +1249,7 @@ static void build_sections(void) {
      * FACEOUT_EVERY takes the wider pitch of a cover. */
     for (int k = 0; k < g_nsec; k++) {
         /* a face takes more shelf than a spine, so the mix decides how much a bay holds */
-        float avg = (4.0f * PITCH_SPINE + 12.0f * PITCH_FACE) / 16.0f;
+        float avg = PITCH_FACE;                  /* one width now: everything faces out */
         float need = ((float)g_sec[k].n / (float)BAY_ROWS) * avg + 0.5f;
         if (need < UNIT_LEN_MIN) need = UNIT_LEN_MIN;
         if (need > UNIT_LEN)     need = UNIT_LEN;
@@ -1363,9 +1408,9 @@ static void place_section(int k) {
         float pitch_ = p->faceout ? PITCH_FACE : PITCH_SPINE;
         int main_cap = BAY_ROWS * S->per_row;
         if (sl < main_cap) {                          /* the long side */
-            int row  = 2 - (sl / S->per_row), colp = sl % S->per_row;
+            int row  = (BAY_ROWS - 1) - (sl / S->per_row), colp = sl % S->per_row;
             if (row < 0) { p->shown = 0; continue; }
-            int rowfirst = (2 - row) * S->per_row;
+            int rowfirst = ((BAY_ROWS - 1) - row) * S->per_row;
             int inrow = total_slots - rowfirst;
             if (inrow > S->per_row) inrow = S->per_row;
             if (inrow < 1) inrow = 1;
@@ -1375,14 +1420,14 @@ static void place_section(int k) {
             float ca = cosf(S->rot), sa = sinf(S->rot);
             p->x  = S->cx + lx * ca + lz * sa;
             p->z  = S->cz - lx * sa + lz * ca;
-            p->y  = 0.46f + row * 0.62f;
+            p->y  = 0.62f + row * 0.78f;
             p->ay = S->rot + ((S->facedir < 0) ? C3D_Angle(0.5f) : 0.0f);
         } else {                                      /* round the corner, onto the return */
             if (!S->has_L) { p->shown = 0; continue; }
             int t = sl - main_cap;
-            int row = 2 - (t / S->Lper_row), colp = t % S->Lper_row;
+            int row = (BAY_ROWS - 1) - (t / S->Lper_row), colp = t % S->Lper_row;
             if (row < 0) { p->shown = 0; continue; }
-            int rowfirst = main_cap + (2 - row) * S->Lper_row;
+            int rowfirst = main_cap + ((BAY_ROWS - 1) - row) * S->Lper_row;
             int left = total_slots - rowfirst;
             if (left > S->Lper_row) left = S->Lper_row;
             if (left < 1) left = 1;
@@ -1391,7 +1436,7 @@ static void place_section(int k) {
             float outn  = (UNIT_DEPTH * 0.5f + 0.02f) * ((S->cx < 0) ? 1.0f : -1.0f);
             p->x  = S->Lx + outn;                     /* the return faces the walkway */
             p->z  = S->Lz + along;
-            p->y  = 0.46f + row * 0.62f;
+            p->y  = 0.62f + row * 0.78f;
             p->ay = S->Lay;
         }
         /* bake the model matrix now */
@@ -1898,10 +1943,6 @@ int main(void) {
             if (kd & KEY_DDOWN)  nsel = step_sel(sel, 0, -1, 0, cx, cz, EYE);
             if (nsel != sel) {
                 sel = nsel; aim_lock = 1;
-                /* load the cover as soon as it is SELECTED, not when it is picked up. The
-                 * highlighted case turns face-on, and until this it turned face-on wearing
-                 * the blank spine sheet -- white, with the real art appearing only on pickup. */
-                if (!g_pos[sel].is_more) load_detail(&g_pos[sel], sel);
                 if (held >= 0) {          /* holding one: swap it for the next along the shelf */
                     held = sel; spin = 0.0f;
                     rebuild_back(&g_pos[sel]); g_back_for = sel;
@@ -1976,9 +2017,6 @@ int main(void) {
                 if (dot < bestscore) continue;
                 bestscore = dot; sel = i;            /* the best-aimed case wins, not the nearest */
             }
-            /* Aiming with the stick has to load the cover as well. Only the d-pad path did, so
-             * a case picked out with the stick turned face-on wearing the blank clamshell. */
-            if (sel >= 0 && !g_pos[sel].is_more) load_detail(&g_pos[sel], sel);
         }
 
         float slider = osGet3DSliderState();
@@ -2099,16 +2137,17 @@ int main(void) {
             int need[COVER_POOL]; int nneed = 0;
             for (int i = 0; i < g_nposters; i++) {
                 if (!g_pos[i].ok || !g_pos[i].shown || !g_pos[i].faceout) continue;
-                if (i == held || i == sel) continue;
+                if (i == held) continue;
                 float dxs = g_pos[i].x - cx, dzs = g_pos[i].z - cz;
                 float d2 = dxs * dxs + dzs * dzs;
                 if (d2 > SPINE_VIEW * SPINE_VIEW) continue;
                 int slot = g_covers_on ? pool_find(i) : -1;
-                if (g_covers_on && d2 < 42.0f && g_pos[i].cover_state >= 0) {
+                if (g_covers_on && (i == sel || d2 < 42.0f) && g_pos[i].cover_state >= 0) {
                     g_pos[i].vis_frame = g_frame;         /* protected from eviction */
                     if (slot < 0 && nneed < COVER_POOL) need[nneed++] = i;
                 }
-                if (slot < 0) continue;                  /* no art yet: the blank front stands */
+                /* the selected one is wanted in the pool but drawn below, proud of the shelf */
+                if (slot < 0 || i == sel) continue;      /* no art yet: the blank front stands */
                 C3D_Mtx m;
                 Mtx_Multiply(&m, &view, &g_pos[i].model);
                 /* A hair toward the camera so it sits on top of the blank one. Nudged in VIEW
@@ -2120,12 +2159,12 @@ int main(void) {
                 draw_range(0, 6);
             }
             if (eye == 0) g_drawn = drawn;
-            /* Two a frame while there is a backlog, so a pool this size fills in about a
-             * second of walking rather than half a minute -- but still never more than two,
-             * because building one means reading and rescaling a file. */
+            /* Held in RAM a load is a 16 KB memcpy, so a shelf can fill in a single frame and
+             * you never see a blank front. Only the fallback path touches the card, and that
+             * one stays rationed at two. */
             if (eye == 0 && g_covers_on) {
-                int loads = 0;
-                for (int k = 0; k < nneed && loads < 2; k++)
+                int loads = 0, budget = g_ram_n > 0 ? COVER_POOL : 2;
+                for (int k = 0; k < nneed && loads < budget; k++)
                     if (pool_find(need[k]) < 0) {
                         if (pool_load(need[k], &g_pos[need[k]]) >= 0) loads++;
                         else break;              /* nothing evictable: leave it for next frame */
@@ -2143,7 +2182,13 @@ int main(void) {
                 Mtx_RotateY(&m, yaw, true);                  /* square to the viewer */
                 Mtx_Scale(&m, 0.40f, 0.40f * (float)DET_IMG_H / (float)DET_IMG_W, 1.0f);
                 C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
-                bind_tex((g_detail_ok && g_detail_for == sel) ? &g_detail : &g_spine[g_pos[sel].col], 1);
+                /* Its pool cover, which is already in hand -- NOT a fresh detail texture.
+                 * Sweeping the stick changes the selection almost every frame, and loading the
+                 * big sheet meant an SD open per frame while aiming. The full one is for the
+                 * case in your hand, where a single hitch on a deliberate button press is fine. */
+                int ps = pool_find(sel);
+                bind_tex((g_detail_ok && g_detail_for == sel) ? &g_detail
+                         : (ps >= 0 ? &g_pool[ps] : &g_front), 1);
                 draw_range(0, 6);
             }
 
