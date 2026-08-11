@@ -2074,9 +2074,13 @@ static int build_room(void) {
                                          UNIT_DEPTH * 0.5f + 0.42f,
                                          g_sec[i].Llen * 0.5f + 0.42f, 0.0f };
     }
+    /* The counter, and only the counter. There was a second blocker here for the returns bin
+     * that used to sit on the far end of it -- the bin went and its blocker stayed, so a metre
+     * and a half of open floor beside the counter still stopped you dead. And the counter's
+     * own was 3.0 wide against a counter of 2.05, so it reached out further than the wood did.
+     * Both now come from the same numbers the geometry uses. */
     { float ccx = -STORE_HX + 2.15f;
-      g_block[g_nblock++] = (Blocker){ ccx,        -1.6f, 3.0f, 1.1f, 0.0f };
-      g_block[g_nblock++] = (Blocker){ ccx + 3.6f, -1.6f, 1.3f, 1.0f, 0.0f }; }
+      g_block[g_nblock++] = (Blocker){ ccx, -1.6f, 2.05f + 0.42f, 0.7f + 0.42f, 0.0f }; }
     return n;
 }
 
