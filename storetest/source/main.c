@@ -104,6 +104,7 @@ static float g_depth = 24.0f;
  * closing down -- so it merges into OTHER. One with more than BAY_MAX gets a SECOND unit
  * instead of hiding the rest behind a MORE case. */
 #define BAY_MIN       4
+#define MAX_COPIES    2         /* extra facings of one title: three on the shelf, never twelve */
 #define BAY_MAX      32
 #define PER_ROW      22         /* the most cases a full-length bay holds in a row */
 /* One side only. Stocking both faces doubled what had to be drawn, hid half of it behind the
@@ -141,6 +142,7 @@ static float g_depth = 24.0f;
 
 /* Metadata is cheap -- about 1.2 KB a title, so even a thousand is well under 2 MB. What
  * costs is the cover bitmap at 16 KB each, and that is what cover_budget_bytes() rations. */
+#define MIN_STOCK   90      /* below this the catalogue cache is used to fill the room out */
 #define MAX_POSTERS 760
 #define ROOM_TEX 64
 
@@ -492,8 +494,19 @@ static int load_posters(int *built) {
     /* moviedata first: those entries come with a description, which is what the info panel
      * is for. art/ only tops up the shelf when there is room left. */
     g_from_data = scan_dir(DATA_DIR, SRC_W, SRC_H, 1, built);
-    g_from_art  = scan_dir(ART_DIR,  0,     0,     0, built);
     g_collapsed = collapse_same_title();
+    /* art/ is the CATALOGUE poster cache: pixels for films on the server, with no .nfo beside
+     * them and so no title, genres or category. They filled the shelves with cases that could
+     * not say what they were and could not be kept out of a section they did not belong in --
+     * a music video is only identifiable by its category, and they have none.
+     *
+     * The library is the stock. The cache is only drawn on when the library alone would not
+     * furnish a shop, because someone with a dozen films still deserves a room that looks
+     * open for business. */
+    if (g_nposters < MIN_STOCK) {
+        g_from_art   = scan_dir(ART_DIR, 0, 0, 0, built);
+        g_collapsed += collapse_same_title();
+    }
     return g_nposters;
 }
 
@@ -1714,7 +1727,10 @@ static void build_sections(void) {
         if (k == g_new_idx || g_sec[k].n > 0) continue;
         int src = -1;
         for (int j = 0; j < g_nsec; j++) {
-            if (j == k || j == g_new_idx || g_sec[j].n <= g_sec[j].cap) continue;
+            /* a third of a bay's worth over, or it is not worth a bay of its own: splitting
+             * two spare films onto their own shelf is what produced a bay of two covers */
+            if (j == k || j == g_new_idx) continue;
+            if (g_sec[j].n - g_sec[j].cap < g_sec[k].cap / 3) continue;
             if (src < 0 || (g_sec[j].n - g_sec[j].cap) > (g_sec[src].n - g_sec[src].cap)) src = j;
         }
         if (src < 0) continue;                     /* nothing is overflowing: it will be hidden */
@@ -1782,9 +1798,13 @@ static void build_sections(void) {
                 if (g_pos[i].ok && !g_pos[i].is_more && g_pos[i].sect != k &&
                     g_pos[i].copy_of < 0 && genre_listed(g_pos[i].genres, g_sec[k].name))
                     if (add_copy(i, k) < 0) break;
-        /* then round-robin over this section's own stock until the bay is full */
+        /* Then round-robin over this section's own stock, at most MAX_COPIES laps.
+         *
+         * Unbounded, a bay holding two films came out as twelve facings of two covers, which
+         * reads as a fault rather than as stock -- and made its restock look broken, because
+         * the next page was more of the same two. A part-empty shelf is the better failure. */
         int guard = 0;
-        while (g_sec[k].n < g_sec[k].cap && guard < MAX_POSTERS) {
+        while (g_sec[k].n < g_sec[k].cap && guard < MAX_COPIES) {
             int placed = 0;
             for (int i = 0; i < base && g_sec[k].n < g_sec[k].cap; i++) {
                 if (!g_pos[i].ok || g_pos[i].is_more || g_pos[i].sect != k) continue;
@@ -2956,6 +2976,7 @@ int main(void) {
                 if (q->desc[0]) panel_wrap(4, 17, q->desc);
                 else panel_set(4, q->hasinfo ? " (no description in the .nfo)"
                                              : " (no .nfo for this one - poster only)");
+            }
             if (held >= 0) panel_fmt(24, " in hand");
         } else {
             panel_set(0, " MOFLEX STORE  (prototype)");
