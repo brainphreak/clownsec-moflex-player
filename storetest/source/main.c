@@ -124,8 +124,8 @@ static float g_depth = 24.0f;
  * cover anyway, so the saving was never real once you were browsing rather than walking past.
  * A shelf of covers is what a rental shop looks like and it is what reads at a glance. The
  * cost is fewer titles a bay, which is what the MORE case at the end of a section is for. */
-#define FACEOUT_PATTERN "F"
-#define FACEOUT_LEN     16
+
+
 /* Covers held at once, 16 KB apiece. Eight was timid -- an earlier build gave every one of
  * ninety-six cases its own texture and cost 1.5 MB, which this room has room for several times
  * over. Thirty-two is half a megabyte and keeps most of what you can actually see in real art,
@@ -151,6 +151,8 @@ typedef struct {
                                  * could only express four directions and fell apart the moment
                                  * a unit sat at 45 degrees. */
     char    name[80];           /* title, or the filename when there is no .nfo */
+    char    category[32];       /* "Movies" / "TV Shows" / "Music" -- what marks a music video */
+    char    season[128];        /* "Show|S01" for an episode, "" for anything else */
     char    genres[80];
     char    desc[400];
     int     year, runtime, hasinfo;
@@ -277,12 +279,40 @@ static void read_nfo(const char *path, Poster *p) {
         while (*v == ' ' || *v == '\t') v++;
         if      (!strcasecmp(k, "title"))   snprintf(p->name,   sizeof p->name,   "%s", v);
         else if (!strcasecmp(k, "genres"))  snprintf(p->genres, sizeof p->genres, "%s", v);
+        else if (!strcasecmp(k, "category")) snprintf(p->category, sizeof p->category, "%s", v);
         else if (!strcasecmp(k, "desc"))    snprintf(p->desc,   sizeof p->desc,   "%s", v);
         else if (!strcasecmp(k, "year"))    p->year    = atoi(v);
         else if (!strcasecmp(k, "runtime")) p->runtime = atoi(v);
     }
     fclose(f);
     p->hasinfo = 1;
+}
+
+static int isdig(char c) { return c >= '0' && c <= '9'; }
+
+/* "Show - S01e05 - Episode Title" -> key "Show|S01", shelf name "Show  Season 01".
+ *
+ * A season is one case on the shelf, not thirteen identical ones. The tag is matched on the
+ * NAME rather than the metadata because a catalog match gives every episode of a season the
+ * same title and the same description -- the episode number only survives in the filename. */
+static int season_key(const char *nm, char *key, size_t kcap, char *show, size_t scap) {
+    for (const char *p = nm; p[0] && p[1] && p[2] && p[3] && p[4] && p[5]; p++) {
+        if ((p[0] != 'S' && p[0] != 's') || !isdig(p[1]) || !isdig(p[2])) continue;
+        if ((p[3] != 'E' && p[3] != 'e') || !isdig(p[4]) || !isdig(p[5])) continue;
+        int pre = (int)(p - nm);
+        while (pre > 0 && (nm[pre-1] == ' ' || nm[pre-1] == '-' ||
+                           nm[pre-1] == '_' || nm[pre-1] == '.')) pre--;      /* drop the " - " */
+        if (pre <= 0) return 0;
+        snprintf(key,  kcap, "%.*s|S%c%c", pre, nm, p[1], p[2]);
+        snprintf(show, scap, "%.*s  Season %c%c", pre, nm, p[1], p[2]);
+        return 1;
+    }
+    return 0;
+}
+
+/* music videos are not what anyone walks into a rental shop for */
+static int is_music(const Poster *p) {
+    return !strcasecmp(p->category, "Music") || !strncasecmp(p->genres, "Music", 5);
 }
 
 /* pretty name from "Some_Movie_2011_132x188.p565" */
@@ -346,6 +376,19 @@ static int scan_dir(const char *dir, int fixed_w, int fixed_h, int with_nfo, int
             char nfo[400];
             snprintf(nfo, sizeof nfo, "%s/%s.nfo", dir, base);
             read_nfo(nfo, p);
+        }
+        /* by here the .nfo has been read, so the category and the real title are known */
+        if (is_music(p)) { memset(p, 0, sizeof *p); continue; }
+        {   char sk[128], show[80];
+            if (season_key(key, sk, sizeof sk, show, sizeof show) ||
+                season_key(p->name, sk, sizeof sk, show, sizeof show)) {
+                int dup = 0;
+                for (int j = 0; j < g_nposters && !dup; j++)
+                    if (g_pos[j].season[0] && !strcasecmp(g_pos[j].season, sk)) dup = 1;
+                if (dup) { memset(p, 0, sizeof *p); continue; }   /* this season is already stocked */
+                snprintf(p->season, sizeof p->season, "%s", sk);
+                snprintf(p->name,   sizeof p->name,   "%s", show);
+            }
         }
         if (p->hasinfo) g_withinfo++;
         g_nposters++; added++;
@@ -587,15 +630,21 @@ static int     g_pool_ok = 0;
  * hitches the way it used to. */
 #define COVER_BYTES ((size_t)TEX_W * TEX_H * 2)
 #define RAM_BUDGET  (16u << 20)
-/* Ration the cover cache against what the console actually has free rather than a number
- * picked on a desktop: an Old 3DS under the homebrew launcher has far less headroom than a
- * New one, and running it out is a crash, not a slowdown. */
-static size_t cover_budget_bytes(void) {
-    u32 freeb = osGetMemRegionFree(MEMREGION_APPLICATION);
-    const u32 HEADROOM = 6u << 20;             /* textures, the room mesh, stdio, slack */
-    if (freeb <= HEADROOM) return 0;
-    size_t b = (size_t)(freeb - HEADROOM);
-    return b > RAM_BUDGET ? RAM_BUDGET : b;
+/* Ask for the whole catalogue's worth, and halve until the console agrees.
+ *
+ * osGetMemRegionFree(MEMREGION_APPLICATION) reports 0 for a .3dsx, which runs inside the
+ * homebrew launcher's allocation rather than a region of its own -- so a budget computed from
+ * it cached nothing at all and fell back to reading the card every frame. Probing needs no
+ * knowledge of who we are running under: if malloc returns it, it is ours. */
+static unsigned char *cover_alloc(size_t *bytes) {
+    size_t want = *bytes > RAM_BUDGET ? RAM_BUDGET : *bytes;
+    while (want >= COVER_BYTES) {
+        unsigned char *p = (unsigned char *)malloc(want);
+        if (p) { *bytes = want; return p; }
+        want /= 2;
+    }
+    *bytes = 0;
+    return NULL;
 }
 static unsigned char *g_ram = NULL;
 static int g_ram_of[MAX_POSTERS];       /* poster -> its slab in g_ram, or -1 */
@@ -671,9 +720,9 @@ static int pool_load(int idx, Poster *q) {
 static void prebuild_covers(int *built) {
     char path[400];
     for (int i = 0; i < MAX_POSTERS; i++) g_ram_of[i] = -1;
-    size_t cap = cover_budget_bytes() / COVER_BYTES;
-    if (cap > (size_t)g_nposters) cap = (size_t)g_nposters;
-    g_ram = cap ? malloc(cap * COVER_BYTES) : NULL;
+    size_t want = (size_t)g_nposters * COVER_BYTES;      /* all of them, if it will fit */
+    g_ram = cover_alloc(&want);
+    size_t cap = want / COVER_BYTES;
     if (!g_ram) cap = 0;                          /* no room: fall back to reading from disk */
     size_t used = 0;
 
@@ -1399,12 +1448,12 @@ static void row_offsets(int first_slot, int count) {
     float total = 0.0f;
     for (int i = 0; i < count; i++) {
         int sl = first_slot + i;
-        total += (FACEOUT_PATTERN[sl % FACEOUT_LEN] == 'F') ? PITCH_FACE : PITCH_SPINE;
+        total += PITCH_FACE;
     }
     float x = -total * 0.5f;
     for (int i = 0; i < count && i < 1024; i++) {
         int sl = first_slot + i;
-        float w = (FACEOUT_PATTERN[sl % FACEOUT_LEN] == 'F') ? PITCH_FACE : PITCH_SPINE;
+        float w = PITCH_FACE;
         g_slotx[i] = x + w * 0.5f;
         x += w;
     }
@@ -1430,8 +1479,7 @@ static void place_section(int k) {
         }
         p->shown = 1;
         /* every Nth one turns its face to the aisle */
-        p->faceout = (!p->is_more && FACEOUT_PATTERN[sl % FACEOUT_LEN] == 'F');
-        float pitch_ = p->faceout ? PITCH_FACE : PITCH_SPINE;
+        p->faceout = !p->is_more;
         int main_cap = BAY_ROWS * S->per_row;
         if (sl < main_cap) {                          /* the long side */
             int row  = (BAY_ROWS - 1) - (sl / S->per_row), colp = sl % S->per_row;
@@ -2367,9 +2415,7 @@ int main(void) {
             panel_fmt(22, " meta %uKB (%u B each)",
                       (unsigned)((size_t)g_nposters * sizeof(Poster) / 1024),
                       (unsigned)sizeof(Poster));
-            panel_fmt(23, " app free %uKB   linear %uKB",
-                      (unsigned)(osGetMemRegionFree(MEMREGION_APPLICATION) / 1024),
-                      (unsigned)(linearSpaceFree() / 1024));
+            panel_fmt(23, " linear free %uKB", (unsigned)(linearSpaceFree() / 1024));
             panel_fmt(5, " fps %2d   eyes %d", fps, (slider > 0.0f ? 2 : 1));
             panel_set(6, " walk up to a case for its info");
             panel_set(8, " sections");
