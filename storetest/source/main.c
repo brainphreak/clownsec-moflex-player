@@ -82,7 +82,7 @@ static float g_depth = 24.0f;
 /* A bay is BUILT TO ITS SECTION now, not to a fixed size: a quiet genre gets a short unit, a
  * busy one a long one. That is what a shop looks like, and it is the only way to have every
  * shelf full instead of a hall of half-empty carpet. These are the limits. */
-#define UNIT_LEN      9.0f
+#define UNIT_LEN      5.6f
 #define UNIT_LEN_MIN  3.0f
 #define UNIT_DEPTH    1.0f
 #define UNIT_H        2.0f
@@ -96,8 +96,8 @@ static float g_depth = 24.0f;
  * closing down -- so it merges into OTHER. One with more than BAY_MAX gets a SECOND unit
  * instead of hiding the rest behind a MORE case. */
 #define BAY_MIN       6
-#define BAY_MAX      78
-#define PER_ROW      34         /* the most spines a full-length bay can hold in a row */
+#define BAY_MAX      32
+#define PER_ROW      16         /* the most cases a full-length bay holds in a row */
 /* One side only. Stocking both faces doubled what had to be drawn, hid half of it behind the
  * unit, and put titles on a face you have to walk round the bay to reach. A shop merchandises
  * the side that faces the aisle. */
@@ -1251,7 +1251,11 @@ static void build_sections(void) {
     int other = 0;
     for (int i = 0; i < uniq && spare > 1; i++) {
         if (count[i] < BAY_MIN) { other += count[i]; continue; }
-        int units = (count[i] + BAY_MAX - 1) / BAY_MAX;
+        /* One bay per genre, however big it is. Splitting a big genre across two and three
+         * units was what grew the room faster than it grew the stock -- ten genres became
+         * seventeen bays and a lot of floor to walk. A genre that outgrows its bay restocks
+         * instead, which costs nothing while every title is already resident. */
+        int units = 1;
         if (units > spare - 1) units = spare - 1;
         for (int u = 0; u < units; u++) {
             int share = count[i] / units + ((u < count[i] % units) ? 1 : 0);
@@ -1358,7 +1362,7 @@ static void build_sections(void) {
     }
 
 
-    /* A bay that cannot hold its whole genre gets a MORE case in the top-left slot: pick it up,
+    /* A bay that cannot hold its whole genre gets a RESTOCK case in the top-left slot: pick it up,
      * press the verb, and the shelf turns over to the next lot. Only where it is needed -- a
      * bay with room to spare should not carry a control nobody has to press. */
     for (int k = 0; k < g_nsec; k++) {
@@ -1372,7 +1376,7 @@ static void build_sections(void) {
             memset(&g_pos[m], 0, sizeof g_pos[m]);
             g_pos[m].ok = 1; g_pos[m].is_more = 1; g_pos[m].sect = k;
             g_pos[m].col = 1;   /* a black case: the MORE marker stands out on a white run */
-            snprintf(g_pos[m].name, sizeof g_pos[m].name, "MORE %s", g_sec[k].name);
+            snprintf(g_pos[m].name, sizeof g_pos[m].name, "RESTOCK %s", g_sec[k].name);
             g_sec[k].more_idx = m;
         }
         int cap = g_sec[k].cap > 0 ? g_sec[k].cap : 1;
@@ -2347,8 +2351,8 @@ int main(void) {
                 if (hi > S->n) hi = S->n;
                 panel_fmt(1, " showing %d-%d of %d", lo, hi, S->n);
                 panel_fmt(2, " page %d of %d", S->page + 1, S->pages);
-                panel_set(4, " Take this one and press the button");
-                panel_set(5, " to restock the shelf with the next.");
+                panel_set(4, " Take this one and press the button to");
+                panel_set(5, " restock the shelf with the next lot.");
             } else if (q->desc[0]) panel_wrap(4, 19, q->desc);
             else            panel_set(4, q->hasinfo ? " (no description in the .nfo)"
                                                     : " (no .nfo for this one - poster only)");
