@@ -1769,6 +1769,34 @@ static void build_sections(void) {
         }
     }
 
+    /* Copies stand NEXT TO the title they are copies of.
+     *
+     * The fill goes round the shelf adding one copy of each title per lap, which spreads them
+     * evenly -- and left them scattered down the run, one here and one four slots along, which
+     * looks like a filing error rather than stock. A shop with four of a title puts the four
+     * together and that is the whole visual point of having them. So the run is renumbered by
+     * TITLE: each one keeps the position it first appeared at, and its copies follow it.
+     *
+     * Copies filed here off a secondary genre have their original on another shelf entirely;
+     * they group among themselves, wherever the first of them landed. */
+    {   static char done[MAX_POSTERS];
+        for (int k = 0; k < g_nsec; k++) {
+            memset(done, 0, sizeof done);
+            int next = 0;
+            for (int i = 0; i < g_nposters; i++) {
+                if (g_pos[i].is_more || g_pos[i].sect != k) continue;
+                int root = g_pos[i].copy_of >= 0 ? g_pos[i].copy_of : i;
+                if (done[root]) continue;
+                done[root] = 1;
+                for (int j = 0; j < g_nposters; j++) {
+                    if (g_pos[j].is_more || g_pos[j].sect != k) continue;
+                    int r = g_pos[j].copy_of >= 0 ? g_pos[j].copy_of : j;
+                    if (r == root) g_pos[j].order = next++;
+                }
+            }
+        }
+    }
+
     for (int k = 0; k < g_nsec; k++) {
         g_sec[k].more_idx = -1;
         g_sec[k].page = 0;
