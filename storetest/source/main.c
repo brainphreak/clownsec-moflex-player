@@ -327,15 +327,38 @@ static int isdig(char c) { return c >= '0' && c <= '9'; }
  * NAME rather than the metadata because a catalog match gives every episode of a season the
  * same title and the same description -- the episode number only survives in the filename. */
 static int season_key(const char *nm, char *key, size_t kcap, char *show, size_t scap) {
-    for (const char *p = nm; p[0] && p[1] && p[2] && p[3] && p[4] && p[5]; p++) {
-        if ((p[0] != 'S' && p[0] != 's') || !isdig(p[1]) || !isdig(p[2])) continue;
-        if ((p[3] != 'E' && p[3] != 'e') || !isdig(p[4]) || !isdig(p[5])) continue;
+    /* Two shapes, because releases use both and insisting on exactly SxxExx let whole seasons
+     * back onto the shelf one episode at a time:  S1E2 / S01E02 / s01e2, and 1x02 / 01x02.
+     * The season number is normalised to two digits so S1E2 and S01E05 land in the same bay. */
+    for (const char *p = nm; p[0]; p++) {
+        int se = -1, ep_at = 0;
+        if (p[0] == 'S' || p[0] == 's') {
+            int d = isdig(p[1]) ? (isdig(p[2]) ? 2 : 1) : 0;
+            if (d) {
+                const char *e = p + 1 + d;
+                if ((e[0] == 'E' || e[0] == 'e') && isdig(e[1])) {
+                    se = (d == 1) ? (p[1] - '0') : ((p[1] - '0') * 10 + (p[2] - '0'));
+                    ep_at = 1;
+                }
+            }
+        } else if (isdig(p[0])) {
+            int d = isdig(p[1]) ? 2 : 1;
+            const char *e = p + d;
+            if ((e[0] == 'x' || e[0] == 'X') && isdig(e[1])) {
+                /* only when it is a standalone token, or "2001" looks like season 20 */
+                if (p == nm || p[-1] == ' ' || p[-1] == '-' || p[-1] == '_' || p[-1] == '.') {
+                    se = (d == 1) ? (p[0] - '0') : ((p[0] - '0') * 10 + (p[1] - '0'));
+                    ep_at = 1;
+                }
+            }
+        }
+        if (!ep_at || se < 0) continue;
         int pre = (int)(p - nm);
         while (pre > 0 && (nm[pre-1] == ' ' || nm[pre-1] == '-' ||
                            nm[pre-1] == '_' || nm[pre-1] == '.')) pre--;      /* drop the " - " */
         if (pre <= 0) return 0;
-        snprintf(key,  kcap, "%.*s|S%c%c", pre, nm, p[1], p[2]);
-        snprintf(show, scap, "%.*s  Season %c%c", pre, nm, p[1], p[2]);
+        snprintf(key,  kcap, "%.*s|S%02d", pre, nm, se);
+        snprintf(show, scap, "%.*s  Season %02d", pre, nm, se);
         return 1;
     }
     return 0;
@@ -687,7 +710,7 @@ static void make_sign_tex2(C3D_Tex *t, const char *l1, const char *l2,
 }
 
 /* store name and fire-exit board */
-static C3D_Tex g_storesign, g_exitsign;
+static C3D_Tex g_storesign, g_exitsign, g_jukesign;
 static int     g_store_ok = 0, g_exit_ok = 0;
 
 /* Covers for the cases that stand face out.
@@ -1515,16 +1538,19 @@ static void build_sections(void) {
         {  0.0f, rowz[0], 0.0f },                  /* the centre column */
         {  0.0f, rowz[1], 0.0f },
         {  0.0f, rowz[2], 0.0f },
-        { -1.0f, -99.0f, 0.0f },                   /* -99 marks the back wall run */
-        {  1.0f, -99.0f, 0.0f },                   /* two only: a third would sit on the first */
+        {  1.0f, -99.0f, 0.0f },                   /* -99 marks the back wall run; the left
+                                                    * half of it belongs to NEW RELEASES */
     };
     for (int i = 0; i < g_nsec; i++) {
         /* the far end sits against the wall; the near end reaches toward the walkway by
          * however long this bay needs to be */
         if (i == g_new_idx) {
-            g_sec[i].cx  = -STORE_HX + g_sec[i].len * 0.5f + 1.5f;
-            g_sec[i].cz  = STORE_Z0 - STORE_DEPTH + 1.9f;
-            g_sec[i].rot = 0.7854f;                    /* 45 degrees, facing the middle */
+            /* Square to the room like everything else. On the diagonal its sign hung straight
+             * out while the bay ran at 45, and the end poster stood off the end of it -- the
+             * sign and poster code both assume a bay faces the way the room does. */
+            g_sec[i].cx  = -STORE_HX + g_sec[i].len * 0.5f + 1.4f;
+            g_sec[i].cz  = STORE_Z0 - STORE_DEPTH + 2.6f;
+            g_sec[i].rot = 0.0f;
             g_sec[i].facedir = 1.0f;
             g_sec[i].has_L = 0;
             make_sign_tex(&g_sec[i].sign, g_sec[i].name);
@@ -1550,7 +1576,10 @@ static void build_sections(void) {
         /* the return runs along z at the inner end, facing the walkway */
         float inner = g_sec[i].cx + ((g_sec[i].cx < 0) ? g_sec[i].len * 0.5f : -g_sec[i].len * 0.5f);
         g_sec[i].Llen = 3.2f;
-        g_sec[i].Lx   = inner;
+        /* Clear of the bay, not half inside it. Lx was the bay's own end, and the return is a
+         * unit deep, so half of it sat on top of the last column of cases -- which is why the
+         * restock case came out sliced down the middle. It starts where the bay stops. */
+        g_sec[i].Lx   = inner + ((g_sec[i].cx < 0) ? UNIT_DEPTH * 0.5f : -UNIT_DEPTH * 0.5f);
         g_sec[i].Lz   = g_sec[i].cz + 1.6f;
         g_sec[i].Lay  = (g_sec[i].cx < 0) ? C3D_Angle(0.25f) : C3D_Angle(-0.25f);
         make_sign_tex(&g_sec[i].sign, g_sec[i].name);
@@ -1857,11 +1886,12 @@ static int build_room(void) {
         push_box(g_roomv, &n, sx + 2.15f, 0.28f, sz + 0.55f, 0.34f, 0.28f, 0.30f, 1, 1, 0.42f); }
 
     /* the counter: a long wood block by the door, a register on top, and a returns box */
-    { float ccx = -STORE_HX * 0.55f;                    /* the counter sits by the door */
-      push_box(g_roomv, &n, ccx, 0.55f, -1.6f, 2.6f, 0.55f, 0.7f, 4, 1, 0.62f);
-      push_box(g_roomv, &n, ccx - 1.0f, 1.28f, -1.6f, 0.6f, 0.18f, 0.45f, 1, 1, 0.40f);
-      push_box(g_roomv, &n, ccx - 1.0f, 1.60f, -1.75f, 0.5f, 0.14f, 0.22f, 1, 1, 0.78f);
-      push_box(g_roomv, &n, ccx + 3.6f, 0.60f, -1.6f, 0.9f, 0.60f, 0.6f, 1, 1, 0.50f); }
+    /* Hard against the left wall, and shorter. It reached far enough into the room to foul
+     * the nearest bay, and the returns bin on its far end read as a second counter. */
+    { float ccx = -STORE_HX + 2.15f;
+      push_box(g_roomv, &n, ccx, 0.55f, -1.6f, 2.05f, 0.55f, 0.7f, 4, 1, 0.62f);
+      push_box(g_roomv, &n, ccx - 0.7f, 1.28f, -1.6f, 0.6f, 0.18f, 0.45f, 1, 1, 0.40f);
+      push_box(g_roomv, &n, ccx - 0.7f, 1.60f, -1.75f, 0.5f, 0.14f, 0.22f, 1, 1, 0.78f); }
     /* An L on the end of two bays: a short return that turns the corner, which is what stops a
      * rank of units reading as a row of identical slabs. */
     for (int i = 0; i < g_nsec; i++) {
@@ -1915,7 +1945,7 @@ static int build_room(void) {
                                          UNIT_DEPTH * 0.5f + 0.42f,
                                          g_sec[i].Llen * 0.5f + 0.42f, 0.0f };
     }
-    { float ccx = -STORE_HX * 0.55f;
+    { float ccx = -STORE_HX + 2.15f;
       g_block[g_nblock++] = (Blocker){ ccx,        -1.6f, 3.0f, 1.1f, 0.0f };
       g_block[g_nblock++] = (Blocker){ ccx + 3.6f, -1.6f, 1.3f, 1.0f, 0.0f }; }
     return n;
@@ -2125,6 +2155,8 @@ int main(void) {
     make_white_tex();
     make_front_tex();
     make_sign_tex2(&g_storesign, "CLOWNSEC VIDEO", "RENTALS", TH_BLUE, TH_YELLOW, TH_YELLOW);
+    /* the cabinet is a wooden box until it says what it is */
+    make_sign_tex_col(&g_jukesign, "MUSIC", TH_BLUE, TH_YELLOW, TH_YELLOW, 4);
     g_store_ok = 1;
     /* the exit board stays green: that one is a fire sign, not branding */
     make_sign_tex_col(&g_exitsign,  "EXIT",              0x0140, 0x07E0, TH_WHITE, 2);
@@ -2449,13 +2481,25 @@ int main(void) {
                   draw_range(0, 6); }
                 g_doorx = dx;                              /* the exit board hangs over it */
             }
+            if (g_store_ok) {                          /* MUSIC across the front of the cabinet */
+                bind_tex(&g_jukesign, 1);
+                C3D_Mtx m; Mtx_Copy(&m, &view);
+                Mtx_Translate(&m, g_jukex + sinf(g_jukerot) * 0.43f, 1.12f,
+                              g_jukez + cosf(g_jukerot) * 0.43f, true);
+                Mtx_RotateY(&m, g_jukerot, true);
+                Mtx_Scale(&m, 0.80f, 0.80f * (float)SIGN_H / (float)SIGN_W, 1.0f);
+                C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
+                draw_range(0, 6);
+            }
             if (g_store_ok) {                              /* name across the back wall */
                 bind_tex(&g_storesign, g_store_ok);
                 C3D_Mtx m; Mtx_Copy(&m, &view);
-                Mtx_Translate(&m, 0.0f, 3.42f, STORE_Z0 - STORE_DEPTH + 0.06f, true);
-                /* narrower than it was: the board is sized to its type now, not to the wall */
-                float nw = STORE_HX * 0.78f;
-                if (nw > 8.0f) nw = 8.0f;
+                Mtx_Translate(&m, 0.0f, 3.10f, STORE_Z0 - STORE_DEPTH + 0.06f, true);
+                /* Sized to its type, not to the wall -- and capped so the top of the board
+                 * stays under the ceiling. Once the bays were sized properly the room grew,
+                 * the board grew with it, and it went straight through the roof. */
+                float nw = STORE_HX * 0.55f;
+                if (nw > 7.0f) nw = 7.0f;
                 Mtx_Scale(&m, nw, nw * (float)SIGN2_H / (float)SIGN2_W, 1.0f);
                 C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
                 draw_range(0, 6);
@@ -2644,12 +2688,13 @@ int main(void) {
                     { -STORE_HX + 0.08f, 1.62f, g_gapz[1],  1.5708f },
                     {  STORE_HX - 0.08f, 1.62f, g_gapz[0], -1.5708f },
                     {  STORE_HX - 0.08f, 1.62f, g_gapz[1], -1.5708f },
-                    { -STORE_HX * 0.82f, 1.62f, STORE_Z0 - STORE_DEPTH + 0.08f, 0.0f },
-                    {  STORE_HX * 0.82f, 1.62f, STORE_Z0 - STORE_DEPTH + 0.08f, 0.0f },
+                    /* Flanking the name, and high enough to clear the bays standing in front
+                     * of the back wall -- at 0.82 of the half-width they were behind the back
+                     * run on one side and the staff door on the other. */
+                    { -5.2f, 2.75f, STORE_Z0 - STORE_DEPTH + 0.08f, 0.0f },
+                    {  5.2f, 2.75f, STORE_Z0 - STORE_DEPTH + 0.08f, 0.0f },
                 };
                 for (int i = 0; i < 6; i++) {
-                    /* the back wall is only bare when there is no run of bays against it */
-                    if (i >= 4 && g_nsec > 6) continue;
                     int k;                                       /* walls: the supplied art */
                     if (wu < wnU)      k = wlU[wu++];
                     else if (wb < wnB) k = wlB[wb++];
@@ -2669,7 +2714,9 @@ int main(void) {
                      * was over the shopfront before, straight across the door and windows. */
                     const float BN[BANNERS][5] = {   /* x, y, z, facing, half-width */
                         { 0.0f,             1.18f, STORE_Z0 - STORE_DEPTH + 0.08f, 0.0f,    4.3f },
-                        { -STORE_HX + 0.10f, 2.90f, g_gapz[0],                     1.5708f, 3.6f },
+                        /* higher up the wall: at 2.90 its bottom edge sat on the top of the
+                         * portrait poster hanging in the same gap */
+                        { -STORE_HX + 0.10f, 3.25f, g_gapz[0],                     1.5708f, 3.4f },
                     };
                     int any = 0;
                     for (int i = 0; i < BANNERS; i++) if (g_banner_ok[i]) any = 1;
@@ -2780,7 +2827,7 @@ int main(void) {
     if (g_mat_ok) { C3D_TexDelete(&g_carpet); C3D_TexDelete(&g_wood);
                     C3D_TexDelete(&g_glass);  C3D_TexDelete(&g_door); }
     for (int v = 0; v < OUTSIDES; v++) if (g_outside_ok[v]) C3D_TexDelete(&g_outside[v]);
-    if (g_store_ok) C3D_TexDelete(&g_storesign);
+    if (g_store_ok) { C3D_TexDelete(&g_storesign); C3D_TexDelete(&g_jukesign); }
     if (g_exit_ok)  C3D_TexDelete(&g_exitsign);
     if (g_covers_ok) C3D_TexDelete(&g_covers);
     if (g_spine_ok) for (int i = 0; i < SPINE_COLOURS; i++) C3D_TexDelete(&g_spine[i]);
