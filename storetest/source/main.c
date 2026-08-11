@@ -445,6 +445,15 @@ static int scan_dir(const char *dir, int fixed_w, int fixed_h, int with_nfo, int
         }
         /* by here the .nfo has been read, so the category and the real title are known */
         if (is_music(p)) { memset(p, 0, sizeof *p); continue; }
+        /* Television goes on its own shelf rather than in among the films. The category says
+         * so plainly, so it is put at the head of the genre list and the ordinary section
+         * machinery does the rest: it earns a bay like any other genre, and if there are too
+         * few episodes to fill one they fall back to Animation or Comedy as before. */
+        if (!strncasecmp(p->category, "TV", 2)) {
+            char g2[80]; snprintf(g2, sizeof g2, "%s", p->genres);
+            if (g2[0]) snprintf(p->genres, sizeof p->genres, "TV SHOWS, %.60s", g2);
+            else       snprintf(p->genres, sizeof p->genres, "TV SHOWS");
+        }
         {   char sk[128], show[80];
             if (season_key(key, sk, sizeof sk, show, sizeof show) ||
                 season_key(p->name, sk, sizeof sk, show, sizeof show)) {
@@ -453,7 +462,13 @@ static int scan_dir(const char *dir, int fixed_w, int fixed_h, int with_nfo, int
                     if (g_pos[j].season[0] && !strcasecmp(g_pos[j].season, sk)) dup = 1;
                 if (dup) { memset(p, 0, sizeof *p); continue; }   /* this season is already stocked */
                 snprintf(p->season, sizeof p->season, "%s", sk);
-                snprintf(p->name,   sizeof p->name,   "%s", show);
+                /* Only name it from the filename when the .nfo could not. A catalog match
+                 * gives every episode the show's own title already, and renaming it to
+                 * "<show> Season 01" broke the one thing that catches the episodes this tag
+                 * matcher cannot see -- a "Season 1 - All Episodes" file carries no SxxExx, so
+                 * it survived under the real title while the tagged ones had been renamed away
+                 * from it, and the show appeared two and three times over. */
+                if (!p->hasinfo) snprintf(p->name, sizeof p->name, "%s", show);
             }
         }
         if (p->hasinfo) g_withinfo++;
@@ -2966,8 +2981,8 @@ int main(void) {
                 if (hi > S->n) hi = S->n;
                 panel_fmt(1, " showing %d-%d of %d", lo, hi, S->n);
                 panel_fmt(2, " page %d of %d", S->page + 1, S->pages);
-                panel_set(4, " Take this one and press the button to");
-                panel_set(5, " restock the shelf with the next lot.");
+                panel_set(4, " A to take it, then Y to restock this");
+                panel_set(5, " shelf with the next lot.");
             } else {
                 /* what we know about it, so anything that slipped past a filter can be read
                  * off the screen instead of guessed at */
@@ -2977,7 +2992,11 @@ int main(void) {
                 else panel_set(4, q->hasinfo ? " (no description in the .nfo)"
                                              : " (no .nfo for this one - poster only)");
             }
-            if (held >= 0) panel_fmt(24, " in hand");
+            /* What to press, while it is in your hand and you are looking for it. "press the
+             * button" is not a button. */
+            if (held >= 0)
+                panel_fmt(24, " Y: %-10s   B: put it back",
+                          g_pos[held].is_more ? "RESTOCK" : verb());
         } else {
             panel_set(0, " MOFLEX STORE  (prototype)");
             panel_fmt(2, " %d cases, %d with info%s", g_nposters, g_withinfo,
