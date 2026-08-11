@@ -115,9 +115,9 @@ static float g_depth = 24.0f;
  * covers are what make a shelf browsable; the spines are what make it a shop. */
 /* How a shelf is merchandised. Face out is what a shop WANTS -- a cover sells, a spine does
  * not -- and spines are what it falls back to when the run outgrows the shelf. So the pattern
- * is mostly F, in blocks, with runs of spines between: three spines, four faces, two spines,
- * five faces, two spines. Sixteen slots, nine of them face out. */
-#define FACEOUT_PATTERN "SSSFFFFSSFFFFFSS"
+ * is mostly F, in blocks, with short runs of spines between where the shelf ran out of room.
+ * Twelve of sixteen face out. */
+#define FACEOUT_PATTERN "SSFFFFFFSSFFFFFF"   /* twelve of sixteen face out */
 #define FACEOUT_LEN     16
 /* Covers held at once, 16 KB apiece. Eight was timid -- an earlier build gave every one of
  * ninety-six cases its own texture and cost 1.5 MB, which this room has room for several times
@@ -606,6 +606,31 @@ static int pool_load(int idx, Poster *q) {
     C3D_TexFlush(&g_pool[victim]);
     g_pool_for[victim] = idx;
     return victim;
+}
+
+/* Build every scaled cover ONCE, up front, with the work on screen.
+ *
+ * Streaming was never the expensive part -- reading a 16 KB file is nothing. Building one is:
+ * read the source, rescale it, tile it, write it out. Doing that the first time you walk up to
+ * a shelf is exactly where it hurts, and it is why the shop felt worse than the old build that
+ * loaded everything at startup. Same work, paid where you are not moving. Second run finds
+ * them all and skips straight through. */
+static void prebuild_covers(int *built) {
+    char path[400];
+    for (int i = 0; i < g_nposters; i++) {
+        Poster *q = &g_pos[i];
+        if (!q->ok || q->is_more || !q->srcpath[0]) continue;
+        snprintf(path, sizeof path, "%s/%s.w565", CACHE_DIR, q->key);
+        FILE *f = fopen(path, "rb");
+        if (f) { fclose(f); continue; }
+        if (build_cache_entry_sz(q->srcpath, q->src_w, q->src_h, path,
+                                 TEX_W, TEX_H, IMG_W, IMG_H)) (*built)++;
+        else q->cover_state = -1;
+        if ((i & 7) == 0) {                       /* say what it is doing; this takes a while */
+            printf("\x1b[8;1H  preparing covers  %d / %d   ", i + 1, g_nposters);
+            gfxFlushBuffers(); gspWaitForVBlank();
+        }
+    }
 }
 
 /* The full-resolution front of whatever is in your hand. One texture, filled on pickup. */
@@ -1179,7 +1204,7 @@ static void build_sections(void) {
      * FACEOUT_EVERY takes the wider pitch of a cover. */
     for (int k = 0; k < g_nsec; k++) {
         /* a face takes more shelf than a spine, so the mix decides how much a bay holds */
-        float avg = (7.0f * PITCH_SPINE + 9.0f * PITCH_FACE) / 16.0f;
+        float avg = (4.0f * PITCH_SPINE + 12.0f * PITCH_FACE) / 16.0f;
         float need = ((float)g_sec[k].n / (float)BAY_ROWS) * avg + 0.5f;
         if (need < UNIT_LEN_MIN) need = UNIT_LEN_MIN;
         if (need > UNIT_LEN)     need = UNIT_LEN;
@@ -1741,6 +1766,8 @@ int main(void) {
         }
     }
 
+    printf("\x1b[6;1H  MOFLEX STORE");
+    prebuild_covers(&built);                /* the slow part, done where you are standing still */
     build_sections();                       /* genres -> units -> poster positions */
     make_wall_posters();                    /* decorate: unit ends and the bare walls */
     int roomn = build_room();               /* needs the unit positions */
