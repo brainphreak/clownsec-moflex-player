@@ -1094,6 +1094,13 @@ static void make_white_tex(void) {
  * store/wallN.p565 and it will be used in preference to a title from the shelves. */
 /* Enough distinct titles that the same face does not stare back at you from three walls. There
  * are up to ~20 places a poster can hang, so a few still repeat -- but never side by side. */
+/* Framed art is drawn about a metre wide, four times the size a case is, so it gets four
+ * times the pixels. The ratio is deliberately the same as a cover's -- 182/256 == 91/128 --
+ * so the poster quad's UVs fit both without a second quad. */
+#define WALL_TEX_W 128
+#define WALL_TEX_H 256
+#define WALL_IMG_W 128
+#define WALL_IMG_H 182
 #define WALLPOSTERS 16
 static C3D_Tex g_wall[WALLPOSTERS];
 static int     g_wall_ok[WALLPOSTERS];
@@ -1106,7 +1113,7 @@ static void make_wall_posters(void) {
          * here can never destroy it. */
         char user[400], small[400];
         snprintf(user,  sizeof user,  "%s/wall%d.p565", CACHE_DIR, i);
-        snprintf(small, sizeof small, "%s/wall%d.w565", CACHE_DIR, i);
+        snprintf(small, sizeof small, "%s/wall%d.x565", CACHE_DIR, i);
         int from_user = 0;
         { FILE *uf = fopen(user, "rb");
           if (uf) { fclose(uf); from_user = 1; } }
@@ -1118,20 +1125,21 @@ static void make_wall_posters(void) {
             if (pick >= g_nposters) pick = g_nposters - 1;
             q = &g_pos[pick];
             if (!q->srcpath[0]) continue;
-            snprintf(small, sizeof small, "%s/%s.w565", CACHE_DIR, q->key);
+            snprintf(small, sizeof small, "%s/%s.x565", CACHE_DIR, q->key);  /* framed, not shelf */
         }
         FILE *cf = fopen(small, "rb");
         if (!cf) {
             const char *src = from_user ? user : q->srcpath;
             int sw = from_user ? SRC_W : q->src_w, sh = from_user ? SRC_H : q->src_h;
-            if (!build_cache_entry_sz(src, sw, sh, small, TEX_W, TEX_H, IMG_W, IMG_H)) continue;
+            if (!build_cache_entry_sz(src, sw, sh, small,
+                                      WALL_TEX_W, WALL_TEX_H, WALL_IMG_W, WALL_IMG_H)) continue;
             cf = fopen(small, "rb");
             if (!cf) continue;
         }
-        if (!C3D_TexInit(&g_wall[i], TEX_W, TEX_H, GPU_RGB565)) { fclose(cf); continue; }
-        size_t got = fread(g_wall[i].data, 1, (size_t)TEX_W * TEX_H * 2, cf);
+        if (!C3D_TexInit(&g_wall[i], WALL_TEX_W, WALL_TEX_H, GPU_RGB565)) { fclose(cf); continue; }
+        size_t got = fread(g_wall[i].data, 1, (size_t)WALL_TEX_W * WALL_TEX_H * 2, cf);
         fclose(cf);
-        if (got != (size_t)TEX_W * TEX_H * 2) { C3D_TexDelete(&g_wall[i]); continue; }
+        if (got != (size_t)WALL_TEX_W * WALL_TEX_H * 2) { C3D_TexDelete(&g_wall[i]); continue; }
         C3D_TexFlush(&g_wall[i]);
         C3D_TexSetFilter(&g_wall[i], GPU_LINEAR, GPU_LINEAR);
         C3D_TexSetWrap(&g_wall[i], GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
