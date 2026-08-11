@@ -74,6 +74,8 @@
  * bays know their own lengths. A fixed room with variable bays left a hall of empty carpet up
  * the middle. */
 #define STORE_Z0      2.0f
+#define ROW_PITCH     5.4f      /* front-to-back spacing of the rows of bays */
+static float g_gapz[2] = { -7.3f, -12.7f };   /* midway between rows: where wall art hangs */
 static float g_hx    = 13.5f;
 static float g_depth = 24.0f;
 #define STORE_HX     g_hx
@@ -82,7 +84,7 @@ static float g_depth = 24.0f;
 /* A bay is BUILT TO ITS SECTION now, not to a fixed size: a quiet genre gets a short unit, a
  * busy one a long one. That is what a shop looks like, and it is the only way to have every
  * shelf full instead of a hall of half-empty carpet. These are the limits. */
-#define UNIT_LEN      5.6f
+#define UNIT_LEN      7.4f
 #define UNIT_LEN_MIN  3.0f
 #define UNIT_DEPTH    1.0f
 #define UNIT_H        2.0f
@@ -95,9 +97,9 @@ static float g_depth = 24.0f;
 /* A genre with fewer than this is not worth a unit -- a bay holding five films reads as a shop
  * closing down -- so it merges into OTHER. One with more than BAY_MAX gets a SECOND unit
  * instead of hiding the rest behind a MORE case. */
-#define BAY_MIN       6
+#define BAY_MIN       4
 #define BAY_MAX      32
-#define PER_ROW      16         /* the most cases a full-length bay holds in a row */
+#define PER_ROW      22         /* the most cases a full-length bay holds in a row */
 /* One side only. Stocking both faces doubled what had to be drawn, hid half of it behind the
  * unit, and put titles on a face you have to walk round the bay to reach. A shop merchandises
  * the side that faces the aisle. */
@@ -618,6 +620,30 @@ static int     g_store_ok = 0, g_exit_ok = 0;
  * nothing loads while you walk because nothing is left to load. */
 static int g_cov_n = 0;         /* how many got one before linear space ran out */
 
+/* One cover shared by every restock case, from store/restock.p565 (a 132x188 raw, the same
+ * shape the player caches its posters in). Without it they wear the blank clamshell. */
+static C3D_Tex g_restock;
+static int     g_restock_ok = 0;
+static void load_restock(void) {
+    char src[400], small[400];
+    snprintf(src,   sizeof src,   "%s/restock.p565", CACHE_DIR);
+    snprintf(small, sizeof small, "%s/restock.w565", CACHE_DIR);
+    FILE *f = fopen(small, "rb");
+    if (!f) {
+        if (!build_cache_entry_sz(src, SRC_W, SRC_H, small, TEX_W, TEX_H, IMG_W, IMG_H)) return;
+        f = fopen(small, "rb");
+        if (!f) return;
+    }
+    if (!C3D_TexInit(&g_restock, TEX_W, TEX_H, GPU_RGB565)) { fclose(f); return; }
+    size_t got = fread(g_restock.data, 1, (size_t)TEX_W * TEX_H * 2, f);
+    fclose(f);
+    if (got != (size_t)TEX_W * TEX_H * 2) { C3D_TexDelete(&g_restock); return; }
+    C3D_TexSetFilter(&g_restock, GPU_LINEAR, GPU_LINEAR);
+    C3D_TexSetWrap(&g_restock, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
+    C3D_TexFlush(&g_restock);
+    g_restock_ok = 1;
+}
+
 /* Every cover, tiled and ready, sitting in main RAM.
  *
  * This is the one that mattered. Opening a file on the SD card costs milliseconds -- not the
@@ -806,20 +832,22 @@ static void upload_tex(C3D_Tex *t, u16 *lin, int w, int h) {
 /* What you can see through the shopfront: a car park at night. Drawn once at 256x128 -- big
  * enough that a car reads as a car -- and shown whole on each window rather than tiled, so it
  * is a view rather than wallpaper. */
-static C3D_Tex g_outside;
-static int     g_outside_ok = 0;
+#define OUTSIDES 3              /* one street scene per window, so the view is not repeated */
+static C3D_Tex g_outside[OUTSIDES];
+static int     g_outside_ok[OUTSIDES];
 static void px(u16 *l, int W, int H, int x, int y, u16 c) {
     if (x >= 0 && x < W && y >= 0 && y < H) l[y * W + x] = c;
 }
 static void box2(u16 *l, int W, int H, int x0, int y0, int x1, int y1, u16 c) {
     for (int y = y0; y <= y1; y++) for (int x = x0; x <= x1; x++) px(l, W, H, x, y, c);
 }
-static void make_outside_tex(void) {
+static void make_outside_tex(int v) {
     const int W = 256, H = 128;
-    if (!C3D_TexInit(&g_outside, W, H, GPU_RGB565)) return;
+    C3D_Tex *T = &g_outside[v];
+    if (!C3D_TexInit(T, W, H, GPU_RGB565)) return;
     u16 *lin = (u16 *)malloc(W * H * 2);
     u16 *til = (u16 *)malloc(W * H * 2);
-    if (!lin || !til) { free(lin); free(til); C3D_TexDelete(&g_outside); return; }
+    if (!lin || !til) { free(lin); free(til); C3D_TexDelete(T); return; }
     const u16 sky = 0x0821, far_ = 0x18E3, lot = 0x2124, bay = 0x6B4D;
     const u16 lampglow = 0xFF98, win = 0xFDA0;
     const u16 carcol[4] = { 0x8000, 0x0011, 0x7BEF, 0xA145 };
@@ -827,11 +855,11 @@ static void make_outside_tex(void) {
     for (int y = 0; y < H; y++)                              /* sky, darker toward the top */
         for (int x = 0; x < W; x++)
             lin[y * W + x] = (y < 52) ? (u16)(sky + ((y / 14) << 5)) : lot;
-    for (int i = 0; i < 40; i++) px(lin, W, H, (i * 6197) % W, (i * 977) % 44, 0x8410);  /* stars */
+    for (int i = 0; i < 40; i++) px(lin, W, H, (i * 6197 + v * 331) % W, (i * 977 + v * 7) % 44, 0x8410);
 
     /* a low skyline with lit windows */
     for (int b = 0; b < 7; b++) {
-        int bx = 4 + b * 36, bw = 18 + (b * 7) % 14, bh = 12 + (b * 11) % 20;
+        int bx = 4 + b * 36 + v * 9, bw = 18 + ((b + v) * 7) % 14, bh = 12 + (b * 11 + v * 13) % 20;
         box2(lin, W, H, bx, 52 - bh, bx + bw, 51, far_);
         for (int wy = 52 - bh + 3; wy < 50; wy += 5)
             for (int wx = bx + 2; wx < bx + bw - 2; wx += 5)
@@ -842,9 +870,10 @@ static void make_outside_tex(void) {
     box2(lin, W, H, 0, 70, W - 1, 71, bay);
 
     /* cars: body, cabin, wheels, and a pair of lights */
-    for (int c = 0; c < 4; c++) {
-        int cx = 18 + c * 62, cy = 84 + (c % 2) * 10;
-        u16 col = carcol[c % 4];
+    for (int c = 0; c < 3 + (v & 1); c++) {
+        int cx = 18 + c * 62 + v * 21, cy = 84 + ((c + v) % 2) * 10;
+        u16 col = carcol[(c + v) % 4];
+        if (cx > W - 36) cx -= W - 36;
         box2(lin, W, H, cx, cy, cx + 34, cy + 11, col);          /* body */
         box2(lin, W, H, cx + 8, cy - 6, cx + 25, cy - 1, col);    /* cabin */
         box2(lin, W, H, cx + 10, cy - 5, cx + 23, cy - 2, 0x2965);/* glass */
@@ -855,7 +884,7 @@ static void make_outside_tex(void) {
     }
     /* lamp posts with a pool of light */
     for (int l = 0; l < 3; l++) {
-        int lx = 40 + l * 80;
+        int lx = 40 + l * 80 + v * 11;
         box2(lin, W, H, lx, 30, lx + 1, 74, 0x39E7);
         box2(lin, W, H, lx - 5, 28, lx + 6, 31, lampglow);
         for (int r = 1; r < 16; r++)
@@ -869,12 +898,12 @@ static void make_outside_tex(void) {
     for (int x = 0; x < W; x++) { px(lin, W, H, x, 0, 0x4208); px(lin, W, H, x, 1, 0x4208);
                                   px(lin, W, H, x, H-1, 0x4208); px(lin, W, H, x, H-2, 0x4208); }
     tile_rgb565(lin, til, W, H);
-    memcpy(g_outside.data, til, W * H * 2);
-    C3D_TexFlush(&g_outside);
-    C3D_TexSetFilter(&g_outside, GPU_LINEAR, GPU_LINEAR);
-    C3D_TexSetWrap(&g_outside, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
+    memcpy(T->data, til, W * H * 2);
+    C3D_TexFlush(T);
+    C3D_TexSetFilter(T, GPU_LINEAR, GPU_LINEAR);
+    C3D_TexSetWrap(T, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
     free(lin); free(til);
-    g_outside_ok = 1;
+    g_outside_ok[v] = 1;
 }
 
 static void make_materials(void) {
@@ -908,7 +937,7 @@ static void make_materials(void) {
     }
     upload_tex(&g_glass, lin, N, N);
     free(lin);
-    make_outside_tex();                                /* the car park, drawn at its own size */
+    for (int v = 0; v < OUTSIDES; v++) make_outside_tex(v);   /* a street per window */
     lin = (u16 *)malloc(N * N * 2);
     if (!lin) return;
     C3D_TexInit(&g_door, N, N, GPU_RGB565);            /* panelled door with a handle */
@@ -1164,6 +1193,10 @@ static int step_sel(int cur, float dirx, float diry, float dirz, float cx, float
         /* and stay on the face you are actually looking at */
         float fx = g_pos[i].x - cx, fz = g_pos[i].z - cz;
         if (fx * fx + fz * fz > 36.0f) continue;
+        /* and on the side of the unit you are standing on: a case faces along its own ay, so
+         * only one turned toward you may be taken. Reaching through the back of a bay and
+         * lifting a case off the far side is not something a shop allows. */
+        if (sinf(g_pos[i].ay) * fx + cosf(g_pos[i].ay) * fz > 0.0f) continue;
         (void)eye;
         if (score < bestscore) { bestscore = score; best = i; }
     }
@@ -1259,13 +1292,17 @@ static void build_sections(void) {
     {
         float maxlen = UNIT_LEN_MIN;
         for (int k = 0; k < g_nsec; k++) if (g_sec[k].len > maxlen) maxlen = g_sec[k].len;
-        g_hx = maxlen + 2.4f;                       /* bay + half the walkway */
-        if (g_hx < 8.5f)  g_hx = 8.5f;              /* narrower than this is a corridor */
+        /* The walkway is whatever gap is left between the two runs of bays, so the room comes
+         * out only as wide as it needs to be. It used to clear 2.4 a side off the longest bay
+         * with an 8.5 floor under it, which on a short bay left the whole middle of the shop
+         * as bare carpet. 1.5 a side is a walkway; the rest was floor to cross. */
+        g_hx = maxlen + 1.5f;
+        if (g_hx < 7.2f)  g_hx = 7.2f;
         int side = g_nsec < 6 ? g_nsec : 6;
         int rows = (side + 1) / 2;                  /* they fill in left/right pairs */
         if (rows < 1) rows = 1;
-        g_depth = 5.0f + rows * 6.5f + 4.0f;        /* door end + aisles + the back run */
-        if (g_depth < 14.0f) g_depth = 14.0f;
+        g_depth = 4.2f + rows * ROW_PITCH + 3.4f;   /* door end + aisles + the back run */
+        if (g_depth < 13.0f) g_depth = 13.0f;
     }
 
     /* Bays, the way a rental shop is actually laid out: units run OUT FROM THE WALLS with
@@ -1274,7 +1311,9 @@ static void build_sections(void) {
      * shop you can navigate. The back corners turn in to close the room off. */
     /* left column, right column, then a pair across the back -- spaced to the room's depth */
     float rowz[3];
-    for (int r = 0; r < 3; r++) rowz[r] = -5.0f - r * 6.5f;
+    for (int r = 0; r < 3; r++) rowz[r] = -4.6f - r * ROW_PITCH;
+    g_gapz[0] = (rowz[0] + rowz[1]) * 0.5f;   /* midway between rows: where wall art hangs */
+    g_gapz[1] = (rowz[1] + rowz[2]) * 0.5f;
     /* left, right, left, right... A column-at-a-time order put the first three bays all on
      * one wall, so a shop with three sections had a bare side. */
     const float PLAN[MAX_SECTIONS][3] = {          /* x sign, z, rotation */
@@ -1298,7 +1337,10 @@ static void build_sections(void) {
                     g_sec[i].cz = PLAN[i][1]; }
         g_sec[i].rot = PLAN[i][2];
         g_sec[i].facedir = ((i / 3) % 2) ? -1.0f : 1.0f;   /* bays face each other in pairs */
-        g_sec[i].has_L   = (i < 6) && (g_sec[i].len > UNIT_LEN_MIN + 1.0f) && !back;
+        /* An L return needs a bay long enough that turning the corner is worth it. The old
+         * threshold wanted a whole unit over the minimum, which after the stock was filtered
+         * no section reached -- so the shop had no returns in it at all. */
+        g_sec[i].has_L   = (i < 6) && (g_sec[i].len > UNIT_LEN_MIN + 0.4f) && !back;
         /* the return runs along z at the inner end, facing the walkway */
         float inner = g_sec[i].cx + ((g_sec[i].cx < 0) ? g_sec[i].len * 0.5f : -g_sec[i].len * 0.5f);
         g_sec[i].Llen = 3.2f;
@@ -1391,7 +1433,7 @@ static void place_section(int k) {
         }
         p->shown = 1;
         /* every Nth one turns its face to the aisle */
-        p->faceout = !p->is_more;
+        p->faceout = 1;                  /* the restock case faces out too -- it wears a cover */
         int main_cap = BAY_ROWS * S->per_row;
         if (sl < main_cap) {                          /* the long side */
             int row  = (BAY_ROWS - 1) - (sl / S->per_row), colp = sl % S->per_row;
@@ -1769,7 +1811,7 @@ int main(void) {
     make_spine_tex();
     make_white_tex();
     make_front_tex();
-    make_sign_tex_col(&g_storesign, "3DS VIDEO RENTALS", TH_BLUE, TH_YELLOW, TH_YELLOW, 1);
+    make_sign_tex_col(&g_storesign, "CLOWNSEC VIDEO RENTALS", TH_BLUE, TH_YELLOW, TH_YELLOW, 1);
     g_store_ok = 1;
     /* the exit board stays green: that one is a fire sign, not branding */
     make_sign_tex_col(&g_exitsign,  "EXIT",              0x0140, 0x07E0, TH_WHITE, 2);
@@ -1799,6 +1841,7 @@ int main(void) {
     printf("\x1b[6;1H  MOFLEX STORE");
     prebuild_covers(&built);                /* the slow part, done where you are standing still */
     build_sections();                       /* genres -> units -> poster positions */
+    load_restock();                         /* after: the restock cases are made in there */
     make_wall_posters();                    /* decorate: unit ends and the bare walls */
     int roomn = build_room();               /* needs the unit positions */
     g_roomvbo = g_roomv; g_quadvbo = g_quadv; g_signvbo = g_signv; g_boxvbo = g_boxv;
@@ -1998,6 +2041,7 @@ int main(void) {
                 float dx = g_pos[i].x - cx, dy = g_pos[i].y - EYE, dz = g_pos[i].z - cz;
                 float d = sqrtf(dx * dx + dy * dy + dz * dz);
                 if (d > 3.2f || d < 1e-4f) continue;
+                if (sinf(g_pos[i].ay) * dx + cosf(g_pos[i].ay) * dz > 0.0f) continue;  /* front only */
                 float dot = (dx * ax + dy * ay + dz * az) / d;
                 if (dot < bestscore) continue;
                 bestscore = dot; sel = i;            /* the best-aimed case wins, not the nearest */
@@ -2051,9 +2095,10 @@ int main(void) {
                  * once the shop shrank the windows overlapped each other and the door. */
                 const int FRONT_BAYS = 4, DOOR_BAY = 2;
                 float bw = (STORE_HX * 2.0f) / (float)FRONT_BAYS;
-                bind_tex(g_outside_ok ? &g_outside : &g_glass, 1);
                 for (int w = 0; w < FRONT_BAYS; w++) {
                     if (w == DOOR_BAY) continue;
+                    int v = w % OUTSIDES;             /* a different stretch of street each time */
+                    bind_tex(g_outside_ok[v] ? &g_outside[v] : &g_glass, 1);
                     float wx = -STORE_HX + bw * ((float)w + 0.5f);
                     C3D_Mtx m; Mtx_Copy(&m, &view);
                     Mtx_Translate(&m, wx, 1.95f, STORE_Z0 - 0.05f, true);
@@ -2122,15 +2167,19 @@ int main(void) {
             for (int i = 0; i < g_nposters; i++) {
                 if (!g_pos[i].ok || !g_pos[i].shown || !g_pos[i].faceout) continue;
                 if (i == held || i == sel) continue;   /* held and selected are drawn separately */
-                if (!g_covers_on || !g_pos[i].tex_ok) continue;
+                int more = g_pos[i].is_more;
+                if (!g_covers_on) continue;
+                if (!(more ? g_restock_ok : g_pos[i].tex_ok)) continue;
                 float dxs = g_pos[i].x - cx, dzs = g_pos[i].z - cz;
                 float d2 = dxs * dxs + dzs * dzs;
                 if (d2 > COVER_VIEW * COVER_VIEW) continue;
-                /* Distance alone is no longer the budget -- the cull is. Skip anything behind
-                 * the camera, and anything whose face is turned away: a cover is a flat quad,
-                 * so from behind it is an invisible draw call and nothing else. */
+                /* Behind the camera only. There WAS a second test here that skipped a case
+                 * whose face was turned away, and it is what made a shelf go white when you
+                 * looked along it from a sharp angle: the blank clamshell underneath comes
+                 * from one batched buffer with no such test, so at the angle where the two
+                 * disagreed the cover vanished and the blank one stayed. A cull may only
+                 * remove what nothing else is drawing. */
                 if (dxs * fwx + dzs * fwz < -0.5f) continue;
-                if (sinf(g_pos[i].ay) * dxs + cosf(g_pos[i].ay) * dzs > 0.0f) continue;
                 C3D_Mtx m;
                 Mtx_Multiply(&m, &view, &g_pos[i].model);
                 /* A hair toward the camera so it sits on top of the blank one. Nudged in VIEW
@@ -2138,7 +2187,7 @@ int main(void) {
                  * frame, so a world-space offset here would push it sideways instead. */
                 m.r[2].w += 0.010f;
                 C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
-                bind_tex(&g_pos[i].tex, g_pos[i].tex_ok);
+                bind_tex(more ? &g_restock : &g_pos[i].tex, more ? g_restock_ok : g_pos[i].tex_ok);
                 draw_range(0, 6);
                 drawn++;
             }
@@ -2158,7 +2207,8 @@ int main(void) {
                  * Sweeping the stick changes the selection almost every frame, and loading the
                  * big sheet meant an SD open per frame while aiming. The full one is for the
                  * case in your hand, where a single hitch on a deliberate button press is fine. */
-                bind_tex((g_detail_ok && g_detail_for == sel) ? &g_detail
+                bind_tex(g_pos[sel].is_more ? (g_restock_ok ? &g_restock : &g_front)
+                         : (g_detail_ok && g_detail_for == sel) ? &g_detail
                          : (g_pos[sel].tex_ok ? &g_pos[sel].tex : &g_front), 1);
                 draw_range(0, 6);
             }
@@ -2207,7 +2257,9 @@ int main(void) {
 
             /* framed posters: an end cap on each unit, and a few around the walls */
             if (g_wall_n > 0) {
-                set_buf(g_signvbo, 6);
+                /* the POSTER quad, not the sign quad: a cover fills only the top IMG_H of its
+                 * texture box, so a full 0..1 quad shows it squashed up top over a black band */
+                set_buf(g_quadvbo, 6);
                 int w = 0;
                 for (int i = 0; i < g_nsec; i++) {
                     for (int e = 0; e < 2; e++) {
@@ -2227,19 +2279,22 @@ int main(void) {
                         draw_range(0, 6);
                     }
                 }
-                /* on the walls, above the stock so they are not hidden by it */
-                /* not static: these hang off the walls, and the walls move with the room */
-                const float WP[8][4] = {          /* x, y, z, facing (radians about y) */
-                    { -STORE_HX + 0.08f, 2.70f, STORE_Z0 - STORE_DEPTH * 0.25f,  1.5708f },
-                    { -STORE_HX + 0.08f, 2.70f, STORE_Z0 - STORE_DEPTH * 0.70f,  1.5708f },
-                    {  STORE_HX - 0.08f, 2.70f, STORE_Z0 - STORE_DEPTH * 0.25f, -1.5708f },
-                    {  STORE_HX - 0.08f, 2.70f, STORE_Z0 - STORE_DEPTH * 0.70f, -1.5708f },
-                    { -STORE_HX * 0.55f, 2.70f, STORE_Z0 - STORE_DEPTH + 0.08f, 0.0f },
-                    {  STORE_HX * 0.55f, 2.70f, STORE_Z0 - STORE_DEPTH + 0.08f, 0.0f },
-                    { -STORE_HX * 0.20f, 2.70f, STORE_Z0 - STORE_DEPTH + 0.08f, 0.0f },
-                    {  STORE_HX * 0.20f, 2.70f, STORE_Z0 - STORE_DEPTH + 0.08f, 0.0f },
+                /* On the side walls at eye height, in the GAPS between the rows of bays. Hung
+                 * up near the ceiling they read as a border rather than as stock, and at their
+                 * old height the bays covered the wall anyway. g_gapz carries the midpoints,
+                 * so these follow the layout when it changes.
+                 *
+                 * The back wall carries two, low and wide apart: four of them at 2.70 sat
+                 * straight over the shop name. */
+                const float WP[6][4] = {          /* x, y, z, facing (radians about y) */
+                    { -STORE_HX + 0.08f, 1.62f, g_gapz[0],  1.5708f },
+                    { -STORE_HX + 0.08f, 1.62f, g_gapz[1],  1.5708f },
+                    {  STORE_HX - 0.08f, 1.62f, g_gapz[0], -1.5708f },
+                    {  STORE_HX - 0.08f, 1.62f, g_gapz[1], -1.5708f },
+                    { -STORE_HX * 0.80f, 1.62f, STORE_Z0 - STORE_DEPTH + 0.08f, 0.0f },
+                    {  STORE_HX * 0.80f, 1.62f, STORE_Z0 - STORE_DEPTH + 0.08f, 0.0f },
                 };
-                for (int i = 0; i < 8; i++) {
+                for (int i = 0; i < 6; i++) {
                     int k = (w++) % WALLPOSTERS;
                     if (!g_wall_ok[k]) continue;
                     bind_tex(&g_wall[k], g_wall_ok[k]);
@@ -2339,7 +2394,7 @@ int main(void) {
     C3D_TexDelete(&g_room);
     if (g_mat_ok) { C3D_TexDelete(&g_carpet); C3D_TexDelete(&g_wood);
                     C3D_TexDelete(&g_glass);  C3D_TexDelete(&g_door); }
-    if (g_outside_ok) C3D_TexDelete(&g_outside);
+    for (int v = 0; v < OUTSIDES; v++) if (g_outside_ok[v]) C3D_TexDelete(&g_outside[v]);
     if (g_store_ok) C3D_TexDelete(&g_storesign);
     if (g_exit_ok)  C3D_TexDelete(&g_exitsign);
     if (g_covers_ok) C3D_TexDelete(&g_covers);
@@ -2347,6 +2402,7 @@ int main(void) {
     if (g_white_ok)  C3D_TexDelete(&g_white);
     if (g_front_ok)  C3D_TexDelete(&g_front);
     for (int i = 0; i < g_nposters; i++) if (g_pos[i].tex_ok) C3D_TexDelete(&g_pos[i].tex);
+    if (g_restock_ok) C3D_TexDelete(&g_restock);
     for (int i = 0; i < WALLPOSTERS; i++) if (g_wall_ok[i]) C3D_TexDelete(&g_wall[i]);
     if (g_back_ok) C3D_TexDelete(&g_back);
     if (g_detail_ok) C3D_TexDelete(&g_detail);
