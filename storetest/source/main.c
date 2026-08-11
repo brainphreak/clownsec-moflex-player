@@ -610,8 +610,7 @@ static int     g_store_ok = 0, g_exit_ok = 0;
 /* Covers for the cases that stand face out.
  *
  * A shelf of nothing but spines is unbrowsable -- you want a run of edges, then a cover, then
- * more edges, the way a shop merchandises. Every FACEOUT_EVERY'th case turns its face to the
- * aisle, and the nearest few of those get a real cover from this pool. Eight at 64x128 is
+ * Every case faces the aisle, and the nearest of them get a real cover from this pool. Eight at 64x128 is
  * 128 KB, and one is loaded per frame so walking down an aisle never hitches. */
 static C3D_Tex g_pool[COVER_POOL];
 static int     g_pool_for[COVER_POOL];
@@ -1320,8 +1319,7 @@ static void build_sections(void) {
     g_nsec++;
     for (int k = 0; k < g_nsec; k++) g_sec[k].n = 0;   /* recounted when titles are assigned */
 
-    /* Build each bay to its contents. A row holds `len / pitch` cases; three rows, and one in
-     * FACEOUT_EVERY takes the wider pitch of a cover. */
+    /* Build each bay to its contents: a row holds `len / PITCH_FACE` cases, BAY_ROWS of them. */
     for (int k = 0; k < g_nsec; k++) {
         /* a face takes more shelf than a spine, so the mix decides how much a bay holds */
         float avg = PITCH_FACE;                  /* one width now: everything faces out */
