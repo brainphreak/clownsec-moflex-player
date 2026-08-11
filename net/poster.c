@@ -63,6 +63,20 @@ int poster_decode_file(const char *path, u16 *out, int pw, int ph) {
     return 1;
 }
 
+void poster_save_meta(const char *cache_key, const char *nfo_text) {
+    if (!cache_key || !cache_key[0] || !nfo_text || !nfo_text[0]) return;
+    char safe[128]; sanitize(cache_key, safe, sizeof safe);
+    char path[256]; snprintf(path, sizeof path, "%s/%s.nfo", ART_DIR, safe);
+    FILE *ex = fopen(path, "rb");
+    if (ex) { fclose(ex); return; }                 /* already written: do not churn the card */
+    mkdir("sdmc:/moflex_player", 0777);
+    mkdir(ART_DIR, 0777);
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    fwrite(nfo_text, 1, strlen(nfo_text), f);
+    fclose(f);
+}
+
 int poster_get(const char *art_url, const char *cache_key, u16 *out, int pw, int ph) {
     if (!art_url || !art_url[0]) return 0;
     size_t need = (size_t)pw * ph * sizeof(u16);

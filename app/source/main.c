@@ -1101,6 +1101,7 @@ static void browser_show_top(int is_dir, const char *name, const char *fullpath)
  * poster download/decode; a worker thread does it and the UI just polls for the result). ---- */
 static volatile int pw_run = 0, pw_req = -1, pw_done = -2, pw_ok = 0;
 static char      pw_url[256], pw_key[NAMELEN];
+static char      pw_nfo[1024];   /* the entry's metadata, written beside the poster it caches */
 static u16      *pw_buf = NULL;
 static LightLock pw_lock;
 static Thread    pw_thread = NULL;
@@ -1108,12 +1109,15 @@ static Thread    pw_thread = NULL;
 static void pw_fn(void *arg) {
     (void)arg;
     while (pw_run) {
-        int id; char url[256], key[NAMELEN];
+        int id; char url[256], key[NAMELEN], nfo[1024];
         LightLock_Lock(&pw_lock);
         id = pw_req; snprintf(url, sizeof url, "%s", pw_url); snprintf(key, sizeof key, "%s", pw_key);
+        snprintf(nfo, sizeof nfo, "%s", pw_nfo);
         LightLock_Unlock(&pw_lock);
         if (id < 0 || id == pw_done) { svcSleepThread(12000000); continue; }   /* nothing new -> idle */
         int ok = url[0] && pw_buf && poster_get(url, key, pw_buf, POSTER_W, POSTER_H);
+        /* the sidecar goes down here, on this thread, so browsing never waits on a card write */
+        if (ok) poster_save_meta(key, nfo);
         LightLock_Lock(&pw_lock);
         if (pw_req == id) { pw_ok = ok; pw_done = id; }   /* publish only if still the wanted selection */
         LightLock_Unlock(&pw_lock);
@@ -1129,11 +1133,24 @@ static void pw_stop(void) {
     if (!pw_thread) return;
     pw_run = 0; threadJoin(pw_thread, 2000000000LL); threadFree(pw_thread); pw_thread = NULL;
 }
-static void pw_request(int id, const char *url, const char *key) {
+static void pw_request(int id, const char *url, const char *key, const CatEntry *e) {
     LightLock_Lock(&pw_lock);
     pw_req = id;
     snprintf(pw_url, sizeof pw_url, "%s", url ? url : "");
     snprintf(pw_key, sizeof pw_key, "%s", key ? key : "");
+    pw_nfo[0] = 0;
+    if (e) {                                  /* same "key: value" shape movieinfo writes */
+        const char *title = e->title[0] ? e->title : e->name;
+        int n = 0;
+        n += snprintf(pw_nfo + n, sizeof pw_nfo - n, "title: %s\n", title);
+        if (e->year)        n += snprintf(pw_nfo + n, sizeof pw_nfo - n, "year: %d\n", e->year);
+        if (e->runtime)     n += snprintf(pw_nfo + n, sizeof pw_nfo - n, "runtime: %d\n", e->runtime);
+        if (e->category[0]) n += snprintf(pw_nfo + n, sizeof pw_nfo - n, "category: %s\n", e->category);
+        if (e->genres[0])   n += snprintf(pw_nfo + n, sizeof pw_nfo - n, "genres: %s\n", e->genres);
+        if (e->is3d >= 0)   n += snprintf(pw_nfo + n, sizeof pw_nfo - n, "3d: %s\n", e->is3d ? "yes" : "no");
+        if (e->desc[0])     n += snprintf(pw_nfo + n, sizeof pw_nfo - n, "desc: %s\n", e->desc);
+        if (n >= (int)sizeof pw_nfo) pw_nfo[sizeof pw_nfo - 1] = 0;
+    }
     LightLock_Unlock(&pw_lock);
 }
 
@@ -1885,7 +1902,7 @@ cb_rebuild:;   /* X-search inside the list jumps back here with filt_search set 
         if (s_qtoast_t > 0 && --s_qtoast_t == 0) redraw = 1;   /* toast expired -> repaint without it */
         if (csel != shown) { redraw = 1; phave = 0; settle = 0; requested = 0; }   /* moved -> drop poster */
         /* debounced request to the background loader, then poll -- scrolling never blocks on a poster */
-        if (!phave && !requested && cat[idx[csel]].art[0] && ++settle >= 6) { pw_request(idx[csel], cat[idx[csel]].art, cat[idx[csel]].fname); requested = 1; }
+        if (!phave && !requested && cat[idx[csel]].art[0] && ++settle >= 6) { pw_request(idx[csel], cat[idx[csel]].art, cat[idx[csel]].fname, &cat[idx[csel]]); requested = 1; }
         if (!phave && requested && pw_done == idx[csel]) {
             if (pw_ok && poster && pworker) { memcpy(poster, pworker, (size_t)POSTER_W * POSTER_H * 2); phave = 1; }
             requested = 0; redraw = 1;

@@ -334,9 +334,15 @@ static int scan_dir(const char *dir, int fixed_w, int fixed_h, int with_nfo, int
         p->ok = 1;
         snprintf(p->key, sizeof p->key, "%s", key);
         pretty(e->d_name, p->name, sizeof p->name);
-        if (with_nfo) {
+        {
+            /* moviedata/ keeps "<stem>.nfo" beside "<stem>.p565". art/ names its posters
+             * "<key>_<W>x<H>.p565", and the sidecar the catalog browser leaves is just
+             * "<key>.nfo" -- so the size has to come off before looking. */
+            char base[160];
+            snprintf(base, sizeof base, "%s", key);
+            if (!with_nfo) { char *u2 = strrchr(base, '_'); if (u2) *u2 = 0; }
             char nfo[400];
-            snprintf(nfo, sizeof nfo, "%s/%s.nfo", dir, key);
+            snprintf(nfo, sizeof nfo, "%s/%s.nfo", dir, base);
             read_nfo(nfo, p);
         }
         if (p->hasinfo) g_withinfo++;
