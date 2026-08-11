@@ -206,6 +206,7 @@ typedef struct {
 } Section;
 static Section g_sec[MAX_SECTIONS];
 static int     g_nsec = 0;
+static int     g_new_idx = -1;   /* the NEW RELEASES rack: a real bay, just not a genre */
 
 static Poster g_pos[MAX_POSTERS];
 static int    g_nposters = 0;
@@ -1422,7 +1423,7 @@ static void build_sections(void) {
      * around inside a fixed shop. */
     int spare = MAX_SECTIONS;
     int other = 0;
-    for (int i = 0; i < uniq && spare > 1; i++) {
+    for (int i = 0; i < uniq && spare > 2; i++) {   /* two held back: OTHER and NEW RELEASES */
         if (count[i] < BAY_MIN) { other += count[i]; continue; }
         /* A genre may take a SECOND bay when it has the stock for one, but never a third --
          * that is what once turned ten genres into seventeen bays and a great deal of floor to
@@ -1442,9 +1443,18 @@ static void build_sections(void) {
     }
     for (int i = 0; i < uniq; i++) if (count[i] >= BAY_MIN) continue; else (void)0;
     snprintf(g_sec[g_nsec].name, 24, "%s", other ? "OTHER" : "GENERAL");
-    g_nsec++;
-    for (int k = 0; k < g_nsec; k++) g_sec[k].n = 0;   /* recounted when titles are assigned */
-
+    int other_idx = g_nsec++;
+    /* A rack of its own in the back corner, angled to the room. It is an ordinary bay in every
+     * respect -- unit, boards, sign, blocker all come from the same code -- it just takes its
+     * stock by year rather than by genre, and it is placed by hand instead of from PLAN. */
+    g_new_idx = -1;
+    if (g_nsec < MAX_SECTIONS) {
+        g_new_idx = g_nsec;
+        snprintf(g_sec[g_nsec].name, 24, "NEW RELEASES");
+        g_sec[g_nsec].part = 0;
+        g_sec[g_nsec].n = 14;                  /* provisional: a corner rack, not a full bay */
+        g_nsec++;
+    }
     /* Build each bay to its contents: a row holds `len / PITCH_FACE` cases, BAY_ROWS of them. */
     for (int k = 0; k < g_nsec; k++) {
         /* a face takes more shelf than a spine, so the mix decides how much a bay holds */
@@ -1511,6 +1521,16 @@ static void build_sections(void) {
     for (int i = 0; i < g_nsec; i++) {
         /* the far end sits against the wall; the near end reaches toward the walkway by
          * however long this bay needs to be */
+        if (i == g_new_idx) {
+            g_sec[i].cx  = -STORE_HX + g_sec[i].len * 0.5f + 1.5f;
+            g_sec[i].cz  = STORE_Z0 - STORE_DEPTH + 1.9f;
+            g_sec[i].rot = 0.7854f;                    /* 45 degrees, facing the middle */
+            g_sec[i].facedir = 1.0f;
+            g_sec[i].has_L = 0;
+            make_sign_tex(&g_sec[i].sign, g_sec[i].name);
+            g_sec[i].sign_ok = 1;
+            continue;
+        }
         float side = PLAN[i][0];
         int   back = (PLAN[i][1] < -90.0f);
         if (side == 0.0f && back) side = -1.0f;     /* nothing parks under the shop name */
@@ -1537,15 +1557,22 @@ static void build_sections(void) {
         g_sec[i].sign_ok = 1;
     }
 
+    /* Only NOW is the provisional count spent. It used to be cleared before the bay lengths
+     * were worked out, so `need` was always 0.5 and every bay in the shop clamped to the
+     * minimum length whatever it held -- which is why raising UNIT_LEN never changed anything.
+     * The lengths are set above; from here the count is rebuilt for real. */
+    for (int k = 0; k < g_nsec; k++) g_sec[k].n = 0;
+
     /* Which bay each title belongs to. A split genre has several units named "COMEDY 1",
      * "COMEDY 2" -- match on the genre and take whichever of its units is emptiest, so the
      * pair fill evenly rather than one being full and one bare. */
     for (int i = 0; i < g_nposters; i++) {
         char g[24]; first_genre(g_pos[i].genres, g, sizeof g);
         size_t gl = strlen(g);
-        int k = g_nsec - 1;                            /* OTHER unless a section matches */
+        int k = other_idx;                             /* OTHER unless a section matches */
         int best = -1;
         for (int j = 0; j < g_nsec; j++) {
+            if (j == g_new_idx) continue;              /* stocked by year, not by genre */
             if (strncmp(g_sec[j].name, g, gl)) continue;
             char t = g_sec[j].name[gl];
             if (t != 0 && t != ' ') continue;           /* "COMEDY" must not match "COMEDYDRAMA" */
@@ -1563,6 +1590,27 @@ static void build_sections(void) {
     for (int k = 0; k < g_nsec; k++) {
         g_sec[k].Lcap = g_sec[k].has_L ? BAY_ROWS * g_sec[k].Lper_row : 0;
         g_sec[k].cap  = BAY_ROWS * g_sec[k].per_row + g_sec[k].Lcap;
+    }
+
+    /* The new-releases rack takes the highest years first. Not a release date -- nothing on
+     * the card carries one -- but the year is what a shop would have gone by anyway. */
+    if (g_new_idx >= 0) {
+        int base = g_nposters;
+        int cap  = g_sec[g_new_idx].cap;
+        for (int slot = 0; slot < cap; slot++) {
+            int best = -1;
+            for (int i = 0; i < base; i++) {
+                if (!g_pos[i].ok || g_pos[i].is_more || g_pos[i].copy_of >= 0) continue;
+                if (g_pos[i].sect == g_new_idx || !g_pos[i].year) continue;
+                int dup = 0;                           /* not twice on the same rack */
+                for (int j = base; j < g_nposters && !dup; j++)
+                    if (g_pos[j].copy_of == i) dup = 1;
+                if (dup) continue;
+                if (best < 0 || g_pos[i].year > g_pos[best].year) best = i;
+            }
+            if (best < 0) break;
+            if (add_copy(best, g_new_idx) < 0) break;
+        }
     }
 
     /* A bay with four films in it and room for forty looks stripped, and how empty it looks
@@ -1797,6 +1845,17 @@ static int build_room(void) {
         push_box_rot(g_roomv, &n, g_jukex, 0.62f, g_jukez, 0.55f, 0.62f, 0.40f, g_jukerot, 1, 1, 0.44f);
         push_box_rot(g_roomv, &n, g_jukex, 1.34f, g_jukez, 0.50f, 0.16f, 0.36f, g_jukerot, 1, 1, 0.66f); }
 
+    /* Back of house, in the far right corner: a service door and the crates that pile up
+     * beside one. Geometry only -- no texture work -- but an empty corner reads as an
+     * unfinished room, and a door reads as somewhere the stock comes from. */
+    {   float sx = STORE_HX - 2.3f, sz = STORE_Z0 - STORE_DEPTH + 0.10f;
+        push_box(g_roomv, &n, sx, 1.05f, sz, 0.62f, 1.05f, 0.07f, 1, 1, 0.26f);   /* the door */
+        push_box(g_roomv, &n, sx, 2.18f, sz, 0.70f, 0.09f, 0.09f, 1, 1, 0.60f);   /* its lintel */
+        push_box(g_roomv, &n, sx + 0.44f, 1.02f, sz + 0.10f, 0.05f, 0.10f, 0.05f, 1, 1, 0.85f);
+        push_box(g_roomv, &n, sx + 1.45f, 0.34f, sz + 0.75f, 0.42f, 0.34f, 0.38f, 1, 1, 0.46f);
+        push_box(g_roomv, &n, sx + 1.38f, 0.94f, sz + 0.68f, 0.36f, 0.26f, 0.32f, 1, 1, 0.54f);
+        push_box(g_roomv, &n, sx + 2.15f, 0.28f, sz + 0.55f, 0.34f, 0.28f, 0.30f, 1, 1, 0.42f); }
+
     /* the counter: a long wood block by the door, a register on top, and a returns box */
     { float ccx = -STORE_HX * 0.55f;                    /* the counter sits by the door */
       push_box(g_roomv, &n, ccx, 0.55f, -1.6f, 2.6f, 0.55f, 0.7f, 4, 1, 0.62f);
@@ -1839,6 +1898,11 @@ static int build_room(void) {
     g_block[g_nblock].cx = g_jukex; g_block[g_nblock].cz = g_jukez;
     g_block[g_nblock].hx = 0.95f;   g_block[g_nblock].hz = 0.80f;
     g_block[g_nblock].rot = g_jukerot; g_nblock++;
+    /* the crates by the staff door -- walking through a stack of them spoils the illusion */
+    g_block[g_nblock].cx = STORE_HX - 0.5f;
+    g_block[g_nblock].cz = STORE_Z0 - STORE_DEPTH + 0.85f;
+    g_block[g_nblock].hx = 1.4f; g_block[g_nblock].hz = 0.9f;
+    g_block[g_nblock].rot = 0.0f; g_nblock++;
     for (int i = 0; i < g_nsec; i++) {
         g_block[g_nblock].cx = g_sec[i].cx; g_block[g_nblock].cz = g_sec[i].cz;
         g_block[g_nblock].hx = g_sec[i].len * 0.5f + 0.42f;
