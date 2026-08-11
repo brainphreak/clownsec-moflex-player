@@ -141,7 +141,7 @@ static float g_depth = 24.0f;
 
 /* Metadata is cheap -- about 1.2 KB a title, so even a thousand is well under 2 MB. What
  * costs is the cover bitmap at 16 KB each, and that is what cover_budget_bytes() rations. */
-#define MAX_POSTERS 512
+#define MAX_POSTERS 760
 #define ROOM_TEX 64
 
 typedef struct { float x, y, z, u, v, s; } Vtx;
@@ -215,6 +215,7 @@ static int    g_withinfo = 0;    /* how many came with a description */
  * genres, description. art/ is the catalogue's poster cache and has no text at all, so titles
  * from there have nothing to show AND no genre, which lands every one of them in GENERAL. */
 static int    g_from_data = 0, g_from_art = 0;
+static int    g_scan_capped = 0;   /* the scan hit MAX_POSTERS: titles exist that we never saw */
 /* The same room serves both stores; only the source of the shelves and the VERB differ.
  * Library: take one off the shelf and play it. Catalogue: take one and queue the download. */
 enum { STORE_LIBRARY = 0, STORE_CATALOG = 1 };
@@ -391,7 +392,8 @@ static int scan_dir(const char *dir, int fixed_w, int fixed_h, int with_nfo, int
     if (!d) return 0;
     struct dirent *e;
     int added = 0;
-    while ((e = readdir(d)) && g_nposters < MAX_POSTERS) {
+    while ((e = readdir(d))) {
+        if (g_nposters >= MAX_POSTERS) { g_scan_capped = 1; break; }
         size_t L = strlen(e->d_name);
         if (L < 6 || strcmp(e->d_name + L - 5, ".p565")) continue;
         int sw = fixed_w, sh = fixed_h;
@@ -2422,7 +2424,11 @@ int main(void) {
         }
 
         float slider = osGet3DSliderState();
-        float iod = slider * 0.28f;                 /* gentle: an aisle already has lots of depth */
+        /* Parallax at infinity is iod/focal, so a convergence plane 2.2 away in a room
+         * twenty-five deep put the whole far end of the shop miles off the screen -- which is
+         * what ghosts. Half the separation and the plane pushed out past the near bays: the
+         * far wall settles down, and the case in your hand still stands off the screen. */
+        float iod = slider * 0.14f;
 
         C3D_Mtx view;
         Mtx_Identity(&view);
@@ -2438,7 +2444,7 @@ int main(void) {
             C3D_RenderTarget *tgt = eye ? tR : tL;
             C3D_Mtx proj;
             Mtx_PerspStereoTilt(&proj, C3D_AngleFromDegrees(58.0f), C3D_AspectRatioTop,
-                                0.05f, 60.0f, eye ? iod : -iod, 2.2f, false);
+                                0.05f, 60.0f, eye ? iod : -iod, 5.0f, false);
             C3D_RenderTargetClear(tgt, C3D_CLEAR_ALL, 0x101418FF, 0);
             C3D_FrameDrawOn(tgt);
             C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocProjection, &proj);
@@ -2796,7 +2802,8 @@ int main(void) {
             if (held >= 0) panel_fmt(24, " in hand");
         } else {
             panel_set(0, " MOFLEX STORE  (prototype)");
-            panel_fmt(2, " %d cases, %d with info", g_nposters, g_withinfo);
+            panel_fmt(2, " %d cases, %d with info%s", g_nposters, g_withinfo,
+                      g_scan_capped ? "   CAPPED" : "");
             panel_fmt(3, " moviedata %d   art %d", g_from_data, g_from_art);
             panel_fmt(4, " built %d   load %llums", built, (unsigned long long)t_load);
             if (music_n > 0) panel_fmt(19, " playing  %.30s", music_now());
