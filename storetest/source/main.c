@@ -203,6 +203,7 @@ typedef struct {
                                  * aisle, the way a shop lays them out. */
     int     has_L;              /* an L return on the inner end -- no poster fits there */
     int     more_idx;           /* the MORE case for this bay, -1 if it all fits */
+    int     hide;               /* nothing was filed here: build no unit, sign or blocker */
 } Section;
 static Section g_sec[MAX_SECTIONS];
 static int     g_nsec = 0;
@@ -1418,9 +1419,17 @@ static int add_copy(int src, int k) {
     return m;
 }
 
-/* The idx'th genre a title lists, upper-cased. Returns 0 when there are no more. */
+/* The idx'th genre a title lists, upper-cased. Returns 0 when there are no more.
+ *
+ * A title with no genres answers GENERAL to its first, which is what first_genre says too.
+ * The two MUST agree: sections are counted with one and filled with the other, so if this
+ * returned nothing for an empty list the GENERAL bay would be built and never filled. */
 static int genre_token(const char *g, int idx, char *out, size_t cap) {
-    if (!g) return 0;
+    if (!g || !g[0]) {
+        if (idx != 0) return 0;
+        snprintf(out, cap, "GENERAL");
+        return 1;
+    }
     const char *p = g;
     for (int k = 0; ; k++) {
         while (*p == ' ' || *p == ',') p++;
@@ -1733,6 +1742,10 @@ static void build_sections(void) {
         g_sec[k].pages = (g_sec[k].n + cap - 1) / cap;
         if (g_sec[k].pages < 1) g_sec[k].pages = 1;
     }
+    /* A bay with a lit sign over it and not one case on it looks like a fault, so it is not
+     * built at all. The catch-all earns this regularly: once a title can be filed under any
+     * genre it lists rather than only its first, there is often nothing left over for it. */
+    for (int k = 0; k < g_nsec; k++) g_sec[k].hide = (g_sec[k].n == 0);
     for (int k = 0; k < g_nsec; k++) place_section(k);
     bake_spines();
 }
@@ -1898,6 +1911,7 @@ static int build_room(void) {
     /* one shelf unit per section: a box you can see over, with a lighter top so it reads as a
      * surface rather than a wall */
     for (int i = 0; i < g_nsec; i++) {
+        if (g_sec[i].hide) continue;
         push_box_rot(g_roomv, &n, g_sec[i].cx, UNIT_H * 0.5f, g_sec[i].cz,
                      g_sec[i].len * 0.5f, UNIT_H * 0.5f, UNIT_DEPTH * 0.5f, g_sec[i].rot,
                      3, 1, 0.52f);
@@ -1940,7 +1954,7 @@ static int build_room(void) {
     /* An L on the end of two bays: a short return that turns the corner, which is what stops a
      * rank of units reading as a row of identical slabs. */
     for (int i = 0; i < g_nsec; i++) {
-        if (!g_sec[i].has_L) continue;
+        if (g_sec[i].hide || !g_sec[i].has_L) continue;
         push_box_rot(g_roomv, &n, g_sec[i].Lx, UNIT_H * 0.5f, g_sec[i].Lz,
                      UNIT_DEPTH * 0.5f, UNIT_H * 0.5f, g_sec[i].Llen * 0.5f, 0.0f, 1, 1, 0.48f);
     }
@@ -1977,6 +1991,7 @@ static int build_room(void) {
     g_block[g_nblock].hx = 1.4f; g_block[g_nblock].hz = 0.9f;
     g_block[g_nblock].rot = 0.0f; g_nblock++;
     for (int i = 0; i < g_nsec; i++) {
+        if (g_sec[i].hide) continue;
         g_block[g_nblock].cx = g_sec[i].cx; g_block[g_nblock].cz = g_sec[i].cz;
         g_block[g_nblock].hx = g_sec[i].len * 0.5f + 0.42f;
         g_block[g_nblock].hz = UNIT_DEPTH * 0.5f + 0.42f;
@@ -2704,6 +2719,7 @@ int main(void) {
                  * texture box, so a full 0..1 quad shows it squashed up top over a black band */
                 set_buf(g_quadvbo, 6);
                 for (int i = 0; i < g_nsec; i++) {
+                    if (g_sec[i].hide) continue;
                     for (int e = 0; e < 2; e++) {
                         /* the inner end of a bay with an L return is up against the return --
                          * a poster there is half-buried by it */
@@ -2788,7 +2804,7 @@ int main(void) {
              * mirrored from behind. */
             set_buf(g_signvbo, 6);
             for (int i = 0; i < g_nsec; i++) {
-                if (!g_sec[i].sign_ok) continue;
+                if (g_sec[i].hide || !g_sec[i].sign_ok) continue;
                 bind_tex(&g_sec[i].sign, g_sec[i].sign_ok);
                 for (int f = 0; f < 2; f++) {
                     C3D_Mtx m;
