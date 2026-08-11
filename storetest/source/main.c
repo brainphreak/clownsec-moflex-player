@@ -94,7 +94,7 @@ static float g_depth = 24.0f;
 #define ROW_Y0        0.74f     /* centre of the bottom row */
 #define ROW_DY        0.68f     /* row to row -- a case is 0.47 tall, so this is a shelf gap */
 #define CASE_W        0.40f     /* a case on the shelf; PITCH_FACE is this plus the gap */
-#define MAX_SECTIONS  8
+#define MAX_SECTIONS  11
 #define SEC_COLS      3
 #define BAY_ROWS      2
 #define PITCH_SPINE   0.235f
@@ -1373,11 +1373,12 @@ static void build_sections(void) {
     int other = 0;
     for (int i = 0; i < uniq && spare > 1; i++) {
         if (count[i] < BAY_MIN) { other += count[i]; continue; }
-        /* One bay per genre, however big it is. Splitting a big genre across two and three
-         * units was what grew the room faster than it grew the stock -- ten genres became
-         * seventeen bays and a lot of floor to walk. A genre that outgrows its bay restocks
-         * instead, which costs nothing while every title is already resident. */
-        int units = 1;
+        /* A genre may take a SECOND bay when it has the stock for one, but never a third --
+         * that is what once turned ten genres into seventeen bays and a great deal of floor to
+         * cross. Two is what fills the centre column without the room running away. Anything
+         * past two bays' worth restocks instead, which costs nothing while every title is
+         * already resident. */
+        int units = (count[i] >= BAY_MAX * 2) ? 2 : 1;
         if (units > spare - 1) units = spare - 1;
         for (int u = 0; u < units; u++) {
             int share = count[i] / units + ((u < count[i] % units) ? 1 : 0);
@@ -1417,10 +1418,13 @@ static void build_sections(void) {
          * out only as wide as it needs to be. It used to clear 2.4 a side off the longest bay
          * with an 8.5 floor under it, which on a short bay left the whole middle of the shop
          * as bare carpet. 1.5 a side is a walkway; the rest was floor to cross. */
-        g_hx = maxlen + 1.5f;
+        /* Past six sections a third column runs down the middle of the room, so the floor has
+         * to carry three bays across instead of two: bay, aisle, bay, aisle, bay. */
+        int centre = (g_nsec > 6);
+        g_hx = centre ? (maxlen * 1.5f + 1.6f) : (maxlen + 1.5f);
         if (g_hx < 7.2f)  g_hx = 7.2f;
         int side = g_nsec < 6 ? g_nsec : 6;
-        int rows = (side + 1) / 2;                  /* they fill in left/right pairs */
+        int rows = centre ? 3 : (side + 1) / 2;     /* they fill in left/right pairs */
         if (rows < 1) rows = 1;
         g_depth = 6.0f + rows * ROW_PITCH + 3.4f;   /* door end + aisles + the back run */
         if (g_depth < 13.0f) g_depth = 13.0f;
@@ -1437,6 +1441,9 @@ static void build_sections(void) {
     g_gapz[1] = (rowz[1] + rowz[2]) * 0.5f;
     /* left, right, left, right... A column-at-a-time order put the first three bays all on
      * one wall, so a shop with three sections had a bare side. */
+    /* Left and right walls first, because a shop with a bare side reads as unfinished, then
+     * the centre column, then the back wall. An x sign of 0 IS the centre: cx works out to
+     * zero through the same expression the wall bays use, with no special case. */
     const float PLAN[MAX_SECTIONS][3] = {          /* x sign, z, rotation */
         { -1.0f, rowz[0], 0.0f },
         {  1.0f, rowz[0], 0.0f },
@@ -1444,14 +1451,18 @@ static void build_sections(void) {
         {  1.0f, rowz[1], 0.0f },
         { -1.0f, rowz[2], 0.0f },
         {  1.0f, rowz[2], 0.0f },
+        {  0.0f, rowz[0], 0.0f },                  /* the centre column */
+        {  0.0f, rowz[1], 0.0f },
+        {  0.0f, rowz[2], 0.0f },
         { -1.0f, -99.0f, 0.0f },                   /* -99 marks the back wall run */
-        {  1.0f, -99.0f, 0.0f },
+        {  1.0f, -99.0f, 0.0f },                   /* two only: a third would sit on the first */
     };
     for (int i = 0; i < g_nsec; i++) {
         /* the far end sits against the wall; the near end reaches toward the walkway by
          * however long this bay needs to be */
         float side = PLAN[i][0];
         int   back = (PLAN[i][1] < -90.0f);
+        if (side == 0.0f && back) side = -1.0f;     /* nothing parks under the shop name */
         if (back) { g_sec[i].cx = side * (g_sec[i].len * 0.5f + 1.4f);
                     g_sec[i].cz = STORE_Z0 - STORE_DEPTH + 2.6f; }   /* room to stand behind */
         else      { g_sec[i].cx = side * (STORE_HX - g_sec[i].len * 0.5f - 0.15f);
@@ -1634,7 +1645,7 @@ static void place_section(int k) {
 }
 
 /* ---------------- geometry ---------------- */
-#define ROOM_VTX     3000        /* shell + units + counter + wall shelving */
+#define ROOM_VTX     5200        /* shell + units + counter + wall shelving */
 static Vtx *g_roomv, *g_quadv, *g_signv;
 static void *g_roomvbo, *g_quadvbo, *g_signvbo;
 
@@ -2029,10 +2040,16 @@ int main(void) {
     prebuild_covers(&built);                /* the slow part, done where you are standing still */
     load_restock();                         /* BEFORE: the bake needs to know it has art */
     build_sections();                       /* genres -> units -> poster positions */
-    int music_n = music_init(MUSIC_DIR);    /* quiet if the folder is empty or dsp is missing */
     for (int i = 0; i < BANNERS; i++) load_banner(i);
     make_wall_posters();                    /* decorate: unit ends and the bare walls */
     int roomn = build_room();               /* needs the unit positions */
+    /* Music starts LAST, once nothing else wants the card.
+     *
+     * It used to start before the wall art was built, so the feeder thread was trying to read
+     * a track while the main thread sat on the SD building sixteen poster caches -- and it
+     * lost, every time, which is what the stuttering was. Nothing else reads the card after
+     * this point, so from here it has the bus to itself. */
+    int music_n = music_init(MUSIC_DIR);    /* quiet if the folder is empty or dsp is missing */
     g_roomvbo = g_roomv; g_quadvbo = g_quadv; g_signvbo = g_signv; g_boxvbo = g_boxv;
 
     float cx = 0, cz = STORE_Z0 - 1.5f, yaw = 0, pitch = 0;
