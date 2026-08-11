@@ -31,6 +31,7 @@
 #include <math.h>
 #include <dirent.h>
 #include "music.h"
+#include "art_data.h"
 #include <stdarg.h>
 #include <sys/stat.h>
 
@@ -240,6 +241,29 @@ static void tile_rgb565(const u16 *lin, u16 *out, int w, int h) {
         }
 }
 
+/* Scale a linear RGB565 image already in memory into a texture, tiling as it goes.
+ * The same arithmetic build_cache_entry_sz does, without the file at either end -- which is
+ * what the built-in art needs, and what makes it cost nothing at startup. */
+static int build_tex_mem(const u16 *src, int sw, int sh, C3D_Tex *t,
+                         int tw, int th, int iw, int ih) {
+    if (!C3D_TexInit(t, tw, th, GPU_RGB565)) return 0;
+    u16 *lin = (u16 *)calloc((size_t)tw * th, 2);
+    u16 *til = (u16 *)malloc((size_t)tw * th * 2);
+    if (!lin || !til) { free(lin); free(til); C3D_TexDelete(t); return 0; }
+    for (int j = 0; j < ih; j++) {
+        const u16 *row = src + (size_t)(j * sh / ih) * sw;
+        u16 *d = lin + (size_t)j * tw;
+        for (int i = 0; i < iw; i++) d[i] = row[i * sw / iw];
+    }
+    tile_rgb565(lin, til, tw, th);
+    memcpy(t->data, til, (size_t)tw * th * 2);
+    C3D_TexFlush(t);
+    C3D_TexSetFilter(t, GPU_LINEAR, GPU_LINEAR);
+    C3D_TexSetWrap(t, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
+    free(lin); free(til);
+    return 1;
+}
+
 /* ---------------- poster cache ----------------
  * Source: the player's own art cache, "<key>_<W>x<H>.p565", raw linear RGB565.
  * Destination: "<key>.t565", TEX_W x TEX_H, already tiled. */
@@ -318,7 +342,12 @@ static int season_key(const char *nm, char *key, size_t kcap, char *show, size_t
 
 /* music videos are not what anyone walks into a rental shop for */
 static int is_music(const Poster *p) {
-    return !strcasecmp(p->category, "Music") || !strncasecmp(p->genres, "Music", 5);
+    /* "Music", "Music Video", "Music Videos" -- and a genre naming it anywhere in the list,
+     * not only first. Matching the exact word "Music" let most of them straight onto a shelf. */
+    if (!strncasecmp(p->category, "Music", 5)) return 1;
+    for (const char *q = p->genres; *q; q++)
+        if ((q == p->genres || q[-1] == ',' || q[-1] == ' ') && !strncasecmp(q, "Music", 5)) return 1;
+    return 0;
 }
 
 /* pretty name from "Some_Movie_2011_132x188.p565" */
@@ -690,6 +719,13 @@ static void load_banner(int i) {
     char src[400], small[400];
     snprintf(src,   sizeof src,   "%s/banner%d.p565", CACHE_DIR, i);
     snprintf(small, sizeof small, "%s/banner%d.b565", CACHE_DIR, i);
+    FILE *sf = fopen(src, "rb");
+    if (!sf) {                                  /* nothing supplied: use the one we ship with */
+        g_banner_ok[i] = build_tex_mem(art_banner[i], ART_BAN_W, ART_BAN_H, &g_banner[i],
+                                       BAN_W, BAN_H, BAN_W, BAN_H);
+        return;
+    }
+    fclose(sf);
     FILE *f = fopen(small, "rb");
     if (!f) {
         if (!build_cache_entry_sz(src, BAN_W * 2, BAN_H * 2, small, BAN_W, BAN_H, BAN_W, BAN_H)) return;
@@ -710,6 +746,13 @@ static void load_restock(void) {
     char src[400], small[400];
     snprintf(src,   sizeof src,   "%s/restock.p565", CACHE_DIR);
     snprintf(small, sizeof small, "%s/restock.w565", CACHE_DIR);
+    FILE *sf = fopen(src, "rb");
+    if (!sf) {                                  /* nothing supplied: use the one we ship with */
+        g_restock_ok = build_tex_mem(art_restock, ART_WALL_W, ART_WALL_H, &g_restock,
+                                     TEX_W, TEX_H, IMG_W, IMG_H);
+        return;
+    }
+    fclose(sf);
     FILE *f = fopen(small, "rb");
     if (!f) {
         if (!build_cache_entry_sz(src, SRC_W, SRC_H, small, TEX_W, TEX_H, IMG_W, IMG_H)) return;
@@ -1174,6 +1217,14 @@ static void make_wall_posters(void) {
         int from_user = 0;
         { FILE *uf = fopen(user, "rb");
           if (uf) { fclose(uf); from_user = 1; } }
+        if (!from_user && i < ART_WALLS) {
+            /* built in: no file to copy anywhere, and still overridable by one */
+            if (build_tex_mem(art_wall[i], ART_WALL_W, ART_WALL_H, &g_wall[i],
+                              WALL_TEX_W, WALL_TEX_H, WALL_IMG_W, WALL_IMG_H)) {
+                g_wall_ok[i] = 1; g_wall_user[i] = 1; g_wall_n++;
+            }
+            continue;
+        }
         Poster *q = NULL;
         if (!from_user) {
             /* otherwise borrow a title from the shelves, spread across the catalogue */
@@ -1741,8 +1792,8 @@ static int build_room(void) {
     }
     /* The jukebox, opposite the counter. A cabinet with a lit arch on the front -- it is a
      * prop, so it is two boxes and a panel, but it is a landmark you can walk to and press. */
-    {   g_jukex = STORE_HX - 1.05f; g_jukez = STORE_Z0 - 1.35f;   /* the front-right corner */
-        g_jukerot = -0.7854f;                                     /* turned in to the room */
+    {   g_jukex = STORE_HX - 0.46f; g_jukez = STORE_Z0 - 3.2f;    /* flat against the right wall */
+        g_jukerot = -1.5708f;                                     /* facing the counter across the room */
         push_box_rot(g_roomv, &n, g_jukex, 0.62f, g_jukez, 0.55f, 0.62f, 0.40f, g_jukerot, 1, 1, 0.44f);
         push_box_rot(g_roomv, &n, g_jukex, 1.34f, g_jukez, 0.50f, 0.16f, 0.36f, g_jukerot, 1, 1, 0.66f); }
 
