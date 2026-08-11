@@ -1920,8 +1920,6 @@ static int build_room(void) {
      * -- but a bright white fitting under the ceiling reads as one, and it is what stops the
      * room feeling like a basement. Their own group, so they get a white texture instead of
      * the wood the shelving uses. */
-    push_box_rot(g_roomv, &n, g_jukex + sinf(g_jukerot) * 0.42f, 1.10f,
-                 g_jukez + cosf(g_jukerot) * 0.42f, 0.34f, 0.26f, 0.03f, g_jukerot, 1, 1, 1.0f);
     for (int r = 0; r < 3; r++)
         for (int c = 0; c < 2; c++) {
             float lz = -3.0f - r * 11.0f;
@@ -2498,10 +2496,10 @@ int main(void) {
             if (g_store_ok) {                          /* MUSIC across the front of the cabinet */
                 bind_tex(&g_jukesign, 1);
                 C3D_Mtx m; Mtx_Copy(&m, &view);
-                Mtx_Translate(&m, g_jukex + sinf(g_jukerot) * 0.43f, 1.12f,
-                              g_jukez + cosf(g_jukerot) * 0.43f, true);
+                Mtx_Translate(&m, g_jukex + sinf(g_jukerot) * 0.41f, 1.12f,
+                              g_jukez + cosf(g_jukerot) * 0.41f, true);
                 Mtx_RotateY(&m, g_jukerot, true);
-                Mtx_Scale(&m, 0.80f, 0.80f * (float)SIGN_H / (float)SIGN_W, 1.0f);
+                Mtx_Scale(&m, 0.86f, 0.86f * (float)SIGN_H / (float)SIGN_W, 1.0f);
                 C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
                 draw_range(0, 6);
             }
