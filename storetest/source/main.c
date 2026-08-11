@@ -132,7 +132,9 @@ static float g_depth = 24.0f;
  * with the blank clamshell behind the rest. */
 #define COVER_POOL   32
 
-#define MAX_POSTERS 320         /* spines cost no texture; this is only metadata */
+/* Metadata is cheap -- about 1.2 KB a title, so even a thousand is well under 2 MB. What
+ * costs is the cover bitmap at 16 KB each, and that is what cover_budget_bytes() rations. */
+#define MAX_POSTERS 512
 #define ROOM_TEX 64
 
 typedef struct { float x, y, z, u, v, s; } Vtx;
@@ -584,7 +586,17 @@ static int     g_pool_ok = 0;
  * falls back to reading from disk, so a catalogue too big to hold still works -- it just
  * hitches the way it used to. */
 #define COVER_BYTES ((size_t)TEX_W * TEX_H * 2)
-#define RAM_BUDGET  (12u << 20)
+#define RAM_BUDGET  (16u << 20)
+/* Ration the cover cache against what the console actually has free rather than a number
+ * picked on a desktop: an Old 3DS under the homebrew launcher has far less headroom than a
+ * New one, and running it out is a crash, not a slowdown. */
+static size_t cover_budget_bytes(void) {
+    u32 freeb = osGetMemRegionFree(MEMREGION_APPLICATION);
+    const u32 HEADROOM = 6u << 20;             /* textures, the room mesh, stdio, slack */
+    if (freeb <= HEADROOM) return 0;
+    size_t b = (size_t)(freeb - HEADROOM);
+    return b > RAM_BUDGET ? RAM_BUDGET : b;
+}
 static unsigned char *g_ram = NULL;
 static int g_ram_of[MAX_POSTERS];       /* poster -> its slab in g_ram, or -1 */
 static int g_ram_n = 0;
@@ -617,7 +629,11 @@ static int pool_load(int idx, Poster *q) {
         if (who < 0 || g_pos[who].vis_frame != g_frame) victim = i;
     }
     if (victim < 0) return -1;
-    if (g_ram && g_ram_of[idx] >= 0) {              /* resident: a memcpy, and no file touched */
+    if (g_ram) {
+        /* Resident is a memcpy. NOT resident means we ran out of budget for this one, and it
+         * keeps the blank front -- reading it off the card here is exactly the millisecond
+         * stall this cache exists to remove, so the walk never does it. */
+        if (g_ram_of[idx] < 0) return -1;
         memcpy(g_pool[victim].data, g_ram + (size_t)g_ram_of[idx] * COVER_BYTES, COVER_BYTES);
         q->cover_state = 1;
         C3D_TexFlush(&g_pool[victim]);
@@ -655,7 +671,7 @@ static int pool_load(int idx, Poster *q) {
 static void prebuild_covers(int *built) {
     char path[400];
     for (int i = 0; i < MAX_POSTERS; i++) g_ram_of[i] = -1;
-    size_t cap = RAM_BUDGET / COVER_BYTES;
+    size_t cap = cover_budget_bytes() / COVER_BYTES;
     if (cap > (size_t)g_nposters) cap = (size_t)g_nposters;
     g_ram = cap ? malloc(cap * COVER_BYTES) : NULL;
     if (!g_ram) cap = 0;                          /* no room: fall back to reading from disk */
@@ -2342,6 +2358,14 @@ int main(void) {
             panel_fmt(2, " %d cases, %d with info", g_nposters, g_withinfo);
             panel_fmt(3, " moviedata %d   art %d", g_from_data, g_from_art);
             panel_fmt(4, " built %d   load %llums", built, (unsigned long long)t_load);
+            panel_fmt(21, " covers held %d/%d  %uKB", g_ram_n, g_nposters,
+                      (unsigned)((size_t)g_ram_n * COVER_BYTES / 1024));
+            panel_fmt(22, " meta %uKB (%u B each)",
+                      (unsigned)((size_t)g_nposters * sizeof(Poster) / 1024),
+                      (unsigned)sizeof(Poster));
+            panel_fmt(23, " app free %uKB   linear %uKB",
+                      (unsigned)(osGetMemRegionFree(MEMREGION_APPLICATION) / 1024),
+                      (unsigned)(linearSpaceFree() / 1024));
             panel_fmt(5, " fps %2d   eyes %d", fps, (slider > 0.0f ? 2 : 1));
             panel_set(6, " walk up to a case for its info");
             panel_set(8, " sections");
