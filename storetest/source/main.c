@@ -30,6 +30,7 @@
 #include <string.h>
 #include <math.h>
 #include <dirent.h>
+#include "music.h"
 #include <stdarg.h>
 #include <sys/stat.h>
 
@@ -60,6 +61,7 @@
 /* moviedata/ holds BOTH a decoded poster and the description, under the same key:
  *   <name>.p565  132x188 RGB565      <name>.nfo  "key: value" title/year/genres/desc
  * art/ is the catalogue's poster cache -- posters only, no text -- so it is the fallback. */
+#define MUSIC_DIR "sdmc:/moflex_player/music"
 #define DATA_DIR  "sdmc:/moflex_player/moviedata"
 #define ART_DIR   "sdmc:/moflex_player/art"
 #define CACHE_DIR "sdmc:/moflex_player/store"
@@ -217,6 +219,7 @@ enum { STORE_LIBRARY = 0, STORE_CATALOG = 1 };
 static int    g_mode = STORE_LIBRARY;
 static int    g_drawn = 0;      /* cases actually drawn last frame */
 static float  g_doorx = 0.0f;   /* where the door ended up, so the EXIT board follows it */
+static float  g_jukex = 0.0f, g_jukez = 0.0f;  /* the jukebox: stand beside it and press A */
 static int    g_covers_on = 1;  /* SELECT: face-out covers on/off, to isolate the stutter */
 static const char *verb(void) { return g_mode == STORE_CATALOG ? "QUEUE" : "PLAY"; }
 
@@ -1724,6 +1727,12 @@ static int build_room(void) {
                          g_sec[i].rot, 3, 1, 0.70f);
         }
     }
+    /* The jukebox, opposite the counter. A cabinet with a lit arch on the front -- it is a
+     * prop, so it is two boxes and a panel, but it is a landmark you can walk to and press. */
+    {   g_jukex = STORE_HX * 0.60f; g_jukez = -1.8f;
+        push_box(g_roomv, &n, g_jukex, 0.62f, g_jukez, 0.55f, 0.62f, 0.40f, 1, 1, 0.44f);
+        push_box(g_roomv, &n, g_jukex, 1.34f, g_jukez, 0.50f, 0.16f, 0.36f, 1, 1, 0.66f); }
+
     /* the counter: a long wood block by the door, a register on top, and a returns box */
     { float ccx = -STORE_HX * 0.55f;                    /* the counter sits by the door */
       push_box(g_roomv, &n, ccx, 0.55f, -1.6f, 2.6f, 0.55f, 0.7f, 4, 1, 0.62f);
@@ -1748,6 +1757,7 @@ static int build_room(void) {
      * -- but a bright white fitting under the ceiling reads as one, and it is what stops the
      * room feeling like a basement. Their own group, so they get a white texture instead of
      * the wood the shelving uses. */
+    push_box(g_roomv, &n, g_jukex, 1.10f, g_jukez - 0.42f, 0.34f, 0.26f, 0.03f, 1, 1, 1.0f);
     for (int r = 0; r < 3; r++)
         for (int c = 0; c < 2; c++) {
             float lz = -3.0f - r * 11.0f;
@@ -1759,8 +1769,11 @@ static int build_room(void) {
         g_n_light = 0;
     }
 
-    /* blockers: every unit, plus the counter and the returns bin */
+    /* blockers: every unit, plus the counter, the returns bin and the jukebox */
     g_nblock = 0;
+    g_block[g_nblock].cx = g_jukex; g_block[g_nblock].cz = g_jukez;
+    g_block[g_nblock].hx = 0.95f;   g_block[g_nblock].hz = 0.80f;
+    g_block[g_nblock].rot = 0.0f;   g_nblock++;
     for (int i = 0; i < g_nsec; i++) {
         g_block[g_nblock].cx = g_sec[i].cx; g_block[g_nblock].cz = g_sec[i].cz;
         g_block[g_nblock].hx = g_sec[i].len * 0.5f + 0.42f;
@@ -2005,6 +2018,7 @@ int main(void) {
     prebuild_covers(&built);                /* the slow part, done where you are standing still */
     build_sections();                       /* genres -> units -> poster positions */
     load_restock();                         /* after: the restock cases are made in there */
+    int music_n = music_init(MUSIC_DIR);    /* quiet if the folder is empty or dsp is missing */
     for (int i = 0; i < BANNERS; i++) load_banner(i);
     make_wall_posters();                    /* decorate: unit ends and the bare walls */
     int roomn = build_room();               /* needs the unit positions */
@@ -2046,6 +2060,13 @@ int main(void) {
          * touches the SD card while you walk, so the frame rate either jumps when they are off
          * -- the stutter is the cover pool -- or it does not, and it is draw volume. */
         if (kd & KEY_SELECT) g_covers_on = !g_covers_on;
+        /* R skips a track from anywhere; the jukebox by the counter does the same if you walk
+         * up to it and press A with no case highlighted. */
+        int at_juke = 0;
+        {   float jdx = cx - g_jukex, jdz = cz - g_jukez;
+            at_juke = (music_n > 0) && (jdx * jdx + jdz * jdz < 2.6f * 2.6f); }
+        if (music_n > 0 && ((kd & KEY_R) || (at_juke && sel < 0 && held < 0 && (kd & KEY_A))))
+            music_next();
         if ((kd & KEY_A) && held < 0 && sel >= 0) {                /* take it off the shelf */
             held = sel; spin = 0.0f; hold_d = 0.78f;
             if (g_back_for != sel) { rebuild_back(&g_pos[sel]); g_back_for = sel; }
@@ -2557,6 +2578,7 @@ int main(void) {
             panel_fmt(2, " %d cases, %d with info", g_nposters, g_withinfo);
             panel_fmt(3, " moviedata %d   art %d", g_from_data, g_from_art);
             panel_fmt(4, " built %d   load %llums", built, (unsigned long long)t_load);
+            if (music_n > 0) panel_fmt(19, " playing  %.30s", music_now());
             panel_fmt(21, " covers %d/%d  %uKB linear", g_cov_n, g_nposters,
                       (unsigned)((size_t)g_cov_n * COVER_BYTES / 1024));
             panel_fmt(22, " meta %uKB (%u B each)",
@@ -2570,6 +2592,8 @@ int main(void) {
                 panel_fmt(9 + i, "   %-16s %d", g_sec[i].name, g_sec[i].n);
         }
         if (held >= 0) {
+            if (music_n > 0) panel_set(23, at_juke ? " A: next track   R: next track"
+                                                    : " R: next track");
             panel_fmt(25, " fps %2d  drawn %d  covers %s", fps, g_drawn, g_covers_on ? "on" : "OFF");
             panel_set(26, " pad turn/zoom   d-pad next");
             panel_fmt(27, " %s: Y    put back: B",
@@ -2596,6 +2620,7 @@ int main(void) {
     if (g_spine_ok) for (int i = 0; i < SPINE_COLOURS; i++) C3D_TexDelete(&g_spine[i]);
     if (g_white_ok)  C3D_TexDelete(&g_white);
     if (g_front_ok)  C3D_TexDelete(&g_front);
+    music_exit();
     for (int i = 0; i < g_nposters; i++) if (g_pos[i].tex_ok) C3D_TexDelete(&g_pos[i].tex);
     if (g_restock_ok) C3D_TexDelete(&g_restock);
     for (int i = 0; i < BANNERS; i++) if (g_banner_ok[i]) C3D_TexDelete(&g_banner[i]);
