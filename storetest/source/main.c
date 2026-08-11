@@ -216,6 +216,7 @@ static int    g_withinfo = 0;    /* how many came with a description */
  * genres, description. art/ is the catalogue's poster cache and has no text at all, so titles
  * from there have nothing to show AND no genre, which lands every one of them in GENERAL. */
 static int    g_from_data = 0, g_from_art = 0;
+static int    g_collapsed = 0;     /* dropped for sharing a title with something already shelved */
 static int    g_scan_capped = 0;   /* the scan hit MAX_POSTERS: titles exist that we never saw */
 /* The same room serves both stores; only the source of the shelves and the VERB differ.
  * Library: take one off the shelf and play it. Catalogue: take one and queue the download. */
@@ -460,12 +461,39 @@ static int scan_dir(const char *dir, int fixed_w, int fixed_h, int with_nfo, int
     return added;
 }
 
+/* Collapse titles that share a name.
+ *
+ * The tag matcher only catches an episode when the FILENAME carries one, and plenty do not.
+ * But a catalog match gives every episode of a season the same title and the same description
+ * -- that is documented behaviour in the player, and it is a stronger signal than any naming
+ * convention. So after the tag pass, anything left sharing a name with something already
+ * shelved is a second copy of it by another route, and one is enough.
+ *
+ * Two genuinely different films with identical titles would collapse too. That is rare, and a
+ * shop showing one of them beats a shelf of thirteen identical covers. */
+static int collapse_same_title(void) {
+    int w = 0;
+    for (int i = 0; i < g_nposters; i++) {
+        int dup = 0;
+        if (g_pos[i].name[0])
+            for (int j = 0; j < w && !dup; j++)
+                if (!strcasecmp(g_pos[j].name, g_pos[i].name)) dup = 1;
+        if (dup) continue;
+        if (w != i) g_pos[w] = g_pos[i];
+        w++;
+    }
+    int removed = g_nposters - w;
+    g_nposters = w;
+    return removed;
+}
+
 static int load_posters(int *built) {
     mkdir(CACHE_DIR, 0777);
     /* moviedata first: those entries come with a description, which is what the info panel
      * is for. art/ only tops up the shelf when there is room left. */
     g_from_data = scan_dir(DATA_DIR, SRC_W, SRC_H, 1, built);
     g_from_art  = scan_dir(ART_DIR,  0,     0,     0, built);
+    g_collapsed = collapse_same_title();
     return g_nposters;
 }
 
@@ -2920,15 +2948,20 @@ int main(void) {
                 panel_fmt(2, " page %d of %d", S->page + 1, S->pages);
                 panel_set(4, " Take this one and press the button to");
                 panel_set(5, " restock the shelf with the next lot.");
-            } else if (q->desc[0]) panel_wrap(4, 19, q->desc);
-            else            panel_set(4, q->hasinfo ? " (no description in the .nfo)"
-                                                    : " (no .nfo for this one - poster only)");
+            } else {
+                /* what we know about it, so anything that slipped past a filter can be read
+                 * off the screen instead of guessed at */
+                panel_fmt(22, " cat:%.14s", q->category[0] ? q->category : "(none)");
+                panel_fmt(23, " %.37s", q->key);
+                if (q->desc[0]) panel_wrap(4, 17, q->desc);
+                else panel_set(4, q->hasinfo ? " (no description in the .nfo)"
+                                             : " (no .nfo for this one - poster only)");
             if (held >= 0) panel_fmt(24, " in hand");
         } else {
             panel_set(0, " MOFLEX STORE  (prototype)");
             panel_fmt(2, " %d cases, %d with info%s", g_nposters, g_withinfo,
                       g_scan_capped ? "   CAPPED" : "");
-            panel_fmt(3, " moviedata %d   art %d", g_from_data, g_from_art);
+            panel_fmt(3, " moviedata %d   art %d   merged %d", g_from_data, g_from_art, g_collapsed);
             panel_fmt(4, " built %d   load %llums", built, (unsigned long long)t_load);
             if (music_n > 0) panel_fmt(19, " playing  %.30s", music_now());
             panel_fmt(21, " covers %d/%d  %uKB linear", g_cov_n, g_nposters,
