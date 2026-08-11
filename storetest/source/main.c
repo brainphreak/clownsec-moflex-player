@@ -1418,6 +1418,29 @@ static int add_copy(int src, int k) {
     return m;
 }
 
+/* The idx'th genre a title lists, upper-cased. Returns 0 when there are no more. */
+static int genre_token(const char *g, int idx, char *out, size_t cap) {
+    if (!g) return 0;
+    const char *p = g;
+    for (int k = 0; ; k++) {
+        while (*p == ' ' || *p == ',') p++;
+        if (!*p) return 0;
+        const char *e = p; while (*e && *e != ',') e++;
+        if (k == idx) {
+            size_t len = (size_t)(e - p);
+            while (len && p[len - 1] == ' ') len--;
+            if (len >= cap) len = cap - 1;
+            for (size_t i = 0; i < len; i++) {
+                char c = p[i];
+                out[i] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : c;
+            }
+            out[len] = 0;
+            return len > 0;
+        }
+        p = *e ? e + 1 : e;
+    }
+}
+
 static void place_section(int k);
 static void bake_spines(void);
 static void build_sections(void) {
@@ -1551,7 +1574,7 @@ static void build_sections(void) {
              * out while the bay ran at 45, and the end poster stood off the end of it -- the
              * sign and poster code both assume a bay faces the way the room does. */
             g_sec[i].cx  = -STORE_HX + g_sec[i].len * 0.5f + 1.4f;
-            g_sec[i].cz  = STORE_Z0 - STORE_DEPTH + 2.6f;
+            g_sec[i].cz  = STORE_Z0 - STORE_DEPTH + UNIT_DEPTH * 0.5f + 0.06f;   /* flush */
             g_sec[i].rot = 0.0f;
             g_sec[i].facedir = 1.0f;
             g_sec[i].has_L = 0;
@@ -1563,7 +1586,10 @@ static void build_sections(void) {
         int   back = (PLAN[i][1] < -90.0f);
         if (side == 0.0f && back) side = -1.0f;     /* nothing parks under the shop name */
         if (back) { g_sec[i].cx = side * (g_sec[i].len * 0.5f + 1.4f);
-                    g_sec[i].cz = STORE_Z0 - STORE_DEPTH + 2.6f; }   /* room to stand behind */
+                    g_sec[i].cz = STORE_Z0 - STORE_DEPTH + UNIT_DEPTH * 0.5f + 0.06f; }
+                    /* Flush to the wall. Standing it off left a strip of floor you could see
+                     * but not use, which reads worse than no gap at all -- and these face
+                     * forward, so there is nothing behind them to reach. */
         else      { g_sec[i].cx = side * (STORE_HX - g_sec[i].len * 0.5f - 0.15f);
                     g_sec[i].cz = PLAN[i][1]; }
         g_sec[i].rot = PLAN[i][2];
@@ -1606,16 +1632,25 @@ static void build_sections(void) {
     for (int pass = 0; pass < 2; pass++)
     for (int i = 0; i < g_nposters; i++) {
         if ((g_pos[i].hasinfo ? 0 : 1) != pass) continue;
-        char g[24]; first_genre(g_pos[i].genres, g, sizeof g);
-        size_t gl = strlen(g);
-        int k = other_idx;                             /* OTHER unless a section matches */
+        /* EVERY genre it lists, in order, not just the first.
+         *
+         * A section exists only for a genre that is first on enough titles, but assignment
+         * used to look at the first genre and nothing else -- so a film listed
+         * "Mystery, Horror" went to the catch-all because Mystery was too small, with the
+         * HORROR bay standing next to it. Its first genre still wins where that bay exists;
+         * the rest are what it falls back on before giving up and going to OTHER. */
+        int k = other_idx;                             /* OTHER unless some genre matches */
         int best = -1;
-        for (int j = 0; j < g_nsec; j++) {
-            if (j == g_new_idx) continue;              /* stocked by year, not by genre */
-            if (strncmp(g_sec[j].name, g, gl)) continue;
-            char t = g_sec[j].name[gl];
-            if (t != 0 && t != ' ') continue;           /* "COMEDY" must not match "COMEDYDRAMA" */
-            if (best < 0 || g_sec[j].n < g_sec[best].n) best = j;
+        char g[24];
+        for (int gi = 0; best < 0 && genre_token(g_pos[i].genres, gi, g, sizeof g); gi++) {
+            size_t gl = strlen(g);
+            for (int j = 0; j < g_nsec; j++) {
+                if (j == g_new_idx) continue;          /* stocked by year, not by genre */
+                if (strncmp(g_sec[j].name, g, gl)) continue;
+                char t = g_sec[j].name[gl];
+                if (t != 0 && t != ' ') continue;      /* "COMEDY" must not match "COMEDYDRAMA" */
+                if (best < 0 || g_sec[j].n < g_sec[best].n) best = j;
+            }
         }
         if (best >= 0) k = best;
         g_pos[i].sect  = k;
