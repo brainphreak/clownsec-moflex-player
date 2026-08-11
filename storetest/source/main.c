@@ -624,6 +624,32 @@ static int g_cov_n = 0;         /* how many got one before linear space ran out 
  * shape the player caches its posters in). Without it they wear the blank clamshell. */
 static C3D_Tex g_restock;
 static int     g_restock_ok = 0;
+/* A wide banner for the back wall, from store/banner.p565 -- a 2:1 landscape raw. Unlike a
+ * poster it fills its texture edge to edge, so it draws on the full-UV sign quad. */
+#define BAN_W 256
+#define BAN_H 128
+static C3D_Tex g_banner;
+static int     g_banner_ok = 0;
+static void load_banner(void) {
+    char src[400], small[400];
+    snprintf(src,   sizeof src,   "%s/banner.p565", CACHE_DIR);
+    snprintf(small, sizeof small, "%s/banner.b565", CACHE_DIR);
+    FILE *f = fopen(small, "rb");
+    if (!f) {
+        if (!build_cache_entry_sz(src, BAN_W * 2, BAN_H * 2, small, BAN_W, BAN_H, BAN_W, BAN_H)) return;
+        f = fopen(small, "rb");
+        if (!f) return;
+    }
+    if (!C3D_TexInit(&g_banner, BAN_W, BAN_H, GPU_RGB565)) { fclose(f); return; }
+    size_t got = fread(g_banner.data, 1, (size_t)BAN_W * BAN_H * 2, f);
+    fclose(f);
+    if (got != (size_t)BAN_W * BAN_H * 2) { C3D_TexDelete(&g_banner); return; }
+    C3D_TexSetFilter(&g_banner, GPU_LINEAR, GPU_LINEAR);
+    C3D_TexSetWrap(&g_banner, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
+    C3D_TexFlush(&g_banner);
+    g_banner_ok = 1;
+}
+
 static void load_restock(void) {
     char src[400], small[400];
     snprintf(src,   sizeof src,   "%s/restock.p565", CACHE_DIR);
@@ -1842,6 +1868,7 @@ int main(void) {
     prebuild_covers(&built);                /* the slow part, done where you are standing still */
     build_sections();                       /* genres -> units -> poster positions */
     load_restock();                         /* after: the restock cases are made in there */
+    load_banner();
     make_wall_posters();                    /* decorate: unit ends and the bare walls */
     int roomn = build_room();               /* needs the unit positions */
     g_roomvbo = g_roomv; g_quadvbo = g_quadv; g_signvbo = g_signv; g_boxvbo = g_boxv;
@@ -2291,8 +2318,8 @@ int main(void) {
                     { -STORE_HX + 0.08f, 1.62f, g_gapz[1],  1.5708f },
                     {  STORE_HX - 0.08f, 1.62f, g_gapz[0], -1.5708f },
                     {  STORE_HX - 0.08f, 1.62f, g_gapz[1], -1.5708f },
-                    { -STORE_HX * 0.80f, 1.62f, STORE_Z0 - STORE_DEPTH + 0.08f, 0.0f },
-                    {  STORE_HX * 0.80f, 1.62f, STORE_Z0 - STORE_DEPTH + 0.08f, 0.0f },
+                    { -STORE_HX * 0.82f, 1.62f, STORE_Z0 - STORE_DEPTH + 0.08f, 0.0f },
+                    {  STORE_HX * 0.82f, 1.62f, STORE_Z0 - STORE_DEPTH + 0.08f, 0.0f },
                 };
                 for (int i = 0; i < 6; i++) {
                     int k = (w++) % WALLPOSTERS;
@@ -2302,6 +2329,17 @@ int main(void) {
                     Mtx_Translate(&m, WP[i][0], WP[i][1], WP[i][2], true);
                     Mtx_RotateY(&m, WP[i][3], true);
                     Mtx_Scale(&m, 1.05f, 1.05f * (float)IMG_H / (float)IMG_W, 1.0f);
+                    C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
+                    draw_range(0, 6);
+                }
+                /* the wide one, centred on the back wall below the name */
+                if (g_banner_ok) {
+                    set_buf(g_signvbo, 6);           /* it fills its texture, so full UVs */
+                    bind_tex(&g_banner, g_banner_ok);
+                    float bw = STORE_HX * 0.62f; if (bw > 6.2f) bw = 6.2f;
+                    C3D_Mtx m; Mtx_Copy(&m, &view);
+                    Mtx_Translate(&m, 0.0f, 1.72f, STORE_Z0 - STORE_DEPTH + 0.08f, true);
+                    Mtx_Scale(&m, bw, bw * (float)BAN_H / (float)BAN_W, 1.0f);
                     C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
                     draw_range(0, 6);
                 }
@@ -2403,6 +2441,7 @@ int main(void) {
     if (g_front_ok)  C3D_TexDelete(&g_front);
     for (int i = 0; i < g_nposters; i++) if (g_pos[i].tex_ok) C3D_TexDelete(&g_pos[i].tex);
     if (g_restock_ok) C3D_TexDelete(&g_restock);
+    if (g_banner_ok)  C3D_TexDelete(&g_banner);
     for (int i = 0; i < WALLPOSTERS; i++) if (g_wall_ok[i]) C3D_TexDelete(&g_wall[i]);
     if (g_back_ok) C3D_TexDelete(&g_back);
     if (g_detail_ok) C3D_TexDelete(&g_detail);
