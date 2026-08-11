@@ -88,12 +88,15 @@ static float g_depth = 24.0f;
 #define UNIT_LEN_MIN  3.0f
 #define UNIT_DEPTH    1.0f
 #define UNIT_H        2.0f
-#define SIGN_Y        3.35f
+#define SIGN_Y        2.62f     /* hung low enough to clear the name across the back wall */
+#define ROW_Y0        0.60f     /* centre of the bottom row */
+#define ROW_DY        0.58f     /* row to row -- a case is 0.47 tall, so this is a shelf gap */
+#define CASE_W        0.33f     /* a case on the shelf; PITCH_FACE is this plus the gap */
 #define MAX_SECTIONS  8
 #define SEC_COLS      3
 #define BAY_ROWS      2
 #define PITCH_SPINE   0.235f
-#define PITCH_FACE    0.34f
+#define PITCH_FACE    0.35f
 /* A genre with fewer than this is not worth a unit -- a bay holding five films reads as a shop
  * closing down -- so it merges into OTHER. One with more than BAY_MAX gets a SECOND unit
  * instead of hiding the rest behind a MORE case. */
@@ -156,6 +159,8 @@ typedef struct {
     char    season[128];        /* "Show|S01" for an episode, "" for anything else */
     C3D_Tex tex;                /* its cover, owned outright -- see g_cov_n */
     int     tex_ok;             /* the ONLY thing that may bind tex; an uninitialised one wedges the GPU */
+    int     copy_of;            /* a second copy of another title: -1 normally, else its index.
+                                 * It has no texture of its own and binds the original's. */
     char    genres[80];
     char    desc[400];
     int     year, runtime, hasinfo;
@@ -354,6 +359,7 @@ static int scan_dir(const char *dir, int fixed_w, int fixed_h, int with_nfo, int
         (void)big;
         Poster *p = &g_pos[g_nposters];
         memset(p, 0, sizeof *p);
+        p->copy_of = -1;
         snprintf(p->srcpath, sizeof p->srcpath, "%s", src);
         p->src_w = sw; p->src_h = sh;
         { unsigned h = 2166136261u;                        /* spine colour from the title */
@@ -601,6 +607,52 @@ static void make_sign_tex_col(C3D_Tex *t, const char *text, u16 board, u16 edge,
 static void make_sign_tex(C3D_Tex *t, const char *text) {
     make_sign_tex_col(t, text, TH_BLUE, TH_YELLOW, TH_YELLOW, 2);
 }
+/* The shop name, on two lines, each scaled up until it fills the width.
+ *
+ * One line of 8px type at 1x on a 256 board left the text a third the height of its own frame,
+ * which reads as a label rather than as signage. Splitting it lets both lines run nearly the
+ * full width, and the scale is computed from the longest line rather than picked, so a
+ * different name still fills the board. */
+#define SIGN2_W 512
+#define SIGN2_H 128
+static void make_sign_tex2(C3D_Tex *t, const char *l1, const char *l2,
+                           u16 board, u16 edge, u16 ink) {
+    if (!C3D_TexInit(t, SIGN2_W, SIGN2_H, GPU_RGB565)) return;
+    u16 *lin = (u16 *)calloc(SIGN2_W * SIGN2_H, 2);
+    u16 *til = (u16 *)malloc(SIGN2_W * SIGN2_H * 2);
+    if (!lin || !til) { free(lin); free(til); C3D_TexDelete(t); return; }
+    for (int y = 0; y < SIGN2_H; y++)
+        for (int x = 0; x < SIGN2_W; x++) {
+            int b = (x < 5 || x >= SIGN2_W - 5 || y < 5 || y >= SIGN2_H - 5);
+            lin[y * SIGN2_W + x] = b ? edge : board;
+        }
+    const char *L[2] = { l1, l2 };
+    int sc[2], w[2];
+    const int avail = SIGN2_W - 40;
+    for (int i = 0; i < 2; i++) {
+        int len = (int)strlen(L[i]); if (len < 1) len = 1;
+        sc[i] = avail / (len * 8);
+        if (sc[i] > 8) sc[i] = 8;
+        if (sc[i] < 1) sc[i] = 1;
+        w[i] = len * 8 * sc[i];
+    }
+    int th = sc[0] * 8 + sc[1] * 8 + 10;              /* both lines plus the gap between them */
+    int y = (SIGN2_H - th) / 2;
+    for (int i = 0; i < 2; i++) {
+        int x0 = (SIGN2_W - w[i]) / 2;
+        for (const char *c = L[i]; *c; c++) {
+            draw_glyph(lin, SIGN2_W, SIGN2_H, x0, y, sc[i], ink, (unsigned char)*c);
+            x0 += 8 * sc[i];
+        }
+        y += sc[i] * 8 + 10;
+    }
+    tile_rgb565(lin, til, SIGN2_W, SIGN2_H);
+    memcpy(t->data, til, SIGN2_W * SIGN2_H * 2);
+    C3D_TexFlush(t);
+    C3D_TexSetFilter(t, GPU_LINEAR, GPU_LINEAR);
+    free(lin); free(til);
+}
+
 /* store name and fire-exit board */
 static C3D_Tex g_storesign, g_exitsign;
 static int     g_store_ok = 0, g_exit_ok = 0;
@@ -628,26 +680,27 @@ static int     g_restock_ok = 0;
  * poster it fills its texture edge to edge, so it draws on the full-UV sign quad. */
 #define BAN_W 256
 #define BAN_H 128
-static C3D_Tex g_banner;
-static int     g_banner_ok = 0;
-static void load_banner(void) {
+#define BANNERS 2
+static C3D_Tex g_banner[BANNERS];
+static int     g_banner_ok[BANNERS];
+static void load_banner(int i) {
     char src[400], small[400];
-    snprintf(src,   sizeof src,   "%s/banner.p565", CACHE_DIR);
-    snprintf(small, sizeof small, "%s/banner.b565", CACHE_DIR);
+    snprintf(src,   sizeof src,   "%s/banner%d.p565", CACHE_DIR, i);
+    snprintf(small, sizeof small, "%s/banner%d.b565", CACHE_DIR, i);
     FILE *f = fopen(small, "rb");
     if (!f) {
         if (!build_cache_entry_sz(src, BAN_W * 2, BAN_H * 2, small, BAN_W, BAN_H, BAN_W, BAN_H)) return;
         f = fopen(small, "rb");
         if (!f) return;
     }
-    if (!C3D_TexInit(&g_banner, BAN_W, BAN_H, GPU_RGB565)) { fclose(f); return; }
-    size_t got = fread(g_banner.data, 1, (size_t)BAN_W * BAN_H * 2, f);
+    if (!C3D_TexInit(&g_banner[i], BAN_W, BAN_H, GPU_RGB565)) { fclose(f); return; }
+    size_t got = fread(g_banner[i].data, 1, (size_t)BAN_W * BAN_H * 2, f);
     fclose(f);
-    if (got != (size_t)BAN_W * BAN_H * 2) { C3D_TexDelete(&g_banner); return; }
-    C3D_TexSetFilter(&g_banner, GPU_LINEAR, GPU_LINEAR);
-    C3D_TexSetWrap(&g_banner, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
-    C3D_TexFlush(&g_banner);
-    g_banner_ok = 1;
+    if (got != (size_t)BAN_W * BAN_H * 2) { C3D_TexDelete(&g_banner[i]); return; }
+    C3D_TexSetFilter(&g_banner[i], GPU_LINEAR, GPU_LINEAR);
+    C3D_TexSetWrap(&g_banner[i], GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
+    C3D_TexFlush(&g_banner[i]);
+    g_banner_ok[i] = 1;
 }
 
 static void load_restock(void) {
@@ -1254,6 +1307,36 @@ static void first_genre(const char *g, char *out, size_t cap) {
     if (!out[0]) snprintf(out, cap, "GENERAL");
 }
 
+/* is `name` one of the genres this title lists, at any position? */
+static int genre_listed(const char *genres, const char *name) {
+    if (!genres[0] || !name[0]) return 0;
+    size_t nl = strlen(name);
+    for (const char *q = genres; *q; ) {
+        while (*q == ' ' || *q == ',') q++;
+        if (!*q) break;
+        const char *e = q; while (*e && *e != ',') e++;
+        size_t len = (size_t)(e - q);
+        while (len && q[len - 1] == ' ') len--;
+        if (len == nl && !strncasecmp(q, name, nl)) return 1;
+        q = *e ? e + 1 : e;
+    }
+    return 0;
+}
+
+/* Shelve `src` again, in section k. Metadata is 1.2 KB and the cover is shared with the
+ * original, so a second copy costs almost nothing. */
+static int add_copy(int src, int k) {
+    if (g_nposters >= MAX_POSTERS) return -1;
+    int m = g_nposters++;
+    g_pos[m] = g_pos[src];
+    memset(&g_pos[m].tex, 0, sizeof g_pos[m].tex);   /* NOT its own -- and must not be deleted */
+    g_pos[m].tex_ok  = 0;
+    g_pos[m].copy_of = (g_pos[src].copy_of >= 0) ? g_pos[src].copy_of : src;
+    g_pos[m].sect    = k;
+    g_pos[m].order   = g_sec[k].n++;
+    return m;
+}
+
 static void place_section(int k);
 static void bake_spines(void);
 static void build_sections(void) {
@@ -1366,11 +1449,14 @@ static void build_sections(void) {
         float side = PLAN[i][0];
         int   back = (PLAN[i][1] < -90.0f);
         if (back) { g_sec[i].cx = side * (g_sec[i].len * 0.5f + 1.4f);
-                    g_sec[i].cz = STORE_Z0 - STORE_DEPTH + 1.2f; }
+                    g_sec[i].cz = STORE_Z0 - STORE_DEPTH + 2.6f; }   /* room to stand behind */
         else      { g_sec[i].cx = side * (STORE_HX - g_sec[i].len * 0.5f - 0.15f);
                     g_sec[i].cz = PLAN[i][1]; }
         g_sec[i].rot = PLAN[i][2];
-        g_sec[i].facedir = ((i / 3) % 2) ? -1.0f : 1.0f;   /* bays face each other in pairs */
+        /* Every bay faces the door. Alternating them meant half the shop had its stock on
+         * the far side, so you walked past a plain wooden back and had to go round to see
+         * anything -- and the covers on it were facing a wall. */
+        g_sec[i].facedir = 1.0f;
         /* An L return needs a bay long enough that turning the corner is worth it. The old
          * threshold wanted a whole unit over the minimum, which after the stock was filtered
          * no section reached -- so the shop had no returns in it at all. */
@@ -1410,14 +1496,47 @@ static void build_sections(void) {
      * bay with room to spare should not carry a control nobody has to press. */
     for (int k = 0; k < g_nsec; k++) {
         g_sec[k].Lcap = g_sec[k].has_L ? BAY_ROWS * g_sec[k].Lper_row : 0;
-        g_sec[k].cap = BAY_ROWS * g_sec[k].per_row + g_sec[k].Lcap;
+        g_sec[k].cap  = BAY_ROWS * g_sec[k].per_row + g_sec[k].Lcap;
+    }
+
+    /* A bay with four films in it and room for forty looks stripped, and how empty it looks
+     * depends entirely on how big the person's library is -- which we do not control. So fill
+     * it, the way a shop would: first with films that name this genre further down their list
+     * and were filed elsewhere on their first, then with second and third copies of what is
+     * already there. A rental shop carrying four copies of the same new release is what the
+     * shelves actually looked like. */
+    for (int k = 0; k < g_nsec; k++) {
+        if (g_sec[k].n == 0 || g_sec[k].n >= g_sec[k].cap) continue;
+        int named = strcasecmp(g_sec[k].name, "OTHER") && strcasecmp(g_sec[k].name, "GENERAL");
+        int base = g_nposters;                     /* snapshot: we are appending as we go */
+        if (named)
+            for (int i = 0; i < base && g_sec[k].n < g_sec[k].cap; i++)
+                if (g_pos[i].ok && !g_pos[i].is_more && g_pos[i].sect != k &&
+                    g_pos[i].copy_of < 0 && genre_listed(g_pos[i].genres, g_sec[k].name))
+                    if (add_copy(i, k) < 0) break;
+        /* then round-robin over this section's own stock until the bay is full */
+        int guard = 0;
+        while (g_sec[k].n < g_sec[k].cap && guard < MAX_POSTERS) {
+            int placed = 0;
+            for (int i = 0; i < base && g_sec[k].n < g_sec[k].cap; i++) {
+                if (!g_pos[i].ok || g_pos[i].is_more || g_pos[i].sect != k) continue;
+                if (g_pos[i].copy_of >= 0) continue;
+                if (add_copy(i, k) < 0) { guard = MAX_POSTERS; break; }
+                placed = 1;
+            }
+            if (!placed) break;                    /* nothing in here to copy: leave the gap */
+            guard++;
+        }
+    }
+
+    for (int k = 0; k < g_nsec; k++) {
         g_sec[k].more_idx = -1;
         g_sec[k].page = 0;
         if (g_sec[k].n > g_sec[k].cap && g_nposters < MAX_POSTERS) {
             g_sec[k].cap -= 1;                         /* the MORE case takes a slot */
             int m = g_nposters++;
             memset(&g_pos[m], 0, sizeof g_pos[m]);
-            g_pos[m].ok = 1; g_pos[m].is_more = 1; g_pos[m].sect = k;
+            g_pos[m].ok = 1; g_pos[m].is_more = 1; g_pos[m].sect = k; g_pos[m].copy_of = -1;
             g_pos[m].col = 1;   /* a black case: the MORE marker stands out on a white run */
             snprintf(g_pos[m].name, sizeof g_pos[m].name, "RESTOCK %s", g_sec[k].name);
             g_sec[k].more_idx = m;
@@ -1482,7 +1601,7 @@ static void place_section(int k) {
             float ca = cosf(S->rot), sa = sinf(S->rot);
             p->x  = S->cx + lx * ca + lz * sa;
             p->z  = S->cz - lx * sa + lz * ca;
-            p->y  = 0.62f + row * 0.78f;
+            p->y  = ROW_Y0 + row * ROW_DY;
             p->ay = S->rot + ((S->facedir < 0) ? C3D_Angle(0.5f) : 0.0f);
         } else {                                      /* round the corner, onto the return */
             if (!S->has_L) { p->shown = 0; continue; }
@@ -1498,20 +1617,20 @@ static void place_section(int k) {
             float outn  = (UNIT_DEPTH * 0.5f + 0.02f) * ((S->cx < 0) ? 1.0f : -1.0f);
             p->x  = S->Lx + outn;                     /* the return faces the walkway */
             p->z  = S->Lz + along;
-            p->y  = 0.62f + row * 0.78f;
+            p->y  = ROW_Y0 + row * ROW_DY;
             p->ay = S->Lay;
         }
         /* bake the model matrix now */
         Mtx_Identity(&p->model);
         Mtx_Translate(&p->model, p->x, p->y, p->z, true);
         Mtx_RotateY(&p->model, p->ay, true);
-        if (p->faceout) Mtx_Scale(&p->model, 0.30f, 0.30f * (float)IMG_H / (float)IMG_W, 1.0f);
+        if (p->faceout) Mtx_Scale(&p->model, CASE_W, CASE_W * (float)IMG_H / (float)IMG_W, 1.0f);
         else            Mtx_Scale(&p->model, 0.20f, 0.56f, 1.0f);
     }
 }
 
 /* ---------------- geometry ---------------- */
-#define ROOM_VTX     1200        /* shell + units + counter + wall shelving */
+#define ROOM_VTX     3000        /* shell + units + counter + wall shelving */
 static Vtx *g_roomv, *g_quadv, *g_signv;
 static void *g_roomvbo, *g_quadvbo, *g_signvbo;
 
@@ -1594,6 +1713,16 @@ static int build_room(void) {
         push_box_rot(g_roomv, &n, g_sec[i].cx, UNIT_H * 0.5f, g_sec[i].cz,
                      g_sec[i].len * 0.5f, UNIT_H * 0.5f, UNIT_DEPTH * 0.5f, g_sec[i].rot,
                      3, 1, 0.52f);
+        /* A board under each row and one over the top, standing a little proud of the face.
+         * Without them the cases hang on a flat slab -- the boards are what make it read as
+         * shelving. They go in the same batch as the unit, so they cost no extra draw. */
+        const float CH = CASE_W * (float)IMG_H / (float)IMG_W;
+        for (int r = 0; r <= BAY_ROWS; r++) {
+            float by = ROW_Y0 + r * ROW_DY - CH * 0.5f - 0.035f;
+            push_box_rot(g_roomv, &n, g_sec[i].cx, by, g_sec[i].cz,
+                         g_sec[i].len * 0.5f, 0.035f, UNIT_DEPTH * 0.5f + 0.045f,
+                         g_sec[i].rot, 3, 1, 0.70f);
+        }
     }
     /* the counter: a long wood block by the door, a register on top, and a returns box */
     { float ccx = -STORE_HX * 0.55f;                    /* the counter sits by the door */
@@ -1845,7 +1974,7 @@ int main(void) {
     make_spine_tex();
     make_white_tex();
     make_front_tex();
-    make_sign_tex_col(&g_storesign, "CLOWNSEC VIDEO RENTALS", TH_BLUE, TH_YELLOW, TH_YELLOW, 1);
+    make_sign_tex2(&g_storesign, "CLOWNSEC VIDEO", "RENTALS", TH_BLUE, TH_YELLOW, TH_YELLOW);
     g_store_ok = 1;
     /* the exit board stays green: that one is a fire sign, not branding */
     make_sign_tex_col(&g_exitsign,  "EXIT",              0x0140, 0x07E0, TH_WHITE, 2);
@@ -1876,7 +2005,7 @@ int main(void) {
     prebuild_covers(&built);                /* the slow part, done where you are standing still */
     build_sections();                       /* genres -> units -> poster positions */
     load_restock();                         /* after: the restock cases are made in there */
-    load_banner();
+    for (int i = 0; i < BANNERS; i++) load_banner(i);
     make_wall_posters();                    /* decorate: unit ends and the bare walls */
     int roomn = build_room();               /* needs the unit positions */
     g_roomvbo = g_roomv; g_quadvbo = g_quadv; g_signvbo = g_signv; g_boxvbo = g_boxv;
@@ -2154,10 +2283,11 @@ int main(void) {
             if (g_store_ok) {                              /* name across the back wall */
                 bind_tex(&g_storesign, g_store_ok);
                 C3D_Mtx m; Mtx_Copy(&m, &view);
-                Mtx_Translate(&m, 0.0f, 3.3f, STORE_Z0 - STORE_DEPTH + 0.06f, true);
-                float nw = STORE_HX * 1.3f;                /* fits the back wall it hangs on */
-                if (nw > 15.0f) nw = 15.0f;
-                Mtx_Scale(&m, nw, nw * (float)SIGN_H / (float)SIGN_W, 1.0f);
+                Mtx_Translate(&m, 0.0f, 3.42f, STORE_Z0 - STORE_DEPTH + 0.06f, true);
+                /* narrower than it was: the board is sized to its type now, not to the wall */
+                float nw = STORE_HX * 0.78f;
+                if (nw > 8.0f) nw = 8.0f;
+                Mtx_Scale(&m, nw, nw * (float)SIGN2_H / (float)SIGN2_W, 1.0f);
                 C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
                 draw_range(0, 6);
             }
@@ -2204,7 +2334,8 @@ int main(void) {
                 if (i == held || i == sel) continue;   /* held and selected are drawn separately */
                 int more = g_pos[i].is_more;
                 if (!g_covers_on) continue;
-                if (!(more ? g_restock_ok : g_pos[i].tex_ok)) continue;
+                int ti = g_pos[i].copy_of >= 0 ? g_pos[i].copy_of : i;   /* a copy shares its art */
+                if (!(more ? g_restock_ok : g_pos[ti].tex_ok)) continue;
                 float dxs = g_pos[i].x - cx, dzs = g_pos[i].z - cz;
                 float d2 = dxs * dxs + dzs * dzs;
                 if (d2 > COVER_VIEW * COVER_VIEW) continue;
@@ -2222,7 +2353,7 @@ int main(void) {
                  * frame, so a world-space offset here would push it sideways instead. */
                 m.r[2].w += 0.010f;
                 C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
-                bind_tex(more ? &g_restock : &g_pos[i].tex, more ? g_restock_ok : g_pos[i].tex_ok);
+                bind_tex(more ? &g_restock : &g_pos[ti].tex, more ? g_restock_ok : g_pos[ti].tex_ok);
                 draw_range(0, 6);
                 drawn++;
             }
@@ -2242,9 +2373,10 @@ int main(void) {
                  * Sweeping the stick changes the selection almost every frame, and loading the
                  * big sheet meant an SD open per frame while aiming. The full one is for the
                  * case in your hand, where a single hitch on a deliberate button press is fine. */
+                int st = g_pos[sel].copy_of >= 0 ? g_pos[sel].copy_of : sel;
                 bind_tex(g_pos[sel].is_more ? (g_restock_ok ? &g_restock : &g_front)
                          : (g_detail_ok && g_detail_for == sel) ? &g_detail
-                         : (g_pos[sel].tex_ok ? &g_pos[sel].tex : &g_front), 1);
+                         : (g_pos[st].tex_ok ? &g_pos[st].tex : &g_front), 1);
                 draw_range(0, 6);
             }
 
@@ -2292,6 +2424,11 @@ int main(void) {
 
             /* framed posters: an end cap on each unit, and a few around the walls */
             if (g_wall_n > 0) {
+                /* Every frame takes the NEXT unused poster and stops when they run out, rather
+                 * than wrapping -- wrapping is why the same art turned up on a bay end and on
+                 * the wall beside it. */
+                int wl[WALLPOSTERS], wn = 0;
+                for (int i = 0; i < WALLPOSTERS; i++) if (g_wall_ok[i]) wl[wn++] = i;
                 /* the POSTER quad, not the sign quad: a cover fills only the top IMG_H of its
                  * texture box, so a full 0..1 quad shows it squashed up top over a black band */
                 set_buf(g_quadvbo, 6);
@@ -2302,8 +2439,8 @@ int main(void) {
                          * a poster there is half-buried by it */
                         int inner = (g_sec[i].cx < 0) ? 1 : 0;
                         if (g_sec[i].has_L && e == inner) continue;
-                        int k = (w++) % WALLPOSTERS;
-                        if (!g_wall_ok[k]) continue;
+                        if (w >= wn) continue;
+                        int k = wl[w++];
                         bind_tex(&g_wall[k], g_wall_ok[k]);
                         C3D_Mtx m; Mtx_Copy(&m, &view);
                         Mtx_Translate(&m, g_sec[i].cx + (e ? 1 : -1) * (g_sec[i].len * 0.5f + 0.03f),
@@ -2330,8 +2467,10 @@ int main(void) {
                     {  STORE_HX * 0.82f, 1.62f, STORE_Z0 - STORE_DEPTH + 0.08f, 0.0f },
                 };
                 for (int i = 0; i < 6; i++) {
-                    int k = (w++) % WALLPOSTERS;
-                    if (!g_wall_ok[k]) continue;
+                    /* the back wall is only bare when there is no run of bays against it */
+                    if (i >= 4 && g_nsec > 6) continue;
+                    if (w >= wn) continue;
+                    int k = wl[w++];
                     bind_tex(&g_wall[k], g_wall_ok[k]);
                     C3D_Mtx m; Mtx_Copy(&m, &view);
                     Mtx_Translate(&m, WP[i][0], WP[i][1], WP[i][2], true);
@@ -2340,16 +2479,26 @@ int main(void) {
                     C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
                     draw_range(0, 6);
                 }
-                /* the wide one, centred on the back wall below the name */
-                if (g_banner_ok) {
-                    set_buf(g_signvbo, 6);           /* it fills its texture, so full UVs */
-                    bind_tex(&g_banner, g_banner_ok);
-                    float bw = STORE_HX * 0.62f; if (bw > 6.2f) bw = 6.2f;
-                    C3D_Mtx m; Mtx_Copy(&m, &view);
-                    Mtx_Translate(&m, 0.0f, 1.72f, STORE_Z0 - STORE_DEPTH + 0.08f, true);
-                    Mtx_Scale(&m, bw, bw * (float)BAN_H / (float)BAN_W, 1.0f);
-                    C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
-                    draw_range(0, 6);
+                /* the wide ones: back wall below the name, and over the door on the way out */
+                {
+                    const float BN[BANNERS][4] = {   /* x, y, z, facing */
+                        { 0.0f, 1.72f, STORE_Z0 - STORE_DEPTH + 0.08f, 0.0f },
+                        { 0.0f, 2.95f, STORE_Z0 - 0.10f,               3.14159f },
+                    };
+                    int any = 0;
+                    for (int i = 0; i < BANNERS; i++) if (g_banner_ok[i]) any = 1;
+                    if (any) set_buf(g_signvbo, 6);  /* a banner fills its texture: full UVs */
+                    for (int i = 0; i < BANNERS; i++) {
+                        if (!g_banner_ok[i]) continue;
+                        bind_tex(&g_banner[i], g_banner_ok[i]);
+                        float bw = STORE_HX * 0.62f; if (bw > 6.2f) bw = 6.2f;
+                        C3D_Mtx m; Mtx_Copy(&m, &view);
+                        Mtx_Translate(&m, BN[i][0], BN[i][1], BN[i][2], true);
+                        Mtx_RotateY(&m, BN[i][3], true);
+                        Mtx_Scale(&m, bw, bw * (float)BAN_H / (float)BAN_W, 1.0f);
+                        C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
+                        draw_range(0, 6);
+                    }
                 }
             }
 
@@ -2449,7 +2598,7 @@ int main(void) {
     if (g_front_ok)  C3D_TexDelete(&g_front);
     for (int i = 0; i < g_nposters; i++) if (g_pos[i].tex_ok) C3D_TexDelete(&g_pos[i].tex);
     if (g_restock_ok) C3D_TexDelete(&g_restock);
-    if (g_banner_ok)  C3D_TexDelete(&g_banner);
+    for (int i = 0; i < BANNERS; i++) if (g_banner_ok[i]) C3D_TexDelete(&g_banner[i]);
     for (int i = 0; i < WALLPOSTERS; i++) if (g_wall_ok[i]) C3D_TexDelete(&g_wall[i]);
     if (g_back_ok) C3D_TexDelete(&g_back);
     if (g_detail_ok) C3D_TexDelete(&g_detail);
