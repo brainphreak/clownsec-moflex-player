@@ -87,7 +87,7 @@ static float g_depth = 24.0f;
 /* A bay is BUILT TO ITS SECTION now, not to a fixed size: a quiet genre gets a short unit, a
  * busy one a long one. That is what a shop looks like, and it is the only way to have every
  * shelf full instead of a hall of half-empty carpet. These are the limits. */
-#define UNIT_LEN      7.4f
+#define UNIT_LEN      6.3f
 #define UNIT_LEN_MIN  3.0f
 #define UNIT_DEPTH    1.0f
 #define UNIT_H        2.0f
@@ -137,7 +137,7 @@ static float g_depth = 24.0f;
  * ninety-six cases its own texture and cost 1.5 MB, which this room has room for several times
  * over. Thirty-two is half a megabyte and keeps most of what you can actually see in real art,
  * with the blank clamshell behind the rest. */
-#define COVER_VIEW   18.0f      /* a cover is drawn this far off; the cull does the rest */
+#define COVER_VIEW   14.5f      /* a cover is drawn this far off; the cull does the rest */
 
 /* Metadata is cheap -- about 1.2 KB a title, so even a thousand is well under 2 MB. What
  * costs is the cover bitmap at 16 KB each, and that is what cover_budget_bytes() rations. */
@@ -1595,7 +1595,15 @@ static void build_sections(void) {
     /* Which bay each title belongs to. A split genre has several units named "COMEDY 1",
      * "COMEDY 2" -- match on the genre and take whichever of its units is emptiest, so the
      * pair fill evenly rather than one being full and one bare. */
+    /* Titles WITH a description are shelved first, and the ones without take what is left.
+     *
+     * A bay shows one page at a time and restocks for the rest, so this does not hide anything
+     * -- it decides what is on the shelf when you walk in. A case with no title and no blurb
+     * is the least useful thing we can put in front of someone, so it goes behind the ones
+     * that can actually answer a question about themselves. */
+    for (int pass = 0; pass < 2; pass++)
     for (int i = 0; i < g_nposters; i++) {
+        if ((g_pos[i].hasinfo ? 0 : 1) != pass) continue;
         char g[24]; first_genre(g_pos[i].genres, g, sizeof g);
         size_t gl = strlen(g);
         int k = other_idx;                             /* OTHER unless a section matches */
