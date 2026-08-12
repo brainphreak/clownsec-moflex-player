@@ -1625,14 +1625,6 @@ static void build_sections(void) {
     }
 
 
-    /* A bay that cannot hold its whole genre gets a RESTOCK case in the top-left slot: pick it up,
-     * press the verb, and the shelf turns over to the next lot. Only where it is needed -- a
-     * bay with room to spare should not carry a control nobody has to press. */
-    for (int k = 0; k < g_nsec; k++) {
-        g_sec[k].Lcap = g_sec[k].has_L ? BAY_ROWS * g_sec[k].Lper_row : 0;
-        g_sec[k].cap  = BAY_ROWS * g_sec[k].per_row + g_sec[k].Lcap;
-    }
-
     /* Build each bay to its contents: a row holds `len / PITCH_FACE` cases, BAY_ROWS of them. */
     for (int k = 0; k < g_nsec; k++) {
         /* a face takes more shelf than a spine, so the mix decides how much a bay holds */
@@ -1747,6 +1739,16 @@ static void build_sections(void) {
         g_sec[i].Lay  = (g_sec[i].cx < 0) ? C3D_Angle(0.25f) : C3D_Angle(-0.25f);
         make_sign_tex(&g_sec[i].sign, g_sec[i].name);
         g_sec[i].sign_ok = 1;
+    }
+
+    /* How much a bay holds. This has to come after BOTH the sizing loop, which sets per_row,
+     * and the placement loop, which decides whether a bay gets an L return -- moving the
+     * filing earlier dragged this up with it, so cap was worked out from a per_row of zero.
+     * Every bay then held nothing, every title fell outside its page, and the only thing left
+     * standing on the shelves was the restock case in slot zero. */
+    for (int k = 0; k < g_nsec; k++) {
+        g_sec[k].Lcap = g_sec[k].has_L ? BAY_ROWS * g_sec[k].Lper_row : 0;
+        g_sec[k].cap  = BAY_ROWS * g_sec[k].per_row + g_sec[k].Lcap;
     }
 
     /* An empty bay is given to whichever genre has the most it cannot show.
@@ -2845,7 +2847,14 @@ int main(void) {
                 C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
 
                 set_buf(g_boxvbo, 36);
-                bind_tex((g_detail_ok && g_detail_for == held) ? &g_detail : &g_spine[g_pos[held].col], 1);
+                /* The restock case has no artwork of its own on the card -- no key, no source
+                 * -- so load_detail can never fill the big sheet for it and it came up blank
+                 * the moment you picked it up. It wears the same cover in your hand that it
+                 * wears on the shelf. */
+                bind_tex(g_pos[held].is_more
+                             ? (g_restock_ok ? &g_restock : &g_front)
+                             : (g_detail_ok && g_detail_for == held) ? &g_detail
+                                                                     : &g_front, 1);
                 draw_range(0, 6);
                 if (g_back_ok) {
                     bind_tex(&g_back, g_back_ok);                /* back: the printed card */
