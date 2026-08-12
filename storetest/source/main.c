@@ -895,6 +895,18 @@ static void prebuild_covers(int *built) {
         C3D_TexSetWrap(&q->tex, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
         C3D_TexFlush(&q->tex);
         q->tex_ok = 1; q->cover_state = 1; g_cov_n++;
+        /* Build the big one too, while we are standing still.
+         *
+         * Picking a case up loads a 128x256 sheet, and building that means reading the source,
+         * rescaling and writing a file -- on the main thread, holding the card. The music
+         * feeder wants the card every quarter second and loses, which is the skip you hear
+         * when you grab something whose sheet had never been built. Built here, a pickup is a
+         * plain read. */
+        snprintf(path, sizeof path, "%s/%s.t565", CACHE_DIR, q->key);
+        FILE *bf = fopen(path, "rb");
+        if (bf) fclose(bf);
+        else if (build_cache_entry_sz(q->srcpath, q->src_w, q->src_h, path,
+                                      DET_W, DET_H, DET_IMG_W, DET_IMG_H)) (*built)++;
         if ((i & 7) == 0) {                       /* say what it is doing; this takes a while */
             printf("\x1b[8;1H  preparing covers  %d / %d   ", i + 1, g_nposters);
             gfxFlushBuffers(); gspWaitForVBlank();
@@ -1568,11 +1580,65 @@ static void build_sections(void) {
         g_sec[g_nsec].n = 14;                  /* provisional: a corner rack, not a full bay */
         g_nsec++;
     }
+    /* Titles are filed BEFORE the bays are sized, so a bay is built to what it actually
+     * holds. Sizing first meant sizing from the provisional first-genre tally, which stopped
+     * being true the moment a film could be filed under any genre it lists and television
+     * moved to a shelf of its own -- bays came out built for stock that had gone elsewhere,
+     * which is what left them looking half empty. */
+    for (int k = 0; k < g_nsec; k++) g_sec[k].n = 0;
+
+    /* Which bay each title belongs to. A split genre has several units named "COMEDY 1",
+     * "COMEDY 2" -- match on the genre and take whichever of its units is emptiest, so the
+     * pair fill evenly rather than one being full and one bare. */
+    /* Titles WITH a description are shelved first, and the ones without take what is left.
+     *
+     * A bay shows one page at a time and restocks for the rest, so this does not hide anything
+     * -- it decides what is on the shelf when you walk in. A case with no title and no blurb
+     * is the least useful thing we can put in front of someone, so it goes behind the ones
+     * that can actually answer a question about themselves. */
+    for (int pass = 0; pass < 2; pass++)
+    for (int i = 0; i < g_nposters; i++) {
+        if ((g_pos[i].hasinfo ? 0 : 1) != pass) continue;
+        /* EVERY genre it lists, in order, not just the first.
+         *
+         * A section exists only for a genre that is first on enough titles, but assignment
+         * used to look at the first genre and nothing else -- so a film listed
+         * "Mystery, Horror" went to the catch-all because Mystery was too small, with the
+         * HORROR bay standing next to it. Its first genre still wins where that bay exists;
+         * the rest are what it falls back on before giving up and going to OTHER. */
+        int k = other_idx;                             /* OTHER unless some genre matches */
+        int best = -1;
+        char g[24];
+        for (int gi = 0; best < 0 && genre_token(g_pos[i].genres, gi, g, sizeof g); gi++) {
+            size_t gl = strlen(g);
+            for (int j = 0; j < g_nsec; j++) {
+                if (j == g_new_idx) continue;          /* stocked by year, not by genre */
+                if (strncmp(g_sec[j].name, g, gl)) continue;
+                char t = g_sec[j].name[gl];
+                if (t != 0 && t != ' ') continue;      /* "COMEDY" must not match "COMEDYDRAMA" */
+                if (best < 0 || g_sec[j].n < g_sec[best].n) best = j;
+            }
+        }
+        if (best >= 0) k = best;
+        g_pos[i].sect  = k;
+        g_pos[i].order = g_sec[k].n++;
+    }
+
+
+    /* A bay that cannot hold its whole genre gets a RESTOCK case in the top-left slot: pick it up,
+     * press the verb, and the shelf turns over to the next lot. Only where it is needed -- a
+     * bay with room to spare should not carry a control nobody has to press. */
+    for (int k = 0; k < g_nsec; k++) {
+        g_sec[k].Lcap = g_sec[k].has_L ? BAY_ROWS * g_sec[k].Lper_row : 0;
+        g_sec[k].cap  = BAY_ROWS * g_sec[k].per_row + g_sec[k].Lcap;
+    }
+
     /* Build each bay to its contents: a row holds `len / PITCH_FACE` cases, BAY_ROWS of them. */
     for (int k = 0; k < g_nsec; k++) {
         /* a face takes more shelf than a spine, so the mix decides how much a bay holds */
         float avg = PITCH_FACE;                  /* one width now: everything faces out */
-        float need = ((float)g_sec[k].n / (float)BAY_ROWS) * avg + 0.5f;
+        int nn = (k == g_new_idx) ? 14 : g_sec[k].n;   /* the rack is stocked later, by year */
+        float need = ((float)nn / (float)BAY_ROWS) * avg + 0.5f;
         if (need < UNIT_LEN_MIN) need = UNIT_LEN_MIN;
         if (need > UNIT_LEN)     need = UNIT_LEN;
         g_sec[k].len = need;
@@ -1665,7 +1731,11 @@ static void build_sections(void) {
         /* An L return needs a bay long enough that turning the corner is worth it. The old
          * threshold wanted a whole unit over the minimum, which after the stock was filtered
          * no section reached -- so the shop had no returns in it at all. */
-        g_sec[i].has_L   = (i < 6) && (g_sec[i].len > UNIT_LEN_MIN + 0.4f) && !back;
+        /* An L return doubles what a bay can hold, so it only goes on where the stock would
+         * otherwise overflow. Adding one to a bay that was already going to be short just
+         * bought twelve more empty slots. */
+        g_sec[i].has_L   = (i < 6) && (g_sec[i].len > UNIT_LEN_MIN + 0.4f) && !back &&
+                           (g_sec[i].n > BAY_ROWS * g_sec[i].per_row + 4);
         /* the return runs along z at the inner end, facing the walkway */
         float inner = g_sec[i].cx + ((g_sec[i].cx < 0) ? g_sec[i].len * 0.5f : -g_sec[i].len * 0.5f);
         g_sec[i].Llen = 3.2f;
@@ -1677,58 +1747,6 @@ static void build_sections(void) {
         g_sec[i].Lay  = (g_sec[i].cx < 0) ? C3D_Angle(0.25f) : C3D_Angle(-0.25f);
         make_sign_tex(&g_sec[i].sign, g_sec[i].name);
         g_sec[i].sign_ok = 1;
-    }
-
-    /* Only NOW is the provisional count spent. It used to be cleared before the bay lengths
-     * were worked out, so `need` was always 0.5 and every bay in the shop clamped to the
-     * minimum length whatever it held -- which is why raising UNIT_LEN never changed anything.
-     * The lengths are set above; from here the count is rebuilt for real. */
-    for (int k = 0; k < g_nsec; k++) g_sec[k].n = 0;
-
-    /* Which bay each title belongs to. A split genre has several units named "COMEDY 1",
-     * "COMEDY 2" -- match on the genre and take whichever of its units is emptiest, so the
-     * pair fill evenly rather than one being full and one bare. */
-    /* Titles WITH a description are shelved first, and the ones without take what is left.
-     *
-     * A bay shows one page at a time and restocks for the rest, so this does not hide anything
-     * -- it decides what is on the shelf when you walk in. A case with no title and no blurb
-     * is the least useful thing we can put in front of someone, so it goes behind the ones
-     * that can actually answer a question about themselves. */
-    for (int pass = 0; pass < 2; pass++)
-    for (int i = 0; i < g_nposters; i++) {
-        if ((g_pos[i].hasinfo ? 0 : 1) != pass) continue;
-        /* EVERY genre it lists, in order, not just the first.
-         *
-         * A section exists only for a genre that is first on enough titles, but assignment
-         * used to look at the first genre and nothing else -- so a film listed
-         * "Mystery, Horror" went to the catch-all because Mystery was too small, with the
-         * HORROR bay standing next to it. Its first genre still wins where that bay exists;
-         * the rest are what it falls back on before giving up and going to OTHER. */
-        int k = other_idx;                             /* OTHER unless some genre matches */
-        int best = -1;
-        char g[24];
-        for (int gi = 0; best < 0 && genre_token(g_pos[i].genres, gi, g, sizeof g); gi++) {
-            size_t gl = strlen(g);
-            for (int j = 0; j < g_nsec; j++) {
-                if (j == g_new_idx) continue;          /* stocked by year, not by genre */
-                if (strncmp(g_sec[j].name, g, gl)) continue;
-                char t = g_sec[j].name[gl];
-                if (t != 0 && t != ' ') continue;      /* "COMEDY" must not match "COMEDYDRAMA" */
-                if (best < 0 || g_sec[j].n < g_sec[best].n) best = j;
-            }
-        }
-        if (best >= 0) k = best;
-        g_pos[i].sect  = k;
-        g_pos[i].order = g_sec[k].n++;
-    }
-
-
-    /* A bay that cannot hold its whole genre gets a RESTOCK case in the top-left slot: pick it up,
-     * press the verb, and the shelf turns over to the next lot. Only where it is needed -- a
-     * bay with room to spare should not carry a control nobody has to press. */
-    for (int k = 0; k < g_nsec; k++) {
-        g_sec[k].Lcap = g_sec[k].has_L ? BAY_ROWS * g_sec[k].Lper_row : 0;
-        g_sec[k].cap  = BAY_ROWS * g_sec[k].per_row + g_sec[k].Lcap;
     }
 
     /* An empty bay is given to whichever genre has the most it cannot show.

@@ -18,8 +18,11 @@
 
 #define MUS_MAX     64          /* tracks in the folder we will look at */
 #define MUS_CHAN    7           /* a high channel: nothing else in here uses the DSP */
-#define MUS_BUFS    2
-#define MUS_FRAMES  8192        /* ~0.25 s at 32 kHz -- two of these is half a second of slack */
+#define MUS_BUFS    3
+/* ~0.5 s each at 32 kHz, so three of them is a second and a half of slack. Two quarter-second
+ * buffers could not ride out the main thread sitting on the SD card to build a cover sheet,
+ * and the track skipped. 196 KB of linear memory to never hear that again is a good trade. */
+#define MUS_FRAMES  16384
 
 static char        g_dir[256];
 static char        g_name[MUS_MAX][128];
