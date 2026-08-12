@@ -104,6 +104,13 @@ static float g_depth = 24.0f;
  * closing down -- so it merges into OTHER. One with more than BAY_MAX gets a SECOND unit
  * instead of hiding the rest behind a MORE case. */
 #define BAY_MIN       6         /* a genre needs this many titles to be worth a shelf */
+/* Television is the exception: it always gets a shelf, however little of it there is.
+ *
+ * It is a CATEGORY, not a genre -- someone looking for a series is not browsing Comedy for it
+ * -- and in most libraries it is the smallest thing on the floor. Folding it into Drama
+ * because there are only five shows would hide the one section a viewer goes straight to. It
+ * simply ends up the shortest bay in the room, which is what it looks like in a real shop. */
+#define TV_SECTION    "TV SHOWS"
 #define MAX_COPIES    3         /* extra facings of one title: four on the shelf, never twelve */
 #define BAY_MAX      32
 #define PER_ROW      22         /* the most cases a full-length bay holds in a row */
@@ -1549,7 +1556,7 @@ static void build_sections(void) {
     int spare = MAX_SECTIONS;
     int other = 0;
     for (int i = 0; i < uniq && spare > 2; i++) {   /* two held back: OTHER and NEW RELEASES */
-        if (count[i] < BAY_MIN) { other += count[i]; continue; }
+        if (count[i] < BAY_MIN && strcasecmp(names[i], TV_SECTION)) { other += count[i]; continue; }
         /* A genre may take a SECOND bay when it has the stock for one, but never a third --
          * that is what once turned ten genres into seventeen bays and a great deal of floor to
          * cross. Two is what fills the centre column without the room running away. Anything
@@ -1830,6 +1837,7 @@ static void build_sections(void) {
      * and the code above either gives it to an overflowing genre or does not build it. */
     for (int k = 0; k < g_nsec; k++) {
         if (k == g_new_idx || g_sec[k].n == 0 || g_sec[k].n >= BAY_MIN) continue;
+        if (!strcasecmp(g_sec[k].name, TV_SECTION)) continue;   /* television keeps its shelf */
         int big = -1;
         for (int j = 0; j < g_nsec; j++) {
             if (j == k || j == g_new_idx || g_sec[j].n < BAY_MIN) continue;
