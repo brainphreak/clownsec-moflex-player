@@ -103,8 +103,8 @@ static float g_depth = 24.0f;
 /* A genre with fewer than this is not worth a unit -- a bay holding five films reads as a shop
  * closing down -- so it merges into OTHER. One with more than BAY_MAX gets a SECOND unit
  * instead of hiding the rest behind a MORE case. */
-#define BAY_MIN       4
-#define MAX_COPIES    2         /* extra facings of one title: three on the shelf, never twelve */
+#define BAY_MIN       6         /* a genre needs this many titles to be worth a shelf */
+#define MAX_COPIES    3         /* extra facings of one title: four on the shelf, never twelve */
 #define BAY_MAX      32
 #define PER_ROW      22         /* the most cases a full-length bay holds in a row */
 /* One side only. Stocking both faces doubled what had to be drawn, hid half of it behind the
@@ -1629,7 +1629,10 @@ static void build_sections(void) {
     for (int k = 0; k < g_nsec; k++) {
         /* a face takes more shelf than a spine, so the mix decides how much a bay holds */
         float avg = PITCH_FACE;                  /* one width now: everything faces out */
-        int nn = (k == g_new_idx) ? 14 : g_sec[k].n;   /* the rack is stocked later, by year */
+        /* Sized for a STOCKED shelf, not a bare one. A bay built for the number of distinct
+         * titles alone came out tiny, because a shop of a hundred titles carries several
+         * hundred cases -- which is the whole reason a rental shop looked full. */
+        int nn = (k == g_new_idx) ? 14 : g_sec[k].n * 3;
         float need = ((float)nn / (float)BAY_ROWS) * avg + 0.5f;
         if (need < UNIT_LEN_MIN) need = UNIT_LEN_MIN;
         if (need > UNIT_LEN)     need = UNIT_LEN;
@@ -1727,7 +1730,7 @@ static void build_sections(void) {
          * otherwise overflow. Adding one to a bay that was already going to be short just
          * bought twelve more empty slots. */
         g_sec[i].has_L   = (i < 6) && (g_sec[i].len > UNIT_LEN_MIN + 0.4f) && !back &&
-                           (g_sec[i].n > BAY_ROWS * g_sec[i].per_row + 4);
+                           (g_sec[i].n * 3 > BAY_ROWS * g_sec[i].per_row + 4);
         /* the return runs along z at the inner end, facing the walkway */
         float inner = g_sec[i].cx + ((g_sec[i].cx < 0) ? g_sec[i].len * 0.5f : -g_sec[i].len * 0.5f);
         g_sec[i].Llen = 3.2f;
@@ -1818,6 +1821,48 @@ static void build_sections(void) {
         }
     }
 
+    /* A shelf holding three films is not a section, whatever its sign says.
+     *
+     * The catch-all is the usual offender: everything that could be filed elsewhere has been,
+     * and what is left is three odds and ends. Rather than give them a bay of their own -- or
+     * pad it out to forty facings of three covers -- they are moved to the biggest section on
+     * the floor, where they are three extra films among many. The bay they came from empties,
+     * and the code above either gives it to an overflowing genre or does not build it. */
+    for (int k = 0; k < g_nsec; k++) {
+        if (k == g_new_idx || g_sec[k].n == 0 || g_sec[k].n >= BAY_MIN) continue;
+        int big = -1;
+        for (int j = 0; j < g_nsec; j++) {
+            if (j == k || j == g_new_idx || g_sec[j].n < BAY_MIN) continue;
+            if (big < 0 || g_sec[j].n > g_sec[big].n) big = j;
+        }
+        if (big < 0) continue;                     /* nowhere better: leave it where it is */
+        for (int i = 0; i < g_nposters; i++) {
+            if (g_pos[i].is_more || g_pos[i].sect != k) continue;
+            g_pos[i].sect = big;
+            g_pos[i].order = g_sec[big].n++;
+        }
+        g_sec[k].n = 0;
+    }
+
+    /* Restock cases and page counts, worked out BEFORE the shelf is topped up, so the filling
+     * below knows how many pages it has to fill rather than only the first one. */
+    for (int k = 0; k < g_nsec; k++) {
+        g_sec[k].more_idx = -1;
+        g_sec[k].page = 0;
+        if (g_sec[k].n > g_sec[k].cap && g_nposters < MAX_POSTERS) {
+            g_sec[k].cap -= 1;                         /* the MORE case takes a slot */
+            int m = g_nposters++;
+            memset(&g_pos[m], 0, sizeof g_pos[m]);
+            g_pos[m].ok = 1; g_pos[m].is_more = 1; g_pos[m].sect = k; g_pos[m].copy_of = -1;
+            g_pos[m].col = 1;   /* a black case: the MORE marker stands out on a white run */
+            snprintf(g_pos[m].name, sizeof g_pos[m].name, "RESTOCK %s", g_sec[k].name);
+            g_sec[k].more_idx = m;
+        }
+        int cap = g_sec[k].cap > 0 ? g_sec[k].cap : 1;
+        g_sec[k].pages = (g_sec[k].n + cap - 1) / cap;
+        if (g_sec[k].pages < 1) g_sec[k].pages = 1;
+    }
+
     /* A bay with four films in it and room for forty looks stripped, and how empty it looks
      * depends entirely on how big the person's library is -- which we do not control. So fill
      * it, the way a shop would: first with films that name this genre further down their list
@@ -1825,11 +1870,15 @@ static void build_sections(void) {
      * already there. A rental shop carrying four copies of the same new release is what the
      * shelves actually looked like. */
     for (int k = 0; k < g_nsec; k++) {
-        if (g_sec[k].n == 0 || g_sec[k].n >= g_sec[k].cap) continue;
+        /* Fill to the last page, not to the first. A restock used to turn a full shelf into
+         * whatever was left over -- three films rattling around a bay built for forty -- because
+         * only page one was ever topped up. Every page is a shelf someone looks at. */
+        int want = g_sec[k].pages * g_sec[k].cap;
+        if (g_sec[k].n == 0 || g_sec[k].n >= want) continue;
         int named = strcasecmp(g_sec[k].name, "OTHER") && strcasecmp(g_sec[k].name, "GENERAL");
         int base = g_nposters;                     /* snapshot: we are appending as we go */
         if (named)
-            for (int i = 0; i < base && g_sec[k].n < g_sec[k].cap; i++)
+            for (int i = 0; i < base && g_sec[k].n < want; i++)
                 if (g_pos[i].ok && !g_pos[i].is_more && g_pos[i].sect != k &&
                     g_pos[i].copy_of < 0 && genre_listed(g_pos[i].genres, g_sec[k].name))
                     if (add_copy(i, k) < 0) break;
@@ -1839,9 +1888,9 @@ static void build_sections(void) {
          * reads as a fault rather than as stock -- and made its restock look broken, because
          * the next page was more of the same two. A part-empty shelf is the better failure. */
         int guard = 0;
-        while (g_sec[k].n < g_sec[k].cap && guard < MAX_COPIES) {
+        while (g_sec[k].n < want && guard < MAX_COPIES) {
             int placed = 0;
-            for (int i = 0; i < base && g_sec[k].n < g_sec[k].cap; i++) {
+            for (int i = 0; i < base && g_sec[k].n < want; i++) {
                 if (!g_pos[i].ok || g_pos[i].is_more || g_pos[i].sect != k) continue;
                 if (g_pos[i].copy_of >= 0) continue;
                 if (add_copy(i, k) < 0) { guard = MAX_POSTERS; break; }
@@ -1880,22 +1929,6 @@ static void build_sections(void) {
         }
     }
 
-    for (int k = 0; k < g_nsec; k++) {
-        g_sec[k].more_idx = -1;
-        g_sec[k].page = 0;
-        if (g_sec[k].n > g_sec[k].cap && g_nposters < MAX_POSTERS) {
-            g_sec[k].cap -= 1;                         /* the MORE case takes a slot */
-            int m = g_nposters++;
-            memset(&g_pos[m], 0, sizeof g_pos[m]);
-            g_pos[m].ok = 1; g_pos[m].is_more = 1; g_pos[m].sect = k; g_pos[m].copy_of = -1;
-            g_pos[m].col = 1;   /* a black case: the MORE marker stands out on a white run */
-            snprintf(g_pos[m].name, sizeof g_pos[m].name, "RESTOCK %s", g_sec[k].name);
-            g_sec[k].more_idx = m;
-        }
-        int cap = g_sec[k].cap > 0 ? g_sec[k].cap : 1;
-        g_sec[k].pages = (g_sec[k].n + cap - 1) / cap;
-        if (g_sec[k].pages < 1) g_sec[k].pages = 1;
-    }
     /* A bay with a lit sign over it and not one case on it looks like a fault, so it is not
      * built at all. The catch-all earns this regularly: once a title can be filed under any
      * genre it lists rather than only its first, there is often nothing left over for it. */
