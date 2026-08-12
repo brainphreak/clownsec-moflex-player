@@ -2492,12 +2492,14 @@ int main(void) {
          * touches the SD card while you walk, so the frame rate either jumps when they are off
          * -- the stutter is the cover pool -- or it does not, and it is draw volume. */
         if (kd & KEY_SELECT) g_covers_on = !g_covers_on;
-        /* R skips a track from anywhere; the jukebox by the counter does the same if you walk
-         * up to it and press A with no case highlighted. */
+        /* ZR skips a track, NOT R -- R strafes, and binding both to it meant sidestepping
+         * along a shelf skipped the song every time. ZR only exists on a New 3DS, so the
+         * jukebox is the one that works everywhere: walk up to it and press A with nothing
+         * highlighted. That is the better interface anyway; the shortcut is a convenience. */
         int at_juke = 0;
         {   float jdx = cx - g_jukex, jdz = cz - g_jukez;
             at_juke = (music_n > 0) && (jdx * jdx + jdz * jdz < 2.6f * 2.6f); }
-        if (music_n > 0 && ((kd & KEY_R) || (at_juke && sel < 0 && held < 0 && (kd & KEY_A))))
+        if (music_n > 0 && ((kd & KEY_ZR) || (at_juke && sel < 0 && held < 0 && (kd & KEY_A))))
             music_next();
         if ((kd & KEY_A) && held < 0 && sel >= 0) {                /* take it off the shelf */
             held = sel; spin = 0.0f; hold_d = 0.78f;
@@ -3085,8 +3087,8 @@ int main(void) {
                 panel_fmt(9 + i, "   %-16s %d", g_sec[i].name, g_sec[i].n);
         }
         if (held >= 0) {
-            if (music_n > 0) panel_set(23, at_juke ? " A: next track   R: next track"
-                                                    : " R: next track");
+            if (music_n > 0) panel_set(23, at_juke ? " A: next track (or ZR)"
+                                                    : " ZR: next track  (jukebox: walk up, A)");
             panel_fmt(25, " fps %2d  drawn %d  covers %s", fps, g_drawn, g_covers_on ? "on" : "OFF");
             panel_set(26, " pad turn/zoom   d-pad next");
             panel_fmt(27, " %s: Y    put back: B",
