@@ -1188,6 +1188,10 @@ static void queue_load(void) {
             }
             pp = t ? t + 1 : NULL; fi++;
         }
+        /* A queue written before the name was sanitized still holds the character FAT cannot
+         * store, and would go on failing to save every time it was retried. Clean it on the
+         * way in so an existing queue heals itself rather than needing to be rebuilt. */
+        fat_sanitize(q->fname);
         if (q->url[0] && q->fname[0]) s_qn++;
     }
     fclose(f);
@@ -1400,6 +1404,12 @@ static int queue_add_front(const CatEntry *e) {   /* 1 = queued, 2 = was already
     QItem *q = &s_q[pos]; memset(q, 0, sizeof *q);
     snprintf(q->name, sizeof q->name, "%s", e->name);
     snprintf(q->fname, sizeof q->fname, "%s", e->fname);
+    /* The SAME sanitize the other queue path does. Without it a catalogue title containing a
+     * character FAT cannot store -- "Thunderbolts*" -- is asked for under that name, the SD
+     * card refuses to create the file, and nothing lands: no file to see in the browser, none
+     * to play, and nothing for fat_rescue to rename either, because rescue can only fix a file
+     * that exists. This is the path A takes from the catalogue, so it is the common one. */
+    fat_sanitize(q->fname);
     snprintf(q->url, sizeof q->url, "%s", e->url);
     snprintf(q->art, sizeof q->art, "%s", e->art);
     snprintf(q->category, sizeof q->category, "%s", e->category);
