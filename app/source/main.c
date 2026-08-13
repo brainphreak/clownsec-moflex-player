@@ -891,6 +891,36 @@ static int pick_folder(char *out, size_t cap) {
 }
 
 /* greedy word-wrap helper for the top-screen info panel */
+/* Wrap `s`, draw at most `maxlines` lines starting from line `skip`, and return how many lines
+ * the whole string wraps to. The return value is what tells a caller there is more text below
+ * than it has room for -- without it, a long description was simply cut off at the twelfth
+ * line with nothing on screen to say so. */
+static int ui_text_wrap_from(int x, int *y, int scale, u16 col, const char *s,
+                             int maxcw, int maxlines, int skip) {
+    char buf[160];   /* holds up to maxcw codepoints (UTF-8: several bytes each) */
+    int lines = 0, drawn = 0;
+    while (*s) {
+        while (*s == ' ') s++;
+        if (!*s) break;
+        const char *p = s; int cp = 0, lastsp = -1;
+        while (*p && cp < maxcw) {
+            if (*p == ' ') lastsp = (int)(p - s);
+            p += ui_u8_bytes(p, 1);
+            cp++;
+        }
+        int cut = (*p && lastsp > 0) ? lastsp : (int)(p - s);
+        if (lines >= skip && drawn < maxlines) {
+            int n = cut < (int)sizeof(buf) - 1 ? cut : (int)sizeof(buf) - 1;
+            memcpy(buf, s, n); buf[n] = 0;
+            ui_text(x, *y, scale, col, buf);
+            *y += 8 * scale + 2;
+            drawn++;
+        }
+        s += cut;
+        lines++;
+    }
+    return lines;
+}
 static void ui_text_wrap(int x, int *y, int scale, u16 col, const char *s, int maxcw, int maxlines) {
     char buf[160];   /* holds up to maxcw codepoints (UTF-8: several bytes each) */
     int lines = 0;
@@ -1019,6 +1049,10 @@ static int entry_super(const CatEntry *e, char *audio, int acap, char *subs, int
     return got;
 }
 
+/* How far the highlighted entry's description is scrolled, and whether it overflows at all.
+ * Reset whenever the highlight moves -- scrolling belongs to the thing you are looking at. */
+static int g_desc_scroll = 0, g_desc_over = 0, g_desc_total = 0;
+#define DESC_LINES 12
 static void draw_info_top(const CatEntry *e, const u16 *poster) {
     ui_begin(GFX_TOP);
     ui_clear(UI_BG);
@@ -1058,7 +1092,20 @@ static void draw_info_top(const CatEntry *e, const u16 *poster) {
         if (e->sub_langs[0])   { snprintf(line, sizeof line, "Subs: %s", e->sub_langs);     ui_text_wrap(tx, &ty, 1, UI_NEONC, line, 30, 2); }
     }
     if (e->genres[0]) { ui_text_wrap(tx, &ty, 1, UI_GRAY, e->genres, 30, 3); ty += 4; }
-    if (e->desc[0])   ui_text_wrap(tx, &ty, 1, UI_INK, e->desc, 30, 12);
+    if (e->desc[0]) {
+        int total = ui_text_wrap_from(tx, &ty, 1, UI_INK, e->desc, 30, DESC_LINES, g_desc_scroll);
+        g_desc_over = (total > DESC_LINES); g_desc_total = total;
+        if (g_desc_over) {
+            /* Say that there is more, and which buttons reach it. A New 3DS has ZL/ZR; every
+             * console has L with up and down, so neither is left without a way down the page. */
+            char hint[40];
+            int shown = total - g_desc_scroll; if (shown > DESC_LINES) shown = DESC_LINES;
+            snprintf(hint, sizeof hint, "%s ZL/ZR or L+%s",
+                     g_desc_scroll + shown < total ? "more..." : "end.",
+                     g_desc_scroll > 0 ? "up/down" : "down");
+            ui_text(tx, 228, 1, UI_DIM, hint);
+        }
+    } else { g_desc_over = 0; g_desc_total = 0; }
     ui_present();
 }
 
@@ -1831,6 +1878,24 @@ cb_rebuild:;   /* X-search inside the list jumps back here with filt_search set 
         int want_dl = 0;
         if (nav_repeat(k, kh, NAV_DOWN, &hfd)) { if (csel < ni - 1) csel++; redraw = 1; }
         if (nav_repeat(k, kh, NAV_UP, &hfu))   { if (csel > 0) csel--; redraw = 1; }
+        /* Scroll the description on the top screen. ZL/ZR where they exist; L held with up or
+         * down everywhere else, because an Old 3DS has no shoulder triggers and would
+         * otherwise be stuck looking at the first twelve lines forever. L on its own still
+         * jumps letter groups -- it is only a modifier while it is HELD with a direction. */
+        if (g_desc_over) {
+            int sd = 0;
+            if (k & KEY_ZR) sd = 1;
+            if (k & KEY_ZL) sd = -1;
+            if ((kh & KEY_L) && (k & KEY_DOWN)) sd = 1;
+            if ((kh & KEY_L) && (k & KEY_UP))   sd = -1;
+            if (sd) {
+                g_desc_scroll += sd * 4;
+                int last = g_desc_total - DESC_LINES;      /* never past the final line */
+                if (g_desc_scroll > last) g_desc_scroll = last;
+                if (g_desc_scroll < 0)    g_desc_scroll = 0;
+                redraw = 1;
+            }
+        }
         if (k & KEY_RIGHT) { csel += BR_ROWS; if (csel > ni - 1) csel = ni - 1; redraw = 1; }
         if (k & KEY_LEFT)  { csel -= BR_ROWS; if (csel < 0) csel = 0; redraw = 1; }
         if (k & KEY_X) {   /* search WITHIN this view (whatever category/genre is filtered) */
@@ -1893,7 +1958,8 @@ cb_rebuild:;   /* X-search inside the list jumps back here with filt_search set 
         if (dlw_poll()) redraw = 1;   /* finalize finished background downloads */
         { static int qt2; if (s_dlw_active && ++qt2 >= 20) { qt2 = 0; redraw = 1; } }
         if (s_qtoast_t > 0 && --s_qtoast_t == 0) redraw = 1;   /* toast expired -> repaint without it */
-        if (csel != shown) { redraw = 1; phave = 0; settle = 0; requested = 0; }   /* moved -> drop poster */
+        if (csel != shown) { redraw = 1; phave = 0; settle = 0; requested = 0;
+                             g_desc_scroll = 0; }   /* moved -> drop poster, rewind the blurb */
         /* debounced request to the background loader, then poll -- scrolling never blocks on a poster */
         if (!phave && !requested && cat[idx[csel]].art[0] && ++settle >= 6) { pw_request(idx[csel], cat[idx[csel]].art, cat[idx[csel]].fname); requested = 1; }
         if (!phave && requested && pw_done == idx[csel]) {
@@ -2811,6 +2877,24 @@ ll_rebuild:;   /* X-search inside the list jumps back here with s_lib_search set
         int play = 0, info = 0;
         if (nav_repeat(k, kh, NAV_DOWN, &hfd)) { if (csel < ni - 1) csel++; redraw = 1; }
         if (nav_repeat(k, kh, NAV_UP, &hfu))   { if (csel > 0) csel--; redraw = 1; }
+        /* Scroll the description on the top screen. ZL/ZR where they exist; L held with up or
+         * down everywhere else, because an Old 3DS has no shoulder triggers and would
+         * otherwise be stuck looking at the first twelve lines forever. L on its own still
+         * jumps letter groups -- it is only a modifier while it is HELD with a direction. */
+        if (g_desc_over) {
+            int sd = 0;
+            if (k & KEY_ZR) sd = 1;
+            if (k & KEY_ZL) sd = -1;
+            if ((kh & KEY_L) && (k & KEY_DOWN)) sd = 1;
+            if ((kh & KEY_L) && (k & KEY_UP))   sd = -1;
+            if (sd) {
+                g_desc_scroll += sd * 4;
+                int last = g_desc_total - DESC_LINES;      /* never past the final line */
+                if (g_desc_scroll > last) g_desc_scroll = last;
+                if (g_desc_scroll < 0)    g_desc_scroll = 0;
+                redraw = 1;
+            }
+        }
         if (k & KEY_RIGHT) { csel += BR_ROWS; if (csel > ni - 1) csel = ni - 1; redraw = 1; }
         if (k & KEY_LEFT)  { csel -= BR_ROWS; if (csel < 0) csel = 0; redraw = 1; }
         if (k & KEY_R) { char cc = firstc(g_lib[idx[csel]].name); int i = csel;
@@ -2865,7 +2949,8 @@ ll_rebuild:;   /* X-search inside the list jumps back here with s_lib_search set
             } else { snprintf(out, cap, "%s", pe->url); result = LL_PLAY; break; }
         }
         if (info) { lib_getinfo_menu(idx, ni, csel); shown = -1; redraw = 1; }   /* This / All-missing */
-        if (csel != shown) { redraw = 1; phave = 0; settle = 0; }   /* moved -> reload local poster */
+        if (csel != shown) { redraw = 1; phave = 0; settle = 0;
+                             g_desc_scroll = 0; }   /* moved -> reload poster, rewind the blurb */
         /* Don't hit the SD for a poster while scrolling: a no-artwork ("Uncategorized") item
          * costs 3 failed FAT lookups (.p565/.jpg/.png) that would stall a held scroll. Load
          * only once the list has settled and no nav key is held / no drag is in progress. */
