@@ -3720,6 +3720,10 @@ static void lib_scrape_one(int i) {
 
 /* Library GET INFO (batch): fill in every movie in the current list that's MISSING info. */
 static void lib_scrape_missing(int *idx, int ni) {
+    if (osGetWifiStrength() == 0) {   /* nothing here can work offline; do not spend the timeouts */
+        msg_screen("GET INFO", "No wireless connection.\nConnect to wifi and try again.");
+        return;
+    }
     load_sources();
     int cap = 2048; CatEntry *cat = (CatEntry *)malloc(sizeof(CatEntry) * cap);
     u16 *pb = (u16 *)malloc((size_t)POSTER_W * POSTER_H * sizeof(u16));
@@ -3789,10 +3793,22 @@ static void lib_rescan_interactive(void) {
         idx[ni++] = j;
     }
     if (ni > 0) {
-        char body[128];
-        snprintf(body, sizeof body, "%s\n%d video%s missing art & info.\nDownload art & info?",
-                 found, ni, ni == 1 ? "" : "s");
-        if (prompt2("LIBRARY", body, "DOWNLOAD", "SKIP") == 0) lib_scrape_missing(idx, ni);
+        char body[192];
+        if (osGetWifiStrength() == 0) {
+            /* Offering a download with no wireless is offering something that cannot work: the
+             * catalogue fetch burns its 20s connect timeout per source and then reports
+             * "matched 0", which reads like a failure of the app rather than an absence of
+             * network. Say what is actually wrong and let them get on with it. */
+            snprintf(body, sizeof body, "%s\n%d video%s missing art & info,\n"
+                     "but there is no wireless connection.\n"
+                     "Connect to wifi and use\nRescan Library to fetch it.",
+                     found, ni, ni == 1 ? "" : "s");
+            msg_screen("LIBRARY", body);
+        } else {
+            snprintf(body, sizeof body, "%s\n%d video%s missing art & info.\nDownload art & info?",
+                     found, ni, ni == 1 ? "" : "s");
+            if (prompt2("LIBRARY", body, "DOWNLOAD", "SKIP") == 0) lib_scrape_missing(idx, ni);
+        }
     } else msg_screen("LIBRARY", found);
     free(idx);
 }
