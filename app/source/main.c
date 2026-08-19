@@ -2244,6 +2244,100 @@ static int show_first_episode(const CatEntry *e, char *out, int cap) {
     return 1;
 }
 
+/* The episode AFTER `path` in its own show, for playing a series straight through.
+ * 1 = out holds the next episode's path, 0 = not an episode, or it was the last one.
+ *
+ * Deliberately built on the same collector the episode picker uses, so "next" means exactly
+ * what the picker shows as next -- including episodes that live in a SIBLING season folder,
+ * which is how S01e13 rolls into S02e01. */
+static int next_episode_path(const char *path, char *out, int cap) {
+    const char *sl = strrchr(path, '/');
+    if (!sl || !has_episode_tag(sl + 1)) return 0;          /* a film has no "next" */
+    char dir[PATHLEN + NAMELEN];
+    snprintf(dir, sizeof dir, "%.*s", (int)(sl - path), path);
+    char show[96];
+    ep_show_prefix(sl + 1, show, sizeof show);
+    /* Always a real string: show_collect_eps dereferences showname when it compares sibling
+     * season folders, so NULL there is a crash. Empty is fine -- it just means "no prefix
+     * filter", which is the right behaviour for a file named plainly "S01e01 - Title". */
+    int n = show_collect_eps(show, dir);
+    if (n <= 1) return 0;
+    for (int i = 0; i < n; i++) {
+        if (strcmp(s_epfile[i], path)) continue;
+        if (i + 1 >= n) return 0;                            /* that was the finale */
+        snprintf(out, cap, "%s", s_epfile[i + 1]);
+        return 1;
+    }
+    return 0;
+}
+
+/* Label for the up-next panel: the episode's own filename, minus the show prefix and the
+ * extension, so it reads "S02e07 - Pride" rather than repeating the show name every time. */
+static void next_episode_label(const char *path, char *out, size_t cap) {
+    const char *sl = strrchr(path, '/');
+    const char *fn = sl ? sl + 1 : path;
+    char show[96];
+    ep_show_prefix(fn, show, sizeof show);
+    size_t skip = strlen(show);
+    if (skip && !strncasecmp(fn, show, skip)) {
+        fn += skip;
+        while (*fn == ' ' || *fn == '-') fn++;
+    }
+    snprintf(out, cap, "%s", fn);
+    char *dot = strrchr(out, '.');
+    if (dot && !strcasecmp(dot, ".moflex")) *dot = 0;
+}
+
+/* "UP NEXT" with a countdown: plays the next episode on its own after AUTONEXT_SECS, or
+ * immediately on A. B stops, because B is always back. Returns 1 = play it, 0 = stop.
+ *
+ * A silent auto-advance is the wrong default on a handheld -- it keeps playing at 2am when
+ * nobody is watching. A visible countdown you can stop costs one screen and no guessing. */
+#define AUTONEXT_SECS 10
+static int next_episode_prompt(const char *nextpath) {
+    char label[NAMELEN];
+    next_episode_label(nextpath, label, sizeof label);
+    int bw = 116, bh = 36, by = 158, x0 = 30, x1 = UI_W - 30 - bw;
+    int sel = 0, tdown = 0, tx0 = 0, ty0 = 0;
+    u64 t0 = osGetTime();
+    int lastsec = -1;
+    while (aptMainLoop()) {
+        hidScanInput();
+        u32 k = hidKeysDown(), ku = hidKeysUp();
+        if (k & KEY_LEFT || k & KEY_RIGHT) sel = !sel;
+        if (k & KEY_A) return sel == 0;
+        if (k & KEY_B) return 0;
+        touchPosition tp; hidTouchRead(&tp);
+        if (k & KEY_TOUCH) { tdown = 1; tx0 = tp.px; ty0 = tp.py; }
+        else if ((ku & KEY_TOUCH) && tdown) { tdown = 0;
+            if (ty0 >= by && ty0 < by + bh) {
+                if (tx0 >= x0 && tx0 < x0 + bw) return 1;
+                if (tx0 >= x1 && tx0 < x1 + bw) return 0;
+            }
+        }
+        int left = AUTONEXT_SECS - (int)((osGetTime() - t0) / 1000);
+        if (left <= 0) return 1;
+        if (left != lastsec) {                       /* redraw once a second, not every frame */
+            lastsec = left;
+            ui_begin(GFX_BOTTOM);
+            ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
+            ui_text_center(UI_W / 2, 48, 2, UI_NEON, "UP NEXT");
+            ui_text_fit(UI_W / 2, 88, 1, UI_INK, label, UI_W - 16);
+            char cd[48];
+            snprintf(cd, sizeof cd, "Playing in %d...", left);
+            ui_text_center(UI_W / 2, 112, 1, UI_DIM, cd);
+            int tw = (UI_W - 60) * left / AUTONEXT_SECS;      /* draining countdown bar */
+            ui_fill_round(30, 130, UI_W - 60, 6, 3, UI_BG2);
+            if (tw > 0) ui_fill_round(30, 130, tw, 6, 3, UI_NEON);
+            ui_button(x0, by, bw, bh, "PLAY", sel == 0, UI_NEON);
+            ui_button(x1, by, bw, bh, "STOP", sel == 1, UI_RED);
+            ui_present();
+        }
+        gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
+    }
+    return 0;
+}
+
 /* One episode's watch status: 2 watched, 1 in progress, 0 new. */
 static int ep_status(const char *path) {
     if (moflex_watched(path)) return 2;
@@ -4848,6 +4942,18 @@ static int play_and_handle(const char *path, int origin) {
     MoflexResult r = play_movie(path);
     for (;;) {
         char np[PATHLEN + NAMELEN];
+        /* Played to the end and it is part of a series -> offer the next episode. Only on a
+         * natural EOF: pressing B is a decision to stop, and answering it with "here's more"
+         * would be ignoring the user. */
+        if (r == MOFLEX_EOF) {
+            char nxt[PATHLEN + NAMELEN];
+            if (g_now_playing_path[0] &&
+                next_episode_path(g_now_playing_path, nxt, sizeof nxt) &&
+                next_episode_prompt(nxt)) {
+                r = play_movie(nxt);
+                continue;
+            }
+        }
         if (r == MOFLEX_QUIT_OPEN) {
             int b = open_video(np, sizeof np);
             if (b == 1) return 1;
