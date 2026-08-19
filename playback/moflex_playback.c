@@ -223,6 +223,11 @@ static void watched_set_key(const char *key, int on) {
 }
 int  moflex_watched(const char *path) { char k[600]; watched_key(path, -1, k, sizeof k); return watched_has_key(k); }
 int  moflex_watched_at(const char *path, long long off) { char k[600]; watched_key(path, off, k, sizeof k); return watched_has_key(k); }
+static int (*g_autonext_cb)(const char *path);
+void moflex_set_autonext(int (*has_next)(const char *path)) { g_autonext_cb = has_next; }
+/* End of movie: 1 = hand control back so the host can roll on to the next episode. */
+static int autonext_wanted(const char *path) { return g_autonext_cb && g_autonext_cb(path); }
+
 void moflex_watched_set(const char *path, int on) { char k[600]; watched_key(path, -1, k, sizeof k); watched_set_key(k, on); }
 void moflex_watched_set_at(const char *path, long long off, int on) { char k[600]; watched_key(path, off, k, sizeof k); watched_set_key(k, on); }
 
@@ -2583,6 +2588,12 @@ static MoflexResult moflex_play_gpu(const char *path) {
 gdone:
     if (dur_us > 0 && cur_us >= dur_us - 10000000) { resume_clear(path); moflex_watched_set(path, 1); }
     else if (cur_us > 3000000) resume_save_us(path, cur_us);
+    /* These paths have no "finished" branch -- they fall out of the loop at end of stream and
+     * return QUIT_BACK, so end-of-file looks exactly like B. Position tells them apart: within
+     * two seconds of the end, and with no button having set another result, this was the end of
+     * the movie. Two seconds rather than ten so quitting near the end is still quitting. */
+    if (result == MOFLEX_QUIT_BACK && dur_us > 0 && cur_us >= dur_us - 2000000 &&
+        autonext_wanted(path)) result = MOFLEX_EOF;
     if (awt) { g_aw_stop = 1; threadJoin(awt, 2000000000LL); threadFree(awt); }   /* stop audio worker */
     C2D_TextBufDelete(sbuf); C2D_TextBufDelete(tmbuf);
     for (int i = 0; i < NTB; i++) { C3D_TexDelete(&texL[i]); C3D_TexDelete(&texR[i]); }
@@ -4099,6 +4110,7 @@ static MoflexResult moflex_play_ring(const char *path) {
             resume_clear(path); moflex_watched_set(path, 1);   /* finished -> watched */
             if (dur_us > 0) cur_us = dur_us;
             dirty = 1;
+            if (autonext_wanted(path)) { result = MOFLEX_EOF; break; }   /* -> next episode */
         }
         /* No banking on this thread now: when no new frame is due (and no UI change), pace to VBlank so
          * the present-due check runs once per refresh -> steady cadence. Present iterations (show>=0)
@@ -4128,6 +4140,12 @@ static MoflexResult moflex_play_ring(const char *path) {
 
     if (dur_us > 0 && cur_us >= dur_us - 10000000) { resume_clear(path); moflex_watched_set(path, 1); }
     else if (cur_us > 3000000) resume_save_us(path, cur_us);
+    /* These paths have no "finished" branch -- they fall out of the loop at end of stream and
+     * return QUIT_BACK, so end-of-file looks exactly like B. Position tells them apart: within
+     * two seconds of the end, and with no button having set another result, this was the end of
+     * the movie. Two seconds rather than ten so quitting near the end is still quitting. */
+    if (result == MOFLEX_QUIT_BACK && dur_us > 0 && cur_us >= dur_us - 2000000 &&
+        autonext_wanted(path)) result = MOFLEX_EOF;
     if (vol_dirty) vol_save();
     /* release panel services (restore backlight first so we never leave the screen dark) */
     if (g_screen_off) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; }
@@ -4540,6 +4558,12 @@ done:
     /* remember where we stopped (clear it if we watched to the end) */
     if (dur_us > 0 && cur_us >= dur_us - 10000000) { resume_clear(path); moflex_watched_set(path, 1); }
     else if (cur_us > 3000000) resume_save_us(path, cur_us);
+    /* These paths have no "finished" branch -- they fall out of the loop at end of stream and
+     * return QUIT_BACK, so end-of-file looks exactly like B. Position tells them apart: within
+     * two seconds of the end, and with no button having set another result, this was the end of
+     * the movie. Two seconds rather than ten so quitting near the end is still quitting. */
+    if (result == MOFLEX_QUIT_BACK && dur_us > 0 && cur_us >= dur_us - 2000000 &&
+        autonext_wanted(path)) result = MOFLEX_EOF;
     if (have_audio) { ndspChnWaveBufClear(0); ndspChnSetPaused(0, false);
         for (int i = 0; i < NWB; i++) if (abuf[i]) linearFree(abuf[i]); }
     if (y2r_started) y2r_video_drain();   /* let any in-flight Y2R finish before freeing frames */
@@ -4833,6 +4857,7 @@ static MoflexResult moflex_play_soft(const char *path) {
             resume_clear(path); moflex_watched_set(path, 1);
             if (dur_us > 0) cur_us = dur_us;
             dirty = 1;
+            if (autonext_wanted(path)) { result = MOFLEX_EOF; break; }   /* -> next episode */
         }
         if (show < 0 && !worked && !dirty) gspWaitForVBlank();
     }
@@ -4846,6 +4871,12 @@ static MoflexResult moflex_play_soft(const char *path) {
     if (vol_dirty) vol_save();
     if (dur_us > 0 && cur_us >= dur_us - 10000000) { resume_clear(path); moflex_watched_set(path, 1); }
     else if (cur_us > 3000000) resume_save_us(path, cur_us);
+    /* These paths have no "finished" branch -- they fall out of the loop at end of stream and
+     * return QUIT_BACK, so end-of-file looks exactly like B. Position tells them apart: within
+     * two seconds of the end, and with no button having set another result, this was the end of
+     * the movie. Two seconds rather than ten so quitting near the end is still quitting. */
+    if (result == MOFLEX_QUIT_BACK && dur_us > 0 && cur_us >= dur_us - 2000000 &&
+        autonext_wanted(path)) result = MOFLEX_EOF;
     r3_audio_close();   /* unconditional: also frees a partial bank when setup failed */
     r3_vq_clear();
     y2r_video_exit();

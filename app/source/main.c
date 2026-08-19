@@ -2293,10 +2293,40 @@ static void next_episode_label(const char *path, char *out, size_t cap) {
  *
  * A silent auto-advance is the wrong default on a handheld -- it keeps playing at 2am when
  * nobody is watching. A visible countdown you can stop costs one screen and no guessing. */
+/* Season/episode numbers out of a SxxEyy tag. 1 = parsed. */
+static int ep_numbers(const char *path, int *season, int *ep) {
+    const char *sl = strrchr(path, '/');
+    const char *t = ep_tag_at(sl ? sl + 1 : path);
+    if (!t) return 0;
+    *season = atoi(t + 1);
+    const char *q = t + 1; while (isdigit((unsigned char)*q)) q++;
+    *ep = atoi(q + 1);
+    return 1;
+}
+
+/* Asked by the playback engines when a movie reaches its end: is this an episode with another
+ * to follow? Only then do they hand control back (MOFLEX_EOF) instead of parking on the last
+ * frame -- so films keep the stop-in-place behaviour exactly as before. */
+static int autonext_has_next(const char *path) {
+    char nxt[PATHLEN + NAMELEN];
+    return next_episode_path(path, nxt, sizeof nxt);
+}
+
 #define AUTONEXT_SECS 10
-static int next_episode_prompt(const char *nextpath) {
+static int next_episode_prompt(const char *curpath, const char *nextpath) {
     char label[NAMELEN];
     next_episode_label(nextpath, label, sizeof label);
+    /* "Next" is the next episode PRESENT on the card, so a missing file is stepped over --
+     * you cannot play what is not there. Stepping over it silently is what would confuse, so
+     * name the gap and let the countdown be stopped. */
+    char gap[64]; gap[0] = 0;
+    { int cs, ce, ns, ne;
+      if (ep_numbers(curpath, &cs, &ce) && ep_numbers(nextpath, &ns, &ne) &&
+          ns == cs && ne > ce + 1) {
+          if (ne == ce + 2) snprintf(gap, sizeof gap, "S%02de%02d is not on the card", cs, ce + 1);
+          else              snprintf(gap, sizeof gap, "S%02de%02d-e%02d are not on the card",
+                                     cs, ce + 1, ne - 1);
+      } }
     int bw = 116, bh = 36, by = 158, x0 = 30, x1 = UI_W - 30 - bw;
     int sel = 0, tdown = 0, tx0 = 0, ty0 = 0;
     u64 t0 = osGetTime();
@@ -2323,9 +2353,10 @@ static int next_episode_prompt(const char *nextpath) {
             ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
             ui_text_center(UI_W / 2, 48, 2, UI_NEON, "UP NEXT");
             ui_text_fit(UI_W / 2, 88, 1, UI_INK, label, UI_W - 16);
+            if (gap[0]) ui_text_fit(UI_W / 2, 104, 1, UI_RED, gap, UI_W - 16);
             char cd[48];
             snprintf(cd, sizeof cd, "Playing in %d...", left);
-            ui_text_center(UI_W / 2, 112, 1, UI_DIM, cd);
+            ui_text_center(UI_W / 2, gap[0] ? 120 : 112, 1, UI_DIM, cd);
             int tw = (UI_W - 60) * left / AUTONEXT_SECS;      /* draining countdown bar */
             ui_fill_round(30, 130, UI_W - 60, 6, 3, UI_BG2);
             if (tw > 0) ui_fill_round(30, 130, tw, 6, 3, UI_NEON);
@@ -4949,7 +4980,7 @@ static int play_and_handle(const char *path, int origin) {
             char nxt[PATHLEN + NAMELEN];
             if (g_now_playing_path[0] &&
                 next_episode_path(g_now_playing_path, nxt, sizeof nxt) &&
-                next_episode_prompt(nxt)) {
+                next_episode_prompt(g_now_playing_path, nxt)) {
                 r = play_movie(nxt);
                 continue;
             }
@@ -4992,6 +5023,7 @@ int main(void) {
      * wctomb pointer is NULL until locale is touched -- so formatting a filename with a non-ASCII
      * byte on that thread called through NULL (prefetch abort, PC=0). This makes it valid. */
     setlocale(LC_ALL, "C");
+    moflex_set_autonext(autonext_has_next);   /* series roll on to the next episode at EOF */
     osSetSpeedupEnable(true);   /* unlock New 3DS 804MHz clock (no-op on old 3DS) */
     gfxInitDefault();
     ndspInit();

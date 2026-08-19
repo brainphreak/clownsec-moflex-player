@@ -139,8 +139,19 @@ static int g_pq_n = 0;
  * pairing each SURFACED picture with the SMALLEST pooled display time keeps the presented
  * timeline gapless no matter how the decoder delays -- labeling outputs with the fed
  * frame's own cts dropped 2 of 3 frames (measured: 125ms present gaps at 41.7ms content). */
-static int64_t g_ft[16];
+/* Pending display times, one per frame FED to the decoder, popped smallest-first as pictures
+ * come back out. The pairing is an invariant: one push per frame in, one pop per picture out.
+ * MVD holds a whole reorder buffer of frames before it emits the first, so this must be deep
+ * enough for the worst DPB in the wild -- 16 was not, and overflowing it silently DROPPED a
+ * timestamp while the frame still went to the decoder. Every lost entry slides the whole
+ * mapping by one frame, which is why MP4 drifted further out of sync the longer it played
+ * and why starting over fixed it. */
+#define FT_MAX 16
+static int64_t g_ft[FT_MAX];
 static int     g_ftn = 0;
+static int     g_ft_full = 0;      /* display times DROPPED because the pool was full */
+static int     g_ft_dry = 0;       /* pictures that surfaced with no display time left */
+static long    g_ft_push = 0, g_ft_pop = 0;   /* frames fed vs pictures surfaced */
 static int64_t ft_pop_min(void) {
     int mi = 0;
     for (int i = 1; i < g_ftn; i++) if (g_ft[i] < g_ft[mi]) mi = i;
@@ -458,7 +469,7 @@ MoflexResult mp4_play(const char *path) {
     g_pq_n = 0;        /* the reorder queue is static: entries from a PREVIOUS session (B-exit
                         * leaves up to 4 queued) would present as phantom frames with stale
                         * timestamps -- the frozen-bar + fast-forward-catch-up bug */
-    g_ftn = 0;
+    g_ftn = 0; g_ft_full = 0; g_ft_dry = 0; g_ft_push = 0; g_ft_pop = 0;
     g_present_log = 12;
 
     /* auto-resume (like moflex): jump to the saved position if any */
@@ -593,7 +604,8 @@ MoflexResult mp4_play(const char *path) {
                 Mp4Sample *s = &m.vsamples[vi];
                 int n = mp4_read_sample(&m, s, buf);
                 t1 = osGetTime();
-                if (g_ftn < 16) g_ft[g_ftn++] = v_cts_us(&m, vi);   /* pool the display time */
+                if (g_ftn < FT_MAX) { g_ft[g_ftn++] = v_cts_us(&m, vi); g_ft_push++; }
+                else g_ft_full++;                       /* timestamp DROPPED, frame still decoded */
                 r = (n == (int)s->size) ? mp4_mvd_pump(buf, n, &consumed) : 0;
                 vi++;
             } else {
@@ -609,13 +621,29 @@ MoflexResult mp4_play(const char *path) {
                     mvd_log("SPIKE f=%d read=%lums pump=%lums audio=%lums",
                             vi, (unsigned long)rd, (unsigned long)dec, (unsigned long)aud);
             }
-            if (r && g_ftn > 0) { g_pq[g_pq_n].cts = ft_pop_min(); g_pq[g_pq_n].slot = r - 1; g_pq_n++; }
-            else if (!r && !consumed) break;   /* dry + nothing fed: nothing more this pass */
+            if (r && g_ftn > 0) { g_pq[g_pq_n].cts = ft_pop_min(); g_ft_pop++; g_pq[g_pq_n].slot = r - 1; g_pq_n++; }
+            else if (r) g_ft_dry++;            /* picture surfaced with no display time to give it */
+            else if (!consumed) break;         /* dry + nothing fed: nothing more this pass */
         }
         if (g_pq_n == 0) continue;   /* nothing display-ready yet (decoder still priming) */
         int mi = 0;
         for (int i = 1; i < g_pq_n; i++) if (g_pq[i].cts < g_pq[mi].cts) mi = i;
         cur_us = g_pq[mi].cts;
+
+        /* A/V drift readout, once a minute. Sync complaints are about a number that grows
+         * slowly, and "looks fine to me" after two minutes proves nothing -- this makes the
+         * drift measurable instead of a matter of opinion. Negative = video behind the audio. */
+        if (g_have_audio) {
+            static int64_t s_drift_next = 60000000LL;
+            if (cur_us >= s_drift_next) {
+                extern void mvd_log(const char *fmt, ...);
+                mvd_log("AV t=%llds video-vs-audio=%+lldms pool=%d fed=%ld out=%ld lost=%d dropped_ts=%d",
+                        (long long)(cur_us / 1000000),
+                        (long long)((cur_us - media_now_us()) / 1000),
+                        g_ftn, g_ft_push, g_ft_pop, g_ft_dry, g_ft_full);
+                s_drift_next = cur_us + 60000000LL;
+            }
+        }
 
         /* ---- wait until this frame is due (audio-master), staying responsive ---- */
         for (;;) {
