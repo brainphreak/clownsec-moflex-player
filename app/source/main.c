@@ -2312,7 +2312,7 @@ static int autonext_has_next(const char *path) {
     return next_episode_path(path, nxt, sizeof nxt);
 }
 
-#define AUTONEXT_SECS 10
+#define AUTONEXT_SECS 5
 static int next_episode_prompt(const char *curpath, const char *nextpath) {
     char label[NAMELEN];
     next_episode_label(nextpath, label, sizeof label);
