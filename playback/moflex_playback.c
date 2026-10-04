@@ -473,7 +473,14 @@ static const char *sub_glyph(uint32_t cp) {
 
 #define SUB_MAX 4000
 #define SUB_TXT 256   /* bytes: UTF-8 cues run longer than their glyph count */
-typedef struct { int64_t s, e; char t[SUB_TXT]; } SubCue;
+/* What a cue carries besides its text. Plain SRT gets the defaults; ASS fills them from its style
+ * and its leading override tags, and an SRT's own {\an8} / <i> are honoured the same way.
+ *   top  -- drawn in the TOP block (signs, \an4-9, or positioned in the upper half), not the bottom
+ *   ital -- slanted: the bitmap faces shear their rows, the console's font is sheared on the GPU
+ *   bold -- emboldened: every face draws its fill twice, 1px apart (none of them has a bold cut)
+ *   col  -- SUB_COL_SET | 0x00RRGGBB, or 0 for the usual white */
+#define SUB_COL_SET 0x01000000u
+typedef struct { int64_t s, e; u32 col; u16 ord; u8 top, ital, bold, sty; char t[SUB_TXT]; } SubCue;
 static SubCue *g_subs = NULL;
 static int  g_nsubs = 0;
 static int  g_sub_on = 0;      /* enabled */
@@ -544,7 +551,11 @@ static void sub_clean(const char *in, char *out, int cap) {
     const unsigned char *p = (const unsigned char *)in; int o = 0;
     while (*p && o < cap - 6) {
         unsigned char c = *p;
-        if (c == '<') { p++; while (*p && *p != '>') p++; if (*p) p++; continue; }   /* <i>, <font ...> */
+        if (c == '<') {                       /* <i>, <font ...> -- but "<3" and "2 < 5" are text */
+            const char *q = (const char *)p + 1; if (*q == '/') q++;
+            const char *e = ((*q | 0x20) >= 'a' && (*q | 0x20) <= 'z') ? strchr(q, '>') : NULL;
+            if (e) { p = (const unsigned char *)e + 1; continue; }
+        }
         if (c < 0x80) { out[o++] = (char)c; p++; continue; }
         uint32_t cp; int n;
         if (g_sub_mode >= 0) { cp = sub_cp_hi[g_sub_mode][c - 0x80]; n = 1; }   /* 8-bit codepage */
@@ -583,6 +594,253 @@ static int sub_is_utf8(FILE *f) {
     rewind(f);
     return cont == 0;
 }
+/* ---- override tags + escapes (ASS, and the ASS tags that turn up inside SRTs) ----------------
+ * {\an8} is all over SRTs converted from ASS and used to be printed literally. Only tags BEFORE
+ * the first visible character set the cue's look: one colour and one slant per cue is what the
+ * renderers can draw. Text inside a drawing ({\p1}..{\p0}) is vector commands, not words. */
+typedef struct { int an, pos, posy, ital, bold, draw, ci, cb; u32 col; } SubTags;   /* ci/cb: see sub_tags */
+static void sub_tags_init(SubTags *tg) { memset(tg, 0, sizeof *tg); tg->ital = -1; tg->bold = -1; }
+static u32 sub_rgb(u32 r, u32 g, u32 b);
+/* &HAABBGGRR / &HBBGGRR (ASS) or a decimal BGR (SSA styles) -> SUB_COL_SET | 0x00RRGGBB */
+static u32 ass_col(const char *p) {
+    while (*p == ' ') p++;
+    unsigned long v;
+    if (p[0] == '&' && (p[1] == 'H' || p[1] == 'h')) v = strtoul(p + 2, NULL, 16);
+    else v = strtoul(p, NULL, 10);
+    return sub_rgb(v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF);
+}
+static u32 sub_rgb(u32 r, u32 g, u32 b) {
+    /* a dark fill is for a style that draws its own box or glow -- with our plain black outline
+     * it would vanish into the video, so anything that dim stays white */
+    if (r * 299 + g * 587 + b * 114 < 50 * 1000) return 0;    /* luma < 50: pure red (76) stays */
+    if (r == 0xFF && g == 0xFF && b == 0xFF) return 0;          /* white is the default anyway */
+    return SUB_COL_SET | (r << 16) | (g << 8) | b;
+}
+/* SSA v4 \a / Alignment: 1-3 bottom, 5-7 top, 9-11 middle -> numpad 1-9 like \an */
+static int ass_legacy_an(int a) {
+    static const signed char m[12] = { 0, 1, 2, 3, 0, 7, 8, 9, 0, 4, 5, 6 };
+    return (a >= 1 && a <= 11) ? m[a] : 0;
+}
+/* Styles switched on before the first word apply to the whole cue. One switched OFF with more
+ * words still to come was only ever a span ("this is {\i1}really{\i0} bad") -- drawing the whole
+ * line in italics would be wrong, so the cue goes plain instead. The pending close is kept in
+ * tg (ci/cb), so an SRT's second line can still cancel a first line's <i>...</i>. */
+#define SUB_OPEN(f, c)  do { if (!seen) { tg->f = 1; tg->c = 0; } } while (0)
+#define SUB_CLOSE(f, c) do { if (!seen) tg->f = 0; else if (tg->f == 1) tg->c = 1; } while (0)
+static void sub_tags(const char *in, char *out, int cap, SubTags *tg) {
+    int o = 0, seen = 0;
+    for (const char *p = in; *p && o < cap - 1; ) {
+        if (*p == '{') {
+            const char *e = strchr(p, '}');
+            if (!e) break;                                     /* unterminated: drop the rest */
+            for (const char *q = p + 1; q < e; q++) {
+                if (*q != '\\') continue;
+                q++;
+                if (q[0] == 'a' && q[1] == 'n' && q[2] >= '1' && q[2] <= '9') tg->an = q[2] - '0';
+                else if (q[0] == 'a' && q[1] >= '0' && q[1] <= '9') tg->an = ass_legacy_an(atoi(q + 1));
+                else if (!strncmp(q, "pos(", 4) || !strncmp(q, "move(", 5)) {
+                    const char *c = strchr(q, ',');           /* \pos(x,y) / \move(x1,y1,..): y */
+                    tg->pos = 1; if (c && c < e) tg->posy = atoi(c + 1);
+                }
+                else if (q[0] == 'p' && q[1] >= '0' && q[1] <= '9') tg->draw = (q[1] != '0');
+                else if (q[0] == 'i' && q[1] == '1') SUB_OPEN(ital, ci);
+                else if (q[0] == 'i' && q[1] == '0') SUB_CLOSE(ital, ci);
+                /* \b1 / \b0, or a font weight (\b700); \blur, \be and \bord are other tags */
+                else if (q[0] == 'b' && q[1] >= '0' && q[1] <= '9') {
+                    int w = atoi(q + 1);
+                    if (w == 1 || w >= 600) SUB_OPEN(bold, cb); else SUB_CLOSE(bold, cb);
+                }
+                else if (q[0] == 'r' && (q + 1 == e || q[1] == '\\')) {   /* \r: back to the style */
+                    if (seen) { if (tg->ital == 1) tg->ci = 1; if (tg->bold == 1) tg->cb = 1; } }
+                else if (!seen && (!strncmp(q, "c&H", 3) || !strncmp(q, "1c&H", 4)))
+                    tg->col = ass_col(q[0] == 'c' ? q + 1 : q + 2);
+            }
+            p = e + 1; continue;
+        }
+        if (tg->draw) { p++; continue; }                       /* vector commands, not text */
+        if (p[0] == '<') {                                     /* SRT's HTML-ish tags */
+            const char *q = p + 1; int close = (*q == '/'); if (close) q++;
+            const char *e = ((*q | 0x20) >= 'a' && (*q | 0x20) <= 'z') ? strchr(q, '>') : NULL;
+            if (e) {                                           /* a real tag: act on it, drop it */
+                int n1 = (int)(e - q);
+                if (n1 == 1 && (*q | 0x20) == 'i') { if (close) SUB_CLOSE(ital, ci); else SUB_OPEN(ital, ci); }
+                else if (n1 == 1 && (*q | 0x20) == 'b') { if (close) SUB_CLOSE(bold, cb); else SUB_OPEN(bold, cb); }
+                else if (!close && !seen && !strncasecmp(q, "font", 4)) {   /* <font color="#rrggbb"> */
+                    const char *h = strchr(q, '#');
+                    if (h && h < e) { unsigned long v = strtoul(h + 1, NULL, 16);
+                                      tg->col = sub_rgb((v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF); }
+                }
+                p = e + 1; continue;
+            }                                                  /* else "<3": plain text */
+        }
+        if (p[0] == '\\' && p[1] == 'N') { out[o++] = '\n'; p += 2; continue; }
+        if (p[0] == '\\' && (p[1] == 'n' || p[1] == 'h')) { out[o++] = ' '; p += 2; continue; }
+        if (*p != ' ') {                                       /* a visible character */
+            if (tg->ci) { tg->ital = 0; tg->ci = 0; }          /* a closed span had words after it */
+            if (tg->cb) { tg->bold = 0; tg->cb = 0; }
+            seen = 1;
+        }
+        out[o++] = *p++;
+    }
+    out[o] = 0;
+}
+#undef SUB_OPEN
+#undef SUB_CLOSE
+
+/* ---- load ---------------------------------------------------------------------------------- */
+static int sub_cmp(const void *a, const void *b) {
+    const SubCue *x = (const SubCue *)a, *y = (const SubCue *)b;
+    if (x->s != y->s) return x->s < y->s ? -1 : 1;
+    if (x->e != y->e) return x->e < y->e ? -1 : 1;
+    return (int)x->ord - (int)y->ord;                         /* stable: file order breaks ties */
+}
+/* Shared tail of every loader: time order (ASS events need not be in it, and the block builder
+ * relies on it), then drop exact repeats -- ASS draws one line several times over (fill, shadow,
+ * glow) and every copy would otherwise stack up as another line. */
+static void subs_finish(void) {
+    qsort(g_subs, g_nsubs, sizeof(SubCue), sub_cmp);
+    int w = 0;
+    for (int i = 0; i < g_nsubs; i++) {
+        int dup = 0;
+        for (int j = w - 1; j >= 0 && g_subs[j].s == g_subs[i].s && g_subs[j].e == g_subs[i].e; j--)
+            if (g_subs[j].top == g_subs[i].top && !strcmp(g_subs[j].t, g_subs[i].t)) { dup = 1; break; }
+        if (!dup) { if (w != i) g_subs[w] = g_subs[i]; w++; }
+    }
+    g_nsubs = w;
+}
+/* Does this file start like ASS/SSA? Decided from the bytes, not the name: an embedded track is
+ * stashed under a fixed .srt name whatever it holds. */
+static int sub_is_ass(FILE *f) {
+    char head[256]; size_t n = fread(head, 1, sizeof head - 1, f); head[n] = 0; rewind(f);
+    const char *p = head;
+    if ((u8)p[0] == 0xEF && (u8)p[1] == 0xBB && (u8)p[2] == 0xBF) p += 3;   /* UTF-8 BOM */
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    return !strncasecmp(p, "[Script Info]", 13);
+}
+static char *sub_trim(char *s) {
+    while (*s == ' ' || *s == '\t') s++;
+    char *e = s + strlen(s);
+    while (e > s && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r' || e[-1] == '\n')) *--e = 0;
+    return s;
+}
+/* split on commas into at most max fields; the last takes the rest (ASS Text holds commas) */
+static int ass_split(char *s, char **f, int max) {
+    int n = 0;
+    while (n < max - 1) { f[n++] = s; char *c = strchr(s, ','); if (!c) return n; *c = 0; s = c + 1; }
+    f[n++] = s;
+    return n;
+}
+static int ass_field(char **names, int n, const char *want) {
+    for (int i = 0; i < n; i++) if (!strcasecmp(sub_trim(names[i]), want)) return i;
+    return -1;
+}
+static int ass_ts(const char *p, int64_t *us) {
+    int h, m, s, cs;
+    if (sscanf(p, " %d:%d:%d.%d", &h, &m, &s, &cs) != 4) return 0;
+    *us = ((int64_t)h * 3600 + m * 60 + s) * 1000000LL + (int64_t)cs * 10000;   /* centiseconds */
+    return 1;
+}
+#define ASS_MAXSTY 64
+#define ASS_FX_SHORT 250000      /* us: per-frame karaoke is 40 ms, real dialogue never this short */
+#define ASS_LINE 2048            /* karaoke lines run long; a cut line would leak into the next */
+typedef struct { char name[40]; u32 col; u8 ital, bold, an; } AssStyle;
+/* ASS/SSA -> cues. Same filtering as the builder's ass_to_srt.py, so a raw fansub file loaded off
+ * the SD card does not strobe its karaoke: drawings, events too short to read and whole styles
+ * that are an effect layer (decided from the data -- names are unreliable) are dropped. Signs
+ * are KEPT and routed to the top block with anything aligned or positioned in the upper half. */
+static int subs_load_ass(FILE *f) {
+    static AssStyle sty[ASS_MAXSTY];
+    static int st_n[ASS_MAXSTY + 1], st_short[ASS_MAXSTY + 1], st_tiny[ASS_MAXSTY + 1];
+    static char line[ASS_LINE], raw[ASS_LINE];
+    int nsty = 0, sec = 0, legacy = 0, play_y = 288;          /* 288: the spec's PlayResY default */
+    /* field indices from the Format lines (defaults = the standard V4+ order) */
+    int sN = 0, sCol = 3, sBo = 7, sIt = 8, sAl = 18, sCnt = 23;
+    int eSt = 1, eEn = 2, eSy = 3, eTx = 9, eCnt = 10;
+    memset(st_n, 0, sizeof st_n); memset(st_short, 0, sizeof st_short); memset(st_tiny, 0, sizeof st_tiny);
+    while (fgets(line, sizeof line, f)) {
+        char *l = sub_trim(line);
+        if ((u8)l[0] == 0xEF && (u8)l[1] == 0xBB && (u8)l[2] == 0xBF) l += 3;
+        if (l[0] == '[') {
+            sec = !strncasecmp(l, "[Script Info]", 13) ? 1
+                : !strncasecmp(l, "[V4+ Styles]", 12) ? 2
+                : !strncasecmp(l, "[V4 Styles]", 11) ? (legacy = 1, sAl = 12, 2)
+                : !strncasecmp(l, "[Events]", 8) ? 3 : 0;
+            continue;
+        }
+        char *colon = strchr(l, ':');
+        if (!colon) continue;
+        *colon = 0;
+        char *key = sub_trim(l), *val = colon + 1;
+        if (sec == 1 && !strcasecmp(key, "PlayResY")) { int y = atoi(val); if (y > 0) play_y = y; }
+        else if ((sec == 2 || sec == 3) && !strcasecmp(key, "Format")) {
+            char *nm[32]; int n = ass_split(val, nm, 32);
+            if (sec == 2) {
+                int a = ass_field(nm, n, "Name"), b = ass_field(nm, n, "PrimaryColour"),
+                    c = ass_field(nm, n, "Italic"), d = ass_field(nm, n, "Alignment"),
+                    g = ass_field(nm, n, "Bold");
+                if (a >= 0) sN = a; if (b >= 0) sCol = b; if (c >= 0) sIt = c; if (d >= 0) sAl = d;
+                if (g >= 0) sBo = g;
+                sCnt = n;
+            } else {
+                int a = ass_field(nm, n, "Start"), b = ass_field(nm, n, "End"),
+                    c = ass_field(nm, n, "Style"), d = ass_field(nm, n, "Text");
+                if (a >= 0) eSt = a; if (b >= 0) eEn = b; if (c >= 0) eSy = c; if (d >= 0) eTx = d;
+                eCnt = n;
+            }
+        }
+        else if (sec == 2 && !strcasecmp(key, "Style") && nsty < ASS_MAXSTY) {
+            char *fl[32]; int n = ass_split(val, fl, sCnt < 32 ? sCnt : 32);
+            if (n <= sN) continue;
+            AssStyle *s = &sty[nsty++];
+            char *nm = sub_trim(fl[sN]); if (*nm == '*') nm++;
+            snprintf(s->name, sizeof s->name, "%s", nm);
+            s->col  = (sCol < n) ? ass_col(fl[sCol]) : 0;
+            s->ital = (sIt < n) ? (atoi(fl[sIt]) != 0) : 0;
+            { int w = (sBo < n) ? atoi(fl[sBo]) : 0;          /* -1 = bold; some write a weight */
+              s->bold = (w == -1 || w == 1 || w >= 600); }
+            int al  = (sAl < n) ? atoi(fl[sAl]) : 2;
+            s->an   = legacy ? ass_legacy_an(al) : (al >= 1 && al <= 9 ? al : 2);
+            if (!s->an) s->an = 2;
+        }
+        else if (sec == 3 && !strcasecmp(key, "Dialogue") && g_nsubs < SUB_MAX) {
+            char *fl[32]; int n = ass_split(val, fl, eCnt < 32 ? eCnt : 32);
+            if (n <= eTx || n <= eSt || n <= eEn) continue;
+            int64_t s, e;
+            if (!ass_ts(fl[eSt], &s) || !ass_ts(fl[eEn], &e) || e <= s) continue;
+            int si = ASS_MAXSTY;                                /* unknown style -> its own bucket */
+            if (eSy < n) { char *nm = sub_trim(fl[eSy]); if (*nm == '*') nm++;
+                           for (int k = 0; k < nsty; k++) if (!strcasecmp(sty[k].name, nm)) { si = k; break; } }
+            st_n[si]++;
+            if (e - s < ASS_FX_SHORT) { st_short[si]++; continue; }
+            SubTags tg; sub_tags_init(&tg);
+            sub_tags(fl[eTx], raw, sizeof raw, &tg);
+            char clean[SUB_TXT]; sub_clean(raw, clean, sizeof clean);
+            char *t = sub_trim(clean);
+            if (!*t) continue;                                  /* a drawing, or tags with no text */
+            int cps = 0; for (const char *q = t; *q; ) { uint32_t cp = u8_next(&q); if (cp > ' ') cps++; }
+            if (cps <= 2) st_tiny[si]++;
+            int an = tg.an ? tg.an : (si < nsty ? sty[si].an : 2);
+            SubCue *c = &g_subs[g_nsubs];
+            c->s = s; c->e = e; c->ord = (u16)g_nsubs; c->sty = (u8)si;
+            c->top  = tg.pos ? (tg.posy < play_y / 2) : (an >= 4);
+            c->ital = tg.ital >= 0 ? (u8)tg.ital : (si < nsty ? sty[si].ital : 0);
+            c->bold = tg.bold >= 0 ? (u8)tg.bold : (si < nsty ? sty[si].bold : 0);
+            c->col  = tg.col ? tg.col : (si < nsty ? sty[si].col : 0);
+            snprintf(c->t, sizeof c->t, "%s", t);
+            g_nsubs++;
+        }
+    }
+    /* effect layers: a style with 50+ events, most of them too short to read or a glyph or two
+     * long, is karaoke/typesetting animation, not subtitles (ass_to_srt.karaoke_styles) */
+    int w = 0;
+    for (int i = 0; i < g_nsubs; i++) {
+        int k = g_subs[i].sty, n = st_n[k];
+        int fx = n >= 50 && (st_short[k] * 2 > n || st_tiny[k] * 2 > n);
+        if (!fx) { if (w != i) g_subs[w] = g_subs[i]; w++; }
+    }
+    g_nsubs = w;
+    return g_nsubs;
+}
 static int subs_load(const char *path) {
     FILE *f = fopen(path, "rb"); if (!f) return 0;
     if (!g_subs) g_subs = (SubCue *)malloc(sizeof(SubCue) * SUB_MAX);
@@ -590,32 +848,70 @@ static int subs_load(const char *path) {
     /* Auto-detect UTF-8; otherwise decode as the user-selected 8-bit codepage. */
     g_sub_mode = sub_is_utf8(f) ? -1 : g_sub_enc;
     g_nsubs = 0;
-    char line[512];
-    while (g_nsubs < SUB_MAX && fgets(line, sizeof line, f)) {
-        if (!strstr(line, "-->")) continue;                       /* the timing line of a cue */
-        char sb[40], eb[40]; int64_t s, e;
-        if (sscanf(line, "%39s --> %39s", sb, eb) != 2) continue;
-        if (!sub_parse_ts(sb, &s) || !sub_parse_ts(eb, &e)) continue;
-        char txt[SUB_TXT]; txt[0] = 0;
-        while (fgets(line, sizeof line, f)) {                     /* text lines until a blank line */
-            char *nl = strpbrk(line, "\r\n"); if (nl) *nl = 0;
-            if (!line[0]) break;
-            char clean[256]; sub_clean(line, clean, sizeof clean);   /* tags + smart quotes/accents -> ASCII */
-            size_t tl = strlen(txt);
-            if (tl && tl + 1 < SUB_TXT) txt[tl++] = '\n';
-            snprintf(txt + tl, SUB_TXT - tl, "%s", clean);
+    if (sub_is_ass(f)) {
+        subs_load_ass(f);
+    } else {
+        char line[512];
+        while (g_nsubs < SUB_MAX && fgets(line, sizeof line, f)) {
+            if (!strstr(line, "-->")) continue;                   /* the timing line of a cue */
+            char sb[40], eb[40]; int64_t s, e;
+            if (sscanf(line, "%39s --> %39s", sb, eb) != 2) continue;
+            if (!sub_parse_ts(sb, &s) || !sub_parse_ts(eb, &e)) continue;
+            char txt[SUB_TXT]; txt[0] = 0;
+            SubTags tg; sub_tags_init(&tg);
+            while (fgets(line, sizeof line, f)) {                 /* text lines until a blank line */
+                char *nl = strpbrk(line, "\r\n"); if (nl) *nl = 0;
+                if (!line[0]) break;
+                char tagless[512]; sub_tags(line, tagless, sizeof tagless, &tg);   /* {\an8}, <i> */
+                char clean[256]; sub_clean(tagless, clean, sizeof clean);   /* tags + smart quotes/accents -> ASCII */
+                size_t tl = strlen(txt);
+                if (tl && tl + 1 < SUB_TXT) txt[tl++] = '\n';
+                snprintf(txt + tl, SUB_TXT - tl, "%s", clean);
+            }
+            SubCue *c = &g_subs[g_nsubs]; c->s = s; c->e = e; c->ord = (u16)g_nsubs; c->sty = 0;
+            c->top = tg.pos ? 0 : (tg.an >= 4);               /* SRT has no PlayRes: \pos stays put */
+            c->ital = tg.ital > 0; c->bold = tg.bold > 0; c->col = tg.col;
+            snprintf(c->t, sizeof c->t, "%s", txt);
+            g_nsubs++;
         }
-        SubCue *c = &g_subs[g_nsubs++]; c->s = s; c->e = e; snprintf(c->t, sizeof c->t, "%s", txt);
     }
     fclose(f);
+    subs_finish();
     snprintf(g_sub_file, sizeof g_sub_file, "%s", path);
     return g_nsubs;
 }
-static const char *subs_active(int64_t us) {
-    if (!g_sub_on) return NULL;
+/* ---- what is on screen now -------------------------------------------------------------------
+ * Every cue live at this instant, in two blocks: dialogue at the bottom, signs at the top. ASS
+ * overlaps events constantly (two speakers, a sign under a line) and SRT does it occasionally;
+ * showing only the first match hid the rest. One colour and slant per block is what the
+ * renderers can draw, so a block keeps a look only when all its cues share it. In the bottom
+ * block the cue that started LATER sits higher, which is how ASS stacks colliding lines. */
+typedef struct { char t[SUB_TXT]; u32 col; int ital, bold; } SubBlock;
+static void sub_block_add(SubBlock *b, const SubCue *c) {
+    size_t L = strlen(b->t), n = strlen(c->t);
+    if (L == 0) { snprintf(b->t, sizeof b->t, "%s", c->t); b->col = c->col; b->ital = c->ital; b->bold = c->bold; return; }
+    if (strstr(b->t, c->t)) return;                            /* the same words, layered again */
+    if (L + 1 + n < sizeof b->t) { b->t[L] = '\n'; memcpy(b->t + L + 1, c->t, n + 1); }
+    /* cues that disagree on their look leave the block plain: an upright line drawn in italics
+     * (or a white one in a sign's yellow) reads as wrong; plain only reads as unstyled */
+    if (b->col != c->col) b->col = 0;
+    if (b->ital != c->ital) b->ital = 0;
+    if (b->bold != c->bold) b->bold = 0;
+}
+static int subs_view(int64_t us, SubBlock *bot, SubBlock *top) {
+    bot->t[0] = 0; bot->col = 0; bot->ital = 0; bot->bold = 0;
+    top->t[0] = 0; top->col = 0; top->ital = 0; top->bold = 0;
+    if (!g_sub_on) return 0;
     int64_t u = us - g_sub_off;   /* +offset delays the cue window (subs appear later) */
-    for (int i = 0; i < g_nsubs; i++) if (u >= g_subs[i].s && u < g_subs[i].e) return g_subs[i].t;
-    return NULL;
+    for (int i = g_nsubs - 1; i >= 0; i--) {                  /* latest start first: stacks highest */
+        const SubCue *c = &g_subs[i];
+        if (!c->top && u >= c->s && u < c->e) sub_block_add(bot, c);
+    }
+    for (int i = 0; i < g_nsubs && g_subs[i].s <= u; i++) {   /* sorted by start: stop past now */
+        const SubCue *c = &g_subs[i];
+        if (c->top && u < c->e) sub_block_add(top, c);
+    }
+    return bot->t[0] || top->t[0];
 }
 /* ---- per-movie subtitle settings ----------------------------------------------------------
  * Everything the SUBTITLES menu exposes -- on/off, position, size, delay, 3D depth, encoding and
@@ -782,7 +1078,9 @@ static void subcfg_load(const char *movie) {
     fclose(f);
 }
 
-/* auto-load a matching track at playback start: "<movie>.srt" beside the file, else moviedata/ */
+/* auto-load a matching track at playback start: "<movie>.srt" beside the file, else moviedata/;
+ * then the same two places for .ass and .ssa. SRT first: where both exist it is the one someone
+ * went to the trouble of making for this player. */
 static void subs_autoload(const char *moviepath) {
     g_nsubs = 0; g_sub_on = 0; g_sub_off = 0; g_sub_file[0] = 0;   /* offset is per-movie */
     subcfg_load(moviepath);   /* this movie's saved settings (else keep last-used) */
@@ -802,11 +1100,14 @@ static void subs_autoload(const char *moviepath) {
     const char *b = strrchr(moviepath, '/'); b = b ? b + 1 : moviepath;
     char stem[256]; snprintf(stem, sizeof stem, "%s", b);
     char *dot = strrchr(stem, '.'); if (dot) *dot = 0;
+    static const char *const ext[3] = { "srt", "ass", "ssa" };
     char cand[600];
-    snprintf(cand, sizeof cand, "%.*s%s.srt", (int)(b - moviepath), moviepath, stem);   /* sidecar */
-    if (subs_load(cand)) { g_sub_on = 1; return; }
-    snprintf(cand, sizeof cand, "sdmc:/moflex_player/moviedata/%s.srt", stem);           /* moviedata */
-    if (subs_load(cand)) { g_sub_on = 1; return; }
+    for (int k = 0; k < 3; k++) {
+        snprintf(cand, sizeof cand, "%.*s%s.%s", (int)(b - moviepath), moviepath, stem, ext[k]);   /* sidecar */
+        if (subs_load(cand)) { g_sub_on = 1; return; }
+        snprintf(cand, sizeof cand, "sdmc:/moflex_player/moviedata/%s.%s", stem, ext[k]);           /* moviedata */
+        if (subs_load(cand)) { g_sub_on = 1; return; }
+    }
 }
 
 /* draw the active cue straight onto the (rotated) TOP framebuffer, both eyes in 3D.
@@ -912,8 +1213,13 @@ static void sub_fbpx(u8 *fb, int x, int y, u32 c) {
         p[0] = (u8)(c & 0xFF); p[1] = (u8)((c >> 8) & 0xFF); p[2] = (u8)((c >> 16) & 0xFF);  /* B,G,R */
     }
 }
-static void sub_fbtext(u8 *fb, int x, int y, int sc, u32 col, const char *s) {
+/* ital: shear each row right by a quarter of its height above the baseline -- the bitmap faces
+ * have no italic cut, and a 1-in-4 slant reads as one at every size */
+/* bold: each lit pixel is also lit one column right -- the usual faux bold for a bitmap face */
+static void sub_fbtext(u8 *fb, int x, int y, int sc, u32 col, const char *s, int ital, int bold) {
     int tall = sub_line_tall(s);            /* a 16px line drops the 8px glyphs to its baseline */
+    int lh = (tall ? 16 : 8) * sc;          /* the line's height: the shear runs over all of it */
+#define SH(ry) (ital ? (lh - 1 - (ry)) >> 2 : 0)
     while (*s) {
         uint32_t cp = u8_next(&s);                          /* one UTF-8 codepoint per glyph */
         const unsigned short *w = sub_glyph16(cp);
@@ -921,25 +1227,39 @@ static void sub_fbtext(u8 *fb, int x, int y, int sc, u32 col, const char *s) {
             for (int row = 0; row < 16; row++) { unsigned bits = w[row];
                 for (int c = 0; c < 16; c++) if (bits & (0x8000u >> c))
                     for (int a = 0; a < sc; a++) for (int b = 0; b < sc; b++)
-                        sub_fbpx(fb, x + c * sc + a, y + row * sc + b, col);
+                    { int px = x + c * sc + a + SH(row * sc + b), py = y + row * sc + b;
+                      sub_fbpx(fb, px, py, col); if (bold) sub_fbpx(fb, px + 1, py, col); }
             }
             x += 16 * sc;
             continue;
         }
         const char *g = sub_glyph(cp); if (!g) g = font8x8_basic['?'];   /* no glyph -> '?' */
-        int y8 = y + (tall ? 8 * sc : 0);                   /* sit on the tall line's baseline */
+        int o8 = tall ? 8 * sc : 0, y8 = y + o8;            /* sit on the tall line's baseline */
         for (int row = 0; row < 8; row++) { char bits = g[row];
             for (int c = 0; c < 8; c++) if (bits & (1 << c))
                 for (int a = 0; a < sc; a++) for (int b = 0; b < sc; b++)
-                    sub_fbpx(fb, x + c * sc + a, y8 + row * sc + b, col);
+                { int px = x + c * sc + a + SH(o8 + row * sc + b), py = y8 + row * sc + b;
+                  sub_fbpx(fb, px, py, col); if (bold) sub_fbpx(fb, px + 1, py, col); }
         }
         x += 8 * sc;
     }
+#undef SH
 }
 static void sub_fbfill(u8 *fb, u32 c) { int n = SCR_W * SCR_H; for (int i = 0; i < n; i++) sub_fbpx(fb, i / SCR_H, SCR_H - 1 - (i % SCR_H), c); }
 
 #define SUB_MAXLN 4
 #define SUB_LNW  160                        /* line buffer in BYTES (UTF-8: up to 3 per glyph) */
+#define SUB_MARGIN 10                       /* px kept clear at each side of the top screen */
+/* Set by every wrap: 1 when the cue needed more than SUB_MAXLN lines and the rest was dropped.
+ * The renderers read it to step the size down until the whole cue fits. */
+static int g_sub_wrap_cut = 0;
+/* Width a caption may use: the screen less the margins, the outline, and the per-eye 3D shift --
+ * a centred line as wide as the screen loses |dep| px off one edge in each eye. */
+static int sub_budget_px(int dep) {
+    if (dep < 0) dep = -dep;
+    int w = SCR_W - 2 * (SUB_MARGIN + dep + 1);
+    return w < 64 ? 64 : w;
+}
 
 /* Wrap a cue into display lines: keep the SRT's own line breaks (dialogue dashes),
  * and word-wrap only within each of those lines. Returns line count. */
@@ -951,7 +1271,12 @@ static int sub_wrap_u(const char *t, char lines[SUB_MAXLN][SUB_LNW], int maxw,
     const int maxcp = (SUB_LNW - 1) / 3;         /* UTF-8 worst case: guard the byte buffer */
     if (maxw < 1) maxw = 1;
     int nl = 0;
-    for (const char *seg = t; *seg && nl < SUB_MAXLN; ) {
+    g_sub_wrap_cut = 0;
+    for (const char *seg = t; *seg; ) {
+        if (nl >= SUB_MAXLN) {                       /* out of lines: anything left with ink is lost */
+            for (const char *q = seg; *q; q++) if (*q != ' ' && *q != '\t' && *q != '\r' && *q != '\n') { g_sub_wrap_cut = 1; break; }
+            break;
+        }
         const char *segend = seg; while (*segend && *segend != '\n') segend++;   /* one source line */
         char cur[SUB_LNW]; int cb = 0, cw = 0, cn = 0;  /* current line: bytes, width, codepoints */
         for (const char *p = seg; p < segend && nl < SUB_MAXLN; ) {
@@ -973,7 +1298,10 @@ static int sub_wrap_u(const char *t, char lines[SUB_MAXLN][SUB_LNW], int maxw,
             else { cur[cb] = 0; snprintf(lines[nl++], SUB_LNW, "%s", cur);
                    memcpy(cur, w, wb); cb = wb; cw = ww; cn = wn; }
         }
-        if (cb > 0 && nl < SUB_MAXLN) { cur[cb] = 0; snprintf(lines[nl++], SUB_LNW, "%s", cur); }
+        if (cb > 0) {
+            if (nl < SUB_MAXLN) { cur[cb] = 0; snprintf(lines[nl++], SUB_LNW, "%s", cur); }
+            else g_sub_wrap_cut = 1;                 /* a pending line with nowhere to go */
+        }
         seg = (*segend == '\n') ? segend + 1 : segend;
     }
     return nl;
@@ -987,35 +1315,49 @@ static int sub_fb_scale(void) {
     int s = g_sub_size < 1 ? 1 : (g_sub_size > SUB_SIZE_MAX ? SUB_SIZE_MAX : g_sub_size);
     return s >= 5 ? 2 : 1;
 }
-/* draw the wrapped lines centered at cx (white text + a thin black outline, no box) */
-static void sub_draw_lines(u8 *fb, int cx, int y0, char lines[SUB_MAXLN][SUB_LNW], int nl, int sc) {
+/* draw the wrapped lines centered at cx (text + a thin black outline, no box). col is 0x00RRGGBB,
+ * which is already the B|G|R byte order sub_fbpx writes. */
+static void sub_draw_lines(u8 *fb, int cx, int y0, char lines[SUB_MAXLN][SUB_LNW], int nl, int sc,
+                           u32 col, int ital, int bold) {
     int tall = 0;
     for (int i = 0; i < nl; i++) if (sub_line_tall(lines[i])) { tall = 1; break; }
     int lh = (tall ? 16 : 8) * sc + 4;
     int block = nl * lh;                       /* tall lines grow upward, not off the screen */
     y0 -= tall ? (block - (nl * (8 * sc + 4))) : 0;
+    if (y0 < 1) y0 = 1;                        /* ...but never past the top (1: the outline row) */
     for (int i = 0; i < nl; i++) {
         const char *s = lines[i];
         int x = cx - sub_str_cells(s) * 8 * sc / 2, y = y0 + i * lh;   /* centre on real width */
-        sub_fbtext(fb, x - 1, y, sc, 0, s); sub_fbtext(fb, x + 1, y, sc, 0, s);
-        sub_fbtext(fb, x, y - 1, sc, 0, s); sub_fbtext(fb, x, y + 1, sc, 0, s);
-        sub_fbtext(fb, x, y, sc, 0x00FFFFFF, s);          /* white, B|G|R all 0xFF */
+        sub_fbtext(fb, x - 1, y, sc, 0, s, ital, bold); sub_fbtext(fb, x + 1, y, sc, 0, s, ital, bold);
+        sub_fbtext(fb, x, y - 1, sc, 0, s, ital, bold); sub_fbtext(fb, x, y + 1, sc, 0, s, ital, bold);
+        sub_fbtext(fb, x, y, sc, col, s, ital, bold);
     }
 }
+#define SUB_TOP_Y 4                            /* the top (signs) block: px below the top edge */
+static u32 sub_col24(u32 col) { return (col & SUB_COL_SET) ? (col & 0x00FFFFFF) : 0x00FFFFFF; }
+/* Lay out one block for the framebuffer: wrap to the width left after the 3D shift, dropping
+ * from 2x to 1x when 2x would cut the cue short. Returns the line count; *sc gets the scale. */
+static int sub_fb_layout(const char *t, char lines[SUB_MAXLN][SUB_LNW], int budget, int *sc) {
+    int nl = sub_wrap(t, lines, budget / (8 * *sc));
+    if (g_sub_wrap_cut && *sc > 1) { *sc = 1; nl = sub_wrap(t, lines, budget / 8); }   /* fit beats size */
+    return nl;
+}
 static void sub_overlay(int is3d, int64_t us) {
-    const char *t = subs_active(us);
-    if (!t || !t[0]) return;
-    int sc = sub_fb_scale();
-    int maxch = (SCR_W - 20) / (8 * sc);
-    char lines[SUB_MAXLN][SUB_LNW]; int nl = sub_wrap(t, lines, maxch);
-    if (nl == 0) return;
-    int total = nl * (8 * sc + 4);
-    int y0 = SCR_H - g_sub_pos - total;
+    static SubBlock bot, top;
+    if (!subs_view(us, &bot, &top)) return;
+    int dep = is3d ? (g_sub_depth < 0 ? -g_sub_depth : g_sub_depth) : 0;
+    char bl[SUB_MAXLN][SUB_LNW], tl[SUB_MAXLN][SUB_LNW];
+    int bsc = sub_fb_scale(), tsc = bsc;
+    /* + the slant's overhang (up to a quarter of a 2x tall line) and bold's extra column */
+    int bn = bot.t[0] ? sub_fb_layout(bot.t, bl, sub_budget_px(dep + (bot.ital ? 8 : 0) + bot.bold), &bsc) : 0;
+    int tn = top.t[0] ? sub_fb_layout(top.t, tl, sub_budget_px(dep + (top.ital ? 8 : 0) + top.bold), &tsc) : 0;
+    int y0 = SCR_H - g_sub_pos - bn * (8 * bsc + 4);
     if (y0 < 0) y0 = 0;
     for (int eye = 0; eye < (is3d ? 2 : 1); eye++) {
         u8 *fb = (u8 *)gfxGetFramebuffer(GFX_TOP, eye ? GFX_RIGHT : GFX_LEFT, NULL, NULL);
         int dx = is3d ? ((eye == 0) ? -g_sub_depth : g_sub_depth) : 0;   /* parallax between eyes */
-        sub_draw_lines(fb, SCR_W / 2 + dx, y0, lines, nl, sc);
+        if (tn) sub_draw_lines(fb, SCR_W / 2 + dx, SUB_TOP_Y, tl, tn, tsc, sub_col24(top.col), top.ital, top.bold);
+        if (bn) sub_draw_lines(fb, SCR_W / 2 + dx, y0, bl, bn, bsc, sub_col24(bot.col), bot.ital, bot.bold);
     }
 }
 
@@ -1211,7 +1553,8 @@ static int sub_srt_scan(const char *dir, char names[][128], char paths[][512], i
     struct dirent *e; int n = start;
     while ((e = readdir(d)) && n < max) {
         size_t L = strlen(e->d_name);
-        if (L > 4 && !strcasecmp(e->d_name + L - 4, ".srt")) {
+        const char *x = L > 4 ? e->d_name + L - 4 : "";
+        if (!strcasecmp(x, ".srt") || !strcasecmp(x, ".ass") || !strcasecmp(x, ".ssa")) {
             snprintf(names[n], 128, "%s", e->d_name);
             snprintf(paths[n], 512, "%s%s", dir, e->d_name);
             n++;
@@ -1228,9 +1571,9 @@ static void sub_load_menu(const char *moviepath) {
     int nf = sub_srt_scan(dir, names, paths, 0, SRT_MAX);    /* was 5: a CIA season's SRTs vanished */
     nf = sub_srt_scan("sdmc:/moflex_player/moviedata/", names, paths, nf, SRT_MAX);
     sub_srt_sort(names, paths, nf);
-    if (nf == 0) { sub_msg("No .srt files found in the\nmovie folder or moviedata."); return; }
+    if (nf == 0) { sub_msg("No .srt/.ass files found in the\nmovie folder or moviedata."); return; }
     const char *items[SRT_MAX]; for (int i = 0; i < nf; i++) items[i] = names[i];
-    int c = sub_modal("LOAD SRT", items, nf, 0);
+    int c = sub_modal("LOAD SUBTITLES", items, nf, 0);
     if (c < 0) return;
     if (subs_load(paths[c])) { g_sub_on = 1; sub_msg("Subtitles loaded."); }
     else sub_msg("Could not read that file.");
@@ -1260,7 +1603,7 @@ static void sub_depth_menu(int is3d) {
             u8 *fb = (u8 *)gfxGetFramebuffer(GFX_TOP, eye ? GFX_RIGHT : GFX_LEFT, NULL, NULL);
             sub_fbfill(fb, rgb565_bgr8(UI_BG2));
             int dx = is3d ? ((eye == 0) ? -g_sub_depth : g_sub_depth) : 0;
-            sub_draw_lines(fb, SCR_W / 2 + dx, SCR_H - 48, lines, nl, sc);
+            sub_draw_lines(fb, SCR_W / 2 + dx, SCR_H - 48, lines, nl, sc, 0x00FFFFFF, 0, 0);
         }
         ui_begin(GFX_BOTTOM);
         ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
@@ -1438,12 +1781,12 @@ static void sub_menu(const char *moviepath, int is3d) {
                      strcmp(g_sub_file, EMB_SRT) ? " (A)" : "");
             items[n] = i8; act[n++] = 8;
         }
-        items[n] = "Load SRT file..."; act[n++] = 5;
+        items[n] = "Load subtitle file..."; act[n++] = 5;
         int c = sub_modal("SUBTITLES", items, n, msel);
         if (c < 0) { subcfg_save(moviepath); return; }        /* B closes the menu -> persist for this movie */
         msel = c;                                            /* stay on this row after the action */
         int a = act[c];
-        if (a == 0) { if (g_nsubs > 0) g_sub_on = !g_sub_on; else sub_msg("No subtitles loaded.\nUse 'Load SRT file'."); }
+        if (a == 0) { if (g_nsubs > 0) g_sub_on = !g_sub_on; else sub_msg("No subtitles loaded.\nUse 'Load subtitle file'."); }
         else if (a == 2) g_sub_size = g_sub_size >= SUB_SIZE_MAX ? 1 : g_sub_size + 1;
         else if (a == 3) sub_offset_menu();
         else if (a == 4) sub_depth_menu(is3d);
@@ -1833,7 +2176,7 @@ static void submenu_label(int a, char *r, int cap) {
                          g_trsub_sel + 1, g_tra.sub_n,
                          /* say how to come back when an external file is what is showing */
                          strcmp(g_sub_file, EMB_SRT) ? "  (A loads)" : ""); break;
-        default: snprintf(r, cap, "Load SRT file..."); break;
+        default: snprintf(r, cap, "Load subtitle file..."); break;
     }
 }
 static void submenu_render(int is3d) {
@@ -1852,9 +2195,9 @@ static void srtpicker_render(void) {
     int top, step, bh; submenu_layout(vis > 0 ? vis : 1, &top, &step, &bh);
     ui_begin(GFX_BOTTOM);
     ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
-    ui_text_center(UI_W / 2, 14, 2, UI_NEON, "LOAD SRT");
+    ui_text_center(UI_W / 2, 14, 2, UI_NEON, "LOAD SUBTITLES");
     if (g_srt_n == 0) {   /* same two-line message as the released sub_load_menu */
-        ui_text_center(UI_W / 2, 100, 1, UI_INK, "No .srt files found in the");
+        ui_text_center(UI_W / 2, 100, 1, UI_INK, "No .srt/.ass files found in the");
         ui_text_center(UI_W / 2, 118, 1, UI_INK, "movie folder or moviedata.");
     }
     for (int i = 0; i < vis; i++)
@@ -2237,7 +2580,7 @@ static int submenu_input(u32 kd, u32 kh, touchPosition tp, int is3d, const char 
                         g_sub_on = 1;   /* picking a language implies wanting it shown */
                     }
                 } break;
-        default: if (press) submenu_open_srt(moviepath); break;   /* Load SRT... */
+        default: if (press) submenu_open_srt(moviepath); break;   /* Load subtitle file... */
     }
     return 0;
 }
@@ -2833,45 +3176,59 @@ static int64_t r3_bts[R3_NB_MAX];   /* absolute movie time (m.ts) for subs/seekb
  * The cue is always rasterised at 1x and scaled on the GPU, which keeps the texture small and
  * makes any size (not just 1/2/3) a matter of the draw call. */
 #define ST_W 512                 /* must stay GT_W: r3_tile_off() assumes that stride */
-#define ST_H 64
-static C3D_Tex g_stex; static Tex3DS_SubTexture g_ssub; static C2D_Image g_simg;
-static int g_stex_ok = 0, g_stex_w = 0, g_stex_h = 0;
-static char g_stex_txt[SUB_TXT]; static int g_stex_cells = -1;
+#define ST_H 128                 /* four 16px lines + gaps need ~77: at 64 the 4th line was dropped */
+/* Two slots: the bottom (dialogue) block and the top (signs) block are on screen together and
+ * each needs its own texture. A slot remembers what it holds, so an unchanged cue costs nothing. */
+typedef struct {
+    C3D_Tex tex; Tex3DS_SubTexture sub; C2D_Image img;
+    int ok, w, h, cells, ital, bold; u32 col; char txt[SUB_TXT];
+} SubTexSlot;
+static SubTexSlot g_stx[2];                  /* [0] bottom, [1] top */
 
-static int subtex_init(void) {
-    if (g_stex_ok) return 1;
-    if (!C3D_TexInit(&g_stex, ST_W, ST_H, GPU_RGBA8)) return 0;
-    C3D_TexSetFilter(&g_stex, GPU_NEAREST, GPU_NEAREST);   /* crisp at integer scales */
-    g_stex_ok = 1; g_stex_txt[0] = 0; g_stex_cells = -1;
+static int subtex_init(SubTexSlot *t) {
+    if (t->ok) return 1;
+    if (!C3D_TexInit(&t->tex, ST_W, ST_H, GPU_RGBA8)) return 0;
+    C3D_TexSetFilter(&t->tex, GPU_NEAREST, GPU_NEAREST);   /* crisp at integer scales */
+    t->ok = 1; t->txt[0] = 0; t->cells = -1;
     return 1;
 }
-static void subtex_free(void) { if (g_stex_ok) { C3D_TexDelete(&g_stex); g_stex_ok = 0; } }
+static void subtex_free(void) {
+    for (int i = 0; i < 2; i++) if (g_stx[i].ok) { C3D_TexDelete(&g_stx[i].tex); g_stx[i].ok = 0; }
+}
 
 /* one pixel into the tiled RGBA8 texture. NOTE: byte order here is A,B,G,R in memory, which is
  * what citro3d expects for GPU_RGBA8; if text ever comes out with swapped colours this u32 is
  * the single place to flip. */
-static inline void subtex_px(u32 x, u32 y, u32 rgba) {
+static inline void subtex_px(SubTexSlot *t, u32 x, u32 y, u32 rgba) {
     if (x >= ST_W || y >= ST_H) return;
-    ((u32 *)g_stex.data)[r3_tile_off(x, y)] = rgba;
+    ((u32 *)t->tex.data)[r3_tile_off(x, y)] = rgba;
 }
-static void subtex_glyph(uint32_t cp, int x, int y, u32 rgba) {
+/* ital: each row shifts right by a quarter of its height above the 16px baseline (0..3 px).
+ * bold: every lit pixel is lit again one column right. */
+static void subtex_glyph(SubTexSlot *t, uint32_t cp, int x, int y, u32 rgba, int ital, int bold) {
+#define SH(r) (ital ? (15 - (r)) >> 2 : 0)
+#define PX(xx, yy) do { subtex_px(t, (xx), (yy), rgba); if (bold) subtex_px(t, (xx) + 1, (yy), rgba); } while (0)
     const unsigned short *w = sub_glyph16(cp);
     if (w) { for (int r = 0; r < 16; r++) for (int c = 0; c < 16; c++)
-                 if (w[r] & (0x8000u >> c)) subtex_px(x + c, y + r, rgba);
+                 if (w[r] & (0x8000u >> c)) PX(x + c + SH(r), y + r);
              return; }
     const unsigned char *n = sub_glyph8x16(cp);
     if (n) { for (int r = 0; r < 16; r++) for (int c = 0; c < 8; c++)
-                 if (n[r] & (1 << c)) subtex_px(x + c, y + r, rgba);
+                 if (n[r] & (1 << c)) PX(x + c + SH(r), y + r);
              return; }
     const char *g = sub_glyph(cp); if (!g) g = font8x8_basic['?'];   /* last resort, half height */
     for (int r = 0; r < 8; r++) for (int c = 0; c < 8; c++)
-        if (g[r] & (1 << c)) subtex_px(x + c, y + r + 8, rgba);   /* baseline of a 16px line */
+        if (g[r] & (1 << c)) PX(x + c + SH(r + 8), y + r + 8);   /* baseline of a 16px line */
+#undef PX
+#undef SH
 }
-/* Rasterise the cue. Returns 1 when the texture holds it (and sets g_stex_w/h). */
-static int subtex_build(const char *text, int maxpx) {
-    if (!subtex_init()) return 0;
-    if (g_stex_cells == maxpx && !strcmp(g_stex_txt, text)) return 1;   /* unchanged */
-    snprintf(g_stex_txt, sizeof g_stex_txt, "%s", text); g_stex_cells = maxpx;
+/* Rasterise a block into its slot. col: SUB_COL_SET|0x00RRGGBB or 0 (white).
+ * Returns 1 when the slot holds it (and sets its w/h). */
+static int subtex_build(SubTexSlot *t, const char *text, int maxpx, u32 col, int ital, int bold) {
+    if (!subtex_init(t)) return 0;
+    if (t->cells == maxpx && t->col == col && t->ital == ital && t->bold == bold && !strcmp(t->txt, text)) return 1;   /* unchanged */
+    snprintf(t->txt, sizeof t->txt, "%s", text); t->cells = maxpx; t->col = col; t->ital = ital; t->bold = bold;
+    u32 fill = (col & SUB_COL_SET) ? ((col & 0x00FFFFFF) << 8) | 0xFF : 0xFFFFFFFF;   /* RRGGBBAA */
 
     char lines[SUB_MAXLN][SUB_LNW];
     int nl = sub_wrap_u(text, lines, maxpx, sub_cp_adv);   /* proportional: wrap on real widths */
@@ -2885,17 +3242,17 @@ static int subtex_build(const char *text, int maxpx) {
         yy += (ibot[i] - itop[i] + 1) + GAP;
     }
     while (nl > 1 && yy - GAP + 1 > ST_H) { nl--; yy = ypos[nl - 1] + ibot[nl - 1] + 1 + GAP; }
-    int wmax = 0;
+    int wmax = 0, slant = (ital ? 4 : 0) + (bold ? 1 : 0);    /* shear widens a line by up to 3, bold by 1 */
     for (int i = 0; i < nl; i++) { int w = sub_str_adv(lines[i]); if (w > wmax) wmax = w; }
-    if (wmax > ST_W - 2) wmax = ST_W - 2;
-    g_stex_w = wmax + 2; g_stex_h = yy - GAP + 1;             /* +1/+2: room for the outline */
-    if (g_stex_h > ST_H) g_stex_h = ST_H;
+    if (wmax > ST_W - 2 - slant) wmax = ST_W - 2 - slant;
+    t->w = wmax + 2 + slant; t->h = yy - GAP + 1;             /* +1/+2: room for the outline */
+    if (t->h > ST_H) t->h = ST_H;
 
-    memset(g_stex.data, 0, ST_W * ST_H * 4);                  /* transparent */
+    memset(t->tex.data, 0, ST_W * ST_H * 4);                  /* transparent */
     for (int i = 0; i < nl; i++) {
         int lw = sub_str_adv(lines[i]);
-        int x0 = (g_stex_w - lw) / 2, y0 = ypos[i];
-        for (int pass = 0; pass < 2; pass++) {                /* black outline, then white text */
+        int x0 = (t->w - slant - lw) / 2, y0 = ypos[i];
+        for (int pass = 0; pass < 2; pass++) {                /* black outline, then the fill */
             const char *s = lines[i];
             int x = x0;
             while (*s) {
@@ -2908,16 +3265,16 @@ static int subtex_build(const char *text, int maxpx) {
                                                                * the bare for/if binds to (ox||oy)
                                                                * and paints the text black. */
                     for (int oy = -1; oy <= 1; oy++) for (int ox = -1; ox <= 1; ox++)
-                        if (ox || oy) subtex_glyph(cp, gx + ox, y0 + oy, 0x000000FF);
-                } else subtex_glyph(cp, gx, y0, 0xFFFFFFFF);
+                        if (ox || oy) subtex_glyph(t, cp, gx + ox, y0 + oy, 0x000000FF, ital, bold);
+                } else subtex_glyph(t, cp, gx, y0, fill, ital, bold);
                 x += adv;
             }
         }
     }
-    C3D_TexFlush(&g_stex);
-    g_ssub = (Tex3DS_SubTexture){ (u16)g_stex_w, (u16)g_stex_h, 0.0f, 1.0f,
-                                  (float)g_stex_w / ST_W, 1.0f - (float)g_stex_h / ST_H };
-    g_simg = (C2D_Image){ &g_stex, &g_ssub };
+    C3D_TexFlush(&t->tex);
+    t->sub = (Tex3DS_SubTexture){ (u16)t->w, (u16)t->h, 0.0f, 1.0f,
+                                  (float)t->w / ST_W, 1.0f - (float)t->h / ST_H };
+    t->img = (C2D_Image){ &t->tex, &t->sub };
     return 1;
 }
 /* Size steps. Both faces have to land on the same on-screen height for a given step, and every
@@ -3010,19 +3367,20 @@ static void r3_frame(float *z, float *ox, float *oy) {
     }
     *z = sc; *ox = SCR_W * 0.5f - cx * sc; *oy = SCR_H * 0.5f - cy * sc;
 }
-static void r3_draw_sub_tex(int dx, float scale) {
-    if (!g_stex_ok || g_stex_w <= 0) return;
+/* top: the signs block, hung from the top edge; otherwise the bottom block on g_sub_pos */
+static void r3_draw_sub_tex(SubTexSlot *t, int dx, float scale, int top) {
+    if (!t->ok || t->w <= 0) return;
     /* NEAREST keeps whole-number scales crisp; a fractional step needs LINEAR or the doubled
      * columns land unevenly and the stems come out ragged. */
     int whole = (scale == (float)(int)scale);
-    C3D_TexSetFilter(&g_stex, whole ? GPU_NEAREST : GPU_LINEAR,
+    C3D_TexSetFilter(&t->tex, whole ? GPU_NEAREST : GPU_LINEAR,
                               whole ? GPU_NEAREST : GPU_LINEAR);
-    float w = g_stex_w * scale, h = g_stex_h * scale;
+    float w = t->w * scale, h = t->h * scale;
     float x = (SCR_W - w) * 0.5f + (float)dx;
-    float y = (float)(SCR_H - g_sub_pos) - h;
+    float y = top ? (float)SUB_TOP_Y : (float)(SCR_H - g_sub_pos) - h;
     if (y < 0.0f) y = 0.0f;
     if (whole) { x = (float)(int)(x + 0.5f); y = (float)(int)(y + 0.5f); }   /* texel-aligned */
-    C2D_DrawImageAt(g_simg, x, y, 0.0f, NULL, scale, scale);
+    C2D_DrawImageAt(t->img, x, y, 0.0f, NULL, scale, scale);
 }
 /* Can the console's own font draw every glyph in this cue? Coverage is whatever the unit's REGION
  * shipped, so this is a runtime question, not a script question: a Japanese 3DS answers yes to
@@ -3039,25 +3397,177 @@ static int sysfont_covers(const char *s) {
     }
     return 1;
 }
+/* Width of one line exactly as citro2d will draw it. MEASURED rather than estimated: the advances
+ * live in the console's font file and differ by region, and an estimate drifts on a long cue. */
+static C2D_TextBuf g_sub_mbuf;
+static float sys_line_w(const char *s, float sc) {
+    if (!g_sub_mbuf) g_sub_mbuf = C2D_TextBufNew(SUB_LNW);
+    if (!g_sub_mbuf) return 0.0f;
+    C2D_Text t; float w = 0.0f;
+    C2D_TextBufClear(g_sub_mbuf);
+    C2D_TextParse(&t, g_sub_mbuf, s);
+    C2D_TextGetDimensions(&t, sc, sc, &w, NULL);
+    return w;
+}
+/* Word-wrap a cue for the system font. This path used to split on the SRT's own line breaks and
+ * nothing else, so a long single-line cue was drawn as one line wider than the panel and lost both
+ * ends. Keeps those breaks, wraps inside each on measured widths, and splits INSIDE a word only when
+ * the word alone is wider than a line (CJK runs have no spaces). Sets g_sub_wrap_cut like
+ * sub_wrap_u when the cue needs more than SUB_MAXLN lines. Runs once per cue, not per frame. */
+static int sys_wrap(const char *t, char lines[SUB_MAXLN][SUB_LNW], float maxw, float sc) {
+    int nl = 0;
+    g_sub_wrap_cut = 0;
+#define SYS_EMIT() do { if (nl >= SUB_MAXLN) { g_sub_wrap_cut = 1; return nl; } \
+                        cur[cb] = 0; memcpy(lines[nl++], cur, cb + 1); cb = 0; } while (0)
+    for (const char *seg = t; *seg; ) {
+        const char *segend = seg; while (*segend && *segend != '\n') segend++;   /* one source line */
+        char cur[SUB_LNW]; int cb = 0;
+        for (const char *p = seg; p < segend; ) {
+            while (p < segend && (*p == ' ' || *p == '\t' || *p == '\r')) p++;
+            if (p >= segend) break;
+            const char *w = p;
+            while (p < segend && *p != ' ' && *p != '\t' && *p != '\r') p++;
+            int wb = (int)(p - w), at = cb ? cb + 1 : 0;
+            if (at + wb < SUB_LNW) {                          /* the whole word on this line? */
+                char cand[SUB_LNW];
+                memcpy(cand, cur, cb); if (cb) cand[cb] = ' ';
+                memcpy(cand + at, w, wb); cand[at + wb] = 0;
+                if (sys_line_w(cand, sc) <= maxw) { memcpy(cur, cand, at + wb + 1); cb = at + wb; continue; }
+            }
+            if (cb) SYS_EMIT();                               /* no: close this line first */
+            for (const char *q = w; q < p; ) {                /* lay the word down, splitting it at
+                                                               * codepoints only if it must */
+                const char *r = q; u8_next(&r);
+                int cl = (int)(r - q);
+                if (cb + cl < SUB_LNW) {
+                    memcpy(cur + cb, q, cl); cur[cb + cl] = 0;
+                    if (cb == 0 || sys_line_w(cur, sc) <= maxw) { cb += cl; q = r; continue; }
+                }
+                SYS_EMIT();
+            }
+        }
+        if (cb) SYS_EMIT();
+        seg = (*segend == '\n') ? segend + 1 : segend;
+    }
+#undef SYS_EMIT
+    return nl;
+}
+/* Lay a cue out so it FITS: wrap to the width left after the margins, the outline and the 3D
+ * shift, and when the wrapped cue still needs more lines than we draw, step the size down until it
+ * does. A smaller caption beats one missing its ends or its last line. Returns the line count and
+ * the scale it used; at the smallest size whatever overflows four lines is all that is lost. */
+static int sys_layout(const char *cue, char lines[SUB_MAXLN][SUB_LNW], int dep, float *out_sc) {
+    float maxw = (float)sub_budget_px(dep);
+    int step = sub_step(), nl = 0;
+    for (;;) {
+        nl = sys_wrap(cue, lines, maxw, SUB_SYS_SC[step]);
+        if (!g_sub_wrap_cut || step == 0) break;
+        step--;
+    }
+    *out_sc = SUB_SYS_SC[step];
+    return nl;
+}
+/* The pixel-font texture path, same rule: the largest step at or below the chosen one whose wrap
+ * keeps the whole cue. Only the wrap is tried per step; the texture is rasterised once, after. */
+static int tex_fit_step(const char *cue, int dep) {
+    char tmp[SUB_MAXLN][SUB_LNW];
+    int budget = sub_budget_px(dep), step = sub_step();
+    for (; step > 0; step--) {
+        sub_wrap_u(cue, tmp, (int)((float)budget / SUB_TEX_SC[step]), sub_cp_adv);
+        if (!g_sub_wrap_cut) break;
+    }
+    return step;
+}
 /* One C2D_Text PER LINE, drawn on our own pitch: letting citro2d stack a '\n' uses the font's
  * line feed, which carries the leading meant for body text and left a near-blank row between
  * caption lines. AlignCenter centres each line on x (block positioning made 2-line cues read as
- * left-aligned), so x is the centre, not the left edge. */
-static void r3_draw_sub(C2D_Text *t, int n, int dx, u32 col, u32 outline) {
+ * left-aligned), so x is the centre, not the left edge. sc is the scale sys_layout() fitted. */
+/* Italic slant for the console's font, as a citro2d view shear: x moves by this much per px of
+ * height. Negative leans the tops RIGHT given citro2d's y-down screen space; if italics ever come
+ * out leaning backwards on hardware, this sign is the one thing to flip. */
+#define SUB_ITAL_SHEAR (-0.2f)
+static void r3_draw_sub(C2D_Text *t, int n, int dx, u32 col, u32 outline, float sc, int top,
+                        int ital, int bold) {
     if (n <= 0) return;
-    float sc = SUB_SYS_SC[sub_step()];
     float w = 0, lh = 0; C2D_TextGetDimensions(&t[0], sc, sc, &w, &lh);
     float pitch = lh * 0.75f;
     float total = pitch * (float)(n - 1) + lh;
     float x = SCR_W * 0.5f + (float)dx;
-    float y0 = (float)(SCR_H - g_sub_pos) - total;
+    float y0 = top ? (float)SUB_TOP_Y : (float)(SCR_H - g_sub_pos) - total;
     if (y0 < 0.0f) y0 = 0.0f;
+    int b = bold ? 1 : 0;                       /* faux bold: the fill twice, 1px apart */
     for (int i = 0; i < n; i++) {
         float y = y0 + pitch * (float)i;
-        for (int oy = -1; oy <= 1; oy++) for (int ox = -1; ox <= 1; ox++)
-            if (ox || oy) C2D_DrawText(&t[i], C2D_WithColor | C2D_AlignCenter, x + ox, y + oy, 0, sc, sc, outline);
-        C2D_DrawText(&t[i], C2D_WithColor | C2D_AlignCenter, x, y, 0, sc, sc, col);
+        C3D_Mtx saved; float ox0 = 0.0f, oy0 = 0.0f;
+        if (ital) {   /* shear about the line's middle, so the slant leaves it centred */
+            C2D_ViewSave(&saved);
+            ox0 = x; oy0 = y + lh * 0.5f;
+            C2D_ViewTranslate(ox0, oy0); C2D_ViewShear(SUB_ITAL_SHEAR, 0.0f);
+        }
+        float lx = x - ox0, ly = y - oy0;      /* in the sheared frame when italic, else as-is */
+        for (int oy = -1; oy <= 1; oy++) for (int ox = -1; ox <= 1 + b; ox++)
+            if (ox || oy) C2D_DrawText(&t[i], C2D_WithColor | C2D_AlignCenter, lx + ox, ly + oy, 0, sc, sc, outline);
+        C2D_DrawText(&t[i], C2D_WithColor | C2D_AlignCenter, lx, ly, 0, sc, sc, col);
+        if (b) C2D_DrawText(&t[i], C2D_WithColor | C2D_AlignCenter, lx + 1, ly, 0, sc, sc, col);
+        if (ital) C2D_ViewRestore(&saved);
     }
+}
+
+/* One on-screen block (bottom dialogue or top signs) as the ring path keeps it between frames:
+ * which face drew it, the layout it was fitted at, and what it held -- so a cue is wrapped,
+ * parsed or rasterised once, and again only when its text, look, size or 3D depth changes. */
+typedef struct {
+    C2D_TextBuf buf; SubTexSlot *tex; int top;
+    C2D_Text t[SUB_MAXLN]; int n, valid, sys, was_tex, lay_step, lay_dep, ital, bold;
+    float sys_sc, tex_sc; u32 col; char last[SUB_TXT];
+} RingSub;
+static void ring_sub_init(RingSub *r, C2D_TextBuf buf, SubTexSlot *tex, int top) {
+    memset(r, 0, sizeof *r);
+    r->buf = buf; r->tex = tex; r->top = top; r->was_tex = 1; r->lay_step = r->lay_dep = -1;
+    r->sys_sc = SUB_SYS_SC[0]; r->tex_sc = SUB_TEX_SC[0];
+}
+static void ring_sub_prep(RingSub *r, const SubBlock *blk, int ldep) {
+    const char *cue = blk->t;
+    if (!cue[0]) { r->valid = 0; r->last[0] = 0; return; }
+    /* The console's own face is proportional and anti-aliased, so it wins whenever it covers the
+     * cue; our tables exist for what it does not ship (Hangul, kana/kanji off a JP/KR unit).
+     * Decided per cue, so one Japanese line in an English track falls back on its own. Italic is
+     * not a reason to switch: a font change mid-film is worse than an upright line. */
+    r->sys = (g_sub_font == 0) && sysfont_covers(cue);
+    /* the slant overhangs both ends of a centred line and bold adds a column: budget for them
+     * as extra 3D shift, which sub_budget_px already takes off both sides. Before the relayout
+     * test, so a styled cue compares like with like and is not re-wrapped every frame. */
+    ldep += (blk->ital ? 3 : 0) + (blk->bold ? 1 : 0);
+    int relayout = (r->lay_step != sub_step() || r->lay_dep != ldep);
+    int changed = strcmp(cue, r->last) || r->col != blk->col || r->ital != blk->ital || r->bold != blk->bold;
+    r->lay_step = sub_step(); r->lay_dep = ldep;
+    if (r->sys) {
+        if (!r->valid || r->was_tex || relayout || changed) {
+            char lines[SUB_MAXLN][SUB_LNW];
+            int nl = sys_layout(cue, lines, ldep, &r->sys_sc);
+            C2D_TextBufClear(r->buf); r->n = 0;
+            for (int i = 0; i < nl; i++) {
+                C2D_TextParse(&r->t[r->n], r->buf, lines[i]);
+                C2D_TextOptimize(&r->t[r->n]); r->n++;
+            }
+        }
+        r->valid = r->n > 0;
+    } else {
+        if (!r->valid || !r->was_tex || relayout || changed)
+            r->tex_sc = SUB_TEX_SC[tex_fit_step(cue, ldep)];   /* fit once per cue */
+        r->valid = subtex_build(r->tex, cue, (int)((float)sub_budget_px(ldep) / r->tex_sc),
+                                blk->col, blk->ital, blk->bold);
+    }
+    r->was_tex = !r->sys;
+    if (r->valid) { snprintf(r->last, sizeof r->last, "%s", cue); r->col = blk->col; r->ital = blk->ital; r->bold = blk->bold; }
+}
+static void ring_sub_draw(const RingSub *r, int dx, u32 white, u32 outline) {
+    if (!r->valid) return;
+    if (r->sys) {
+        u32 c = (r->col & SUB_COL_SET)
+              ? C2D_Color32((r->col >> 16) & 0xFF, (r->col >> 8) & 0xFF, r->col & 0xFF, 255) : white;
+        r3_draw_sub((C2D_Text *)r->t, r->n, dx, c, outline, r->sys_sc, r->top, r->ital, r->bold);
+    } else r3_draw_sub_tex(r->tex, dx, r->tex_sc, r->top);
 }
 
 /* HOME/sleep handling for the GPU ring path. Without releasing Y2R before the applet takes the GPU,
@@ -3488,7 +3998,7 @@ static MoflexResult moflex_play_ring(const char *path) {
     C2D_TextParse(&ttitle, sbuf, title); C2D_TextOptimize(&ttitle);
     C2D_TextParse(&thint, sbuf, "A pause  <>seek  ^v vol  SELECT subs  B back"); C2D_TextOptimize(&thint);
     C2D_TextParse(&ttime, tmbuf, " "); C2D_TextOptimize(&ttime);
-    C2D_TextBuf subbuf = C2D_TextBufNew(512);
+    C2D_TextBuf subbuf = C2D_TextBufNew(512), subbufT = C2D_TextBufNew(512);
     u32 black = C2D_Color32(0, 0, 0, 255), subcol = C2D_Color32(255, 255, 255, 255), subout = C2D_Color32(0, 0, 0, 255);
 
     MoflexResult result = MOFLEX_QUIT_BACK;
@@ -3515,11 +4025,12 @@ static MoflexResult moflex_play_ring(const char *path) {
     int64_t rpos = resume_load(path), last_save = 0;
     if (rpos > 3000000 && (dur_us <= 0 || rpos < dur_us - 10000000)) { seek_to_us = rpos; want_seek = 1; last_save = rpos; resume_exact = 1; }
     int vol_dirty = 0, save_pend = 0, save_delay = 0;
-    char last_ts[64] = "", last_sub[256] = "";
+    char last_ts[64] = "";
     u64 r3_wall0 = 0; int r3_wallset = 0;                 /* fallback real-time clock when no audio */
     u64 pause_wall = 0;                                   /* when the pause began (clock re-anchor on resume) */
-    C2D_Text tsub[SUB_MAXLN]; int tsub_n = 0, sub_valid = 0;   /* parsed cue, one C2D_Text per line */
-    int sub_sys = 0, sub_was_tex = 1;                     /* which face drew it (and drew it last) */
+    RingSub rsb, rst;                                     /* the bottom (dialogue) and top (signs) blocks */
+    ring_sub_init(&rsb, subbuf, &g_stx[0], 0);
+    ring_sub_init(&rst, subbufT, &g_stx[1], 1);
 
     /* profiler + CADENCE METER (v2/v3 = frames held 2/3 refreshes = good; bad = held 1 or 4+ = judder) */
     u64 pf_dec = 0, pf_y2r = 0, pf_gpu = 0, pf_idle = 0, pf_rd = 0, pf_dmax = 0, pf_rdmax = 0; int pf_n = 0; char pf_str[80] = "";
@@ -3998,41 +4509,21 @@ static MoflexResult moflex_play_ring(const char *path) {
          * iteration (wasted CPU while banking), so calm scenes now spend that time decoding ahead -> a
          * bigger cushion -> heavy scenes coast longer before they get choppy. */
         if ((show >= 0 || dirty || dirty2) && (show >= 0 || last_shown >= 0)) {
-            const char *cue = subs_active(disp_us);   /* NULL if subs off or no cue now */
+            static SubBlock vb, vt; subs_view(disp_us, &vb, &vt);   /* empty when off / no cue now */
             char tc[16], td[16], ts[64];
             fmt_time(disp_us, tc, sizeof tc);
             fmt_time(dur_us, td, sizeof td);
             snprintf(ts, sizeof ts, "%s / %s", tc, td);   /* clean current / duration */
             if (strcmp(ts, last_ts)) { snprintf(last_ts, sizeof last_ts, "%s", ts);
                                        C2D_TextBufClear(tmbuf); C2D_TextParse(&ttime, tmbuf, ts); C2D_TextOptimize(&ttime); }
-            if (cue && *cue) {                          /* (re)build only when the cue text changes */
-                /* The console's own face is proportional and anti-aliased, so it wins whenever it
-                 * covers the cue; our tables exist for what it does not ship (Hangul, kana/kanji
-                 * off a JP/KR unit). Decided per cue, so one Japanese line in an English track
-                 * falls back on its own without dragging the rest of the film with it. */
-                sub_sys = (g_sub_font == 0) && sysfont_covers(cue);
-                if (sub_sys) {
-                    if (!sub_valid || sub_was_tex || strcmp(cue, last_sub)) {
-                        C2D_TextBufClear(subbuf); tsub_n = 0;
-                        for (const char *p = cue; *p && tsub_n < SUB_MAXLN; ) {
-                            const char *e = p; while (*e && *e != '\n') e++;
-                            char ln[SUB_LNW]; int b = (int)(e - p);
-                            if (b > SUB_LNW - 1) b = SUB_LNW - 1;
-                            while (b > 0 && (p[b] & 0xC0) == 0x80) b--;   /* never cut a UTF-8 seq */
-                            memcpy(ln, p, b); ln[b] = 0;
-                            if (b) { C2D_TextParse(&tsub[tsub_n], subbuf, ln);
-                                     C2D_TextOptimize(&tsub[tsub_n]); tsub_n++; }
-                            p = *e ? e + 1 : e;
-                        }
-                    }
-                    sub_valid = tsub_n > 0;
-                } else {
-                    float ts_sc = SUB_TEX_SC[sub_step()];
-                    sub_valid = subtex_build(cue, (int)((float)(SCR_W - 20) / ts_sc));
-                }
-                sub_was_tex = !sub_sys;
-                if (sub_valid) snprintf(last_sub, sizeof last_sub, "%s", cue);
-            } else { sub_valid = 0; last_sub[0] = 0; }
+            {   /* the per-eye shift the draw below will apply (same formula), so the wrap leaves room
+                 * for it: a full-width line otherwise loses that many px off an edge */
+                float lz, lox, loy; r3_frame(&lz, &lox, &loy);
+                int ldep = r3_stereo(is3d) ? (int)((float)g_sub_depth * lz + (g_sub_depth < 0 ? -0.5f : 0.5f)) : 0;
+                if (ldep < 0) ldep = -ldep;
+                ring_sub_prep(&rsb, &vb, ldep);         /* each (re)builds only when it changed */
+                ring_sub_prep(&rst, &vt, ldep);
+            }
             int b = (show >= 0) ? show : last_shown;
             /* Picture settings act during the YUV->RGB conversion, so a frame already sitting in
              * the ring keeps the old ones -- on a PAUSED frame nothing would change until
@@ -4068,15 +4559,15 @@ static MoflexResult moflex_play_ring(const char *path) {
             if (mix > 0.0f) C2D_DrawImageAt(imR, zox + cv, zoy, 0, &mixt, zm, zm);
             if (stereo && g_ghost) r3_ghost(r3_imgL[b], zox - cv, imR, zox + cv, zoy, zm);
             r3_mask_edges(cmask, black);
-            if (sub_valid) { if (sub_sys) r3_draw_sub(tsub, tsub_n, stereo ? -sdep : 0, subcol, subout);
-                             else r3_draw_sub_tex(stereo ? -sdep : 0, SUB_TEX_SC[sub_step()]); }
+            ring_sub_draw(&rst, stereo ? -sdep : 0, subcol, subout);
+            ring_sub_draw(&rsb, stereo ? -sdep : 0, subcol, subout);
             C2D_TargetClear(topR, black); C2D_SceneBegin(topR);
             C2D_DrawImageAt(imR, zox + cv, zoy, 0, NULL, zm, zm);
             if (mix > 0.0f) C2D_DrawImageAt(r3_imgL[b], zox - cv, zoy, 0, &mixt, zm, zm);
             if (stereo && g_ghost) r3_ghost(imR, zox + cv, r3_imgL[b], zox - cv, zoy, zm);
             r3_mask_edges(cmask, black);
-            if (sub_valid) { if (sub_sys) r3_draw_sub(tsub, tsub_n, stereo ? sdep : 0, subcol, subout);
-                             else r3_draw_sub_tex(stereo ? sdep : 0, SUB_TEX_SC[sub_step()]); }
+            ring_sub_draw(&rst, stereo ? sdep : 0, subcol, subout);
+            ring_sub_draw(&rsb, stereo ? sdep : 0, subcol, subout);
             if (g_screen_off) { g_dark_sw(bot); g_panel_force = 1; }      /* dark: panel stale -> force on wake */
             else if (g_submenu) { g_submenu_sw(bot, is3d); g_panel_force = 1; }  /* submenu: panel stale on exit */
             else { if (dirty) g_panel_force = 1;                          /* UI changed -> re-render the panel */
@@ -4154,7 +4645,7 @@ static MoflexResult moflex_play_ring(const char *path) {
     ptmuExit();
     r3_audio_close();   /* unconditional: also frees a partial bank when setup failed */
     r3_vq_clear();
-    C2D_TextBufDelete(sbuf); C2D_TextBufDelete(tmbuf); C2D_TextBufDelete(subbuf);
+    C2D_TextBufDelete(sbuf); C2D_TextBufDelete(tmbuf); C2D_TextBufDelete(subbuf); C2D_TextBufDelete(subbufT);
     for (int i = 0; i < NB; i++) { C3D_TexDelete(&r3_texL[i]); if (is3d) C3D_TexDelete(&r3_texR[i]); }
     subtex_free();
     ui_tex_free();   /* release the software-UI panel texture before C3D shuts down */
