@@ -2440,6 +2440,79 @@ static int scan_should_stop(void) {
     if (now - last >= 500) { last = now; if (dl_lid_closed()) s_scan_stop = 1; }
     return s_scan_stop;
 }
+/* ---- scan crash recovery ------------------------------------------------------------------
+ * A file the scan cannot survive (a corrupt CIA or trailer that crashes a parser) used to take
+ * the app down on EVERY launch, and the only way out was skipping the scan and hunting for the
+ * file by hand. This catches it with two SD operations per scan rather than one per file: a
+ * marker written when a scan starts and removed when it ends. A marker still there at the next
+ * scan means that scan died -- so the next one runs in RECOVERY, naming each file in the marker
+ * just before opening it. Recovery dies on the same file (the walk order is stable), and the scan
+ * after that reads the name, adds the file to the skip list and says so. A skipped file stays in
+ * the library under its filename, so it can be deleted from the file manager, but no scan opens
+ * it again -- unless it is REPLACED: entries carry the file's size, so a re-download of the same
+ * name is a different file and gets opened normally. The per-file writes only ever happen in
+ * that one recovery pass. */
+#define SCAN_MARK "sdmc:/moflex_player/.scan_running"
+#define SCAN_SKIP "sdmc:/moflex_player/scan_skip.txt"
+#define SKIP_MAX  32
+static char s_skip[SKIP_MAX][PATHLEN + NAMELEN];
+static long long s_skip_sz[SKIP_MAX];                  /* the size it had when it crashed */
+static int  s_skip_n = 0, s_skip_loaded = 0, s_scan_recovery = 0;
+static long long file_size(const char *path) { struct stat st; return stat(path, &st) ? -1 : (long long)st.st_size; }
+static void skip_load(void) {
+    s_skip_n = 0; s_skip_loaded = 1;
+    FILE *f = fopen(SCAN_SKIP, "rb");
+    if (!f) return;
+    char line[PATHLEN + NAMELEN + 24];
+    while (s_skip_n < SKIP_MAX && fgets(line, sizeof line, f)) {      /* "<size> <path>" */
+        char *nl = strpbrk(line, "\r\n"); if (nl) *nl = 0;
+        char *sp = strchr(line, ' ');
+        if (!sp || !sp[1]) continue;
+        s_skip_sz[s_skip_n] = atoll(line);
+        snprintf(s_skip[s_skip_n], sizeof s_skip[0], "%s", sp + 1);
+        s_skip_n++;
+    }
+    fclose(f);
+}
+static int scan_skipped(const char *path) {
+    if (!s_skip_loaded) skip_load();
+    for (int i = 0; i < s_skip_n; i++)
+        if (!strcmp(s_skip[i], path)) return file_size(path) == s_skip_sz[i];   /* replaced -> try it */
+    return 0;
+}
+/* recovery only: name the file about to be opened, so a crash inside it can be pinned on it */
+static void scan_guard(const char *path) {
+    if (!s_scan_recovery) return;
+    FILE *f = fopen(SCAN_MARK, "wb");
+    if (f) { fprintf(f, "R\n%s\n", path); fclose(f); }
+}
+static void scan_begin(void) {
+    mkdir("sdmc:/moflex_player", 0777);
+    s_scan_recovery = 0;
+    FILE *f = fopen(SCAN_MARK, "rb");
+    if (f) {                                             /* the last scan never finished */
+        char kind[8] = "", path[PATHLEN + NAMELEN] = "";
+        if (fgets(kind, sizeof kind, f) && fgets(path, sizeof path, f)) {
+            char *nl = strpbrk(path, "\r\n"); if (nl) *nl = 0;
+        }
+        fclose(f);
+        if (kind[0] == 'R' && path[0] && !scan_skipped(path)) {   /* recovery died IN this file */
+            long long sz = file_size(path);
+            FILE *s = fopen(SCAN_SKIP, "ab");
+            if (s) { fprintf(s, "%lld %s\n", sz, path); fclose(s); }
+            if (s_skip_n < SKIP_MAX) { s_skip_sz[s_skip_n] = sz; snprintf(s_skip[s_skip_n++], sizeof s_skip[0], "%s", path); }
+            const char *b = strrchr(path, '/'); b = b ? b + 1 : path;
+            char body[400];
+            snprintf(body, sizeof body, "This file crashed the library scan,\nso it will be skipped from now on:\n\n%.120s\n\n"
+                     "It may be corrupt. Delete it or\ndownload it again.", b);
+            msg_screen("FILE SKIPPED", body);
+        } else s_scan_recovery = 1;                      /* died somewhere unknown: find where */
+    }
+    f = fopen(SCAN_MARK, "wb");
+    if (f) { fputs(s_scan_recovery ? "R\n" : "N\n", f); fclose(f); }
+}
+static void scan_end(void) { remove(SCAN_MARK); s_scan_recovery = 0; }
+
 static void lib_scan_dir(const char *dir, int depth) {
     if (g_lib_n >= LIB_MAX || depth > 8) return;
     DIR *d = opendir(dir);
@@ -2463,9 +2536,15 @@ static void lib_scan_dir(const char *dir, int depth) {
                 if (!shows_done) { lib_add_shows_in_dir(dir, NULL); shows_done = 1; }
                 continue;
             }
-            if (cia_is_cia(e->d_name) && !cia_has_moflex(full)) continue;   /* skip non-movie CIAs */
             CatEntry *c = &g_lib[g_lib_n];
-            movieinfo_load(full, c);                          /* name/genres/category/year/is3d from .nfo, if any */
+            if (scan_skipped(full)) {                        /* crashed a scan before: list it by
+                                                               * name only, never open it */
+                memset(c, 0, sizeof *c); c->is3d = -1;
+            } else {
+                scan_guard(full);
+                if (cia_is_cia(e->d_name) && !cia_has_moflex(full)) continue;   /* skip non-movie CIAs */
+                movieinfo_load(full, c);                      /* name/genres/category/year/is3d from .nfo, if any */
+            }
             snprintf(c->url, sizeof c->url, "%s", full);      /* the path we play + the poster key */
             snprintf(c->fname, sizeof c->fname, "%s", e->d_name);
             if (!c->name[0]) { snprintf(c->name, sizeof c->name, "%s", e->d_name); strip_ext(c->name); }
@@ -2572,11 +2651,14 @@ static void lib_rescan(void) {
     ui_text_center(UI_W / 2, 96, 2, UI_NEON, "Scanning...");
     ui_text_center(UI_W / 2, 128, 1, UI_DIM, "searching the SD card for movies"); ui_present();
     gfxFlushBuffers(); gfxSwapBuffers();
+    scan_begin();                                 /* crash recovery: see scan_guard() */
     lib_scan_dir("sdmc:/", 0);
     if (s_scan_stop) { g_lib_n = 0; lib_load_cache_only(); }   /* aborted -> keep the OLD library,
                                                                 * never save a truncated cache */
     else {
         for (int i = 0; i < g_lib_n; i++) {
+            if (scan_skipped(g_lib[i].url)) continue;   /* crashed a scan before: never open it */
+            scan_guard(g_lib[i].url);                   /* (a show: the folder stands for its episode) */
             /* SUPER MOFLEX: import EVERYTHING from the file ONCE at scan (info, poster, tracks),
              * exactly like a website scrape -- afterward the library is self-sufficient and
              * nothing ever opens the moflex again for metadata. */
@@ -2601,6 +2683,7 @@ static void lib_rescan(void) {
         }
         lib_save_cache();
     }
+    scan_end();                  /* finished or aborted on purpose: either way it did not crash */
     if (dl_was) dlw_start();     /* resume the queue (progress was kept) */
 }
 
@@ -2745,6 +2828,7 @@ __attribute__((unused)) static void lib_detect_dir(const char *dir, int depth) {
                 continue;
             }
             if (dt_covered(full)) continue;                                /* cheap hash check first */
+            if (scan_skipped(full)) continue;                              /* crashed a scan: never open */
             if (cia_is_cia(e->d_name) && !cia_has_moflex(full)) continue;  /* open only NEW CIAs */
             if (s_newlist && s_new_n < NEWLIST_MAX) snprintf(s_newlist[s_new_n], sizeof s_newlist[0], "%s", full);
             s_new_n++;
