@@ -4434,8 +4434,11 @@ static void extplay_save(void) {
     FILE *f = fopen(EXTPLAY_CFG, "wb");
     if (f) { fprintf(f, "%d %d\n", g_extplay3d, g_extplay2d); fclose(f); }
 }
-/* 3D or not: the file's own info (a super moflex's flag, imported into its .nfo), else the
- * library's entry, else "3D" in the filename -- the catalog names every 3D file that way. */
+/* 3D or not, cheapest answer first: the file's .nfo flag (a super moflex's, imported), the
+ * library entry's flag, then "3D" in the filename. A name WITHOUT "3D" proves nothing --
+ * Nintendo's own files (Dinosaur Office) have neither an .nfo nor "3D" in the name -- so only
+ * then is the video itself read: the same left/right interleave test playback uses
+ * (mfx_detect_stereo), ~2 s of packets, once, at play time. */
 static int movie_is_3d(const char *path) {
     static CatEntry c;
     memset(&c, 0, sizeof c);
@@ -4447,7 +4450,14 @@ static int movie_is_3d(const char *path) {
     memset(&c, 0, sizeof c);
     const char *b = strrchr(path, '/'); b = b ? b + 1 : path;
     snprintf(c.fname, sizeof c.fname, "%s", b);
-    return cat_is_3d(&c);
+    if (cat_is_3d(&c)) return 1;
+    static MfxDemux m;
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    int st = 0;
+    if (mfx_open_auto(&m, f, path) == 0) { st = mfx_detect_stereo(&m); mfx_close(&m); }
+    fclose(f);
+    return st;
 }
 static const char *extplay_mode_name(int v) {
     return v < 0 ? "ASK" : v ? "NINTENDO PLAYER" : "CLOWNSEC PLAYER";
