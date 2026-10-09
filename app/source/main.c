@@ -5414,10 +5414,14 @@ static int play_and_handle(const char *path, int origin) {
         }
         if (r == MOFLEX_QUIT_BACK) {
             if (origin == PLAY_FROM_HOME) return 0;              /* back IS the home screen */
-            if (origin == PLAY_FROM_STORE) {                     /* back into the aisle */
-                int sr = store_pick(np, sizeof np);
-                if (sr == 1) { r = play_movie(np); continue; }
-                return sr < 0 ? 1 : 0;
+            if (origin == PLAY_FROM_STORE) {
+                /* to OPEN VIDEO, not straight back into the aisle: walking back in is one tap from
+                 * there, and Library / Filesystem / Recent are too, for someone who is done browsing
+                 * the shelves (re-entering the aisle also means waiting for it to load) */
+                int b2 = open_video(np, sizeof np);
+                if (b2 == 1) return 1;
+                if (b2 == 2) { origin = s_pick_origin; r = play_movie(np); continue; }
+                return 0;
             }
             if (origin == PLAY_FROM_RECENT) {                    /* back to the recents list */
                 if (recent_pick(np, sizeof np)) { r = play_movie(np); continue; }
