@@ -2431,11 +2431,29 @@ static void store_free_buffers(void) {
     if (g_spinev) { linearFree(g_spinev); g_spinev = NULL; }
 }
 
+/* The top screen as citro3d's transfer writes it: 24-bit BGR8, double-buffered. The player's own
+ * menus leave it 16-bit RGB565 and single-buffered (branding.c), and the 3-byte output landing in
+ * a 2-byte buffer is the snow-and-lines picture -- so set it on the way in, and again after HOME,
+ * which can hand the screens back reconfigured (playback does the same). */
+static volatile int s_apt_redo = 0;
+static aptHookCookie s_apt_cookie;
+static void store_apt_hook(APT_HookType hook, void *param) {
+    (void)param;
+    if (hook == APTHOOK_ONRESTORE || hook == APTHOOK_ONWAKEUP) s_apt_redo = 1;
+}
+static void store_top_screen(void) {
+    gfxSetScreenFormat(GFX_TOP, GSP_BGR8_OES);
+    gfxSetDoubleBuffering(GFX_TOP, true);
+    gfxSet3D(true);
+}
+
 int store_run(int (*resolve)(const char *key, char *out, size_t cap), char *out, size_t cap) {
     s_resolve = resolve;
     int result = 0;                       /* 0 = walked out, 1 = out[] holds a movie, -1 = app closing */
     store_reset_state();
-    gfxSet3D(true);                       /* the entire point */
+    store_top_screen();                   /* 24-bit, double-buffered, 3D on: the entire point */
+    s_apt_redo = 0;
+    aptHook(&s_apt_cookie, store_apt_hook, NULL);
     consoleInit(GFX_BOTTOM, NULL);
     /* Single-buffer the bottom screen, exactly as the player does (mp4_play.c:328). The console
      * writes into whichever back buffer is current, and this rewrites only the lines that
@@ -2540,6 +2558,7 @@ int store_run(int (*resolve)(const char *key, char *out, size_t cap), char *out,
 
     for (;;) {
         if (!aptMainLoop()) { result = -1; break; }
+        if (s_apt_redo) { s_apt_redo = 0; store_top_screen(); }   /* back from HOME */
         hidScanInput();
         g_frame++;
         u32 kd = hidKeysDown();
@@ -3187,6 +3206,7 @@ int store_run(int (*resolve)(const char *key, char *out, size_t cap), char *out,
     DVLB_Free(vsh_dvlb);
     store_free_buffers();
     C3D_Fini();
-    gfxSet3D(false);
+    aptUnhook(&s_apt_cookie);
+    gfxSet3D(false);                      /* the player's branding_show() puts its own format back */
     return result;
 }
