@@ -1,4 +1,5 @@
 #include "moflex_playback.h"
+#include "store.h"   /* gpu_park_program */
 
 #include <3ds.h>
 #include <stdio.h>
@@ -2987,7 +2988,7 @@ gdone:
     C2D_TextBufDelete(sbuf); C2D_TextBufDelete(tmbuf);
     for (int i = 0; i < NTB; i++) { C3D_TexDelete(&texL[i]); C3D_TexDelete(&texR[i]); }
     gspWaitForVBlank(); gspWaitForVBlank();
-    C2D_Fini(); C3D_Fini(); g_y2r_exit();
+    gpu_park_program(); C2D_Fini(); C3D_Fini(); g_y2r_exit();
     /* restore the software-UI framebuffer format for the home/browser screens */
     gfxSetScreenFormat(GFX_TOP, GSP_BGR8_OES);      /* 24-bit: RGB565 gave blue only 5 bits -> banding */
     gfxSetScreenFormat(GFX_BOTTOM, GSP_RGB565_OES);   /* UI panel stays 16-bit */
@@ -3955,7 +3956,7 @@ static MoflexResult moflex_play_ring(const char *path) {
     }
     if (!C2D_Init(C2D_DEFAULT_MAX_OBJECTS)) {   /* unchecked before: silent no-op draws = dark screens */
         aptUnhook(&g_ring_apt_cookie);
-        C3D_Fini();
+        gpu_park_program(); C3D_Fini();
         gfxSet3D(false); av_frame_free(&fL); av_frame_free(&fR);
         mobi_close(&ctx); free(ctx.priv_data); mfx_close(&m); fclose(f);
         return MOFLEX_FALLBACK;
@@ -3966,7 +3967,7 @@ static MoflexResult moflex_play_ring(const char *path) {
     C3D_RenderTarget *bot  = C2D_CreateScreenTarget(GFX_BOTTOM, GFX_LEFT);
     if (!topL || !topR || !bot) {
         aptUnhook(&g_ring_apt_cookie);
-        C2D_Fini(); C3D_Fini(); gfxSet3D(false);
+        gpu_park_program(); C2D_Fini(); C3D_Fini(); gfxSet3D(false);
         av_frame_free(&fL); av_frame_free(&fR);
         mobi_close(&ctx); free(ctx.priv_data); mfx_close(&m); fclose(f);
         return MOFLEX_FALLBACK;
@@ -3999,7 +4000,7 @@ static MoflexResult moflex_play_ring(const char *path) {
         for (int i = 0; i < NB; i++) { C3D_TexDelete(&r3_texL[i]); if (is3d) C3D_TexDelete(&r3_texR[i]); }
         subtex_free();
     subtex_free();
-        C2D_Fini(); C3D_Fini();
+        gpu_park_program(); C2D_Fini(); C3D_Fini();
         gfxSetScreenFormat(GFX_TOP, GSP_BGR8_OES); gfxSetScreenFormat(GFX_BOTTOM, GSP_RGB565_OES); gfxSet3D(false);
         av_frame_free(&fL); av_frame_free(&fR);
         mobi_close(&ctx); free(ctx.priv_data); mfx_close(&m); fclose(f);
@@ -4010,7 +4011,7 @@ static MoflexResult moflex_play_ring(const char *path) {
         for (int i = 0; i < NB; i++) { C3D_TexDelete(&r3_texL[i]); if (is3d) C3D_TexDelete(&r3_texR[i]); }
         subtex_free();
     subtex_free();
-        C2D_Fini(); C3D_Fini();
+        gpu_park_program(); C2D_Fini(); C3D_Fini();
         gfxSetScreenFormat(GFX_TOP, GSP_BGR8_OES); gfxSetScreenFormat(GFX_BOTTOM, GSP_RGB565_OES); gfxSet3D(false);
         av_frame_free(&fL); av_frame_free(&fR);
         mobi_close(&ctx); free(ctx.priv_data); mfx_close(&m); fclose(f);
@@ -4696,7 +4697,7 @@ static MoflexResult moflex_play_ring(const char *path) {
     subtex_free();
     ui_tex_free();   /* release the software-UI panel texture before C3D shuts down */
     gspWaitForVBlank(); gspWaitForVBlank();
-    C2D_Fini(); C3D_Fini(); g_y2r_exit();
+    gpu_park_program(); C2D_Fini(); C3D_Fini(); g_y2r_exit();
     gfxSet3D(false);
     /* Hand a CLEAN gfx state back to the app ONLY when returning to it (BACK/OPEN). On EXIT the app is
      * closing -- doing gfxExit()+gfxInitDefault() during the applet close hangs on "closing software",

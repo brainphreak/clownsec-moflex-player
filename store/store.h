@@ -10,4 +10,8 @@
  * or poster removes it, so the next visit rebuilds instead of showing stale shelves. */
 #define STORE_PACK "sdmc:/moflex_player/store/shelves.pak"
 int store_run(int (*resolve)(const char *key, char *out, size_t cap), char *out, size_t cap);
+/* Bind the session-long "parking" shader. Call before C2D_Fini()/C3D_Fini() anywhere the GPU
+ * is shut down: citro3d remembers the last program across Fini/Init and reads it on the next
+ * bind, so it must never be left pointing at one that is about to be freed. */
+void gpu_park_program(void);
 #endif

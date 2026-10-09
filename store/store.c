@@ -2599,13 +2599,24 @@ static int uLocProjection, uLocModelview;
  * own. The player's paths only ever bind citro2d's program, so they never hit this; the store is
  * the second program. Kept alive, the stale pointer is always a valid program. */
 static int s_shader_loaded = 0;
+static void shader_load_once(void) {
+    if (s_shader_loaded) return;
+    vsh_dvlb = DVLB_ParseFile((u32 *)vshader_shbin, vshader_shbin_size);
+    shaderProgramInit(&program);
+    shaderProgramSetVsh(&program, &vsh_dvlb->DVLE[0]);
+    s_shader_loaded = 1;
+}
+/* The same problem the other way round: citro2d frees ITS program in C2D_Fini, so after a movie
+ * citro3d's remembered program was citro2d's freed one, and the store's first bind on the next
+ * visit read garbage through it -- the top screen came up blank. Whoever shuts the GPU down
+ * parks citro3d on this program first; it lives for the whole session, so the remembered one
+ * is always valid, whichever way round the store and the movies go. Needs an active context. */
+void gpu_park_program(void) {
+    shader_load_once();
+    C3D_BindProgram(&program);
+}
 static void scene_init(void) {
-    if (!s_shader_loaded) {
-        vsh_dvlb = DVLB_ParseFile((u32 *)vshader_shbin, vshader_shbin_size);
-        shaderProgramInit(&program);
-        shaderProgramSetVsh(&program, &vsh_dvlb->DVLE[0]);
-        s_shader_loaded = 1;
-    }
+    shader_load_once();
     C3D_BindProgram(&program);
     uLocProjection = shaderInstanceGetUniformLocation(program.vertexShader, "projection");
     uLocModelview  = shaderInstanceGetUniformLocation(program.vertexShader, "modelView");
@@ -3707,6 +3718,7 @@ int store_run(int (*resolve)(const char *key, char *out, size_t cap), char *out,
     /* the shader stays loaded: see scene_init */
     near_exit();
     store_free_buffers();
+    gpu_park_program();
     C3D_Fini();
     aptUnhook(&s_apt_cookie);
     gfxSet3D(false);                      /* the player's branding_show() puts its own format back */
