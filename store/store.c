@@ -2599,11 +2599,18 @@ static int uLocProjection, uLocModelview;
  * own. The player's paths only ever bind citro2d's program, so they never hit this; the store is
  * the second program. Kept alive, the stale pointer is always a valid program. */
 static int s_shader_loaded = 0;
+/* A SECOND program over the same shader, used only for parking. It must be a different object:
+ * citro3d uploads a program to the GPU only when the bound one CHANGES, so if the store parked on
+ * its own program, the next visit's bind saw "same program" and uploaded nothing -- after C3D_Init
+ * the GPU had no shader, and the aisle was a black screen with a stray line on every return. */
+static shaderProgram_s s_park_prog;
 static void shader_load_once(void) {
     if (s_shader_loaded) return;
     vsh_dvlb = DVLB_ParseFile((u32 *)vshader_shbin, vshader_shbin_size);
     shaderProgramInit(&program);
     shaderProgramSetVsh(&program, &vsh_dvlb->DVLE[0]);
+    shaderProgramInit(&s_park_prog);
+    shaderProgramSetVsh(&s_park_prog, &vsh_dvlb->DVLE[0]);
     s_shader_loaded = 1;
 }
 /* The same problem the other way round: citro2d frees ITS program in C2D_Fini, so after a movie
@@ -2613,10 +2620,13 @@ static void shader_load_once(void) {
  * is always valid, whichever way round the store and the movies go. Needs an active context. */
 void gpu_park_program(void) {
     shader_load_once();
-    C3D_BindProgram(&program);
+    C3D_BindProgram(&s_park_prog);
 }
 static void scene_init(void) {
     shader_load_once();
+    /* park first, THEN ours: the switch is what makes citro3d upload the shader to the GPU in
+     * this new context, whatever was bound before */
+    C3D_BindProgram(&s_park_prog);
     C3D_BindProgram(&program);
     uLocProjection = shaderInstanceGetUniformLocation(program.vertexShader, "projection");
     uLocModelview  = shaderInstanceGetUniformLocation(program.vertexShader, "modelView");
@@ -2626,6 +2636,28 @@ static void scene_init(void) {
     AttrInfo_AddLoader(ai, 0, GPU_FLOAT, 3);   /* position */
     AttrInfo_AddLoader(ai, 1, GPU_FLOAT, 2);   /* texcoord */
     AttrInfo_AddLoader(ai, 2, GPU_FLOAT, 1);   /* baked shade */
+
+    /* Everything else the GPU might still be set to, put back to citro3d's defaults. C3D_Init
+     * does NOT reset this state, and citro2d (the movie player) leaves its own behind: extra
+     * combiner stages after stage 0, a procedural texture for its rounded shapes, blending and
+     * so on. Stage 0's output went on through citro2d's later stages and came out black -- the
+     * aisle after a movie was a black screen with a line in it. A fresh app never showed it
+     * because a fresh context is all defaults. */
+    for (int i = 1; i < 6; i++) C3D_TexEnvInit(C3D_GetTexEnv(i));   /* pass the previous through */
+    C3D_ProcTexBind(0, NULL);
+    C3D_TexBind(1, NULL); C3D_TexBind(2, NULL);
+    C3D_LightEnvBind(NULL);
+    C3D_FogGasMode(GPU_NO_FOG, GPU_PLAIN_DENSITY, false);
+    C3D_FogLutBind(NULL);
+    C3D_AlphaTest(false, GPU_ALWAYS, 0);
+    C3D_StencilTest(false, GPU_ALWAYS, 0, 0xFF, 0);
+    C3D_StencilOp(GPU_STENCIL_KEEP, GPU_STENCIL_KEEP, GPU_STENCIL_KEEP);
+    C3D_EarlyDepthTest(false, GPU_EARLYDEPTH_GREATER, 0);
+    C3D_FragOpMode(GPU_FRAGOPMODE_GL);
+    C3D_ColorLogicOp(GPU_LOGICOP_COPY);
+    C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_SRC_ALPHA, GPU_ONE_MINUS_SRC_ALPHA,
+                   GPU_SRC_ALPHA, GPU_ONE_MINUS_SRC_ALPHA);
+    C3D_DepthMap(true, -1.0f, 0.0f);
 
     /* texture * vertex colour, in one combiner stage. Nothing per-pixel beyond this. */
     C3D_TexEnv *env = C3D_GetTexEnv(0);
