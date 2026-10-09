@@ -4499,6 +4499,55 @@ static void extplay_restore(void) {
     }
     remove(EXTPLAY_STATE);
 }
+/* Every .moflex in the SD root shows up in the Movie Player's list, not just the one being lent.
+ * Offer to file the others into sdmc:/moflex_movies/ (with their poster/subtitle companions),
+ * keeping their library entries pointed at the new place. `keep` (the movie about to play, if it
+ * already sits in the root) is left alone. Never overwrites: a clash stays in the root. */
+#define TIDY_DIR "sdmc:/moflex_movies"
+static void extplay_tidy_root(const char *keep) {
+    static char names[256][NAMELEN];
+    int n = 0;
+    DIR *d = opendir("sdmc:/");
+    if (!d) return;
+    struct dirent *e;
+    const char *kb = keep ? strrchr(keep, '/') : NULL; kb = kb ? kb + 1 : "";
+    while ((e = readdir(d)) && n < 256) {
+        size_t L = strlen(e->d_name);
+        if (L <= 7 || strcasecmp(e->d_name + L - 7, ".moflex") || !strcasecmp(e->d_name, kb)) continue;
+        snprintf(names[n++], NAMELEN, "%s", e->d_name);
+    }
+    closedir(d);
+    if (n == 0) return;
+    char m[200];
+    snprintf(m, sizeof m, "%d other movie%s in the SD card\nroot will also show up in the\n3D Movie Player. Move %s to\nsdmc:/moflex_movies/ ?",
+             n, n == 1 ? " is" : "s are", n == 1 ? "it" : "them");
+    if (prompt2("SD CARD ROOT", m, "MOVE", "LEAVE") != 0) return;
+    mkdir(TIDY_DIR, 0777);
+    static const char *const comp[] = { ".jpg", ".srt", ".ass", ".ssa" };
+    int moved = 0, kept = 0;
+    for (int i = 0; i < n; i++) {
+        char from[PATHLEN + NAMELEN], to[PATHLEN + NAMELEN];
+        struct stat st;
+        snprintf(from, sizeof from, "sdmc:/%s", names[i]);
+        snprintf(to, sizeof to, TIDY_DIR "/%s", names[i]);
+        if (stat(to, &st) == 0 || rename(from, to) != 0) { kept++; continue; }
+        lib_note_renamed(from, to);
+        moved++;
+        size_t L = strlen(names[i]) - 7;                 /* companions: same name, other extension */
+        for (int c = 0; c < 4; c++) {
+            char cf[PATHLEN + NAMELEN], ct[PATHLEN + NAMELEN];
+            snprintf(cf, sizeof cf, "sdmc:/%.*s%s", (int)L, names[i], comp[c]);
+            snprintf(ct, sizeof ct, TIDY_DIR "/%.*s%s", (int)L, names[i], comp[c]);
+            if (stat(cf, &st) == 0 && stat(ct, &st) != 0) rename(cf, ct);
+        }
+    }
+    if (kept) {
+        snprintf(m, sizeof m, "Moved %d movie%s. %d could not be\nmoved (same name already in\nmoflex_movies) and stayed put.",
+                 moved, moved == 1 ? "" : "s", kept);
+        msg_screen("SD CARD ROOT", m);
+    }
+}
+
 /* Lend path to the Movie Player. Returns 1 when the jump is under way (the app must now exit),
  * 0 when it did not happen (a message was shown; the file is where it was). */
 static int extplay_launch(const char *path) {
@@ -4510,6 +4559,8 @@ static int extplay_launch(const char *path) {
     const char *b = strrchr(path, '/'); b = b ? b + 1 : path;
     char root[PATHLEN + NAMELEN];
     snprintf(root, sizeof root, "sdmc:/%s", b);
+    /* before the name check: tidying may move a same-named file out of the way */
+    extplay_tidy_root(strcasecmp(root, path) == 0 ? path : NULL);
     int moved = 0;
     if (strcasecmp(root, path) != 0) {               /* already in the root: nothing to move */
         struct stat st;
