@@ -402,12 +402,20 @@ static void pretty(const char *fn, char *out, size_t cap) {
 /* Loading screen. The setup before the first frame takes seconds (minutes the first time, while
  * the cover cache is built), and the bottom screen used to sit black for all of it. Row 6 says
  * what is happening as soon as the aisle is entered; row 8 is the step, updated as it goes. */
+/* It is also where loading can be LEFT: B or START cancels (1), the app closing aborts (2). The
+ * slow loops check s_load_abort and stop; store_run then cleans up and walks out. */
+static int s_load_abort = 0;
 static void load_step(const char *fmt, ...) {
     char b[48];
     va_list ap; va_start(ap, fmt); vsnprintf(b, sizeof b, fmt, ap); va_end(ap);
     printf("\x1b[6;1H  LOADING VIRTUAL MOVIE SHELVES...");
     printf("\x1b[8;1H\x1b[2K  %s", b);
+    printf("\x1b[11;1H  B: cancel");
     gfxFlushBuffers(); gspWaitForVBlank();
+    if (s_load_abort) return;
+    if (!aptMainLoop()) { s_load_abort = 2; return; }
+    hidScanInput();
+    if (hidKeysDown() & (KEY_B | KEY_START)) s_load_abort = 1;
 }
 
 static int scan_dir(const char *dir, int fixed_w, int fixed_h, int with_nfo, int *built) {
@@ -417,6 +425,7 @@ static int scan_dir(const char *dir, int fixed_w, int fixed_h, int with_nfo, int
     int added = 0;
     while ((e = readdir(d))) {
         if (g_nposters >= MAX_POSTERS) { g_scan_capped = 1; break; }
+        if (s_load_abort) break;
         size_t L = strlen(e->d_name);
         if (L < 6 || strcmp(e->d_name + L - 5, ".p565")) continue;
         if ((g_nposters & 15) == 0) load_step("reading your library  %d", g_nposters);
@@ -895,6 +904,7 @@ static void prebuild_covers(int *built) {
     for (int i = 0; i < g_nposters; i++) {
         Poster *q = &g_pos[i];
         q->tex_ok = 0;
+        if (s_load_abort) continue;           /* cancelled: leave the rest unloaded (tex_ok 0) */
         if (!q->ok || q->is_more || !q->srcpath[0]) continue;
         snprintf(path, sizeof path, "%s/%s.w565", CACHE_DIR, q->key);
         FILE *f = fopen(path, "rb");
@@ -2451,6 +2461,7 @@ int store_run(int (*resolve)(const char *key, char *out, size_t cap), char *out,
     s_resolve = resolve;
     int result = 0;                       /* 0 = walked out, 1 = out[] holds a movie, -1 = app closing */
     store_reset_state();
+    s_load_abort = 0;
     store_top_screen();                   /* 24-bit, double-buffered, 3D on: the entire point */
     s_apt_redo = 0;
     aptHook(&s_apt_cookie, store_apt_hook, NULL);
@@ -2526,7 +2537,7 @@ int store_run(int (*resolve)(const char *key, char *out, size_t cap), char *out,
      * a track while the main thread sat on the SD building sixteen poster caches -- and it
      * lost, every time, which is what the stuttering was. Nothing else reads the card after
      * this point, so from here it has the bus to itself. */
-    int music_n = music_init(MUSIC_DIR);    /* quiet if the folder is empty or dsp is missing */
+    int music_n = s_load_abort ? 0 : music_init(MUSIC_DIR);    /* quiet if the folder is empty or dsp is missing */
     g_roomvbo = g_roomv; g_quadvbo = g_quadv; g_signvbo = g_signv; g_boxvbo = g_boxv;
 
     float cx = 0, cz = STORE_Z0 - 1.5f, yaw = 0, pitch = 0;
@@ -2557,6 +2568,7 @@ int store_run(int (*resolve)(const char *key, char *out, size_t cap), char *out,
     char  toast[48] = ""; int toast_t = 0;
 
     for (;;) {
+        if (s_load_abort) { result = (s_load_abort == 2) ? -1 : 0; break; }   /* cancelled loading */
         if (!aptMainLoop()) { result = -1; break; }
         if (s_apt_redo) { s_apt_redo = 0; store_top_screen(); }   /* back from HOME */
         hidScanInput();
