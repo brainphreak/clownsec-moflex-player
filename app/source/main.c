@@ -4409,44 +4409,84 @@ static int pick_moflex(const char *ciapath, const CiaMoflex *list, int n) {
 #define EXTPLAY_CFG   "sdmc:/moflex_player/extplayer.cfg"
 #define EXTPLAY_STATE "sdmc:/moflex_player/extplay_state.txt"
 /* -1 = ask at every play (the default), 0 = always ours, 1 = always the 3D Movie Player */
-static int g_extplay = -1;
+/* Per KIND of movie, -1 = ask at play time, 0 = always ours, 1 = always the 3D Movie Player.
+ * 3D is what stutters on an Old 3DS, so it asks by default; 2D plays fine here and goes straight
+ * to our player unless someone opts in (say, for an unusually heavy 2D encode). */
+static int g_extplay3d = -1, g_extplay2d = 0;
 static int g_extplay_ok = 0;                  /* Old 3DS only: a New 3DS plays everything fine */
 static void extplay_load(void) {
     bool isnew = false; APT_CheckNew3DS(&isnew);
     g_extplay_ok = !isnew;
     FILE *f = fopen(EXTPLAY_CFG, "rb");
-    int v = -1;
-    if (f) { if (fscanf(f, "%d", &v) != 1 || v < -1 || v > 1) v = -1; fclose(f); }
+    int v3 = -1, v2 = 0;
+    if (f) {
+        /* "3d 2d"; a file from build 61008.18 holds one value, which was asked about 3D files */
+        if (fscanf(f, "%d", &v3) != 1 || v3 < -1 || v3 > 1) v3 = -1;
+        if (fscanf(f, "%d", &v2) != 1 || v2 < -1 || v2 > 1) v2 = 0;
+        fclose(f);
+    }
     /* the file survives an SD card moving to a New 3DS; the mode does not (read through
      * g_extplay_ok everywhere, so the saved choice is still there if the card moves back) */
-    g_extplay = v;
+    g_extplay3d = v3; g_extplay2d = v2;
 }
 static void extplay_save(void) {
     mkdir("sdmc:/moflex_player", 0777);
     FILE *f = fopen(EXTPLAY_CFG, "wb");
-    if (f) { fprintf(f, "%d\n", g_extplay); fclose(f); }
+    if (f) { fprintf(f, "%d %d\n", g_extplay3d, g_extplay2d); fclose(f); }
 }
-/* X on home: the way back from an ALWAYS answered at play time */
+/* 3D or not: the file's own info (a super moflex's flag, imported into its .nfo), else the
+ * library's entry, else "3D" in the filename -- the catalog names every 3D file that way. */
+static int movie_is_3d(const char *path) {
+    static CatEntry c;
+    memset(&c, 0, sizeof c);
+    movieinfo_load(path, &c);
+    if (c.is3d >= 0) return c.is3d;
+    if (g_lib)
+        for (int i = 0; i < g_lib_n; i++)
+            if (!strcmp(g_lib[i].url, path) && g_lib[i].is3d >= 0) return g_lib[i].is3d;
+    memset(&c, 0, sizeof c);
+    const char *b = strrchr(path, '/'); b = b ? b + 1 : path;
+    snprintf(c.fname, sizeof c.fname, "%s", b);
+    return cat_is_3d(&c);
+}
+static const char *extplay_mode_name(int v) {
+    return v < 0 ? "ASK" : v ? "MOVIE PLAYER" : "CLOWNSEC PLAYER";
+}
+/* X on home: one row per kind of movie, each opening the three choices */
 static void extplay_choose(void) {
     if (!g_extplay_ok) return;
-    const char *it[4] = { "ASK EVERY TIME", "ALWAYS CLOWNSEC", "ALWAYS MOVIE PLAYER", "CANCEL" };
-    int c = ui_menu("PLAY MOVIES WITH", "Movie Player: smooth, no subs/2nd audio", it, 4);
-    if (c >= 0 && c <= 2) { g_extplay = c - 1; extplay_save(); }
+    for (;;) {
+        char r3[40], r2[40];
+        snprintf(r3, sizeof r3, "3D MOVIES: %s", extplay_mode_name(g_extplay3d));
+        snprintf(r2, sizeof r2, "2D MOVIES: %s", extplay_mode_name(g_extplay2d));
+        const char *rows[3] = { r3, r2, "DONE" };
+        int k = ui_menu("PLAY MOVIES WITH", "Movie Player: smooth, no subs/2nd audio", rows, 3);
+        if (k != 0 && k != 1) return;
+        const char *it[4] = { "ASK EVERY TIME", "ALWAYS CLOWNSEC PLAYER", "ALWAYS MOVIE PLAYER", "CANCEL" };
+        int c = ui_menu(k == 0 ? "3D MOVIES" : "2D MOVIES", "Movie Player: smooth, no subs/2nd audio", it, 4);
+        if (c >= 0 && c <= 2) {
+            if (k == 0) g_extplay3d = c - 1; else g_extplay2d = c - 1;
+            extplay_save();
+        }
+    }
 }
 /* Which player for this movie, Old 3DS: 1 = 3D Movie Player, 0 = ours, -1 = backed out.
  * Asked at the moment it matters -- pressing play -- unless an ALWAYS answer was saved. */
-static int extplay_pick(void) {
+static int extplay_pick(int is3d) {
     if (!g_extplay_ok) return 0;
-    if (g_extplay == 0 || g_extplay == 1) return g_extplay;
+    int *mode = is3d ? &g_extplay3d : &g_extplay2d;
+    if (*mode == 0 || *mode == 1) return *mode;
     int c = prompt2("OLD 3DS",
-                    "Movies may stutter in this player\non an Old 3DS. Nintendo's 3D Movie\nPlayer plays smoothly, but has no\nsubtitles or 2nd audio track.",
+                    is3d ? "3D movies may stutter in this player\non an Old 3DS. Nintendo's 3D Movie\nPlayer plays smoothly, but has no\nsubtitles or 2nd audio track."
+                         : "Nintendo's 3D Movie Player plays\nsmoothly, but has no subtitles or\n2nd audio track.",
                     "MOVIE PLAYER", "CLOWNSEC");
     if (c < 0) return -1;
     int use = (c == 0);
     int a = prompt2(use ? "3D MOVIE PLAYER" : "CLOWNSEC PLAYER",
-                    "Always play movies this way?\n\nChange it later with X\non the home screen.",
+                    is3d ? "Always play 3D movies this way?\n\nChange it later with X\non the home screen."
+                         : "Always play 2D movies this way?\n\nChange it later with X\non the home screen.",
                     "ALWAYS", "JUST ONCE");
-    if (a == 0) { g_extplay = use; extplay_save(); }
+    if (a == 0) { *mode = use; extplay_save(); }
     return use;
 }
 static int extplay_find(u64 *tid, FS_MediaType *mt) {
@@ -4507,7 +4547,7 @@ static void extplay_restore(void) {
  * known entries follow the move. Never overwrites: a clash stays in the root. */
 #define TIDY_DIR "sdmc:/moflex_movies"
 static void extplay_tidy_root(void) {
-    if (!g_extplay_ok || g_extplay == 0) return;      /* always-Clownsec: the root is harmless */
+    if (!g_extplay_ok || (g_extplay3d == 0 && g_extplay2d == 0)) return;   /* never lends: root is harmless */
     static char names[256][NAMELEN];
     int n = 0;
     DIR *d = opendir("sdmc:/");
@@ -4659,7 +4699,7 @@ static MoflexResult play_movie(const char *path) {
     if (g_extplay_ok && !cia_is_cia(path)) {
         size_t L = strlen(path);
         if (L > 7 && !strcasecmp(path + L - 7, ".moflex")) {
-            int use = extplay_pick();
+            int use = extplay_pick(movie_is_3d(path));
             if (use < 0) { cia_clear_selection(); branding_show(); return MOFLEX_QUIT_BACK; }
             if (use && extplay_launch(path)) {
                 cia_clear_selection();
@@ -5088,8 +5128,7 @@ static void home_draw(int bsel, long long rpos) {
         ui_fill_round(THSW_X + 24, THSW_Y + 5, 6, 6, 2, a3);
         ui_text(THSW_X + 36, THSW_Y + 4, 1, UI_DIM, "Y");
     }
-    ui_text_center(UI_W / 2, 32, 1, UI_NEONP, !g_extplay_ok ? "3DS VIDEO PLAYER"
-                   : g_extplay == 1 ? "PLAYS IN 3D MOVIE PLAYER (X)" : "3DS VIDEO PLAYER  (X: PLAYER)");
+    ui_text_center(UI_W / 2, 32, 1, UI_NEONP, g_extplay_ok ? "3DS VIDEO PLAYER  (X: PLAYER)" : "3DS VIDEO PLAYER");
     ui_glow_round(28, 46, UI_W - 56, 2, 1, UI_NEON, 3, 34);
     ui_fill_round(28, 46, UI_W - 56, 2, 1, UI_NEON);
 
