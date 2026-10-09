@@ -2356,10 +2356,20 @@ static DVLB_s *vsh_dvlb;
 static shaderProgram_s program;
 static int uLocProjection, uLocModelview;
 
+/* The shader is loaded ONCE per app session and never freed. citro3d remembers the last bound
+ * program across C3D_Fini/C3D_Init, and the next C3D_BindProgram reads the OLD one's shaders
+ * before switching. Freeing ours on the way out left that pointing at freed shaders, and the
+ * movie the user picked crashed in C3D_BindProgram (NULL+8 read) the moment citro2d bound its
+ * own. The player's paths only ever bind citro2d's program, so they never hit this; the store is
+ * the second program. Kept alive, the stale pointer is always a valid program. */
+static int s_shader_loaded = 0;
 static void scene_init(void) {
-    vsh_dvlb = DVLB_ParseFile((u32 *)vshader_shbin, vshader_shbin_size);
-    shaderProgramInit(&program);
-    shaderProgramSetVsh(&program, &vsh_dvlb->DVLE[0]);
+    if (!s_shader_loaded) {
+        vsh_dvlb = DVLB_ParseFile((u32 *)vshader_shbin, vshader_shbin_size);
+        shaderProgramInit(&program);
+        shaderProgramSetVsh(&program, &vsh_dvlb->DVLE[0]);
+        s_shader_loaded = 1;
+    }
     C3D_BindProgram(&program);
     uLocProjection = shaderInstanceGetUniformLocation(program.vertexShader, "projection");
     uLocModelview  = shaderInstanceGetUniformLocation(program.vertexShader, "modelView");
@@ -2431,7 +2441,6 @@ static void store_reset_state(void) {
     g_boxv = NULL; g_boxvbo = NULL; g_spinev = NULL;
     memset(g_spine_first, 0, sizeof g_spine_first); memset(g_spine_count, 0, sizeof g_spine_count);
     g_front_first = g_front_count = 0;
-    vsh_dvlb = NULL;
 }
 static void store_free_buffers(void) {
     if (g_roomv)  { linearFree(g_roomv);  g_roomv = NULL; }
@@ -3218,8 +3227,7 @@ int store_run(int (*resolve)(const char *key, char *out, size_t cap), char *out,
     for (int i = 0; i < WALLPOSTERS; i++) if (g_wall_ok[i]) C3D_TexDelete(&g_wall[i]);
     if (g_back_ok) C3D_TexDelete(&g_back);
     if (g_detail_ok) C3D_TexDelete(&g_detail);
-    shaderProgramFree(&program);
-    DVLB_Free(vsh_dvlb);
+    /* the shader stays loaded: see scene_init */
     store_free_buffers();
     C3D_Fini();
     aptUnhook(&s_apt_cookie);
