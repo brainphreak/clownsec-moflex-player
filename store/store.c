@@ -3172,6 +3172,10 @@ int store_run(int (*resolve)(const char *key, char *out, size_t cap), char *out,
                       (unsigned)((size_t)g_nposters * sizeof(Poster) / 1024),
                       (unsigned)sizeof(Poster));
             panel_fmt(23, " linear free %uKB", (unsigned)(linearSpaceFree() / 1024));
+            /* the held case's sharp cover and its printed back are separate textures, created
+             * once at entry; if either failed, a picked-up case stays at shelf resolution */
+            panel_fmt(24, " hand tex %s   back tex %s", g_detail_ok ? "OK" : "FAILED",
+                      g_back_ok ? "OK" : "FAILED");
             panel_fmt(5, " fps %2d   eyes %d", fps, (slider > 0.0f ? 2 : 1));
             panel_set(6, " walk up to a case for its info");
             panel_set(8, " sections");
