@@ -717,6 +717,62 @@ static void draw_glyph(u16 *lin, int W, int H, int x, int y, int sc, u16 col, un
 static void draw_text(u16 *lin, int W, int H, int x, int y, int sc, u16 col, const char *t) {
     for (int i = 0; t[i]; i++) draw_glyph(lin, W, H, x + i * 8 * sc, y, sc, col, (unsigned char)t[i]);
 }
+/* A glyph at a fractional scale: each output pixel samples the 8x8 cell. Integer-only scaling
+ * jumped from 1x (half the back of a case empty) to 2x (a 200-character blurb no longer fits);
+ * the in-between sizes let the text fill the space it has. The back texture is filtered when it
+ * is drawn, so the uneven pixel doubling does not show. */
+static void draw_glyph_f(u16 *lin, int W, int H, int x, int y, float sc, u16 col, unsigned c) {
+    if (c > 127) c = '?';
+    const char *g = store_font8x8[c];
+    int n = (int)(8 * sc + 0.5f);
+    for (int oy = 0; oy < n; oy++) {
+        int gy = (int)(oy / sc); if (gy > 7) gy = 7;
+        for (int ox = 0; ox < n; ox++) {
+            int gx = (int)(ox / sc); if (gx > 7) gx = 7;
+            if (!(g[gy] & (1 << gx))) continue;
+            int px = x + ox, py = y + oy;
+            if (px >= 0 && px < W && py >= 0 && py < H) lin[py * W + px] = col;
+        }
+    }
+}
+/* word-wrap `t` into lines of `cols`; calls out() per line when given. Returns the line count. */
+static int wrap_lines(const char *t, int cols, void (*out)(const char *, int, void *), void *ctx) {
+    char line[96]; int used = 0;
+    if (cols > 95) cols = 95;
+    while (*t) {
+        while (*t == ' ') t++;
+        if (!*t) break;
+        int n = (int)strlen(t);
+        if (n > cols) { n = cols; while (n > 0 && t[n] != ' ') n--; if (n <= 0) n = cols; }
+        snprintf(line, sizeof line, "%.*s", n, t);
+        if (out) out(line, used, ctx);
+        t += n; used++;
+    }
+    return used;
+}
+typedef struct { u16 *lin; int W, H, x, y, lh; float sc; u16 col; } WrapCtx;
+static void wrap_draw_line(const char *line, int i, void *vp) {
+    WrapCtx *c = (WrapCtx *)vp;
+    int cw = (int)(8 * c->sc + 0.5f);
+    for (int k = 0; line[k]; k++)
+        draw_glyph_f(c->lin, c->W, c->H, c->x + k * cw, c->y + i * c->lh, c->sc, c->col, (unsigned char)line[k]);
+}
+/* The biggest of a few sizes at which ALL of `t` fits in w x h, drawn; 0 if not even 1x fits
+ * (the caller falls back to the eliding wrap). */
+static int draw_fit(u16 *lin, int W, int H, int x, int y, int w, int h, u16 col, const char *t) {
+    static const float SIZES[] = { 2.0f, 1.75f, 1.5f, 1.25f, 1.0f };
+    for (int i = 0; i < 5; i++) {
+        float sc = SIZES[i];
+        int cw = (int)(8 * sc + 0.5f), lh = cw + (cw + 3) / 4;   /* a quarter of a glyph between lines */
+        int cols = w / cw;
+        if (cols < 8) continue;
+        if (wrap_lines(t, cols, NULL, NULL) * lh > h) continue;
+        WrapCtx c = { lin, W, H, x, y, lh, sc, col };
+        wrap_lines(t, cols, wrap_draw_line, &c);
+        return 1;
+    }
+    return 0;
+}
 /* word-wrapped block; returns the y just past the last line */
 static int draw_wrap(u16 *lin, int W, int H, int x, int y, int sc, u16 col,
                      const char *t, int cols, int maxlines, int *truncated) {
@@ -1145,9 +1201,15 @@ static void rebuild_back(const Poster *q) {
         }
     for (int y = 10; y < 46; y++)                        /* title bar */
         for (int x = M - 4; x < BACK_W - (M - 4); x++) lin[y * BACK_W + x] = bar;
-    { int cols = TXT_W / 16;                             /* 2x glyphs are 16 px wide */
-      char t[40]; snprintf(t, sizeof t, "%.*s", cols, q->name);
-      draw_text(lin, BACK_W, BACK_H, M, 18, 2, ink, t); }
+    /* the title as big as fits the bar, down to 1x; only past that is it cut */
+    { int L = (int)strlen(q->name);
+      float sc = L > 0 ? (float)TXT_W / (float)(L * 8) : 2.0f;
+      if (sc > 2.0f) sc = 2.0f;
+      if (sc < 1.0f) sc = 1.0f;
+      int cw = (int)(8 * sc + 0.5f), cols = TXT_W / cw;
+      int ty = 28 - cw / 2;                              /* centred in the 10..46 bar */
+      for (int k = 0; k < L && k < cols; k++)
+          draw_glyph_f(lin, BACK_W, BACK_H, M + k * cw, ty, sc, ink, (unsigned char)q->name[k]); }
 
     int y = 54;
     if (q->genres[0]) {
@@ -1161,11 +1223,15 @@ static void rebuild_back(const Poster *q) {
      * sentence or two; at 1x it is twenty-eight a line and twice the lines -- about four times the
      * description. A held case can be pulled closer (up on the pad), which is what makes 1x
      * readable: the same texture over more of the screen. */
+    /* As big as the description allows: the largest size at which all of it fits above the
+     * footer. Most descriptions are about 200 characters and land near 1.5x; a short one gets
+     * 2x; anything that does not fit even at 1x is elided as before. */
     { int cols  = TXT_W / 8;
       int lines = (FOOT_Y - y) / 9;
       int trunc = 0;
       if (lines > 0) {
-          if (q->desc[0]) draw_wrap(lin, BACK_W, BACK_H, M, y, 1, ink, q->desc, cols, lines, &trunc);
+          if (q->desc[0] && draw_fit(lin, BACK_W, BACK_H, M, y, TXT_W, FOOT_Y - 8 - y, ink, q->desc)) { }
+          else if (q->desc[0]) draw_wrap(lin, BACK_W, BACK_H, M, y, 1, ink, q->desc, cols, lines, &trunc);
           else            draw_text(lin, BACK_W, BACK_H, M, y, 1, dim, "No description on file.");
       } }
 
@@ -2626,22 +2692,27 @@ static void bot_thumb(int sel) {
 }
 /* word-wrapped lines of `t` from y, at most `maxl` lines of `cols` characters; returns next y.
  * The last line that does not fit whole ends in "..". */
-static int bot_wrap(int x, int y, u16 c, const char *t, int cols, int maxl, int lh) {
+static int bot_wrap_n(int x, int y, u16 c, const char **tp, int cols, int maxl, int lh, int ell) {
     char line[64];
+    const char *t = *tp;
     if (cols > 63) cols = 63;
     for (int used = 0; *t && used < maxl; used++) {
         while (*t == ' ') t++;
         int n = (int)strlen(t);
         if (n > cols) { n = cols; while (n > 0 && t[n] != ' ') n--; if (n == 0) n = cols; }
         snprintf(line, sizeof line, "%.*s", n, t);
-        if (used == maxl - 1 && t[n]) {                  /* more to come and no room for it */
+        if (ell && used == maxl - 1 && t[n]) {           /* more to come and no room for it */
             int L = (int)strlen(line); if (L > cols - 2) L = cols - 2;
             line[L] = '.'; line[L + 1] = '.'; line[L + 2] = 0;
         }
         ui_text(x, y, 1, c, line);
         y += lh; t += n;
     }
+    *tp = t;
     return y;
+}
+static int bot_wrap(int x, int y, u16 c, const char *t, int cols, int maxl, int lh) {
+    return bot_wrap_n(x, y, c, &t, cols, maxl, lh, 1);
 }
 static u32 bot_hash(u32 h, const char *t) { while (t && *t) h = (h ^ (unsigned char)*t++) * 16777619u; return h; }
 
@@ -2714,41 +2785,33 @@ static void bot_update(int sel, int held, int music_n, const char *toast, int to
         /* a taste of the description in the space left above the buttons / the PLAY circle
          * (the whole of it is on the back of the case) */
         if (!more && q->desc[0]) {
-            int ymax = held >= 0 ? 100 : 122;
+            const int ymax = held >= 0 ? 178 : 190;          /* down to the button row */
+            const char *d = q->desc;
+            int beside = tx > 14 ? (118 - y) / 10 : 0;     /* lines left next to the poster */
+            if (beside > 0) y = bot_wrap_n(tx, y, UI_INK, &d, cols, beside, 10, 0);
+            if (tx > 14 && y < 120) y = 120;
             int nl = (ymax - y) / 10;
-            if (nl > 0) bot_wrap(tx, y, UI_INK, q->desc, cols, nl, 10);
+            if (*d && nl > 0) bot_wrap_n(14, y, UI_INK, &d, (UI_W - 28) / 8, nl, 10, 1);
         }
 
-        if (held >= 0) {                              /* in your hand: PLAY is the point */
-            int cx = UI_W / 2, cy = 150, R = 34;
-            u16 pc = more ? UI_NEONC : UI_NEON;
-            ui_glow_round(cx - R, cy - R, 2 * R, 2 * R, R, pc, 6, 22);
-            ui_vgrad_round(cx - R, cy - R, 2 * R, 2 * R, R, UI_BG2, TH_BG1);
-            ui_frame_round(cx - R, cy - R, 2 * R, 2 * R, R, pc, 2);
-            ui_play(cx + 3, cy, 18, pc);
-            if (s_nbtn < 8) s_btn[s_nbtn++] = (BotBtn){ cx - R - 6, cy - R - 6, 2 * R + 12, 2 * R + 12,
-                                                         more ? ACT_RESTOCK : ACT_PLAY };
-            ui_text_center(cx, cy - R - 13, 1, pc, more ? "RESTOCK  (Y)" : "PLAY  (Y)");
-            bot_btn(16, 196, 104, 32, ACT_PUTBACK, "PUT BACK (B)", 0, UI_NEONP);
-            ui_text(132, 200, 1, UI_DIM, "Circle Pad: turn it");
-            ui_text(132, 214, 1, UI_DIM, "over, pull it closer");
+        /* A slim row along the bottom: a button draws the eye on its own, so it does not need
+         * to be big -- the description gets the screen. The PLAY one is lit. */
+        if (held >= 0) {                              /* in your hand */
+            ui_text_center(UI_W / 2, 186, 1, UI_DIM, "Circle Pad: turn it / pull closer");
+            bot_btn(12, 204, 120, 28, ACT_PUTBACK, "PUT BACK (B)", 0, UI_NEONP);
+            bot_btn(188, 204, 120, 28, more ? ACT_RESTOCK : ACT_PLAY,
+                    more ? "RESTOCK (Y)" : "PLAY (Y)", 1, more ? UI_NEONC : UI_NEON);
         } else {                                      /* highlighted on the shelf */
-            if (more) {
-                bot_btn(16, 128, 136, 40, ACT_PICKUP, "PICK UP  (A)", 0, UI_NEONP);
-                bot_btn(168, 128, 136, 40, ACT_RESTOCK, "RESTOCK", 1, UI_NEONC);
-            } else {
-                bot_btn(16, 128, 136, 40, ACT_PICKUP, "PICK UP  (A)", 0, UI_NEONP);
-                bot_btn(168, 128, 136, 40, ACT_PLAY, "PLAY  (Y)", 1, UI_NEON);
-            }
-            ui_text_center(UI_W / 2, 196, 1, UI_DIM, "Pick it up to read the back");
-            ui_text_center(UI_W / 2, 214, 1, UI_DIM, "D-Pad: next case    B: let go");
+            bot_btn(12, 204, 120, 28, ACT_PICKUP, "PICK UP (A)", 0, UI_NEONP);
+            bot_btn(188, 204, 120, 28, more ? ACT_RESTOCK : ACT_PLAY,
+                    more ? "RESTOCK (Y)" : "PLAY (Y)", 1, more ? UI_NEONC : UI_NEON);
         }
     }
     if (toast_t > 0 && toast && toast[0]) {
         int w = ui_text_w(1, toast) + 24; if (w > UI_W - 16) w = UI_W - 16;
-        ui_fill_round((UI_W - w) / 2, 172, w, 18, 9, UI_BG2);
-        ui_frame_round((UI_W - w) / 2, 172, w, 18, 9, UI_NEONC, 1);
-        bot_fit(UI_W / 2, 177, 1, UI_WHITE, toast, w - 12, 1);
+        ui_fill_round((UI_W - w) / 2, 180, w, 18, 9, UI_BG2);
+        ui_frame_round((UI_W - w) / 2, 180, w, 18, 9, UI_NEONC, 1);
+        bot_fit(UI_W / 2, 185, 1, UI_WHITE, toast, w - 12, 1);
     }
     ui_present();
 }
