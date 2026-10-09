@@ -4596,8 +4596,6 @@ static int extplay_launch(const char *path) {
     ui_text_center(UI_W / 2, 70, 2, UI_NEON, "OPENING");
     ui_text_center(UI_W / 2, 100, 1, UI_NEONC, "Nintendo 3D Movie Player");
     ui_text_center(UI_W / 2, 140, 1, UI_INK, "This may take a moment...");
-    ui_text_center(UI_W / 2, 190, 1, UI_DIM, "Reopen Clownsec afterwards to put");
-    ui_text_center(UI_W / 2, 204, 1, UI_DIM, "the movie back in its folder.");
     ui_present();
     gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
     return 1;
