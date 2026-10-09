@@ -32,6 +32,7 @@
 #include <dirent.h>
 #include "music.h"
 #include "store.h"
+#include "ui_gfx.h"
 #include "art_data.h"
 #include <stdarg.h>
 #include <sys/stat.h>
@@ -409,6 +410,10 @@ static void pretty(const char *fn, char *out, size_t cap) {
 /* It is also where loading can be LEFT: B or START cancels (1), the app closing aborts (2). The
  * slow loops check s_load_abort and stop; store_run then cleans up and walks out. */
 static int s_load_abort = 0;
+#define LCAN_X 100
+#define LCAN_Y 168
+#define LCAN_W 120
+#define LCAN_H 36
 /* Read the cancel buttons. Called for EVERY item, not only when the text is redrawn: hidKeysDown()
  * is "newly pressed since the last scan", so a quick tap that began and ended between two scans
  * eight covers apart was never seen. Held counts too, so pressing and holding always works. */
@@ -416,14 +421,26 @@ static void load_poll(void) {
     if (s_load_abort) return;
     hidScanInput();
     if ((hidKeysDown() | hidKeysHeld()) & (KEY_B | KEY_START)) s_load_abort = 1;
+    if (hidKeysHeld() & KEY_TOUCH) {                    /* the CANCEL button */
+        touchPosition tp; hidTouchRead(&tp);
+        if (tp.px >= LCAN_X && tp.px < LCAN_X + LCAN_W && tp.py >= LCAN_Y && tp.py < LCAN_Y + LCAN_H)
+            s_load_abort = 1;
+    }
 }
 static void load_step(const char *fmt, ...) {
     char b[48];
     va_list ap; va_start(ap, fmt); vsnprintf(b, sizeof b, fmt, ap); va_end(ap);
-    printf("\x1b[6;1H  LOADING VIRTUAL MOVIE SHELVES...");
-    printf("\x1b[8;1H\x1b[2K  %s", b);
-    printf("\x1b[11;1H  B: cancel");
-    gfxFlushBuffers(); gspWaitForVBlank();
+    /* drawn with the player's own UI, the same look as its menus */
+    ui_begin(GFX_BOTTOM);
+    ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
+    ui_text_center(UI_W / 2, 40, 2, UI_NEON, "CLOWNSEC VIDEO");
+    ui_glow_round(40, 64, UI_W - 80, 2, 1, UI_NEON, 3, 34);
+    ui_fill_round(40, 64, UI_W - 80, 2, 1, UI_NEON);
+    ui_text_center(UI_W / 2, 84, 1, UI_NEONC, "LOADING VIRTUAL MOVIE SHELVES...");
+    ui_text_center(UI_W / 2, 112, 1, UI_INK, b);
+    ui_button(LCAN_X, LCAN_Y, LCAN_W, LCAN_H, "CANCEL  (B)", 0, UI_NEONP);
+    ui_present();
+    gspWaitForVBlank();
     if (s_load_abort) return;
     if (!aptMainLoop()) { s_load_abort = 2; return; }
     load_poll();
@@ -2566,6 +2583,185 @@ static void set_buf(void *vbo, int nverts) {
     (void)nverts;
 }
 
+/* ---------------- the bottom screen ----------------
+ * It was the prototype's text console: a debug readout, and "Y: PLAY" one line among thirty.
+ * Now it is drawn with the player's own UI -- its theme, its buttons -- and everything it offers
+ * can be TOUCHED: pick up, play, put back, restock, next song, leave. A touch becomes the button
+ * press it stands for, so it goes through exactly the code the buttons do.
+ * Redrawn only when what it shows changes: it is a full-screen CPU draw, and the Old 3DS has
+ * none of that to spare every frame. */
+enum { ACT_NONE, ACT_PICKUP, ACT_PLAY, ACT_PUTBACK, ACT_RESTOCK, ACT_NEXTSONG, ACT_LEAVE };
+typedef struct { int x, y, w, h, act; } BotBtn;
+static BotBtn s_btn[8];
+static int    s_nbtn = 0;
+static u32    s_bot_sig = 0;
+static int    s_thumb_for = -1, s_thumb_ok = 0, s_sel_still = 0, s_sel_last = -2;
+static u16    s_thumb[SRC_W * SRC_H];
+
+static void bot_btn(int x, int y, int w, int h, int act, const char *label, int hot, u16 accent) {
+    ui_button(x, y, w, h, label, hot, accent);
+    if (s_nbtn < 8) s_btn[s_nbtn++] = (BotBtn){ x, y, w, h, act };
+}
+/* text cut to fit a width, with ".." when it had to be */
+static void bot_fit(int x, int y, int sc, u16 c, const char *t, int maxw, int center) {
+    char b[96]; snprintf(b, sizeof b, "%s", t);
+    if (ui_text_w(sc, b) > maxw) {
+        int n = (int)strlen(b);
+        while (n > 1 && ui_text_w(sc, b) > maxw) { b[--n] = 0; if (n > 2) { b[n-1] = '.'; b[n-2] = '.'; } }
+    }
+    if (center) ui_text_center(x, y, sc, c, b); else ui_text(x, y, sc, c, b);
+}
+/* poster for the highlighted case, from the .p565 the shelf cover was made from -- read once it
+ * has been highlighted for a moment, so sweeping along a shelf never waits on the card */
+static void bot_thumb(int sel) {
+    if (sel != s_sel_last) { s_sel_last = sel; s_sel_still = 0; return; }
+    if (sel < 0 || s_thumb_for == sel || ++s_sel_still < 8) return;
+    s_thumb_for = sel; s_thumb_ok = 0;
+    const Poster *q = &g_pos[sel];
+    if (q->is_more || !q->srcpath[0] || q->src_w != SRC_W || q->src_h != SRC_H) return;
+    FILE *f = fopen(q->srcpath, "rb");
+    if (!f) return;
+    s_thumb_ok = fread(s_thumb, 2, SRC_W * SRC_H, f) == (size_t)(SRC_W * SRC_H);
+    fclose(f);
+}
+/* word-wrapped lines of `t` from y, at most `maxl` lines of `cols` characters; returns next y.
+ * The last line that does not fit whole ends in "..". */
+static int bot_wrap(int x, int y, u16 c, const char *t, int cols, int maxl, int lh) {
+    char line[64];
+    if (cols > 63) cols = 63;
+    for (int used = 0; *t && used < maxl; used++) {
+        while (*t == ' ') t++;
+        int n = (int)strlen(t);
+        if (n > cols) { n = cols; while (n > 0 && t[n] != ' ') n--; if (n == 0) n = cols; }
+        snprintf(line, sizeof line, "%.*s", n, t);
+        if (used == maxl - 1 && t[n]) {                  /* more to come and no room for it */
+            int L = (int)strlen(line); if (L > cols - 2) L = cols - 2;
+            line[L] = '.'; line[L + 1] = '.'; line[L + 2] = 0;
+        }
+        ui_text(x, y, 1, c, line);
+        y += lh; t += n;
+    }
+    return y;
+}
+static u32 bot_hash(u32 h, const char *t) { while (t && *t) h = (h ^ (unsigned char)*t++) * 16777619u; return h; }
+
+static void bot_update(int sel, int held, int music_n, const char *toast, int toast_t, int at_juke) {
+    bot_thumb(held >= 0 ? held : sel);
+    int show = held >= 0 ? held : sel;
+    u32 sig = 2166136261u;
+    sig = (sig ^ (u32)(show + 7)) * 16777619u;
+    sig = (sig ^ (u32)(held >= 0)) * 16777619u;
+    sig = (sig ^ (u32)(s_thumb_ok && s_thumb_for == show)) * 16777619u;
+    sig = (sig ^ (u32)at_juke) * 16777619u;
+    if (show >= 0 && g_pos[show].is_more) sig = (sig ^ (u32)(g_sec[g_pos[show].sect].page + 1)) * 16777619u;
+    if (music_n > 0) sig = bot_hash(sig, music_now());
+    if (toast_t > 0) sig = bot_hash(sig, toast);
+    if (sig == s_bot_sig) return;
+    s_bot_sig = sig;
+    s_nbtn = 0;
+
+    ui_begin(GFX_BOTTOM);
+    ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
+
+    if (show < 0) {                                   /* walking the floor */
+        ui_text_center(UI_W / 2, 12, 2, UI_NEON, "CLOWNSEC VIDEO");
+        char cnt[48]; snprintf(cnt, sizeof cnt, "%d titles on the shelves", g_nposters);
+        ui_text_center(UI_W / 2, 32, 1, UI_DIM, cnt);
+        ui_glow_round(28, 46, UI_W - 56, 2, 1, UI_NEON, 3, 34);
+        ui_fill_round(28, 46, UI_W - 56, 2, 1, UI_NEON);
+        int by = 62;
+        if (music_n > 0) {
+            ui_fill_round(16, by, UI_W - 32, 50, 10, UI_BG2);
+            ui_frame_round(16, by, UI_W - 32, 50, 10, TH_LINE, 1);
+            ui_text(28, by + 8, 1, UI_DIM, at_juke ? "JUKEBOX  -  NOW PLAYING" : "NOW PLAYING");
+            bot_fit(28, by + 26, 1, UI_NEONC, music_now(), UI_W - 56, 0);
+            by += 60;
+            bot_btn(16, by, 140, 36, ACT_NEXTSONG, "NEXT SONG", 0, UI_NEONC);
+            bot_btn(164, by, 140, 36, ACT_LEAVE, "LEAVE  (START)", 0, UI_NEONP);
+        } else {
+            bot_btn(90, by + 20, 140, 36, ACT_LEAVE, "LEAVE  (START)", 0, UI_NEONP);
+        }
+        ui_text_center(UI_W / 2, 196, 1, UI_DIM, "Circle Pad: walk    D-Pad: look / pick");
+        ui_text_center(UI_W / 2, 210, 1, UI_DIM, "L / R: sidestep    X: level the view");
+        ui_text_center(UI_W / 2, 224, 1, UI_DIM, "Walk up to a case to see what it is");
+    } else {
+        const Poster *q = &g_pos[show];
+        int more = q->is_more;
+        int tx = 14;
+        if (!more && s_thumb_ok && s_thumb_for == show) {   /* the poster, at half size */
+            ui_fill_round(10, 10, 74, 102, 4, UI_BG2);
+            for (int y = 0; y < SRC_H / 2; y++)
+                for (int x = 0; x < SRC_W / 2; x++)
+                    ui_px(14 + x, 14 + y, s_thumb[(y * 2) * SRC_W + x * 2]);
+            ui_frame_round(10, 10, 74, 102, 4, TH_LINE, 1);
+            tx = 94;
+        }
+        int tw = UI_W - tx - 12, cols = tw / 8;
+        int y = bot_wrap(tx, 12, UI_NEON, q->name, cols, 2, 12) + 4;   /* titles wrap to two lines */
+        char ln[64] = "";
+        if (more) {
+            const Section *S = &g_sec[q->sect];
+            int lo = S->page * S->cap + 1, hi = lo + S->cap - 1;
+            if (hi > S->n) hi = S->n;
+            snprintf(ln, sizeof ln, "showing %d-%d of %d", lo, hi, S->n);
+        } else if (q->year && q->runtime) snprintf(ln, sizeof ln, "%d   -   %d min", q->year, q->runtime);
+        else if (q->year)                  snprintf(ln, sizeof ln, "%d", q->year);
+        else if (q->runtime)               snprintf(ln, sizeof ln, "%d min", q->runtime);
+        if (ln[0]) { ui_text(tx, y, 1, UI_INK, ln); y += 14; }
+        if (!more && q->genres[0]) { bot_fit(tx, y, 1, UI_DIM, q->genres, tw, 0); y += 16; }
+        if (more) { ui_text(tx, y, 1, UI_DIM, "Restock this shelf"); y += 12;
+                    ui_text(tx, y, 1, UI_DIM, "with the next lot"); y += 16; }
+        /* a taste of the description in the space left above the buttons / the PLAY circle
+         * (the whole of it is on the back of the case) */
+        if (!more && q->desc[0]) {
+            int ymax = held >= 0 ? 100 : 122;
+            int nl = (ymax - y) / 10;
+            if (nl > 0) bot_wrap(tx, y, UI_INK, q->desc, cols, nl, 10);
+        }
+
+        if (held >= 0) {                              /* in your hand: PLAY is the point */
+            int cx = UI_W / 2, cy = 150, R = 34;
+            u16 pc = more ? UI_NEONC : UI_NEON;
+            ui_glow_round(cx - R, cy - R, 2 * R, 2 * R, R, pc, 6, 22);
+            ui_vgrad_round(cx - R, cy - R, 2 * R, 2 * R, R, UI_BG2, TH_BG1);
+            ui_frame_round(cx - R, cy - R, 2 * R, 2 * R, R, pc, 2);
+            ui_play(cx + 3, cy, 18, pc);
+            if (s_nbtn < 8) s_btn[s_nbtn++] = (BotBtn){ cx - R - 6, cy - R - 6, 2 * R + 12, 2 * R + 12,
+                                                         more ? ACT_RESTOCK : ACT_PLAY };
+            ui_text_center(cx, cy - R - 13, 1, pc, more ? "RESTOCK  (Y)" : "PLAY  (Y)");
+            bot_btn(16, 196, 104, 32, ACT_PUTBACK, "PUT BACK (B)", 0, UI_NEONP);
+            ui_text(132, 200, 1, UI_DIM, "Circle Pad: turn it");
+            ui_text(132, 214, 1, UI_DIM, "over, pull it closer");
+        } else {                                      /* highlighted on the shelf */
+            if (more) {
+                bot_btn(16, 128, 136, 40, ACT_PICKUP, "PICK UP  (A)", 0, UI_NEONP);
+                bot_btn(168, 128, 136, 40, ACT_RESTOCK, "RESTOCK", 1, UI_NEONC);
+            } else {
+                bot_btn(16, 128, 136, 40, ACT_PICKUP, "PICK UP  (A)", 0, UI_NEONP);
+                bot_btn(168, 128, 136, 40, ACT_PLAY, "PLAY  (Y)", 1, UI_NEON);
+            }
+            ui_text_center(UI_W / 2, 196, 1, UI_DIM, "Pick it up to read the back");
+            ui_text_center(UI_W / 2, 214, 1, UI_DIM, "D-Pad: next case    B: let go");
+        }
+    }
+    if (toast_t > 0 && toast && toast[0]) {
+        int w = ui_text_w(1, toast) + 24; if (w > UI_W - 16) w = UI_W - 16;
+        ui_fill_round((UI_W - w) / 2, 172, w, 18, 9, UI_BG2);
+        ui_frame_round((UI_W - w) / 2, 172, w, 18, 9, UI_NEONC, 1);
+        bot_fit(UI_W / 2, 177, 1, UI_WHITE, toast, w - 12, 1);
+    }
+    ui_present();
+}
+/* a touch on the bottom screen -> the action of the button under it */
+static int bot_touch(void) {
+    if (!(hidKeysDown() & KEY_TOUCH)) return ACT_NONE;
+    touchPosition tp; hidTouchRead(&tp);
+    for (int i = 0; i < s_nbtn; i++)
+        if (tp.px >= s_btn[i].x && tp.px < s_btn[i].x + s_btn[i].w &&
+            tp.py >= s_btn[i].y && tp.py < s_btn[i].y + s_btn[i].h) return s_btn[i].act;
+    return ACT_NONE;
+}
+
 /* ---------------- sharp covers for the cases you are standing next to ----------------
  * Shelf covers are 64x128: right from across the room, soft up close. The 128x256 sheet every
  * title already has for being picked up is the same proportions, so it can stand in for the shelf
@@ -2704,6 +2900,7 @@ static void store_reset_state(void) {
     g_boxv = NULL; g_boxvbo = NULL; g_spinev = NULL;
     memset(g_spine_first, 0, sizeof g_spine_first); memset(g_spine_count, 0, sizeof g_spine_count);
     g_front_first = g_front_count = 0;
+    s_bot_sig = 0; s_nbtn = 0; s_thumb_for = -1; s_thumb_ok = 0; s_sel_still = 0; s_sel_last = -2;
 }
 static void store_free_buffers(void) {
     if (g_roomv)  { linearFree(g_roomv);  g_roomv = NULL; }
@@ -2737,13 +2934,13 @@ int store_run(int (*resolve)(const char *key, char *out, size_t cap), char *out,
     store_top_screen();                   /* 24-bit, double-buffered, 3D on: the entire point */
     s_apt_redo = 0;
     aptHook(&s_apt_cookie, store_apt_hook, NULL);
-    consoleInit(GFX_BOTTOM, NULL);
+    /* the bottom screen is drawn with the player's UI (bot_update), not a console */
     /* Single-buffer the bottom screen, exactly as the player does (mp4_play.c:328). The console
      * writes into whichever back buffer is current, and this rewrites only the lines that
      * changed -- so with two buffers the pair hold different text and alternate every frame.
      * That is the dark band sweeping across and the letters fading in and out. */
+    gfxSetScreenFormat(GFX_BOTTOM, GSP_RGB565_OES);   /* what the player's UI draws */
     gfxSetDoubleBuffering(GFX_BOTTOM, false);
-    panel_size();
     load_step("building the store");      /* first thing on screen, before any of the slow work */
     C3D_Init(C3D_DEFAULT_CMDBUF_SIZE);
 
@@ -2845,6 +3042,7 @@ int store_run(int (*resolve)(const char *key, char *out, size_t cap), char *out,
      * your hand: rent it in the catalogue store, play it in the library store. Y rather than a
      * second A, so a stray double-tap cannot commit anything. */
     char  toast[48] = ""; int toast_t = 0;
+    int   play_pending = 0;   /* PLAY pressed on a shelved case: pick it up, then play */
 
     for (;;) {
         if (s_load_abort) { result = (s_load_abort == 2) ? -1 : 0; break; }   /* cancelled loading */
@@ -2853,6 +3051,18 @@ int store_run(int (*resolve)(const char *key, char *out, size_t cap), char *out,
         hidScanInput();
         g_frame++;
         u32 kd = hidKeysDown();
+        /* the bottom screen's buttons become the presses they stand for */
+        {   int act = bot_touch();
+            if      (act == ACT_PICKUP)   kd |= KEY_A;
+            else if (act == ACT_PUTBACK)  kd |= KEY_B;
+            else if (act == ACT_LEAVE)    kd |= KEY_START;
+            else if (act == ACT_NEXTSONG) { if (music_n > 0) music_next(); }
+            else if (act == ACT_PLAY || act == ACT_RESTOCK) kd |= KEY_Y;
+            /* PLAY on a case still on the shelf: take it, and play it the next frame */
+            if ((kd & KEY_Y) && held < 0 && sel >= 0) { kd = (kd & ~KEY_Y) | KEY_A; play_pending = 3; }
+            else if (play_pending > 0) {
+                if (held >= 0) { kd |= KEY_Y; play_pending = 0; } else play_pending--;
+            } }
         if (kd & KEY_START) break;
         /* SELECT turns the face-out covers off. They are the only thing in this room that
          * touches the SD card while you walk, so the frame rate either jumps when they are off
@@ -3410,77 +3620,7 @@ int store_run(int (*resolve)(const char *key, char *out, size_t cap), char *out,
         frames++;
         if (osGetTime() - t0 >= 1000) { fps = frames; frames = 0; t0 = osGetTime(); }
 
-        /* The bottom screen is the info panel, the way the player shows a title -- not a second
-         * copy of the poster, which you are already looking at in 3D. */
-        panel_clear();
-        if (sel >= 0) {
-            Poster *q = &g_pos[sel];
-            panel_fmt(0, " %s", q->name);
-            if (q->year && q->runtime) panel_fmt(1, " %d   %d min", q->year, q->runtime);
-            else if (q->year)          panel_fmt(1, " %d", q->year);
-            else if (q->runtime)       panel_fmt(1, " %d min", q->runtime);
-            if (q->genres[0]) panel_fmt(2, " %s", q->genres);
-            if (q->is_more) {
-                Section *S = &g_sec[q->sect];
-                int lo = S->page * S->cap + 1, hi = lo + S->cap - 1;
-                if (hi > S->n) hi = S->n;
-                panel_fmt(1, " showing %d-%d of %d", lo, hi, S->n);
-                panel_fmt(2, " page %d of %d", S->page + 1, S->pages);
-                panel_set(4, " A to take it, then Y to restock this");
-                panel_set(5, " shelf with the next lot.");
-            } else {
-                /* what we know about it, so anything that slipped past a filter can be read
-                 * off the screen instead of guessed at */
-                panel_fmt(22, " cat:%.14s", q->category[0] ? q->category : "(none)");
-                panel_fmt(23, " %.37s", q->key);
-                if (q->desc[0]) panel_wrap(4, 17, q->desc);
-                else panel_set(4, q->hasinfo ? " (no description in the .nfo)"
-                                             : " (no .nfo for this one - poster only)");
-            }
-            /* What to press, while it is in your hand and you are looking for it. "press the
-             * button" is not a button. */
-            if (held >= 0)
-                panel_fmt(24, " Y: %-10s   B: put it back",
-                          g_pos[held].is_more ? "RESTOCK" : verb());
-        } else {
-            panel_set(0, " MOFLEX STORE  (prototype)");
-            panel_fmt(2, " %d cases, %d with info%s", g_nposters, g_withinfo,
-                      g_scan_capped ? "   CAPPED" : "");
-            panel_fmt(3, " moviedata %d   art %d   merged %d", g_from_data, g_from_art, g_collapsed);
-            panel_fmt(4, " built %d   load %llums", built, (unsigned long long)t_load);
-            if (music_n > 0) panel_fmt(19, " playing  %.30s", music_now());
-            panel_fmt(21, " covers %d/%d  %uKB linear", g_cov_n, g_nposters,
-                      (unsigned)((size_t)g_cov_n * COVER_BYTES / 1024));
-            panel_fmt(22, " meta %uKB (%u B each)",
-                      (unsigned)((size_t)g_nposters * sizeof(Poster) / 1024),
-                      (unsigned)sizeof(Poster));
-            panel_fmt(23, " linear free %uKB", (unsigned)(linearSpaceFree() / 1024));
-            /* the held case's sharp cover and its printed back are separate textures, created
-             * once at entry; if either failed, a picked-up case stays at shelf resolution */
-            panel_fmt(24, " hand tex %s   back tex %s", g_detail_ok ? "OK" : "FAILED",
-                      g_back_ok ? "OK" : "FAILED");
-            panel_fmt(5, " fps %2d   eyes %d", fps, (slider > 0.0f ? 2 : 1));
-            panel_set(6, " walk up to a case for its info");
-            panel_set(8, " sections");
-            for (int i = 0; i < g_nsec && i < 8; i++)
-                panel_fmt(9 + i, "   %-16s %d", g_sec[i].name, g_sec[i].n);
-        }
-        if (held >= 0) {
-            if (music_n > 0) panel_set(23, at_juke ? " A: next track (or ZR)"
-                                                    : " ZR: next track  (jukebox: walk up, A)");
-            panel_fmt(25, " fps %2d  drawn %d  covers %s", fps, g_drawn, g_covers_on ? "on" : "OFF");
-            panel_set(26, " pad turn/zoom   d-pad next");
-            panel_fmt(27, " %s: Y    put back: B",
-                      g_pos[held].is_more ? "MORE" : verb());
-        } else {
-            panel_fmt(25, " fps %2d  drawn %d  covers %s", fps, g_drawn, g_covers_on ? "on" : "OFF");
-            panel_set(26, sel >= 0 ? " pad walk/turn   d-pad pick"
-                                   : " pad walk/turn   d-pad look");
-            panel_set(27, sel >= 0 ? " take: A   let go: B   exit: START"
-                                   : " strafe: L/R   level: X   exit: START");
-        }
-        if (toast_t > 0) panel_fmt(22, " %s", toast);
-        panel_flush();
+        bot_update(sel, held, music_n, toast, toast_t, at_juke);   /* only redraws on change */
     }
 
     for (int i = 0; i < g_nsec; i++) if (g_sec[i].sign_ok) C3D_TexDelete(&g_sec[i].sign);

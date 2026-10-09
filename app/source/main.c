@@ -268,6 +268,15 @@ static int is_hidden_dir(const char *n) {
     return 0;
 }
 
+/* Folders the library scans (full rescan, startup new-movie walk) never enter: the system ones,
+ * plus the player's own data folder. moflex_player holds caches -- catalogue posters, the store's
+ * covers (three files a title), movie info -- thousands of small files and never a movie (a
+ * download only lives there as an unfinished partial). Walking it was most of a scan's time on
+ * a card with a handful of films. The file browser still shows it. */
+static int scan_skip_dir(const char *n) {
+    return is_hidden_dir(n) || !strcasecmp(n, "moflex_player");
+}
+
 static void scan(void) {
     nentries = 0;
     DIR *d = opendir(cwd);
@@ -2542,10 +2551,17 @@ static void lib_scan_dir(const char *dir, int depth) {
         if (e->d_name[0] == '.') continue;
         char full[PATHLEN + NAMELEN];
         snprintf(full, sizeof full, "%s%s", dir, e->d_name);
+        /* The listing already says file or folder (d_type). A stat() per entry -- each one a
+         * search of its folder on FAT -- was the slow part, and only a movie needs one (its date). */
+        int isdir;
+        if (e->d_type != DT_UNKNOWN) isdir = (e->d_type == DT_DIR);
+        else { struct stat sd; if (stat(full, &sd)) continue; isdir = S_ISDIR(sd.st_mode); }
+        if (!isdir && !is_moflex(e->d_name)) continue;       /* not a video: nothing to look up */
         struct stat st;
-        if (stat(full, &st)) continue;
-        if (S_ISDIR(st.st_mode)) {
-            if (is_hidden_dir(e->d_name)) continue;          /* skip 3DS / Nintendo / luma / etc. */
+        memset(&st, 0, sizeof st);
+        if (!isdir && stat(full, &st)) continue;
+        if (isdir) {
+            if (scan_skip_dir(e->d_name)) continue;          /* 3DS / Nintendo / luma / our caches */
             char sub[PATHLEN];
             snprintf(sub, sizeof sub, "%s/", full);
             lib_scan_dir(sub, depth + 1);
@@ -2819,7 +2835,7 @@ __attribute__((unused)) static void lib_detect_dir(const char *dir, int depth) {
         if (e->d_type != DT_UNKNOWN) isdir = (e->d_type == DT_DIR);
         else { struct stat st; if (stat(full, &st)) continue; isdir = S_ISDIR(st.st_mode); }
         if (isdir) {
-            if (is_hidden_dir(e->d_name)) continue;
+            if (scan_skip_dir(e->d_name)) continue;
             char sub[PATHLEN];
             snprintf(sub, sizeof sub, "%s/", full);
             lib_detect_dir(sub, depth + 1);
