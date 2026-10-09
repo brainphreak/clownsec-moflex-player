@@ -4450,7 +4450,7 @@ static int movie_is_3d(const char *path) {
     return cat_is_3d(&c);
 }
 static const char *extplay_mode_name(int v) {
-    return v < 0 ? "ASK" : v ? "MOVIE PLAYER" : "CLOWNSEC PLAYER";
+    return v < 0 ? "ASK" : v ? "NINTENDO PLAYER" : "CLOWNSEC PLAYER";
 }
 /* X on home: one row per kind of movie, each opening the three choices */
 static void extplay_choose(void) {
@@ -4460,10 +4460,10 @@ static void extplay_choose(void) {
         snprintf(r3, sizeof r3, "3D MOVIES: %s", extplay_mode_name(g_extplay3d));
         snprintf(r2, sizeof r2, "2D MOVIES: %s", extplay_mode_name(g_extplay2d));
         const char *rows[3] = { r3, r2, "DONE" };
-        int k = ui_menu("PLAY MOVIES WITH", "Movie Player: smooth, no subs/2nd audio", rows, 3);
+        int k = ui_menu("PLAY MOVIES WITH", "Nintendo Player: no subs or 2nd audio", rows, 3);
         if (k != 0 && k != 1) return;
-        const char *it[4] = { "ASK EVERY TIME", "ALWAYS CLOWNSEC PLAYER", "ALWAYS MOVIE PLAYER", "CANCEL" };
-        int c = ui_menu(k == 0 ? "3D MOVIES" : "2D MOVIES", "Movie Player: smooth, no subs/2nd audio", it, 4);
+        const char *it[4] = { "ASK EVERY TIME", "ALWAYS CLOWNSEC PLAYER", "ALWAYS NINTENDO PLAYER", "CANCEL" };
+        int c = ui_menu(k == 0 ? "3D MOVIES" : "2D MOVIES", "Nintendo Player: no subs or 2nd audio", it, 4);
         if (c >= 0 && c <= 2) {
             if (k == 0) g_extplay3d = c - 1; else g_extplay2d = c - 1;
             extplay_save();
@@ -4477,12 +4477,12 @@ static int extplay_pick(int is3d) {
     int *mode = is3d ? &g_extplay3d : &g_extplay2d;
     if (*mode == 0 || *mode == 1) return *mode;
     int c = prompt2("OLD 3DS",
-                    is3d ? "3D movies may stutter in this player\non an Old 3DS. Nintendo's 3D Movie\nPlayer plays smoothly, but has no\nsubtitles or 2nd audio track."
-                         : "Nintendo's 3D Movie Player plays\nsmoothly, but has no subtitles or\n2nd audio track.",
-                    "MOVIE PLAYER", "CLOWNSEC");
+                    is3d ? "3D movies may stutter in the\nClownsec Player on an Old 3DS. The\nNintendo Player plays smoothly, but\nhas no subtitles or 2nd audio track."
+                         : "The Nintendo Player plays smoothly,\nbut has no subtitles or 2nd\naudio track.",
+                    "NINTENDO", "CLOWNSEC");
     if (c < 0) return -1;
     int use = (c == 0);
-    int a = prompt2(use ? "3D MOVIE PLAYER" : "CLOWNSEC PLAYER",
+    int a = prompt2(use ? "NINTENDO PLAYER" : "CLOWNSEC PLAYER",
                     is3d ? "Always play 3D movies this way?\n\nChange it later with X\non the home screen."
                          : "Always play 2D movies this way?\n\nChange it later with X\non the home screen.",
                     "ALWAYS", "JUST ONCE");
@@ -4521,7 +4521,7 @@ static void extplay_restore(void) {
     int at_home = home[0] && stat(home, &st) == 0;
     if (in_root && !at_home) {
         if (rename(root, home) != 0) {
-            msg_screen("3D MOVIE PLAYER", "Could not move the movie back\nfrom the SD card root.\nIt is still in sdmc:/");
+            msg_screen("NINTENDO PLAYER", "Could not move the movie back\nfrom the SD card root.\nIt is still in sdmc:/");
             return;                                   /* keep the note: try again next start */
         }
     } else if (in_root && at_home) {
@@ -4530,12 +4530,12 @@ static void extplay_restore(void) {
         const char *dot = (L > 7) ? home + L - 7 : home + L;   /* ".moflex" */
         snprintf(alt, sizeof alt, "%.*s (2)%s", (int)(dot - home), home, dot);
         if (stat(alt, &st) == 0 || rename(root, alt) != 0) {
-            msg_screen("3D MOVIE PLAYER", "A movie in the SD card root has the\nsame name as one in your library.\nLeft it in sdmc:/ -- nothing\nwas overwritten.");
+            msg_screen("NINTENDO PLAYER", "A movie in the SD card root has the\nsame name as one in your library.\nLeft it in sdmc:/ -- nothing\nwas overwritten.");
         } else {
-            msg_screen("3D MOVIE PLAYER", "A file with the same name appeared\nin the movie's folder, so it came\nback with \" (2)\" added to its name.");
+            msg_screen("NINTENDO PLAYER", "A file with the same name appeared\nin the movie's folder, so it came\nback with \" (2)\" added to its name.");
         }
     } else if (!in_root && !at_home) {
-        msg_screen("3D MOVIE PLAYER", "The movie lent to the 3D Movie Player\nis no longer on the SD card\n(deleted or moved outside the app).");
+        msg_screen("NINTENDO PLAYER", "The movie lent to the Nintendo Player\nis no longer on the SD card\n(deleted or moved outside the app).");
     }
     remove(EXTPLAY_STATE);
 }
@@ -4561,7 +4561,7 @@ static void extplay_tidy_root(void) {
     closedir(d);
     if (n == 0) return;
     char m[200];
-    snprintf(m, sizeof m, "%d movie%s in the SD card root.\nThe 3D Movie Player lists all of\nthem every time. Move %s to\nsdmc:/moflex_movies/ ?",
+    snprintf(m, sizeof m, "%d movie%s in the SD card root.\nThe Nintendo Player lists all of\nthem every time. Move %s to\nsdmc:/moflex_movies/ ?",
              n, n == 1 ? " is" : "s are", n == 1 ? "it" : "them");
     if (prompt2("SD CARD ROOT", m, "MOVE", "LEAVE") != 0) return;
     lib_load_cache();                                 /* so known entries follow (0 = none yet: fine) */
@@ -4596,7 +4596,7 @@ static void extplay_tidy_root(void) {
 static int extplay_launch(const char *path) {
     u64 tid = 0; FS_MediaType mt = MEDIATYPE_SD;
     if (!extplay_find(&tid, &mt)) {
-        msg_screen("3D MOVIE PLAYER", "Nintendo's 3D Movie Player is not\ninstalled. Playing here instead.");
+        msg_screen("NINTENDO PLAYER", "The Nintendo Player (3D Movie\nPlayer) is not installed. Playing\nin the Clownsec Player instead.");
         return 0;
     }
     const char *b = strrchr(path, '/'); b = b ? b + 1 : path;
@@ -4606,17 +4606,17 @@ static int extplay_launch(const char *path) {
     if (strcasecmp(root, path) != 0) {               /* already in the root: nothing to move */
         struct stat st;
         if (stat(root, &st) == 0) {
-            msg_screen("3D MOVIE PLAYER", "A file with this name is already\nin the SD card root. Move or delete\nit first. Playing here instead.");
+            msg_screen("NINTENDO PLAYER", "A file with this name is already\nin the SD card root. Move or delete\nit first. Playing in the\nClownsec Player instead.");
             return 0;
         }
         mkdir("sdmc:/moflex_player", 0777);
         FILE *f = fopen(EXTPLAY_STATE, "wb");
-        if (!f) { msg_screen("3D MOVIE PLAYER", "Could not save the restore note.\nPlaying here instead."); return 0; }
+        if (!f) { msg_screen("NINTENDO PLAYER", "Could not save the restore note.\nPlaying in the\nClownsec Player instead."); return 0; }
         fprintf(f, "%s\n%s\n", path, root);
         fflush(f); fsync(fileno(f)); fclose(f);
         if (rename(path, root) != 0) {
             remove(EXTPLAY_STATE);
-            msg_screen("3D MOVIE PLAYER", "Could not move the movie to the\nSD card root. Playing here instead.");
+            msg_screen("NINTENDO PLAYER", "Could not move the movie to the\nSD card root. Playing in the\nClownsec Player instead.");
             return 0;
         }
         moved = 1;
@@ -4634,7 +4634,7 @@ static int extplay_launch(const char *path) {
     ui_begin(GFX_BOTTOM);
     ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
     ui_text_center(UI_W / 2, 70, 2, UI_NEON, "OPENING");
-    ui_text_center(UI_W / 2, 100, 1, UI_NEONC, "Nintendo 3D Movie Player");
+    ui_text_center(UI_W / 2, 100, 1, UI_NEONC, "Nintendo Player");
     ui_text_center(UI_W / 2, 140, 1, UI_INK, "This may take a moment...");
     ui_present();
     gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
