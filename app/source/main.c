@@ -5309,15 +5309,24 @@ enum { PLAY_FROM_BROWSER = 0, PLAY_FROM_HOME = 1, PLAY_FROM_LIBRARY = 2, PLAY_FR
 static int s_pick_origin = PLAY_FROM_BROWSER;
 
 /* WALK THE AISLE: a case's key is its moviedata key -- the movie's filename without extension --
- * so find the library entry with that name. */
+ * so find the library entry with that name. out may be NULL: the store also asks only "is it
+ * here?" to keep deleted movies' leftover moviedata off the shelves. */
 static int store_resolve(const char *key, char *out, size_t cap) {
     if (!key || !key[0] || lib_load_cache() <= 0) return 0;
     size_t K = strlen(key);
     for (int i = 0; i < g_lib_n; i++) {
         const char *f = g_lib[i].fname;
-        const char *dot = strrchr(f, '.');
-        size_t L = dot ? (size_t)(dot - f) : strlen(f);
-        if (L == K && !strncmp(f, key, K)) { snprintf(out, cap, "%s", g_lib[i].url); return 1; }
+        /* the key is the name with its extension off -- or the whole name, for a show folder,
+         * whose name may well contain a dot of its own ("Dr. Who") */
+        if (strncmp(f, key, K)) continue;
+        const char *rest = f + K;
+        if (!(rest[0] == 0 || (rest[0] == '.' && strlen(rest) <= 7 && !strchr(rest + 1, '.')))) continue;
+        if (!out || !cap) return 1;
+        struct stat st;
+        if (stat(g_lib[i].url, &st) == 0 && S_ISDIR(st.st_mode))   /* a show: its first episode */
+            return show_first_episode(&g_lib[i], out, (int)cap);
+        snprintf(out, cap, "%s", g_lib[i].url);
+        return 1;
     }
     return 0;
 }

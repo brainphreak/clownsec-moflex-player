@@ -1,4 +1,5 @@
 #include "movieinfo.h"
+#include "store.h"
 #include "poster.h"
 #include <stdio.h>
 #include <string.h>
@@ -90,6 +91,7 @@ int movieinfo_poster(const char *moviepath, u16 *out, int pw, int ph) {
 }
 
 void movieinfo_save(const char *moviepath, const CatEntry *e, const u16 *poster, int pw, int ph) {
+    remove(STORE_PACK);   /* WALK THE AISLE's shelf cache now holds stale info: rebuild next visit */
     mkdir("sdmc:/moflex_player", 0777);
     mkdir(MOVIEDATA_DIR, 0777);
 

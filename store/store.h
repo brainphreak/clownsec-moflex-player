@@ -6,5 +6,8 @@
 #ifndef STORE_H
 #define STORE_H
 #include <stddef.h>
+/* The store's one-file cache of shelf metadata + covers. Anything that changes a movie's info
+ * or poster removes it, so the next visit rebuilds instead of showing stale shelves. */
+#define STORE_PACK "sdmc:/moflex_player/store/shelves.pak"
 int store_run(int (*resolve)(const char *key, char *out, size_t cap), char *out, size_t cap);
 #endif

@@ -157,12 +157,24 @@ int music_init(const char *dir) {
 
     /* Shuffle, so it is not the same track every time the shop opens. osGetTime is the only
      * thing here that differs between runs. */
-    unsigned seed = (unsigned)osGetTime() | 1u;
+    /* The clock in ms alone barely moves the seed between visits, and the first pick of this
+     * LCG barely moves with the seed: the same opening song kept coming back. Mix in the CPU tick
+     * (sub-microsecond, different every entry) and stir before drawing. */
+    unsigned seed = (unsigned)osGetTime() ^ (unsigned)svcGetSystemTick() ^ 0x9E3779B9u;
+    for (int k = 0; k < 4; k++) { seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5; }
     for (int i = g_n - 1; i > 0; i--) {
-        seed = seed * 1103515245u + 12345u;
-        int j = (int)((seed >> 16) % (unsigned)(i + 1));
+        seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;   /* xorshift32 */
+        int j = (int)(seed % (unsigned)(i + 1));
         int t = g_order[i]; g_order[i] = g_order[j]; g_order[j] = t;
     }
+    /* and never open with the song the last visit opened with */
+    { char last[128] = ""; FILE *lf = fopen("sdmc:/moflex_player/store/lastsong.txt", "rb");
+      if (lf) { if (fgets(last, sizeof last, lf)) { char *nl = strchr(last, '\n'); if (nl) *nl = 0; } fclose(lf); }
+      if (g_n > 1 && last[0] && !strcmp(g_name[g_order[0]], last)) {
+          int t = g_order[0]; g_order[0] = g_order[1]; g_order[1] = t;
+      }
+      lf = fopen("sdmc:/moflex_player/store/lastsong.txt", "wb");
+      if (lf) { fprintf(lf, "%s\n", g_name[g_order[0]]); fclose(lf); } }
 
     if (ndspInit() != 0) return 0;          /* no dsp firm dumped -> the shop is just quiet */
     g_ok = 1;

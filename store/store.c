@@ -232,6 +232,10 @@ static int    g_scan_capped = 0;   /* the scan hit MAX_POSTERS: titles exist tha
  * Library: take one off the shelf and play it. Catalogue: take one and queue the download. */
 enum { STORE_LIBRARY = 0, STORE_CATALOG = 1 };
 static int    g_mode = STORE_LIBRARY;
+/* the player's lookup: a case's key -> the movie's path. Also the stock filter: moviedata keeps a
+ * .nfo/.p565 after a movie is deleted, and those stood on the shelves as cases Y could not play. */
+static int (*s_resolve)(const char *key, char *out, size_t cap);
+static int in_library(const char *key) { return !s_resolve || s_resolve(key, NULL, 0); }
 static int    g_drawn = 0;      /* cases actually drawn last frame */
 static float  g_doorx = 0.0f;   /* where the door ended up, so the EXIT board follows it */
 static float  g_jukex = 0.0f, g_jukez = 0.0f, g_jukerot = 0.0f;  /* stand beside it, press A */
@@ -445,6 +449,7 @@ static int scan_dir(const char *dir, int fixed_w, int fixed_h, int with_nfo, int
         }
         char key[160];
         snprintf(key, sizeof key, "%.*s", (int)(L - 5), e->d_name);
+        if (with_nfo && !in_library(key)) continue;      /* left behind by a deleted movie */
 
         char cache[400], big[400], src[400];
         snprintf(cache, sizeof cache, "%s/%s.s565", CACHE_DIR, key);   /* shelf: 64x128  */
@@ -555,7 +560,9 @@ static int load_posters(int *built) {
      * The library is the stock. The cache is only drawn on when the library alone would not
      * furnish a shop, because someone with a dozen films still deserves a room that looks
      * open for business. */
-    if (g_nposters < MIN_STOCK) {
+    /* The catalogue top-up is OFF: its cases are films that are not on this card, and Y on them
+     * did nothing. A small library makes a small shop, not one padded with things to not play. */
+    if (0 && g_nposters < MIN_STOCK) {
         g_from_art   = scan_dir(ART_DIR, 0, 0, 0, built);
         g_collapsed += collapse_same_title();
     }
@@ -955,6 +962,117 @@ static void prebuild_covers(int *built) {
 /* The full-resolution front of whatever is in your hand. One texture, filled on pickup. */
 static C3D_Tex g_detail;
 static int     g_detail_ok = 0, g_detail_for = -1;
+/* ---------------- shelves.pak: the whole shop in one file ----------------
+ * A visit used to open a .nfo and a cover file per title -- hundreds of opens, each a search of a
+ * folder holding thousands of entries, which on the 3DS is the slow part, not the bytes. The pack
+ * is written at the end of a full load, straight from what is already in memory, and read back in
+ * one pass next time:     header | Poster[n] | cov_ix[n] | shelf covers (16 KB each)
+ * It is valid while the moviedata listing hashes the same (names only: a listing, no opens), and
+ * the player deletes it whenever it saves new info for a movie (movieinfo_save). The per-title
+ * cache files stay as they were, so a rebuild only costs what changed. Sharp covers are NOT in
+ * it -- 64 KB a title would make every library change rewrite tens of MB; the near-cover loader
+ * reads them from their own files on a thread instead. */
+#define PAK_MAGIC   0x4B505343u        /* "CSPK" */
+#define PAK_VERSION 1
+#define DET_BYTES   ((size_t)DET_W * DET_H * 2)
+typedef struct { u32 magic, version, posz, n, sig, ncov, from_data, collapsed; } PakHdr;
+
+/* Names in moviedata, hashed. Adding or removing a movie (or its poster) changes it. */
+static u32 pak_sig(void) {
+    u32 h = 2166136261u; int n = 0;
+    DIR *d = opendir(DATA_DIR);
+    if (!d) return 0;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        size_t L = strlen(e->d_name);
+        if (L < 5) continue;
+        if (strcmp(e->d_name + L - 5, ".p565") && strcmp(e->d_name + L - 4, ".nfo")) continue;
+        for (const char *c = e->d_name; *c; c++) h = (h ^ (unsigned char)*c) * 16777619u;
+        h = (h ^ 0xFFu) * 16777619u;   /* name separator */
+        n++;
+        if ((n & 63) == 0) load_poll();
+    }
+    closedir(d);
+    return h ^ (u32)n;
+}
+
+/* 1 = the shop came out of the pack (g_pos filled, shelf covers uploaded), 0 = do it the long way */
+static int pak_load(u32 sig) {
+    FILE *f = fopen(STORE_PACK, "rb");
+    if (!f) return 0;
+    PakHdr h;
+    if (fread(&h, sizeof h, 1, f) != 1 || h.magic != PAK_MAGIC || h.version != PAK_VERSION ||
+        h.posz != sizeof(Poster) || h.sig != sig || h.n == 0 || h.n > MAX_POSTERS) { fclose(f); return 0; }
+    static int cov_ix[MAX_POSTERS];
+    if (fread(g_pos, sizeof(Poster), h.n, f) != h.n || fread(cov_ix, sizeof(int), h.n, f) != h.n) {
+        fclose(f); memset(g_pos, 0, sizeof g_pos); return 0;
+    }
+    g_nposters = (int)h.n; g_from_data = (int)h.from_data; g_collapsed = (int)h.collapsed;
+    g_withinfo = 0;
+    for (int i = 0; i < g_nposters; i++) {
+        Poster *q = &g_pos[i];
+        memset(&q->tex, 0, sizeof q->tex); q->tex_ok = 0;   /* pointers from the last session */
+        if (q->hasinfo) g_withinfo++;
+    }
+    /* A movie deleted since the pack was written leaves its moviedata behind, so the listing
+     * signature does not change: check each title against the library as it comes in. */
+    static signed char keep[MAX_POSTERS];
+    for (int i = 0; i < g_nposters; i++) keep[i] = (signed char)in_library(g_pos[i].key);
+    /* shelf covers: in title order, so this is one straight read through the file */
+    for (int i = 0; i < g_nposters; i++) {
+        Poster *q = &g_pos[i];
+        if (cov_ix[i] < 0) continue;
+        if (!keep[i]) { fseek(f, (long)COVER_BYTES, SEEK_CUR); continue; }
+        load_poll();
+        if (s_load_abort) break;
+        if ((i & 15) == 0) load_step("loading shelves  %d / %d", i + 1, g_nposters);
+        if (!C3D_TexInit(&q->tex, TEX_W, TEX_H, GPU_RGB565)) {
+            q->cover_state = -1; fseek(f, (long)COVER_BYTES, SEEK_CUR); continue;
+        }
+        if (fread(q->tex.data, 1, COVER_BYTES, f) != COVER_BYTES) {
+            C3D_TexDelete(&q->tex); q->cover_state = -1; break;
+        }
+        C3D_TexSetFilter(&q->tex, GPU_LINEAR, GPU_LINEAR);
+        C3D_TexSetWrap(&q->tex, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
+        C3D_TexFlush(&q->tex);
+        q->tex_ok = 1; q->cover_state = 1; g_cov_n++;
+    }
+    fclose(f);
+    /* close the gaps the deleted titles left */
+    int w = 0;
+    for (int i = 0; i < g_nposters; i++) {
+        if (!keep[i]) { if (g_pos[i].hasinfo) g_withinfo--; continue; }
+        if (w != i) g_pos[w] = g_pos[i];
+        w++;
+    }
+    for (int i = w; i < g_nposters; i++) memset(&g_pos[i], 0, sizeof g_pos[i]);
+    g_nposters = w;
+    return g_nposters > 0;
+}
+
+/* Written after a full load, from memory. To a temporary name first, so a cancelled or failed
+ * write never leaves a pack that looks valid. */
+static void pak_save(u32 sig) {
+    if (s_load_abort || g_from_art > 0 || g_nposters <= 0) return;   /* catalogue top-up: not packed */
+    load_step("saving shelves for next time");
+    char tmp[300]; snprintf(tmp, sizeof tmp, "%s.tmp", STORE_PACK);
+    FILE *f = fopen(tmp, "wb");
+    if (!f) return;
+    static int cov_ix[MAX_POSTERS];
+    int ncov = 0;
+    for (int i = 0; i < g_nposters; i++) cov_ix[i] = g_pos[i].tex_ok ? ncov++ : -1;
+    PakHdr h = { PAK_MAGIC, PAK_VERSION, sizeof(Poster), (u32)g_nposters, sig, (u32)ncov,
+                 (u32)g_from_data, (u32)g_collapsed };
+    int ok = fwrite(&h, sizeof h, 1, f) == 1 &&
+             fwrite(g_pos, sizeof(Poster), g_nposters, f) == (size_t)g_nposters &&
+             fwrite(cov_ix, sizeof(int), g_nposters, f) == (size_t)g_nposters;
+    for (int i = 0; ok && i < g_nposters; i++)
+        if (cov_ix[i] >= 0) ok = fwrite(g_pos[i].tex.data, 1, COVER_BYTES, f) == COVER_BYTES;
+    fclose(f);
+    if (ok) { remove(STORE_PACK); ok = rename(tmp, STORE_PACK) == 0; }
+    if (!ok) remove(tmp);
+}
+
 static void load_detail(Poster *q, int idx) {
     /* cover_state < 0 means the art could not be built. Without that test this retries the
      * whole read-rescale-write every frame, and the selection scan calls it every frame. */
@@ -2422,12 +2540,122 @@ static void set_buf(void *vbo, int nverts) {
     (void)nverts;
 }
 
+/* ---------------- sharp covers for the cases you are standing next to ----------------
+ * Shelf covers are 64x128: right from across the room, soft up close. The 128x256 sheet every
+ * title already has for being picked up is the same proportions, so it can stand in for the shelf
+ * cover on the same quad. NEAR_N slots (64 KB each) go to the nearest face-out cases; a thread
+ * reads the sheets -- the file opens are the slow part, so they never happen on the frame -- and
+ * the frame only copies a finished one into a slot. One at a time, nearest first. */
+#define NEAR_N    16
+#define NEAR_DIST 2.6f
+static C3D_Tex       s_near[NEAR_N];
+static int           s_near_ok[NEAR_N], s_near_for[NEAR_N];
+static signed char   s_near_bad[MAX_POSTERS];      /* no sheet on the card: never ask again */
+static u8           *s_stage = NULL;               /* the thread reads into this */
+static char          s_ld_path[400];
+/* requests are numbered (s_ld_seq): the same title can be asked for again after it lost its slot */
+static volatile int  s_ld_run = 0, s_ld_req = -1, s_ld_seq = 0, s_ld_done = -1, s_ld_fail = -1;
+static int           s_ld_slot = -1;
+static Thread        s_ld_th = NULL;
+
+static void near_thread(void *arg) {
+    (void)arg;
+    int last = 0;
+    while (s_ld_run) {
+        int q = s_ld_seq;
+        if (q == last || s_ld_req < 0) { svcSleepThread(4000000); continue; }
+        last = q;
+        __sync_synchronize();
+        FILE *f = fopen(s_ld_path, "rb");
+        size_t got = f ? fread(s_stage, 1, DET_W * DET_H * 2, f) : 0;
+        if (f) fclose(f);
+        __sync_synchronize();
+        if (got == (size_t)DET_W * DET_H * 2) s_ld_done = q; else s_ld_fail = q;
+    }
+}
+static void near_init(void) {
+    for (int k = 0; k < NEAR_N; k++) {
+        s_near_for[k] = -1;
+        s_near_ok[k] = C3D_TexInit(&s_near[k], DET_W, DET_H, GPU_RGB565);
+        if (s_near_ok[k]) { C3D_TexSetFilter(&s_near[k], GPU_LINEAR, GPU_LINEAR);
+                            C3D_TexSetWrap(&s_near[k], GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE); }
+    }
+    memset(s_near_bad, 0, sizeof s_near_bad);
+    s_ld_req = s_ld_done = s_ld_fail = -1; s_ld_seq = 0; s_ld_slot = -1;
+    s_stage = (u8 *)malloc(DET_W * DET_H * 2);
+    if (!s_stage) return;
+    s32 prio = 0x30; svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
+    s_ld_run = 1;
+    s_ld_th = threadCreate(near_thread, NULL, 16 * 1024, prio + 1, -1, false);   /* below the frame */
+    if (!s_ld_th) s_ld_run = 0;
+}
+static void near_exit(void) {
+    if (s_ld_th) { s_ld_run = 0; threadJoin(s_ld_th, 2000000000LL); threadFree(s_ld_th); s_ld_th = NULL; }
+    s_ld_run = 0;
+    for (int k = 0; k < NEAR_N; k++) { if (s_near_ok[k]) C3D_TexDelete(&s_near[k]); s_near_ok[k] = 0; s_near_for[k] = -1; }
+    free(s_stage); s_stage = NULL;
+}
+/* the texture to show for title ti: its sharp slot if it has one */
+static C3D_Tex *near_tex(int ti, C3D_Tex *dflt) {
+    for (int k = 0; k < NEAR_N; k++) if (s_near_ok[k] && s_near_for[k] == ti) return &s_near[k];
+    return dflt;
+}
+/* once a frame: collect a finished read, then ask for the nearest case still without a slot */
+static void near_update(float cx, float cz, float fwx, float fwz) {
+    if (!s_ld_run) return;
+    if (s_ld_slot >= 0) {                                /* a read is out */
+        int r = s_ld_req, q = s_ld_seq;
+        if (s_ld_done == q) {
+            memcpy(s_near[s_ld_slot].data, s_stage, DET_W * DET_H * 2);
+            C3D_TexFlush(&s_near[s_ld_slot]);
+            s_near_for[s_ld_slot] = r; s_ld_slot = -1;
+        } else if (s_ld_fail == q) {
+            if (r >= 0 && r < MAX_POSTERS) s_near_bad[r] = 1;
+            s_ld_slot = -1;
+        } else return;                                   /* still reading */
+    }
+    int best = -1; float bd = NEAR_DIST * NEAR_DIST;
+    for (int i = 0; i < g_nposters; i++) {
+        Poster *q = &g_pos[i];
+        if (!q->ok || !q->shown || !q->faceout || q->is_more) continue;
+        int ti = q->copy_of >= 0 ? q->copy_of : i;
+        if (!g_pos[ti].tex_ok || s_near_bad[ti]) continue;
+        float dx = q->x - cx, dz = q->z - cz, d2 = dx * dx + dz * dz;
+        if (d2 >= bd || dx * fwx + dz * fwz < -0.3f) continue;   /* too far, or behind you */
+        if (near_tex(ti, NULL)) continue;                        /* already sharp */
+        best = ti; bd = d2;
+    }
+    if (best < 0) return;
+    /* a slot: a free one, else the one whose title is now farthest away (and farther than this) */
+    int slot = -1; float far2 = bd;
+    for (int k = 0; k < NEAR_N && slot < 0; k++) if (s_near_ok[k] && s_near_for[k] < 0) slot = k;
+    if (slot < 0) {
+        for (int k = 0; k < NEAR_N; k++) {
+            if (!s_near_ok[k]) continue;
+            int t = s_near_for[k]; float d2 = 1e9f;
+            for (int i = 0; i < g_nposters; i++) {       /* nearest copy of that title */
+                int ti = g_pos[i].copy_of >= 0 ? g_pos[i].copy_of : i;
+                if (ti != t || !g_pos[i].shown) continue;
+                float dx = g_pos[i].x - cx, dz = g_pos[i].z - cz, e = dx * dx + dz * dz;
+                if (e < d2) d2 = e;
+            }
+            if (d2 > far2) { far2 = d2; slot = k; }
+        }
+    }
+    if (slot < 0) return;
+    s_near_for[slot] = -1;                               /* not shown sharp while it refills */
+    snprintf(s_ld_path, sizeof s_ld_path, "%s/%s.t565", CACHE_DIR, g_pos[best].key);
+    s_ld_slot = slot;
+    s_ld_req = best;
+    __sync_synchronize();
+    s_ld_seq = s_ld_seq + 1;                             /* last: the thread acts on this */
+}
+
 /* ---- running inside the player ----
  * This was a standalone .3dsx; it is now a screen the player enters and leaves many times in one
  * session. So: no gfxInit/gfxExit (the player owns those), every global put back to its starting
  * value on the way in, and everything allocated -- textures, linear vertex buffers, the shader,
  * citro3d itself -- released on the way out, so the player's own GPU paths start clean. */
-static int (*s_resolve)(const char *key, char *out, size_t cap);
 static void store_reset_state(void) {
     g_gapz[0] = -7.3f; g_gapz[1] = -12.7f; g_hx = 13.5f; g_depth = 24.0f;
     memset(g_sec, 0, sizeof g_sec); g_nsec = 0; g_new_idx = -1;
@@ -2524,14 +2752,18 @@ int store_run(int (*resolve)(const char *key, char *out, size_t cap), char *out,
     g_detail_ok = C3D_TexInit(&g_detail, DET_W, DET_H, GPU_RGB565);
     if (g_detail_ok) { C3D_TexSetFilter(&g_detail, GPU_LINEAR, GPU_LINEAR);
                        C3D_TexSetWrap(&g_detail, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE); }
+    near_init();
     g_back_ok = C3D_TexInit(&g_back, BACK_W, BACK_H, GPU_RGB565);
     if (g_back_ok) { C3D_TexSetFilter(&g_back, GPU_LINEAR, GPU_LINEAR);
                      C3D_TexSetWrap(&g_back, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE); }
 
     int built = 0;
     u64 t_load0 = osGetTime();
-    load_step("reading your library");
-    int found = load_posters(&built);
+    load_step("checking your library");
+    u32 sig = pak_sig();
+    int from_pak = !s_load_abort && pak_load(sig);
+    if (!from_pak) load_step("reading your library");
+    int found = from_pak ? g_nposters : load_posters(&built);
     u64 t_load = osGetTime() - t_load0;
     int placeheld = 0;
     if (found < 12) {                       /* top up so the aisle is never half empty */
@@ -2541,8 +2773,11 @@ int store_run(int (*resolve)(const char *key, char *out, size_t cap), char *out,
         }
     }
 
-    load_step("preparing covers");
-    prebuild_covers(&built);                /* the slow part, done where you are standing still */
+    if (!from_pak) {
+        load_step("preparing covers");
+        prebuild_covers(&built);            /* the slow part, done where you are standing still */
+        pak_save(sig);                      /* so the next visit is one read */
+    }
     load_restock();                         /* BEFORE: the bake needs to know it has art */
     load_step("stocking the shelves");
     build_sections();                       /* genres -> units -> poster positions */
@@ -2794,6 +3029,7 @@ int store_run(int (*resolve)(const char *key, char *out, size_t cap), char *out,
         Mtx_RotateX(&view, -pitch * FWD, true);
         Mtx_RotateY(&view, -yaw, true);
         Mtx_Translate(&view, -cx, -EYE, -cz, true);
+        near_update(cx, cz, fwx, fwz);         /* sharp covers for what you are next to */
 
         /* ONE frame, both eyes inside it. Begin/End per eye submits two command buffers a
          * frame and waits twice -- it halves the rate for nothing. */
@@ -2939,7 +3175,7 @@ int store_run(int (*resolve)(const char *key, char *out, size_t cap), char *out,
                  * frame, so a world-space offset here would push it sideways instead. */
                 m.r[2].w += 0.004f;   /* nothing to fight with now; just off the woodwork */
                 C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uLocModelview, &m);
-                bind_tex(more ? &g_restock : &g_pos[ti].tex, more ? g_restock_ok : g_pos[ti].tex_ok);
+                bind_tex(more ? &g_restock : near_tex(ti, &g_pos[ti].tex), more ? g_restock_ok : g_pos[ti].tex_ok);
                 draw_range(0, 6);
                 drawn++;
             }
@@ -2965,7 +3201,7 @@ int store_run(int (*resolve)(const char *key, char *out, size_t cap), char *out,
                 int st = g_pos[sel].copy_of >= 0 ? g_pos[sel].copy_of : sel;
                 bind_tex(g_pos[sel].is_more ? (g_restock_ok ? &g_restock : &g_front)
                          : (g_detail_ok && g_detail_for == sel) ? &g_detail
-                         : (g_pos[st].tex_ok ? &g_pos[st].tex : &g_front), 1);
+                         : (g_pos[st].tex_ok ? near_tex(st, &g_pos[st].tex) : &g_front), 1);
                 draw_range(0, 6);
             }
 
@@ -3237,6 +3473,7 @@ int store_run(int (*resolve)(const char *key, char *out, size_t cap), char *out,
     if (g_back_ok) C3D_TexDelete(&g_back);
     if (g_detail_ok) C3D_TexDelete(&g_detail);
     /* the shader stays loaded: see scene_init */
+    near_exit();
     store_free_buffers();
     C3D_Fini();
     aptUnhook(&s_apt_cookie);
