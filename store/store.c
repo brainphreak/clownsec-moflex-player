@@ -405,6 +405,14 @@ static void pretty(const char *fn, char *out, size_t cap) {
 /* It is also where loading can be LEFT: B or START cancels (1), the app closing aborts (2). The
  * slow loops check s_load_abort and stop; store_run then cleans up and walks out. */
 static int s_load_abort = 0;
+/* Read the cancel buttons. Called for EVERY item, not only when the text is redrawn: hidKeysDown()
+ * is "newly pressed since the last scan", so a quick tap that began and ended between two scans
+ * eight covers apart was never seen. Held counts too, so pressing and holding always works. */
+static void load_poll(void) {
+    if (s_load_abort) return;
+    hidScanInput();
+    if ((hidKeysDown() | hidKeysHeld()) & (KEY_B | KEY_START)) s_load_abort = 1;
+}
 static void load_step(const char *fmt, ...) {
     char b[48];
     va_list ap; va_start(ap, fmt); vsnprintf(b, sizeof b, fmt, ap); va_end(ap);
@@ -414,8 +422,7 @@ static void load_step(const char *fmt, ...) {
     gfxFlushBuffers(); gspWaitForVBlank();
     if (s_load_abort) return;
     if (!aptMainLoop()) { s_load_abort = 2; return; }
-    hidScanInput();
-    if (hidKeysDown() & (KEY_B | KEY_START)) s_load_abort = 1;
+    load_poll();
 }
 
 static int scan_dir(const char *dir, int fixed_w, int fixed_h, int with_nfo, int *built) {
@@ -425,6 +432,7 @@ static int scan_dir(const char *dir, int fixed_w, int fixed_h, int with_nfo, int
     int added = 0;
     while ((e = readdir(d))) {
         if (g_nposters >= MAX_POSTERS) { g_scan_capped = 1; break; }
+        load_poll();
         if (s_load_abort) break;
         size_t L = strlen(e->d_name);
         if (L < 6 || strcmp(e->d_name + L - 5, ".p565")) continue;
@@ -904,6 +912,7 @@ static void prebuild_covers(int *built) {
     for (int i = 0; i < g_nposters; i++) {
         Poster *q = &g_pos[i];
         q->tex_ok = 0;
+        load_poll();
         if (s_load_abort) continue;           /* cancelled: leave the rest unloaded (tex_ok 0) */
         if (!q->ok || q->is_more || !q->srcpath[0]) continue;
         snprintf(path, sizeof path, "%s/%s.w565", CACHE_DIR, q->key);
