@@ -399,6 +399,17 @@ static void pretty(const char *fn, char *out, size_t cap) {
 
 /* Scan one directory of .p565 posters. moviedata/ files are a fixed 132x188 and carry a sibling
  * .nfo; art/ files put their size in the filename and have no text. */
+/* Loading screen. The setup before the first frame takes seconds (minutes the first time, while
+ * the cover cache is built), and the bottom screen used to sit black for all of it. Row 6 says
+ * what is happening as soon as the aisle is entered; row 8 is the step, updated as it goes. */
+static void load_step(const char *fmt, ...) {
+    char b[48];
+    va_list ap; va_start(ap, fmt); vsnprintf(b, sizeof b, fmt, ap); va_end(ap);
+    printf("\x1b[6;1H  LOADING VIRTUAL MOVIE SHELVES...");
+    printf("\x1b[8;1H\x1b[2K  %s", b);
+    gfxFlushBuffers(); gspWaitForVBlank();
+}
+
 static int scan_dir(const char *dir, int fixed_w, int fixed_h, int with_nfo, int *built) {
     DIR *d = opendir(dir);
     if (!d) return 0;
@@ -408,6 +419,7 @@ static int scan_dir(const char *dir, int fixed_w, int fixed_h, int with_nfo, int
         if (g_nposters >= MAX_POSTERS) { g_scan_capped = 1; break; }
         size_t L = strlen(e->d_name);
         if (L < 6 || strcmp(e->d_name + L - 5, ".p565")) continue;
+        if ((g_nposters & 15) == 0) load_step("reading your library  %d", g_nposters);
         int sw = fixed_w, sh = fixed_h;
         if (!sw) {                                   /* art/: "<key>_<W>x<H>.p565" */
             const char *u = strrchr(e->d_name, '_');
@@ -916,8 +928,7 @@ static void prebuild_covers(int *built) {
         else if (build_cache_entry_sz(q->srcpath, q->src_w, q->src_h, path,
                                       DET_W, DET_H, DET_IMG_W, DET_IMG_H)) (*built)++;
         if ((i & 7) == 0) {                       /* say what it is doing; this takes a while */
-            printf("\x1b[8;1H  preparing covers  %d / %d   ", i + 1, g_nposters);
-            gfxFlushBuffers(); gspWaitForVBlank();
+            load_step("preparing covers  %d / %d", i + 1, g_nposters);
         }
     }
 }
@@ -2432,6 +2443,7 @@ int store_run(int (*resolve)(const char *key, char *out, size_t cap), char *out,
      * That is the dark band sweeping across and the letters fading in and out. */
     gfxSetDoubleBuffering(GFX_BOTTOM, false);
     panel_size();
+    load_step("building the store");      /* first thing on screen, before any of the slow work */
     C3D_Init(C3D_DEFAULT_CMDBUF_SIZE);
 
     C3D_RenderTarget *tL = C3D_RenderTargetCreate(240, 400, GPU_RB_RGBA8, GPU_RB_DEPTH24_STENCIL8);
@@ -2471,6 +2483,7 @@ int store_run(int (*resolve)(const char *key, char *out, size_t cap), char *out,
 
     int built = 0;
     u64 t_load0 = osGetTime();
+    load_step("reading your library");
     int found = load_posters(&built);
     u64 t_load = osGetTime() - t_load0;
     int placeheld = 0;
@@ -2481,9 +2494,10 @@ int store_run(int (*resolve)(const char *key, char *out, size_t cap), char *out,
         }
     }
 
-    printf("\x1b[6;1H  MOFLEX STORE");
+    load_step("preparing covers");
     prebuild_covers(&built);                /* the slow part, done where you are standing still */
     load_restock();                         /* BEFORE: the bake needs to know it has art */
+    load_step("stocking the shelves");
     build_sections();                       /* genres -> units -> poster positions */
     for (int i = 0; i < BANNERS; i++) load_banner(i);
     make_wall_posters();                    /* decorate: unit ends and the bare walls */
