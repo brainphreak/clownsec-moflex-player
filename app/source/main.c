@@ -4581,14 +4581,14 @@ static int extplay_launch(const char *path) {
         }
         moved = 1;
     }
-    u8 param[0x300]; u8 hmac[0x20];
-    memset(param, 0, sizeof param); memset(hmac, 0, sizeof hmac);
-    if (R_SUCCEEDED(APT_PrepareToDoApplicationJump(0, tid, mt)) &&
-        R_SUCCEEDED(APT_DoApplicationJump(param, sizeof param, hmac)))
-        return 1;
-    if (moved) { rename(root, path); remove(EXTPLAY_STATE); }   /* the jump failed: undo */
-    msg_screen("3D MOVIE PLAYER", "Could not start the 3D Movie Player.\nPlaying here instead.");
-    return 0;
+    /* NOT APT_PrepareToDoApplicationJump + APT_DoApplicationJump from here: with current libctru
+     * the app's own shutdown then closes to the HOME menu and the jump never lands (seen on an
+     * Old 3DS: we exited, the Movie Player did not start). The chainloader hands the jump to
+     * aptExit(), which performs it as the LAST step of a normal exit. extplay_find() already
+     * confirmed the title is installed. */
+    (void)moved;
+    aptSetChainloader(tid, (u8)mt);
+    return 1;
 }
 
 static MoflexResult play_movie(const char *path) {
