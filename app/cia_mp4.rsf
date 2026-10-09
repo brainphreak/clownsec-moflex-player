@@ -69,6 +69,7 @@ AccessControlInfo:
   ServiceAccessControl:
    - APT:U
    - ac:i
+   - am:net
    - ac:u
    - cfg:i
    - cfg:s

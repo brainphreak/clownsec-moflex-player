@@ -12,6 +12,7 @@
 #include <ctype.h>
 #include <time.h>
 #include <locale.h>
+#include <unistd.h>
 
 #include "moflex_playback.h"
 #include "mp4_play.h"
@@ -4397,6 +4398,118 @@ static int pick_moflex(const char *ciapath, const CiaMoflex *list, int n) {
     return -1;
 }
 
+/* ---------- play in Nintendo's 3D Movie Player (Old 3DS) ----------
+ * The Old 3DS struggles with our decoder, but the stock 3D Movie Player plays moflex in hardware --
+ * it only looks in the ROOT of the SD card, though, and has no folders. So with this setting on,
+ * picking a movie moves THAT ONE FILE to sdmc:/ (a FAT rename: instant, no copy), notes where it
+ * came from, and jumps to the Movie Player. The next start of this app moves it home again BEFORE
+ * the library loads, so the library never sees it missing. The state file is written and flushed
+ * BEFORE the move: a power cut between the two leaves a note for a file that never left, which the
+ * restore treats as already home. Title IDs as in 3ds-moflex-launcher. */
+#define EXTPLAY_CFG   "sdmc:/moflex_player/extplayer.cfg"
+#define EXTPLAY_STATE "sdmc:/moflex_player/extplay_state.txt"
+static int g_extplay = 0;                     /* 0 = our player, 1 = 3D Movie Player */
+static void extplay_load(void) {
+    FILE *f = fopen(EXTPLAY_CFG, "rb");
+    int v = 0;
+    if (f) { if (fscanf(f, "%d", &v) != 1) v = 0; fclose(f); }
+    g_extplay = !!v;
+}
+static void extplay_save(void) {
+    mkdir("sdmc:/moflex_player", 0777);
+    FILE *f = fopen(EXTPLAY_CFG, "wb");
+    if (f) { fprintf(f, "%d\n", g_extplay); fclose(f); }
+}
+static int extplay_find(u64 *tid, FS_MediaType *mt) {
+    static const u64 ids[] = {
+        0x0004000000036A00ULL,   /* CIA-installed */
+        0x0004001000021A00ULL,   /* USA (preinstalled) */
+        0x0004001000021B01ULL,   /* EUR */
+        0x0004001000020F00ULL,   /* JPN */
+    };
+    static const FS_MediaType mts[] = { MEDIATYPE_SD, MEDIATYPE_NAND };
+    if (R_FAILED(amInit())) return 0;
+    int found = 0;
+    for (int m = 0; m < 2 && !found; m++)
+        for (int i = 0; i < 4 && !found; i++) {
+            AM_TitleEntry te; u64 id = ids[i];
+            if (R_SUCCEEDED(AM_GetTitleInfo(mts[m], 1, &id, &te))) { *tid = id; *mt = mts[m]; found = 1; }
+        }
+    amExit();
+    return found;
+}
+/* Startup: put back a movie the last session lent to the Movie Player. Never overwrites: if a
+ * file of that name has appeared at home meanwhile, the returning one gets a " (2)" name. */
+static void extplay_restore(void) {
+    FILE *f = fopen(EXTPLAY_STATE, "rb");
+    if (!f) return;
+    char home[PATHLEN + NAMELEN] = "", root[PATHLEN + NAMELEN] = "";
+    if (fgets(home, sizeof home, f)) { char *nl = strchr(home, '\n'); if (nl) *nl = 0; }
+    if (fgets(root, sizeof root, f)) { char *nl = strchr(root, '\n'); if (nl) *nl = 0; }
+    fclose(f);
+    struct stat st;
+    int in_root = root[0] && stat(root, &st) == 0;
+    int at_home = home[0] && stat(home, &st) == 0;
+    if (in_root && !at_home) {
+        if (rename(root, home) != 0) {
+            msg_screen("3D MOVIE PLAYER", "Could not move the movie back\nfrom the SD card root.\nIt is still in sdmc:/");
+            return;                                   /* keep the note: try again next start */
+        }
+    } else if (in_root && at_home) {
+        char alt[PATHLEN + NAMELEN];
+        size_t L = strlen(home);
+        const char *dot = (L > 7) ? home + L - 7 : home + L;   /* ".moflex" */
+        snprintf(alt, sizeof alt, "%.*s (2)%s", (int)(dot - home), home, dot);
+        if (stat(alt, &st) == 0 || rename(root, alt) != 0) {
+            msg_screen("3D MOVIE PLAYER", "A movie in the SD card root has the\nsame name as one in your library.\nLeft it in sdmc:/ -- nothing\nwas overwritten.");
+        } else {
+            msg_screen("3D MOVIE PLAYER", "A file with the same name appeared\nin the movie's folder, so it came\nback with \" (2)\" added to its name.");
+        }
+    } else if (!in_root && !at_home) {
+        msg_screen("3D MOVIE PLAYER", "The movie lent to the 3D Movie Player\nis no longer on the SD card\n(deleted or moved outside the app).");
+    }
+    remove(EXTPLAY_STATE);
+}
+/* Lend path to the Movie Player. Returns 1 when the jump is under way (the app must now exit),
+ * 0 when it did not happen (a message was shown; the file is where it was). */
+static int extplay_launch(const char *path) {
+    u64 tid = 0; FS_MediaType mt = MEDIATYPE_SD;
+    if (!extplay_find(&tid, &mt)) {
+        msg_screen("3D MOVIE PLAYER", "Nintendo's 3D Movie Player is not\ninstalled. Playing here instead.");
+        return 0;
+    }
+    const char *b = strrchr(path, '/'); b = b ? b + 1 : path;
+    char root[PATHLEN + NAMELEN];
+    snprintf(root, sizeof root, "sdmc:/%s", b);
+    int moved = 0;
+    if (strcasecmp(root, path) != 0) {               /* already in the root: nothing to move */
+        struct stat st;
+        if (stat(root, &st) == 0) {
+            msg_screen("3D MOVIE PLAYER", "A file with this name is already\nin the SD card root. Move or delete\nit first. Playing here instead.");
+            return 0;
+        }
+        mkdir("sdmc:/moflex_player", 0777);
+        FILE *f = fopen(EXTPLAY_STATE, "wb");
+        if (!f) { msg_screen("3D MOVIE PLAYER", "Could not save the restore note.\nPlaying here instead."); return 0; }
+        fprintf(f, "%s\n%s\n", path, root);
+        fflush(f); fsync(fileno(f)); fclose(f);
+        if (rename(path, root) != 0) {
+            remove(EXTPLAY_STATE);
+            msg_screen("3D MOVIE PLAYER", "Could not move the movie to the\nSD card root. Playing here instead.");
+            return 0;
+        }
+        moved = 1;
+    }
+    u8 param[0x300]; u8 hmac[0x20];
+    memset(param, 0, sizeof param); memset(hmac, 0, sizeof hmac);
+    if (R_SUCCEEDED(APT_PrepareToDoApplicationJump(0, tid, mt)) &&
+        R_SUCCEEDED(APT_DoApplicationJump(param, sizeof param, hmac)))
+        return 1;
+    if (moved) { rename(root, path); remove(EXTPLAY_STATE); }   /* the jump failed: undo */
+    msg_screen("3D MOVIE PLAYER", "Could not start the 3D Movie Player.\nPlaying here instead.");
+    return 0;
+}
+
 static MoflexResult play_movie(const char *path) {
     /* filenames with FAT-illegal characters list fine but can never be OPENED -- offer to fix */
     { const char *b0 = strrchr(path, '/'); b0 = b0 ? b0 + 1 : path;
@@ -4449,6 +4562,15 @@ static MoflexResult play_movie(const char *path) {
         }
         dlw_stop_wait();
         s_dlw_resume_ask = 1;   /* offer to resume once we are back on the home screen */
+    }
+    /* Movie Player mode: plain .moflex only (it cannot open a CIA or an MP4). It keeps its own
+     * resume point, so ours is not asked about. */
+    if (g_extplay && !cia_is_cia(path)) {
+        size_t L = strlen(path);
+        if (L > 7 && !strcasecmp(path + L - 7, ".moflex") && extplay_launch(path)) {
+            cia_clear_selection();
+            return MOFLEX_QUIT_EXIT;                  /* jumping: unwind and exit cleanly */
+        }
     }
     { long long rp = moflex_resume_get(path);   /* pre-played -> resume, start fresh, or back out */
       if (rp > 3000000) {
@@ -4871,7 +4993,7 @@ static void home_draw(int bsel, long long rpos) {
         ui_fill_round(THSW_X + 24, THSW_Y + 5, 6, 6, 2, a3);
         ui_text(THSW_X + 36, THSW_Y + 4, 1, UI_DIM, "Y");
     }
-    ui_text_center(UI_W / 2, 32, 1, UI_NEONP, "3DS VIDEO PLAYER");
+    ui_text_center(UI_W / 2, 32, 1, UI_NEONP, g_extplay ? "PLAYS IN 3D MOVIE PLAYER (X)" : "3DS VIDEO PLAYER");
     ui_glow_round(28, 46, UI_W - 56, 2, 1, UI_NEON, 3, 34);
     ui_fill_round(28, 46, UI_W - 56, 2, 1, UI_NEON);
 
@@ -4933,6 +5055,13 @@ static int home_gui(void) {
         u32 k = hidKeysDown();
         if (k & KEY_START) return -1;
         if (k & KEY_Y) { themes_screen(); redraw = 1; }
+        if (k & KEY_X) {
+            const char *it[3] = { "CLOWNSEC PLAYER", "3D MOVIE PLAYER", "CANCEL" };
+            int c = ui_menu("PLAY MOVIES WITH",
+                            "Movie Player: smooth, no subs/2nd audio", it, 3);
+            if (c == 0 || c == 1) { g_extplay = c; extplay_save(); }
+            redraw = 1;
+        }
         if (k & KEY_RIGHT) { bsel = (bsel + 1) % 3; redraw = 1; }
         if (k & KEY_LEFT)  { bsel = (bsel + 2) % 3; redraw = 1; }
         if (k & KEY_A) return g_btns[bsel].choice;
@@ -5123,6 +5252,8 @@ int main(void) {
     gfxSetDoubleBuffering(GFX_BOTTOM, false);
     branding_show();                                  /* 3D CLOWNSEC logo on top */
 
+    extplay_load();
+    extplay_restore();           /* FIRST: bring back a movie lent to the 3D Movie Player */
     startup_new_movie_check();   /* movies added outside the app -> offer rescan (+ art/info) */
     lastplay_restore();          /* home boots with the last-played movie ready on PLAY */
     if (queue_count() > 0) {
