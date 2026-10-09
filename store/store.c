@@ -1140,14 +1140,15 @@ static void rebuild_back(const Poster *q) {
     }
     y += 6;
 
-    /* The blurb at 2x. At 1x an 8-pixel glyph lands at roughly six screen pixels on a held
-     * case and is genuinely unreadable; 2x is about twelve and legible. The cost is fourteen
-     * characters a line, so what fits here is a blurb -- the bottom screen keeps the rest. */
-    { int cols  = TXT_W / 16;
-      int lines = (FOOT_Y - y) / 18;
+    /* The blurb at 1x, the size the genres use. At 2x it held fourteen characters a line and a
+     * sentence or two; at 1x it is twenty-eight a line and twice the lines -- about four times the
+     * description. A held case can be pulled closer (up on the pad), which is what makes 1x
+     * readable: the same texture over more of the screen. */
+    { int cols  = TXT_W / 8;
+      int lines = (FOOT_Y - y) / 9;
       int trunc = 0;
       if (lines > 0) {
-          if (q->desc[0]) draw_wrap(lin, BACK_W, BACK_H, M, y, 2, ink, q->desc, cols, lines, &trunc);
+          if (q->desc[0]) draw_wrap(lin, BACK_W, BACK_H, M, y, 1, ink, q->desc, cols, lines, &trunc);
           else            draw_text(lin, BACK_W, BACK_H, M, y, 1, dim, "No description on file.");
       } }
 
