@@ -3047,8 +3047,11 @@ int store_run(int (*resolve)(const char *key, char *out, size_t cap), char *out,
         /* Parallax at infinity is iod/focal, so a convergence plane 2.2 away in a room
          * twenty-five deep put the whole far end of the shop miles off the screen -- which is
          * what ghosts. Half the separation and the plane pushed out past the near bays: the
-         * far wall settles down, and the case in your hand still stands off the screen. */
-        float iod = slider * 0.14f;
+         * far wall settles down, and the case in your hand still stands off the screen.
+         * Halved again (0.14 -> 0.07) on hardware: at full slider the doubling was still too
+         * much and people were winding it down every visit, so the top of the slider now gives
+         * what its middle used to. */
+        float iod = slider * 0.07f;
 
         C3D_Mtx view;
         Mtx_Identity(&view);
