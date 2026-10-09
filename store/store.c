@@ -2645,7 +2645,9 @@ static void scene_init(void) {
      * because a fresh context is all defaults. */
     for (int i = 1; i < 6; i++) C3D_TexEnvInit(C3D_GetTexEnv(i));   /* pass the previous through */
     C3D_ProcTexBind(0, NULL);
-    C3D_TexBind(1, NULL); C3D_TexBind(2, NULL);
+    /* NOT C3D_TexBind(n, NULL): it reads the texture's format and data-aborts on NULL (that was
+     * the crash on entering). Units 1-2 are never sampled -- stage 0 reads TEXTURE0 and stages
+     * 1-5 pass the previous through -- so whatever is left bound there cannot show. */
     C3D_LightEnvBind(NULL);
     C3D_FogGasMode(GPU_NO_FOG, GPU_PLAIN_DENSITY, false);
     C3D_FogLutBind(NULL);
