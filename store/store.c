@@ -2039,22 +2039,47 @@ static void build_sections(void) {
                 if (g_pos[i].ok && !g_pos[i].is_more && g_pos[i].sect != k &&
                     g_pos[i].copy_of < 0 && genre_listed(g_pos[i].genres, g_sec[k].name))
                     if (add_copy(i, k) < 0) break;
-        /* Then round-robin over this section's own stock, at most MAX_COPIES laps.
-         *
-         * Unbounded, a bay holding two films came out as twelve facings of two covers, which
-         * reads as a fault rather than as stock -- and made its restock look broken, because
-         * the next page was more of the same two. A part-empty shelf is the better failure. */
-        int guard = 0;
-        while (g_sec[k].n < want && guard < MAX_COPIES) {
-            int placed = 0;
-            for (int i = 0; i < base && g_sec[k].n < want; i++) {
-                if (!g_pos[i].ok || g_pos[i].is_more || g_pos[i].sect != k) continue;
-                if (g_pos[i].copy_of >= 0) continue;
-                if (add_copy(i, k) < 0) { guard = MAX_POSTERS; break; }
-                placed = 1;
+        /* Then copies of this section's own stock -- but NOT evenly. Round-robin gave every
+         * title the same three, which no shop ever looked like: the hits stood four deep and the
+         * rest one. So the free slots are handed out by a weighted draw. A title's weight is a
+         * popularity from its name (most ordinary, a few big) and more for the newest years, and
+         * the draw is seeded from the section, so the same shop is stocked the same way on every
+         * visit. Still at most MAX_COPIES extra of any one title: a part-empty shelf beats twelve
+         * facings of two covers, which reads as a fault rather than as stock. */
+        {
+            static int cand[MAX_POSTERS], wgt[MAX_POSTERS], extra[MAX_POSTERS];
+            static const int POP[10] = { 1, 1, 1, 1, 2, 2, 3, 4, 7, 10 };
+            int nc = 0, newest = 0;
+            for (int i = 0; i < base; i++) if (g_pos[i].year > newest) newest = g_pos[i].year;
+            for (int i = 0; i < base; i++) {
+                if (!g_pos[i].ok || g_pos[i].is_more || g_pos[i].sect != k || g_pos[i].copy_of >= 0) continue;
+                unsigned h = 2166136261u;
+                for (const char *c = g_pos[i].key; *c; c++) h = (h ^ (unsigned char)*c) * 16777619u;
+                int w = POP[(h >> 7) % 10];
+                if (newest && g_pos[i].year >= newest - 1)      w *= 3;   /* this year's releases */
+                else if (newest && g_pos[i].year >= newest - 4) w *= 2;
+                cand[nc] = i; wgt[nc] = w; extra[nc] = 0; nc++;
             }
-            if (!placed) break;                    /* nothing in here to copy: leave the gap */
-            guard++;
+            unsigned r = 2166136261u;
+            for (const char *c = g_sec[k].name; *c; c++) r = (r ^ (unsigned char)*c) * 16777619u;
+            int slots = want - g_sec[k].n;
+            for (int s2 = 0; s2 < slots && nc > 0; s2++) {
+                int total = 0;
+                for (int c = 0; c < nc; c++) if (extra[c] < MAX_COPIES) total += wgt[c];
+                if (total <= 0) break;                 /* everything at its limit: leave the gap */
+                r ^= r << 13; r ^= r >> 17; r ^= r << 5;
+                int pick = (int)(r % (unsigned)total), c = 0;
+                for (; c < nc; c++) {
+                    if (extra[c] >= MAX_COPIES) continue;
+                    if (pick < wgt[c]) break;
+                    pick -= wgt[c];
+                }
+                if (c >= nc) break;
+                extra[c]++;
+            }
+            for (int c = 0; c < nc; c++)
+                for (int e = 0; e < extra[c]; e++)
+                    if (add_copy(cand[c], k) < 0) { c = nc; break; }
         }
     }
 
