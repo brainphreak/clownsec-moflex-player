@@ -490,6 +490,38 @@ static int  g_sub_on = 0;      /* enabled */
 static int  g_sub_pos = 10;
 #define SUB_POS_MAX 216        /* 240 tall: still leaves a line's worth on screen at the top */
 #define SUB_POS_DEF 10
+/* The top (signs / \an8) block's distance DOWN from the top edge -- the mirror of g_sub_pos, so
+ * someone who lifts the dialogue off the bottom edge can drop the signs the same amount and keep
+ * the frame symmetrical. It was a fixed 4 px. Half the screen is plenty: past that it is no
+ * longer a top block. */
+static int  g_sub_tpos = SUB_POS_DEF;
+#define SUB_TPOS_MAX 120
+#define SUB_TPOS_DEF SUB_POS_DEF  /* same gap as the bottom out of the box: symmetrical until changed */
+/* LINKED (the default): the top block mirrors g_sub_pos, so moving either row moves both and the
+ * frame stays symmetrical. Unlinking freezes the top where it is and lets the two differ -- for a
+ * letterbox that is not centred, where the bars top and bottom are different heights. */
+static int  g_sub_link = 1;
+static int sub_tpos(void) {
+    if (!g_sub_link) return g_sub_tpos;
+    return g_sub_pos > SUB_TPOS_MAX ? SUB_TPOS_MAX : g_sub_pos;
+}
+/* d is in the row's own direction: px UP for the bottom row, px DOWN for the top one. Linked, a
+ * bigger top gap is the same thing as a bigger bottom gap, so both rows land on g_sub_pos. */
+static void sub_nudge(int topblk, int d) {
+    if (topblk && !g_sub_link) {
+        g_sub_tpos += d;
+        if (g_sub_tpos < 0) g_sub_tpos = 0;
+        if (g_sub_tpos > SUB_TPOS_MAX) g_sub_tpos = SUB_TPOS_MAX;
+        return;
+    }
+    g_sub_pos += d;
+    if (g_sub_pos < 0) g_sub_pos = 0;
+    if (g_sub_pos > SUB_POS_MAX) g_sub_pos = SUB_POS_MAX;
+}
+static void sub_link_toggle(void) {
+    if (g_sub_link) g_sub_tpos = sub_tpos();   /* unlocking: the top stays exactly where it is */
+    g_sub_link = !g_sub_link;
+}
 static int  g_sub_depth = 0;   /* 3D parallax: per-eye horizontal shift (-=out toward you, +=into screen) */
 static int  g_sub_size = 1;    /* 1..SUB_SIZE_MAX; the step maps to a scale per font (see SUB_*_SC) */
 #define SUB_SIZE_MAX 7
@@ -1028,9 +1060,9 @@ static void subcfg_save(const char *movie) {
      * framing ride in trailing fields, which older builds never read. */
     int coarse = (g_sub_size * SUB_SIZE_OLD + SUB_SIZE_MAX - 1) / SUB_SIZE_MAX;
     if (coarse < 1) coarse = 1;
-    fprintf(f, "1 %d %d %d %d %lld %d %d %d %d %d %d %d %d\n%s\n", g_sub_on, g_sub_pos > 120, coarse,
+    fprintf(f, "1 %d %d %d %d %lld %d %d %d %d %d %d %d %d %d %d\n%s\n", g_sub_on, g_sub_pos > 120, coarse,
             g_sub_depth, (long long)g_sub_off, g_sub_enc, g_atrk_sel, g_sub_font, g_sub_pos,
-            g_sub_size, g_zoom, g_conv, g_ghost, g_sub_file);
+            g_sub_size, g_zoom, g_conv, g_ghost, g_sub_tpos, g_sub_link, g_sub_file);
     fclose(f);
 }
 static void subcfg_load(const char *movie) {
@@ -1039,6 +1071,8 @@ static void subcfg_load(const char *movie) {
     g_sub_font = 0;                     /* the console's own face */
     g_sub_size = 1;
     g_sub_pos  = SUB_POS_DEF;
+    g_sub_tpos = SUB_TPOS_DEF;
+    g_sub_link = 1;
     g_zoom = ZOOM_MIN; g_conv = 0; g_ghost = 0;
     char p[256]; subcfg_path(movie, p, sizeof p);
     FILE *f = fopen(p, "rb");
@@ -1062,7 +1096,11 @@ static void subcfg_load(const char *movie) {
           int z = 0, cv = 0, gh = 0;
           if (fscanf(f, "%d", &z) == 1 && z >= ZOOM_MIN && z <= ZOOM_MAX) g_zoom = z;
           if (fscanf(f, "%d", &cv) == 1 && cv >= -CONV_MAX && cv <= CONV_MAX) g_conv = cv;
-          if (fscanf(f, "%d", &gh) == 1 && gh >= 0 && gh <= GHOST_MAX) g_ghost = gh; }
+          if (fscanf(f, "%d", &gh) == 1 && gh >= 0 && gh <= GHOST_MAX) g_ghost = gh;
+          int tp = -1;                                  /* top-block position, since 61008 */
+          if (fscanf(f, "%d", &tp) == 1 && tp >= 0 && tp <= SUB_TPOS_MAX) g_sub_tpos = tp;
+          int lk = 1;
+          if (fscanf(f, "%d", &lk) == 1) g_sub_link = !!lk; }
         g_sub_depth = depth < -16 ? -16 : (depth > 16 ? 16 : depth);
         g_sub_off   = (int64_t)off;
         g_sub_enc   = (enc >= 0 && enc < 5) ? enc : 0;
@@ -1333,7 +1371,6 @@ static void sub_draw_lines(u8 *fb, int cx, int y0, char lines[SUB_MAXLN][SUB_LNW
         sub_fbtext(fb, x, y, sc, col, s, ital, bold);
     }
 }
-#define SUB_TOP_Y 4                            /* the top (signs) block: px below the top edge */
 static u32 sub_col24(u32 col) { return (col & SUB_COL_SET) ? (col & 0x00FFFFFF) : 0x00FFFFFF; }
 /* Lay out one block for the framebuffer: wrap to the width left after the 3D shift, dropping
  * from 2x to 1x when 2x would cut the cue short. Returns the line count; *sc gets the scale. */
@@ -1356,7 +1393,7 @@ static void sub_overlay(int is3d, int64_t us) {
     for (int eye = 0; eye < (is3d ? 2 : 1); eye++) {
         u8 *fb = (u8 *)gfxGetFramebuffer(GFX_TOP, eye ? GFX_RIGHT : GFX_LEFT, NULL, NULL);
         int dx = is3d ? ((eye == 0) ? -g_sub_depth : g_sub_depth) : 0;   /* parallax between eyes */
-        if (tn) sub_draw_lines(fb, SCR_W / 2 + dx, SUB_TOP_Y, tl, tn, tsc, sub_col24(top.col), top.ital, top.bold);
+        if (tn) sub_draw_lines(fb, SCR_W / 2 + dx, sub_tpos(), tl, tn, tsc, sub_col24(top.col), top.ital, top.bold);
         if (bn) sub_draw_lines(fb, SCR_W / 2 + dx, y0, bl, bn, bsc, sub_col24(bot.col), bot.ital, bot.bold);
     }
 }
@@ -1621,7 +1658,7 @@ static void sub_depth_menu(int is3d) {
 static int sub_ramp(int n) { return n > 40 ? 10 : n > 18 ? 5 : 1; }
 /* vertical placement, 1px a step across the whole screen: anywhere from flush with the bottom
  * edge to up under the top one, so a caption can sit inside whatever letterbox this film has */
-static void sub_position_menu(void) {
+static void sub_position_menu(int topblk) {
     int hrep = 0;
     while (aptMainLoop()) {
         hidScanInput();
@@ -1638,13 +1675,14 @@ static void sub_position_menu(void) {
                int step = 1;
                if (fire) hrep = 0;                       /* a fresh press restarts the ramp */
                else { hrep++; if (hrep > 8 && hrep % 2 == 0) { fire = 1; step = sub_ramp(hrep); } }
-               if (fire) { g_sub_pos += ud * step;
-                           if (g_sub_pos < 0) g_sub_pos = 0;
-                           if (g_sub_pos > SUB_POS_MAX) g_sub_pos = SUB_POS_MAX; } }
-        char v[24]; snprintf(v, sizeof v, "%d px up", g_sub_pos);
+               /* HIGHER moves the block up the screen either way: for the top block that is
+                * FEWER px down */
+               if (fire) sub_nudge(topblk, (topblk ? -ud : ud) * step); }
+        char v[24]; snprintf(v, sizeof v, topblk ? "%d px down" : "%d px up", topblk ? sub_tpos() : g_sub_pos);
         ui_begin(GFX_BOTTOM);
         ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
-        ui_text_center(UI_W / 2, 20, 2, UI_NEON, "SUBTITLE POSITION");
+        ui_text_center(UI_W / 2, 20, 2, UI_NEON, topblk ? "TOP SUBTITLE POSITION" : "SUBTITLE POSITION");
+        if (g_sub_link) ui_text_center(UI_W / 2, 118, 1, UI_INK, "Top & bottom linked: both move");
         ui_text_center(UI_W / 2, 74, 3, UI_NEONC, v);
         ui_button(20, 150, 135, 36, "< LOWER", 0, UI_NEONP);
         ui_button(165, 150, 135, 36, "HIGHER >", 0, UI_NEON);
@@ -1754,7 +1792,7 @@ static void sub_offset_menu(void) {
 static void sub_menu(const char *moviepath, int is3d) {
     int msel = 0;                       /* keep the cursor on the item you just changed */
     for (;;) {
-        char i0[28], i2[28], i3[28], i4[28], i5[28], i6[28], i7[28], i8[40];
+        char i0[28], i2[28], i3[28], i4[28], i5[28], i6[28], i7[28], i8[40], i9[36], i10[28];
         snprintf(i0, sizeof i0, "Subtitles: %s", g_sub_on ? "ON" : "OFF");
         snprintf(i2, sizeof i2, "Size: %d / %d", g_sub_size, SUB_SIZE_MAX);
         int64_t da = g_sub_off < 0 ? -g_sub_off : g_sub_off;
@@ -1763,9 +1801,13 @@ static void sub_menu(const char *moviepath, int is3d) {
         snprintf(i5, sizeof i5, "Encoding: %s%s", g_sub_enc_name[g_sub_enc], g_sub_mode < 0 ? " (UTF-8)" : "");
         snprintf(i6, sizeof i6, "Font: %s", g_sub_font ? "PIXEL" : "SYSTEM");
         snprintf(i7, sizeof i7, "Position: %d px up", g_sub_pos);
-        const char *items[10]; int act[10], n = 0;
+        snprintf(i9, sizeof i9, "Top position: %d px down%s", sub_tpos(), g_sub_link ? " *" : "");
+        snprintf(i10, sizeof i10, "Link top & bottom: %s", g_sub_link ? "ON" : "OFF");
+        const char *items[12]; int act[12], n = 0;
         items[n] = i0; act[n++] = 0;
         items[n] = i7; act[n++] = 10;
+        items[n] = i9; act[n++] = 11;
+        items[n] = i10; act[n++] = 12;
         items[n] = i2; act[n++] = 2;
         items[n] = i6; act[n++] = 9;
         items[n] = i3; act[n++] = 3;
@@ -1792,7 +1834,9 @@ static void sub_menu(const char *moviepath, int is3d) {
         else if (a == 4) sub_depth_menu(is3d);
         else if (a == 5) sub_load_menu(moviepath);
         else if (a == 9) g_sub_font = !g_sub_font;
-        else if (a == 10) sub_position_menu();
+        else if (a == 10) sub_position_menu(0);
+        else if (a == 11) sub_position_menu(1);
+        else if (a == 12) sub_link_toggle();
         else if (a == 8 && g_tra.sub_n > 0) {   /* back to the file's own subtitles */
             if (!strcmp(g_sub_file, EMB_SRT) && g_tra.sub_n > 1)
                 g_trsub_sel = (g_trsub_sel + 1) % g_tra.sub_n;   /* already showing: next language */
@@ -2145,7 +2189,7 @@ static char g_srt_names[SRT_MAX][128], g_srt_paths[SRT_MAX][512];
 /* action codes per row, in display order (depth row only when 3D). Returns row count. */
 static int submenu_actions(int is3d, int *act) {
     int n = 0;
-    act[n++] = 0; act[n++] = 10; act[n++] = 2; act[n++] = 9; act[n++] = 3; act[n++] = 6;
+    act[n++] = 0; act[n++] = 10; act[n++] = 11; act[n++] = 12; act[n++] = 2; act[n++] = 9; act[n++] = 3; act[n++] = 6;
     /* Shown whenever the file HAS a built-in track, not only when it has several. With one
      * track the row was hidden, so loading an external .srt was a one-way trip: nothing on
      * screen could put the built-in subtitles back. */
@@ -2168,6 +2212,8 @@ static void submenu_label(int a, char *r, int cap) {
         case 6: snprintf(r, cap, "Encoding:  %s%s", g_sub_enc_name[g_sub_enc], g_sub_mode < 0 ? " (UTF-8)" : ""); break;
         case 9: snprintf(r, cap, "Font:  %s", g_sub_font ? "Pixel" : "System"); break;
         case 10: snprintf(r, cap, "Position:  %d px up   (left/right)", g_sub_pos); break;
+        case 11: snprintf(r, cap, "Top position:  %d px down%s", sub_tpos(), g_sub_link ? "  (linked)" : ""); break;
+        case 12: snprintf(r, cap, "Link top & bottom:  %s", g_sub_link ? "ON" : "OFF"); break;
         case 4: snprintf(r, cap, "Depth (3D):  %+d", g_sub_depth); break;
         case 7: snprintf(r, cap, "Audio:  Track %d / %d", g_atrk_sel + 1, g_atrk_n); break;
         case 8: snprintf(r, cap, "Built-in:  %s (%d/%d)%s",
@@ -2180,7 +2226,7 @@ static void submenu_label(int a, char *r, int cap) {
     }
 }
 static void submenu_render(int is3d) {
-    int act[10]; int n = submenu_actions(is3d, act);
+    int act[12]; int n = submenu_actions(is3d, act);
     int top, step, bh; submenu_layout(n, &top, &step, &bh);
     ui_begin(GFX_BOTTOM);
     ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
@@ -2522,7 +2568,7 @@ static int submenu_input(u32 kd, u32 kh, touchPosition tp, int is3d, const char 
         }
         return 0;
     }
-    int act[10]; int n = submenu_actions(is3d, act);
+    int act[12]; int n = submenu_actions(is3d, act);
     if (g_sub_sel >= n) g_sub_sel = n - 1;
     if (g_sub_sel < 0)  g_sub_sel = 0;
     if (kd & KEY_B) { subcfg_save(moviepath); g_submenu = 0; return 1; }
@@ -2532,7 +2578,7 @@ static int submenu_input(u32 kd, u32 kh, touchPosition tp, int is3d, const char 
     int t_side = 0, t_row = (kd & KEY_TOUCH) ? submenu_hit(tp.px, tp.py, n, &t_side) : -1;
     if (t_row >= 0) g_sub_sel = t_row;
     int a = act[g_sub_sel];
-    int val_row = (a == 2 || a == 3 || a == 4 || a == 10);   /* size/delay/depth/position: -/+ */
+    int val_row = (a == 2 || a == 3 || a == 4 || a == 10 || a == 11);   /* size/delay/depth/position: -/+ */
     int press = (kd & KEY_RIGHT) ? 1 : (kd & KEY_LEFT) ? -1 : 0;   /* single tap: toggles/cycles */
     if (kd & KEY_A) press = 1;
     int held = (kh & KEY_RIGHT) ? 1 : (kh & KEY_LEFT) ? -1 : 0;    /* hold-repeat: delay/depth */
@@ -2565,9 +2611,9 @@ static int submenu_input(u32 kd, u32 kh, touchPosition tp, int is3d, const char 
                     g_atrk_apply = 1;   /* the player loop retunes + re-locks at the current spot */
                 } break;
         case 9: if (press) g_sub_font = !g_sub_font; break;
-        case 10: if (rep) { g_sub_pos += rep * sub_ramp(g_sub_rep);   /* left/down lower, right/up higher */
-                            if (g_sub_pos < 0) g_sub_pos = 0;
-                            if (g_sub_pos > SUB_POS_MAX) g_sub_pos = SUB_POS_MAX; } break;
+        case 10: if (rep) sub_nudge(0, rep * sub_ramp(g_sub_rep)); break;   /* left/down lower, right/up higher */
+        case 11: if (rep) sub_nudge(1, rep * sub_ramp(g_sub_rep)); break;   /* left/right: closer/further from the top edge */
+        case 12: if (press) sub_link_toggle(); break;
         case 8: if (press && g_tra.sub_n > 0) {
                     /* A on this row means "show the built-in subtitles". Only advance the
                      * language when they are ALREADY what is showing -- otherwise the first
@@ -3377,7 +3423,7 @@ static void r3_draw_sub_tex(SubTexSlot *t, int dx, float scale, int top) {
                               whole ? GPU_NEAREST : GPU_LINEAR);
     float w = t->w * scale, h = t->h * scale;
     float x = (SCR_W - w) * 0.5f + (float)dx;
-    float y = top ? (float)SUB_TOP_Y : (float)(SCR_H - g_sub_pos) - h;
+    float y = top ? (float)sub_tpos() : (float)(SCR_H - g_sub_pos) - h;
     if (y < 0.0f) y = 0.0f;
     if (whole) { x = (float)(int)(x + 0.5f); y = (float)(int)(y + 0.5f); }   /* texel-aligned */
     C2D_DrawImageAt(t->img, x, y, 0.0f, NULL, scale, scale);
@@ -3493,7 +3539,7 @@ static void r3_draw_sub(C2D_Text *t, int n, int dx, u32 col, u32 outline, float 
     float pitch = lh * 0.75f;
     float total = pitch * (float)(n - 1) + lh;
     float x = SCR_W * 0.5f + (float)dx;
-    float y0 = top ? (float)SUB_TOP_Y : (float)(SCR_H - g_sub_pos) - total;
+    float y0 = top ? (float)sub_tpos() : (float)(SCR_H - g_sub_pos) - total;
     if (y0 < 0.0f) y0 = 0.0f;
     int b = bold ? 1 : 0;                       /* faux bold: the fill twice, 1px apart */
     for (int i = 0; i < n; i++) {
