@@ -26,6 +26,7 @@
 #include "cia_moflex.h"
 #include "ui_gfx.h"
 #include "branding.h"
+#include "store.h"
 
 #define APP_VERSION "v1.0"
 #ifndef BUILD_TAG
@@ -1149,6 +1150,7 @@ static void browser_show_top(int is_dir, const char *name, const char *fullpath)
  * poster download/decode; a worker thread does it and the UI just polls for the result). ---- */
 static volatile int pw_run = 0, pw_req = -1, pw_done = -2, pw_ok = 0;
 static char      pw_url[256], pw_key[NAMELEN];
+static char      pw_nfo[1024];   /* the entry's metadata, written beside the poster it caches */
 static u16      *pw_buf = NULL;
 static LightLock pw_lock;
 static Thread    pw_thread = NULL;
@@ -1156,12 +1158,15 @@ static Thread    pw_thread = NULL;
 static void pw_fn(void *arg) {
     (void)arg;
     while (pw_run) {
-        int id; char url[256], key[NAMELEN];
+        int id; char url[256], key[NAMELEN], nfo[1024];
         LightLock_Lock(&pw_lock);
         id = pw_req; snprintf(url, sizeof url, "%s", pw_url); snprintf(key, sizeof key, "%s", pw_key);
+        snprintf(nfo, sizeof nfo, "%s", pw_nfo);
         LightLock_Unlock(&pw_lock);
         if (id < 0 || id == pw_done) { svcSleepThread(12000000); continue; }   /* nothing new -> idle */
         int ok = url[0] && pw_buf && poster_get(url, key, pw_buf, POSTER_W, POSTER_H);
+        /* the sidecar goes down here, on this thread, so browsing never waits on a card write */
+        if (ok) poster_save_meta(key, nfo);
         LightLock_Lock(&pw_lock);
         if (pw_req == id) { pw_ok = ok; pw_done = id; }   /* publish only if still the wanted selection */
         LightLock_Unlock(&pw_lock);
@@ -1177,11 +1182,24 @@ static void pw_stop(void) {
     if (!pw_thread) return;
     pw_run = 0; threadJoin(pw_thread, 2000000000LL); threadFree(pw_thread); pw_thread = NULL;
 }
-static void pw_request(int id, const char *url, const char *key) {
+static void pw_request(int id, const char *url, const char *key, const CatEntry *e) {
     LightLock_Lock(&pw_lock);
     pw_req = id;
     snprintf(pw_url, sizeof pw_url, "%s", url ? url : "");
     snprintf(pw_key, sizeof pw_key, "%s", key ? key : "");
+    pw_nfo[0] = 0;
+    if (e) {                                  /* same "key: value" shape movieinfo writes */
+        const char *title = e->title[0] ? e->title : e->name;
+        int n = 0;
+        n += snprintf(pw_nfo + n, sizeof pw_nfo - n, "title: %s\n", title);
+        if (e->year)        n += snprintf(pw_nfo + n, sizeof pw_nfo - n, "year: %d\n", e->year);
+        if (e->runtime)     n += snprintf(pw_nfo + n, sizeof pw_nfo - n, "runtime: %d\n", e->runtime);
+        if (e->category[0]) n += snprintf(pw_nfo + n, sizeof pw_nfo - n, "category: %s\n", e->category);
+        if (e->genres[0])   n += snprintf(pw_nfo + n, sizeof pw_nfo - n, "genres: %s\n", e->genres);
+        if (e->is3d >= 0)   n += snprintf(pw_nfo + n, sizeof pw_nfo - n, "3d: %s\n", e->is3d ? "yes" : "no");
+        if (e->desc[0])     n += snprintf(pw_nfo + n, sizeof pw_nfo - n, "desc: %s\n", e->desc);
+        if (n >= (int)sizeof pw_nfo) pw_nfo[sizeof pw_nfo - 1] = 0;
+    }
     LightLock_Unlock(&pw_lock);
 }
 
@@ -1962,7 +1980,7 @@ cb_rebuild:;   /* X-search inside the list jumps back here with filt_search set 
         if (csel != shown) { redraw = 1; phave = 0; settle = 0; requested = 0;
                              g_desc_scroll = 0; }   /* moved -> drop poster, rewind the blurb */
         /* debounced request to the background loader, then poll -- scrolling never blocks on a poster */
-        if (!phave && !requested && cat[idx[csel]].art[0] && ++settle >= 6) { pw_request(idx[csel], cat[idx[csel]].art, cat[idx[csel]].fname); requested = 1; }
+        if (!phave && !requested && cat[idx[csel]].art[0] && ++settle >= 6) { pw_request(idx[csel], cat[idx[csel]].art, cat[idx[csel]].fname, &cat[idx[csel]]); requested = 1; }
         if (!phave && requested && pw_done == idx[csel]) {
             if (pw_ok && poster && pworker) { memcpy(poster, pworker, (size_t)POSTER_W * POSTER_H * 2); phave = 1; }
             requested = 0; redraw = 1;
@@ -5263,20 +5281,20 @@ static int open_pick(void) {
         hidScanInput();
         u32 k = hidKeysDown();
         if (k & KEY_B) return -1;
-        if (k & (KEY_DOWN | KEY_RIGHT)) { if (sel < 2) sel++; redraw = 1; }
+        if (k & (KEY_DOWN | KEY_RIGHT)) { if (sel < 3) sel++; redraw = 1; }
         if (k & (KEY_UP | KEY_LEFT))    { if (sel > 0) sel--; redraw = 1; }
         if (k & KEY_A) return sel;
+        /* four rows now: WALK THE AISLE joined LIBRARY / FILESYSTEM / RECENTLY PLAYED */
         if (k & KEY_TOUCH) { touchPosition tp; hidTouchRead(&tp);
-            if (tp.py >= 52 && tp.py < 100)  return 0;
-            if (tp.py >= 112 && tp.py < 160) return 1;
-            if (tp.py >= 172 && tp.py < 220) return 2; }
+            for (int i = 0; i < 4; i++) if (tp.py >= 44 + i * 47 && tp.py < 44 + i * 47 + 40) return i; }
         if (redraw) {
             ui_begin(GFX_BOTTOM);
             ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
-            ui_text_center(UI_W / 2, 16, 2, UI_NEON, "OPEN VIDEO");
-            ui_button(34,  52, UI_W - 68, 48, "LIBRARY",         sel == 0, UI_NEON);
-            ui_button(34, 112, UI_W - 68, 48, "FILESYSTEM",      sel == 1, UI_NEONP);
-            ui_button(34, 172, UI_W - 68, 48, "RECENTLY PLAYED", sel == 2, UI_NEONC);
+            ui_text_center(UI_W / 2, 14, 2, UI_NEON, "OPEN VIDEO");
+            ui_button(34,  44, UI_W - 68, 40, "LIBRARY",         sel == 0, UI_NEON);
+            ui_button(34,  91, UI_W - 68, 40, "FILESYSTEM",      sel == 1, UI_NEONP);
+            ui_button(34, 138, UI_W - 68, 40, "RECENTLY PLAYED", sel == 2, UI_NEONC);
+            ui_button(34, 185, UI_W - 68, 40, "WALK THE AISLE",  sel == 3, UI_NEON);
             ui_present(); redraw = 0;
         }
         gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
@@ -5286,8 +5304,31 @@ static int open_pick(void) {
 
 /* OPEN VIDEO: pick a source, then a movie. Returns 0 = home, 1 = exit app, 2 = play out[]. */
 /* where the last picked movie came from, so BACK in the player returns to the right place */
-enum { PLAY_FROM_BROWSER = 0, PLAY_FROM_HOME = 1, PLAY_FROM_LIBRARY = 2, PLAY_FROM_RECENT = 3 };
+enum { PLAY_FROM_BROWSER = 0, PLAY_FROM_HOME = 1, PLAY_FROM_LIBRARY = 2, PLAY_FROM_RECENT = 3,
+       PLAY_FROM_STORE = 4 };
 static int s_pick_origin = PLAY_FROM_BROWSER;
+
+/* WALK THE AISLE: a case's key is its moviedata key -- the movie's filename without extension --
+ * so find the library entry with that name. */
+static int store_resolve(const char *key, char *out, size_t cap) {
+    if (!key || !key[0] || lib_load_cache() <= 0) return 0;
+    size_t K = strlen(key);
+    for (int i = 0; i < g_lib_n; i++) {
+        const char *f = g_lib[i].fname;
+        const char *dot = strrchr(f, '.');
+        size_t L = dot ? (size_t)(dot - f) : strlen(f);
+        if (L == K && !strncmp(f, key, K)) { snprintf(out, cap, "%s", g_lib[i].url); return 1; }
+    }
+    return 0;
+}
+/* 1 = picked a movie (out set), 0 = walked out, -1 = app closing */
+static int store_pick(char *out, size_t cap) {
+    int r = store_run(store_resolve, out, cap);
+    consoleInit(GFX_BOTTOM, NULL);            /* the store drew the bottom as a console */
+    gfxSetDoubleBuffering(GFX_BOTTOM, false);
+    branding_show();
+    return r;
+}
 
 static int open_video(char *out, size_t cap) {
     for (;;) {
@@ -5295,6 +5336,9 @@ static int open_video(char *out, size_t cap) {
         if (pick < 0) return 0;                                 /* back -> home */
         if (pick == 0) { if (library_view(out, cap)) { s_pick_origin = PLAY_FROM_LIBRARY; return 2; } }
         else if (pick == 2) { if (recent_pick(out, cap)) { s_pick_origin = PLAY_FROM_RECENT; return 2; } }
+        else if (pick == 3) { int r = store_pick(out, cap);
+                              if (r < 0) return 1;
+                              if (r == 1) { s_pick_origin = PLAY_FROM_STORE; return 2; } }
         else { int r = browser(MODE_PLAY, out, cap);            /* Filesystem */
                if (r == 1) return 1;
                if (r == 2) { s_pick_origin = PLAY_FROM_BROWSER; return 2; } }   /* r==0 backed out -> chooser */
@@ -5345,6 +5389,11 @@ static int play_and_handle(const char *path, int origin) {
         }
         if (r == MOFLEX_QUIT_BACK) {
             if (origin == PLAY_FROM_HOME) return 0;              /* back IS the home screen */
+            if (origin == PLAY_FROM_STORE) {                     /* back into the aisle */
+                int sr = store_pick(np, sizeof np);
+                if (sr == 1) { r = play_movie(np); continue; }
+                return sr < 0 ? 1 : 0;
+            }
             if (origin == PLAY_FROM_RECENT) {                    /* back to the recents list */
                 if (recent_pick(np, sizeof np)) { r = play_movie(np); continue; }
                 return 0;                                        /* backed out of recents -> home */

@@ -13,7 +13,7 @@ include $(DEVKITARM)/3ds_rules
 TARGET   := clownsec_player
 BUILD    := build
 # our decoder + the unmodified FFmpeg support files + the app itself
-SOURCES  := source ../decoder ../ffmpeg_support ../playback ../net ../ui \
+SOURCES  := source ../decoder ../ffmpeg_support ../playback ../net ../ui ../store \
 	../thirdparty/cJSON ../thirdparty/zip ../thirdparty/helixaac
 FF_INC   := ../ffmpeg_support/include
 
@@ -42,7 +42,7 @@ export OFILES  := $(CFILES:.c=.o) $(SFILES:.s=.o) $(PICAFILES:.v.pica=.shbin.o)
 export HFILES  := $(PICAFILES:.v.pica=_shbin.h)
 export INCLUDE := $(foreach dir,$(LIBDIRS),-I$(dir)/include) -I$(CURDIR)/$(BUILD) \
 	-I$(CURDIR)/$(FF_INC) -I$(CURDIR)/$(FF_INC)/libavcodec -I$(CURDIR)/../decoder \
-	-I$(CURDIR)/../playback -I$(CURDIR)/../net -I$(CURDIR)/../ui \
+	-I$(CURDIR)/../playback -I$(CURDIR)/../net -I$(CURDIR)/../ui -I$(CURDIR)/../store \
 	-I$(CURDIR)/../thirdparty/cJSON -I$(CURDIR)/../thirdparty/zip \
 	-I$(CURDIR)/../thirdparty/stb -I$(CURDIR)/../thirdparty/helixaac
 export LIBPATHS := $(foreach dir,$(LIBDIRS),-L$(dir)/lib)
