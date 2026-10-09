@@ -2604,13 +2604,20 @@ static int s_shader_loaded = 0;
  * its own program, the next visit's bind saw "same program" and uploaded nothing -- after C3D_Init
  * the GPU had no shader, and the aisle was a black screen with a stray line on every return. */
 static shaderProgram_s s_park_prog;
+/* ...and over its OWN parse of the shader. C3D_BindProgram only re-uploads the shader CODE when
+ * the old and new programs' DVLP differ (disassembled: same DVLP -> program/attribute flags only,
+ * no code); two programs over one DVLB share a DVLP, so a second visit still drew with whatever
+ * code was left in the GPU -- black, with a sliver of real shelf showing through. A separate
+ * DVLB has its own DVLP, so park -> store is always a code upload. */
+static DVLB_s *s_park_dvlb = NULL;
 static void shader_load_once(void) {
     if (s_shader_loaded) return;
     vsh_dvlb = DVLB_ParseFile((u32 *)vshader_shbin, vshader_shbin_size);
     shaderProgramInit(&program);
     shaderProgramSetVsh(&program, &vsh_dvlb->DVLE[0]);
+    s_park_dvlb = DVLB_ParseFile((u32 *)vshader_shbin, vshader_shbin_size);
     shaderProgramInit(&s_park_prog);
-    shaderProgramSetVsh(&s_park_prog, &vsh_dvlb->DVLE[0]);
+    shaderProgramSetVsh(&s_park_prog, &s_park_dvlb->DVLE[0]);
     s_shader_loaded = 1;
 }
 /* The same problem the other way round: citro2d frees ITS program in C2D_Fini, so after a movie
