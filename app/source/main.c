@@ -4588,6 +4588,18 @@ static int extplay_launch(const char *path) {
      * confirmed the title is installed. */
     (void)moved;
     aptSetChainloader(tid, (u8)mt);
+    /* The exit (stopping the SD walk, the update fetch, networking) and the Movie Player's own
+     * boot take a while on an Old 3DS; without this the screen sat frozen on the last prompt.
+     * Nothing draws after this, so it stays up until the Movie Player takes over. */
+    ui_begin(GFX_BOTTOM);
+    ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
+    ui_text_center(UI_W / 2, 70, 2, UI_NEON, "OPENING");
+    ui_text_center(UI_W / 2, 100, 1, UI_NEONC, "Nintendo 3D Movie Player");
+    ui_text_center(UI_W / 2, 140, 1, UI_INK, "This may take a moment...");
+    ui_text_center(UI_W / 2, 190, 1, UI_DIM, "Reopen Clownsec afterwards to put");
+    ui_text_center(UI_W / 2, 204, 1, UI_DIM, "the movie back in its folder.");
+    ui_present();
+    gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
     return 1;
 }
 
