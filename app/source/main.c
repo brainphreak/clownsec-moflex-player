@@ -4409,16 +4409,38 @@ static int pick_moflex(const char *ciapath, const CiaMoflex *list, int n) {
 #define EXTPLAY_CFG   "sdmc:/moflex_player/extplayer.cfg"
 #define EXTPLAY_STATE "sdmc:/moflex_player/extplay_state.txt"
 static int g_extplay = 0;                     /* 0 = our player, 1 = 3D Movie Player */
+static int g_extplay_ok = 0;                  /* Old 3DS only: a New 3DS plays everything fine */
+static int g_extplay_set = 0;                 /* a choice has been saved (else: ask once) */
 static void extplay_load(void) {
+    bool isnew = false; APT_CheckNew3DS(&isnew);
+    g_extplay_ok = !isnew;
     FILE *f = fopen(EXTPLAY_CFG, "rb");
     int v = 0;
-    if (f) { if (fscanf(f, "%d", &v) != 1) v = 0; fclose(f); }
-    g_extplay = !!v;
+    g_extplay_set = 0;
+    if (f) { if (fscanf(f, "%d", &v) == 1) g_extplay_set = 1; fclose(f); }
+    /* the file survives an SD card moving to a New 3DS; the mode does not */
+    g_extplay = g_extplay_ok && v == 1;
 }
 static void extplay_save(void) {
     mkdir("sdmc:/moflex_player", 0777);
     FILE *f = fopen(EXTPLAY_CFG, "wb");
-    if (f) { fprintf(f, "%d\n", g_extplay); fclose(f); }
+    if (f) { fprintf(f, "%d\n", g_extplay); fclose(f); g_extplay_set = 1; }
+}
+static void extplay_choose(void) {
+    if (!g_extplay_ok) return;
+    const char *it[3] = { "CLOWNSEC PLAYER", "3D MOVIE PLAYER", "CANCEL" };
+    int c = ui_menu("PLAY MOVIES WITH", "Movie Player: smooth, no subs/2nd audio", it, 3);
+    if (c == 0 || c == 1) { g_extplay = c; extplay_save(); }
+}
+/* First start on an Old 3DS: say the choice exists, once. Asked before the library is built, so
+ * it comes before the long first scan rather than after it. */
+static void extplay_first_run(void) {
+    if (!g_extplay_ok || g_extplay_set) return;
+    int c = prompt2("OLD 3DS",
+                    "Movies can play in Nintendo's\n3D Movie Player: smoother here, but\nno subtitles or 2nd audio.\nChange later with X on home.",
+                    "MOVIE PLAYER", "CLOWNSEC");
+    g_extplay = (c == 0);
+    extplay_save();
 }
 static int extplay_find(u64 *tid, FS_MediaType *mt) {
     static const u64 ids[] = {
@@ -4993,7 +5015,8 @@ static void home_draw(int bsel, long long rpos) {
         ui_fill_round(THSW_X + 24, THSW_Y + 5, 6, 6, 2, a3);
         ui_text(THSW_X + 36, THSW_Y + 4, 1, UI_DIM, "Y");
     }
-    ui_text_center(UI_W / 2, 32, 1, UI_NEONP, g_extplay ? "PLAYS IN 3D MOVIE PLAYER (X)" : "3DS VIDEO PLAYER");
+    ui_text_center(UI_W / 2, 32, 1, UI_NEONP, !g_extplay_ok ? "3DS VIDEO PLAYER"
+                   : g_extplay ? "PLAYS IN 3D MOVIE PLAYER (X)" : "3DS VIDEO PLAYER  (X: PLAYER)");
     ui_glow_round(28, 46, UI_W - 56, 2, 1, UI_NEON, 3, 34);
     ui_fill_round(28, 46, UI_W - 56, 2, 1, UI_NEON);
 
@@ -5055,13 +5078,7 @@ static int home_gui(void) {
         u32 k = hidKeysDown();
         if (k & KEY_START) return -1;
         if (k & KEY_Y) { themes_screen(); redraw = 1; }
-        if (k & KEY_X) {
-            const char *it[3] = { "CLOWNSEC PLAYER", "3D MOVIE PLAYER", "CANCEL" };
-            int c = ui_menu("PLAY MOVIES WITH",
-                            "Movie Player: smooth, no subs/2nd audio", it, 3);
-            if (c == 0 || c == 1) { g_extplay = c; extplay_save(); }
-            redraw = 1;
-        }
+        if ((k & KEY_X) && g_extplay_ok) { extplay_choose(); redraw = 1; }
         if (k & KEY_RIGHT) { bsel = (bsel + 1) % 3; redraw = 1; }
         if (k & KEY_LEFT)  { bsel = (bsel + 2) % 3; redraw = 1; }
         if (k & KEY_A) return g_btns[bsel].choice;
@@ -5253,7 +5270,8 @@ int main(void) {
     branding_show();                                  /* 3D CLOWNSEC logo on top */
 
     extplay_load();
-    extplay_restore();           /* FIRST: bring back a movie lent to the 3D Movie Player */
+    extplay_restore();           /* FIRST: bring back a movie lent to the 3D Movie Player (any model) */
+    extplay_first_run();         /* Old 3DS, once: which player should movies open in? */
     startup_new_movie_check();   /* movies added outside the app -> offer rescan (+ art/info) */
     lastplay_restore();          /* home boots with the last-played movie ready on PLAY */
     if (queue_count() > 0) {
