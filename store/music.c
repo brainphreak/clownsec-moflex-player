@@ -24,7 +24,7 @@
  * and the track skipped. 196 KB of linear memory to never hear that again is a good trade. */
 #define MUS_FRAMES  16384
 
-static char        g_dir[256];
+static char        g_path[MUS_MAX][300];  /* full path: tracks come from the app (romfs) AND the card */
 static char        g_name[MUS_MAX][128];
 static int         g_n = 0;
 static int         g_order[MUS_MAX];
@@ -34,6 +34,11 @@ static char        g_now[128];
 static FILE       *g_f = NULL;
 static long        g_left = 0;          /* bytes of sample data still unread */
 static int         g_chan = 2, g_bits = 16;
+/* IMA ADPCM (WAV format 0x11): four bits a sample, a quarter of PCM16. The song that ships
+ * inside the app is stored this way -- 4.4 MB instead of 23 -- and decoding it is a few adds a
+ * sample on this thread, nothing like an mp3. */
+static int         g_ima = 0, g_block = 0, g_spb = 0;   /* is ADPCM; bytes and frames a block */
+static u8         *g_stage = NULL;                      /* raw blocks before decoding */
 static ndspWaveBuf g_wb[MUS_BUFS];
 static s16        *g_buf[MUS_BUFS];
 static int         g_ok = 0;            /* ndsp came up */
@@ -59,10 +64,16 @@ static int wav_open(const char *path) {
             unsigned short tag, ch, bps; unsigned sr;
             if (len < 16 || fread(&tag, 2, 1, f) != 1 || fread(&ch, 2, 1, f) != 1 ||
                 fread(&sr, 4, 1, f) != 1) { fclose(f); return 0; }
-            fseek(f, 6, SEEK_CUR);                       /* byte rate + block align */
-            if (fread(&bps, 2, 1, f) != 1) { fclose(f); return 0; }
+            unsigned short balign;
+            fseek(f, 4, SEEK_CUR);                       /* byte rate */
+            if (fread(&balign, 2, 1, f) != 1 || fread(&bps, 2, 1, f) != 1) { fclose(f); return 0; }
             if (len > 16) fseek(f, (long)len - 16, SEEK_CUR);
-            if (tag != 1 || bps != 16 || ch < 1 || ch > 2) { fclose(f); return 0; }  /* PCM16 only */
+            if (ch < 1 || ch > 2) { fclose(f); return 0; }
+            if (tag == 1 && bps == 16) { g_ima = 0; }
+            else if (tag == 0x11 && bps == 4 && balign > 4u * ch && balign <= 4096) {
+                g_ima = 1; g_block = balign;
+                g_spb = (balign - 4 * ch) * 2 / ch + 1;  /* the header holds one sample per channel */
+            } else { fclose(f); return 0; }              /* PCM16 or IMA ADPCM only */
             rate = (int)sr; chan = ch; bits = bps; fmt_ok = 1;
         } else if (!memcmp(id, "data", 4)) {
             if (!fmt_ok) { fclose(f); return 0; }
@@ -84,9 +95,65 @@ static void wav_close(void) {
     g_left = 0;
 }
 
+static const short ima_step[89] = {
+    7,8,9,10,11,12,13,14,16,17,19,21,23,25,28,31,34,37,41,45,50,55,60,66,73,80,88,97,107,118,130,
+    143,157,173,190,209,230,253,279,307,337,371,408,449,494,544,598,658,724,796,876,963,1060,1166,
+    1282,1411,1552,1707,1878,2066,2272,2499,2749,3024,3327,3660,4026,4428,4871,5358,5894,6484,7132,
+    7845,8630,9493,10442,11487,12635,13899,15289,16818,18500,20350,22385,24623,27086,29794,32767 };
+static const signed char ima_adj[16] = { -1,-1,-1,-1,2,4,6,8,-1,-1,-1,-1,2,4,6,8 };
+static inline s16 ima_nib(int n, int *pred, int *idx) {
+    /* (2*delta+1)*step/8, the exact form -- what ffmpeg's encoder predicted with. The bit-by-bit
+     * version in the original IMA paper rounds differently and drifts a little off every sample. */
+    int step = ima_step[*idx], d = ((2 * (n & 7) + 1) * step) >> 3;
+    int p = (n & 8) ? *pred - d : *pred + d;
+    if (p > 32767) p = 32767; else if (p < -32768) p = -32768;
+    *pred = p;
+    int x = *idx + ima_adj[n]; *idx = x < 0 ? 0 : (x > 88 ? 88 : x);
+    return (s16)p;
+}
+/* One Microsoft-IMA block -> interleaved PCM16. Per channel a 4-byte header (first sample, step
+ * index), then 4 bytes = 8 samples of each channel in turn, low nibble first. */
+static int ima_block(const u8 *in, int len, int ch, s16 *out) {
+    int pred[2], idx[2];
+    for (int c = 0; c < ch; c++) {
+        pred[c] = (s16)(in[4 * c] | (in[4 * c + 1] << 8));
+        idx[c] = in[4 * c + 2] > 88 ? 88 : in[4 * c + 2];
+        out[c] = (s16)pred[c];
+    }
+    int f = 1;
+    for (const u8 *p = in + 4 * ch; p + 4 * ch <= in + len; p += 4 * ch, f += 8)
+        for (int c = 0; c < ch; c++)
+            for (int b = 0; b < 4; b++) {
+                int byte = p[c * 4 + b];
+                out[(f + b * 2)     * ch + c] = ima_nib(byte & 15, &pred[c], &idx[c]);
+                out[(f + b * 2 + 1) * ch + c] = ima_nib(byte >> 4, &pred[c], &idx[c]);
+            }
+    return f;
+}
+
 /* Fill one buffer from the file and hand it to the DSP. Returns 0 at end of track. */
 static int fill(int i) {
     if (!g_f || g_left <= 0) return 0;
+    if (g_ima) {
+        int nb = MUS_FRAMES / g_spb;                     /* whole blocks that fit the buffer */
+        long want = (long)nb * g_block;
+        if (want > g_left) want = g_left;
+        size_t got = fread(g_stage, 1, (size_t)want, g_f);
+        if (got < (size_t)(4 * g_chan)) return 0;
+        g_left -= (long)got;
+        int frames = 0;
+        for (size_t off = 0; off + 4u * g_chan < got; off += g_block) {
+            int blen = (got - off < (size_t)g_block) ? (int)(got - off) : g_block;
+            frames += ima_block(g_stage + off, blen, g_chan, g_buf[i] + (size_t)frames * g_chan);
+        }
+        if (frames <= 0) return 0;
+        memset(&g_wb[i], 0, sizeof g_wb[i]);
+        g_wb[i].data_vaddr = g_buf[i];
+        g_wb[i].nsamples   = (u32)frames;
+        DSP_FlushDataCache(g_buf[i], (size_t)frames * g_chan * 2);
+        ndspChnWaveBufAdd(MUS_CHAN, &g_wb[i]);
+        return 1;
+    }
     size_t want = (size_t)MUS_FRAMES * g_chan * 2;
     if ((long)want > g_left) want = (size_t)g_left;
     size_t got = fread(g_buf[i], 1, want, g_f);
@@ -105,9 +172,7 @@ static int start_track(int which) {
     ndspChnWaveBufClear(MUS_CHAN);
     if (g_n <= 0) return 0;
     g_at = ((which % g_n) + g_n) % g_n;
-    char path[420];
-    snprintf(path, sizeof path, "%s/%s", g_dir, g_name[g_order[g_at]]);
-    if (!wav_open(path)) return 0;
+    if (!wav_open(g_path[g_order[g_at]])) return 0;
     LightLock_Lock(&g_lock);
     snprintf(g_now, sizeof g_now, "%s", g_name[g_order[g_at]]);
     LightLock_Unlock(&g_lock);
@@ -139,20 +204,28 @@ static void mus_thread(void *arg) {
     }
 }
 
-int music_init(const char *dir) {
-    g_n = 0; g_at = 0; g_playing = 0; g_skip = 0; g_now[0] = 0;   /* entered again: start over */
-    snprintf(g_dir, sizeof g_dir, "%s", dir);
+static void add_dir(const char *dir) {
     DIR *d = opendir(dir);
-    if (!d) return 0;
+    if (!d) return;
     struct dirent *e;
     while ((e = readdir(d)) && g_n < MUS_MAX) {
         size_t L = strlen(e->d_name);
         if (L < 5 || strcasecmp(e->d_name + L - 4, ".wav")) continue;
+        int dup = 0;                                  /* the shipped song also copied to the card */
+        for (int k = 0; k < g_n && !dup; k++) if (!strcasecmp(g_name[k], e->d_name)) dup = 1;
+        if (dup) continue;
         snprintf(g_name[g_n], sizeof g_name[0], "%s", e->d_name);
+        snprintf(g_path[g_n], sizeof g_path[0], "%s/%s", dir, e->d_name);
         g_order[g_n] = g_n;
         g_n++;
     }
     closedir(d);
+}
+
+int music_init(const char *dir) {
+    g_n = 0; g_at = 0; g_playing = 0; g_skip = 0; g_now[0] = 0;   /* entered again: start over */
+    add_dir("romfs:/music");                          /* what ships with the app */
+    add_dir(dir);                                     /* and whatever the owner put on the card */
     if (g_n <= 0) return 0;
 
     /* Shuffle, so it is not the same track every time the shop opens. osGetTime is the only
@@ -184,6 +257,8 @@ int music_init(const char *dir) {
         g_buf[i] = (s16 *)linearAlloc((size_t)MUS_FRAMES * 2 * 2);
         if (!g_buf[i]) { music_exit(); return 0; }
     }
+    g_stage = (u8 *)malloc((size_t)MUS_FRAMES * 2);    /* MUS_FRAMES stereo frames at 4 bits */
+    if (!g_stage) { music_exit(); return 0; }
     LightLock_Init(&g_lock);
     int tries = 0;
     while (tries++ < g_n && !start_track(0)) { }
@@ -216,5 +291,6 @@ void music_exit(void) {
     if (g_ok) { ndspChnWaveBufClear(MUS_CHAN); ndspExit(); g_ok = 0; }
     wav_close();
     for (int i = 0; i < MUS_BUFS; i++) if (g_buf[i]) { linearFree(g_buf[i]); g_buf[i] = NULL; }
+    free(g_stage); g_stage = NULL;
     g_playing = 0;
 }

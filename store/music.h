@@ -1,9 +1,10 @@
-/* Background music for the shop: a folder of PCM16 WAVs, shuffled, streamed to the DSP.
- * Nothing decodes -- see music.c for why this is not mp3. */
+/* Background music for the shop: WAVs (PCM16, or IMA ADPCM) from romfs:/music -- the song that
+ * ships with the app -- plus the owner's own folder on the card, shuffled, streamed to the DSP.
+ * No mp3: see music.c for why. */
 #ifndef STORE_MUSIC_H
 #define STORE_MUSIC_H
 
-/* Scan `dir` for .wav, shuffle, and start playing. Returns the track count, 0 if there is
+/* Collect romfs:/music and `dir`, shuffle, and start playing. Returns the track count, 0 if there is
  * nothing to play or no dsp firm (in which case the shop is simply quiet). */
 int         music_init(const char *dir);
 void        music_next(void);      /* skip to the next track -- what the jukebox does */

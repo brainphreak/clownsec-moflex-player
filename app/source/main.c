@@ -5436,6 +5436,7 @@ int main(void) {
     moflex_set_autonext(autonext_has_next);   /* series roll on to the next episode at EOF */
     osSetSpeedupEnable(true);   /* unlock New 3DS 804MHz clock (no-op on old 3DS) */
     gfxInitDefault();
+    romfsInit();                /* files shipped inside the app (the store's song) */
     ndspInit();
     theme_load();               /* restore the saved theme before anything draws */
 
@@ -5485,6 +5486,7 @@ int main(void) {
     downloader_exit();
     socExit();
     ndspExit();
+    romfsExit();
     gfxExit();
     return 0;
 }

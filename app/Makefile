@@ -52,6 +52,9 @@ export APP_DESCRIPTION := MOFLEX VIDEO PLAYER
 export APP_AUTHOR      := brAinphreAk
 export APP_ICON        := $(TOPDIR)/icon.png
 export _3DSXFLAGS      += --smdh=$(OUTPUT).smdh
+# files that ship inside the app, mounted at romfs:/ (the store's own song lives here). The CIA
+# takes the same folder through RomFs/RootPath in the .rsf files.
+export _3DSXFLAGS      += --romfs=$(TOPDIR)/romfs
 
 .PHONY: all clean $(BUILD)
 all: $(BUILD)
