@@ -103,12 +103,13 @@ static float g_depth = 24.0f;
 #define CASE_W        0.40f     /* a case on the shelf; PITCH_FACE is this plus the gap */
 #define MAX_SECTIONS  11
 /* Floor slots: every bay runs out from a side wall, in left/right pairs from the door back.
- * 0 and 1, the front pair, are NEW RELEASES and OTHER; the genres take the rows behind. Nothing
+ * 0 is NEW RELEASES; the genres follow, and MORE MOVIES stands last, at the back. Nothing
  * stands in the middle of the floor or against the back wall: a centre column squeezed the
  * walkway and the back run covered the shop's name. */
 #define MAX_ROWS      ((MAX_SECTIONS + 1) / 2)
-/* The catch-all: small genres and titles with none. It was OTHER, which read as leftovers. */
-#define CATCH_ALL     "GRAB BAG"
+/* The catch-all: small genres and titles with none. OTHER read as leftovers, GRAB BAG did not
+ * say what was in it. */
+#define CATCH_ALL     "MORE MOVIES"
 #define ROW0_Z        (STORE_Z0 - 8.4f)   /* the first row of bays */
 #define SEC_COLS      3
 #define BAY_ROWS      2
@@ -1780,9 +1781,9 @@ static int genre_token(const char *g, int idx, char *out, size_t cap) {
 static void place_section(int k);
 static void bake_spines(void);
 /* Whether bay i gets an L return. Asked once while the room is sized and again when the bays
- * are placed, so the two must not disagree. The front pair, NEW RELEASES and OTHER, never do. */
+ * are placed, so the two must not disagree. NEW RELEASES never does. */
 static int bay_wants_L(int i) {
-    return (g_sec[i].slot >= 2) && (g_sec[i].len > UNIT_LEN_MIN + 0.4f) &&
+    return i != g_new_idx && (g_sec[i].len > UNIT_LEN_MIN + 0.4f) &&
            (g_sec[i].n * 3 > BAY_ROWS * g_sec[i].per_row + 4);
 }
 static void build_sections(void) {
@@ -1919,14 +1920,16 @@ static void build_sections(void) {
          * out only as wide as it needs to be. It used to clear 2.4 a side off the longest bay
          * with an 8.5 floor under it, which on a short bay left the whole middle of the shop
          * as bare carpet. 1.5 a side is a walkway; the rest was floor to cross. */
-        /* Who stands where: NEW RELEASES front left, OTHER front right, as you walk in; then
-         * the genres, biggest first, in left/right pairs down the room. */
+        /* Who stands where: NEW RELEASES front left as you walk in, then the genres, biggest
+         * first, in left/right pairs down the room, and MORE MOVIES last, at the back. */
         int at[MAX_ROWS * 2];
         for (int j = 0; j < MAX_ROWS * 2; j++) at[j] = -1;
         {
-            int j = 2;
+            int j = (g_new_idx >= 0) ? 1 : 0;
             for (int k = 0; k < g_nsec; k++)
-                g_sec[k].slot = (k == g_new_idx) ? 0 : (k == other_idx) ? 1 : j++;
+                if (k != g_new_idx && k != other_idx) g_sec[k].slot = j++;
+            if (g_new_idx >= 0) g_sec[g_new_idx].slot = 0;
+            g_sec[other_idx].slot = j;
             for (int k = 0; k < g_nsec; k++) at[g_sec[k].slot] = k;
         }
         g_hx = maxlen + 1.5f;
