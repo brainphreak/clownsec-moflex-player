@@ -79,7 +79,10 @@
  * bays know their own lengths. A fixed room with variable bays left a hall of empty carpet up
  * the middle. */
 #define STORE_Z0      2.0f
-#define ROW_PITCH     5.4f      /* front-to-back spacing of the rows of bays */
+#define ROW_PITCH     6.0f      /* front-to-back spacing of the rows of bays. 5.4 left 0.9 m
+                                 * to squeeze past the tip of an L return into the next aisle */
+#define AISLE         2.2f      /* clear floor between two fixtures that face across a walkway.
+                                 * Collision keeps you 0.42 off each side, so this walks as 1.36 */
 static float g_gapz[2] = { -7.3f, -12.7f };   /* midway between rows: where wall art hangs */
 static float g_hx    = 13.5f;
 static float g_depth = 24.0f;
@@ -1766,6 +1769,12 @@ static int genre_token(const char *g, int idx, char *out, size_t cap) {
 
 static void place_section(int k);
 static void bake_spines(void);
+/* Whether bay i gets an L return. Asked once while the room is sized and again when the bays
+ * are placed, so the two must not disagree. The NEW RELEASES rack and the back run never do. */
+static int bay_wants_L(int i) {
+    return (i < 6) && i != g_new_idx && (g_sec[i].len > UNIT_LEN_MIN + 0.4f) &&
+           (g_sec[i].n * 3 > BAY_ROWS * g_sec[i].per_row + 4);
+}
 static void build_sections(void) {
     /* static: at 320 titles these are 9 KB, and a .3dsx main thread has little to spare */
     static char names[MAX_POSTERS][24];
@@ -1905,6 +1914,23 @@ static void build_sections(void) {
         int centre = (g_nsec > 6);
         g_hx = centre ? (maxlen * 1.5f + 1.6f) : (maxlen + 1.5f);
         if (g_hx < 7.2f)  g_hx = 7.2f;
+        /* ...and wide enough to walk through, measured from what each bay actually puts on the
+         * floor. A wall bay reaches its length in from the wall, and a whole unit further when
+         * it has an L return on the end. The formula above knew nothing of the returns: two
+         * facing across the walkway left 0.7 m, and beside the centre column it was shut. */
+        float reach[MAX_SECTIONS];
+        for (int k = 0; k < g_nsec; k++)
+            reach[k] = (k == g_new_idx) ? 0.0f
+                     : g_sec[k].len + 0.15f + (bay_wants_L(k) ? UNIT_DEPTH : 0.0f);
+        for (int r = 0; r < 3; r++) {
+            int l = 2 * r, rt = 2 * r + 1, c = 6 + r;
+            float rl = (l  < g_nsec) ? reach[l]  : 0.0f;
+            float rr = (rt < g_nsec) ? reach[rt] : 0.0f;
+            float need = (rl + rr + AISLE) * 0.5f;                 /* wall bay, aisle, wall bay */
+            if (centre && c < g_nsec && c != g_new_idx)            /* bay, aisle, CENTRE, aisle, bay */
+                need = (rl > rr ? rl : rr) + g_sec[c].len * 0.5f + AISLE;
+            if (g_hx < need) g_hx = need;
+        }
         int side = g_nsec < 6 ? g_nsec : 6;
         int rows = centre ? 3 : (side + 1) / 2;     /* they fill in left/right pairs */
         if (rows < 1) rows = 1;
@@ -1976,8 +2002,7 @@ static void build_sections(void) {
         /* An L return doubles what a bay can hold, so it only goes on where the stock would
          * otherwise overflow. Adding one to a bay that was already going to be short just
          * bought twelve more empty slots. */
-        g_sec[i].has_L   = (i < 6) && (g_sec[i].len > UNIT_LEN_MIN + 0.4f) && !back &&
-                           (g_sec[i].n * 3 > BAY_ROWS * g_sec[i].per_row + 4);
+        g_sec[i].has_L   = bay_wants_L(i) && !back;
         /* the return runs along z at the inner end, facing the walkway */
         float inner = g_sec[i].cx + ((g_sec[i].cx < 0) ? g_sec[i].len * 0.5f : -g_sec[i].len * 0.5f);
         g_sec[i].Llen = 3.2f;
