@@ -81,8 +81,9 @@
 #define STORE_Z0      2.0f
 #define ROW_PITCH     6.0f      /* front-to-back spacing of the rows of bays. 5.4 left 0.9 m
                                  * to squeeze past the tip of an L return into the next aisle */
-#define AISLE         2.2f      /* clear floor between two fixtures that face across a walkway.
-                                 * Collision keeps you 0.42 off each side, so this walks as 1.36 */
+#define AISLE         3.0f      /* clear floor between two fixtures that face across a walkway.
+                                 * Collision keeps you 0.42 off each side, so this walks as 2.16;
+                                 * 2.2 (1.36 to walk) felt tight on the 3DS */
 static float g_gapz[2] = { -7.3f, -12.7f };   /* midway between rows: where wall art hangs */
 static float g_hx    = 13.5f;
 static float g_depth = 24.0f;
@@ -101,15 +102,14 @@ static float g_depth = 24.0f;
 #define ROW_DY        0.68f     /* row to row -- a case is 0.47 tall, so this is a shelf gap */
 #define CASE_W        0.40f     /* a case on the shelf; PITCH_FACE is this plus the gap */
 #define MAX_SECTIONS  11
-/* Floor slots. 0-5 run out from the side walls in left/right pairs, door end first; 6-8 are the
- * centre column, door end first. The rest are placed by hand. */
-#define SLOT_BACK_R   9         /* against the back wall, right of the shop name */
-#define SLOT_BACK_L   10        /* left of it: OTHER, the catch-all, goes to the back */
-#define SLOT_FRONT    11        /* NEW RELEASES: a rack facing the door as you walk in */
-#define FRONT_Z       (STORE_Z0 - 5.6f)   /* its centre: clear of the counter and the jukebox */
-#define ROW0_Z        (STORE_Z0 - 11.2f)  /* the first row of bays. Far enough behind the front
-                                            * rack that their L returns end before it does, so
-                                            * nothing has to make the room wider to pass between */
+/* Floor slots: every bay runs out from a side wall, in left/right pairs from the door back.
+ * 0 and 1, the front pair, are NEW RELEASES and OTHER; the genres take the rows behind. Nothing
+ * stands in the middle of the floor or against the back wall: a centre column squeezed the
+ * walkway and the back run covered the shop's name. */
+#define MAX_ROWS      ((MAX_SECTIONS + 1) / 2)
+/* The catch-all: small genres and titles with none. It was OTHER, which read as leftovers. */
+#define CATCH_ALL     "GRAB BAG"
+#define ROW0_Z        (STORE_Z0 - 8.4f)   /* the first row of bays */
 #define SEC_COLS      3
 #define BAY_ROWS      2
 #define PITCH_SPINE   0.235f
@@ -226,7 +226,7 @@ typedef struct {
                                  * Alternated down the room so bays face each other across an
                                  * aisle, the way a shop lays them out. */
     int     has_L;              /* an L return on the inner end -- no poster fits there */
-    int     slot;               /* where it stands: SLOT_* below, or 0-5 the walls, 6-8 centre */
+    int     slot;               /* where it stands: row slot/2, left wall when even */
     int     more_idx;           /* the MORE case for this bay, -1 if it all fits */
     int     hide;               /* nothing was filed here: build no unit, sign or blocker */
 } Section;
@@ -1780,9 +1780,9 @@ static int genre_token(const char *g, int idx, char *out, size_t cap) {
 static void place_section(int k);
 static void bake_spines(void);
 /* Whether bay i gets an L return. Asked once while the room is sized and again when the bays
- * are placed, so the two must not disagree. The NEW RELEASES rack and the back run never do. */
+ * are placed, so the two must not disagree. The front pair, NEW RELEASES and OTHER, never do. */
 static int bay_wants_L(int i) {
-    return (g_sec[i].slot < 6) && (g_sec[i].len > UNIT_LEN_MIN + 0.4f) &&
+    return (g_sec[i].slot >= 2) && (g_sec[i].len > UNIT_LEN_MIN + 0.4f) &&
            (g_sec[i].n * 3 > BAY_ROWS * g_sec[i].per_row + 4);
 }
 static void build_sections(void) {
@@ -1833,7 +1833,7 @@ static void build_sections(void) {
         }
     }
     for (int i = 0; i < uniq; i++) if (count[i] >= BAY_MIN) continue; else (void)0;
-    snprintf(g_sec[g_nsec].name, 24, "%s", other ? "OTHER" : "GENERAL");
+    snprintf(g_sec[g_nsec].name, 24, "%s", CATCH_ALL);
     int other_idx = g_nsec++;
     /* A rack of its own in the back corner, angled to the room. It is an ordinary bay in every
      * respect -- unit, boards, sign, blocker all come from the same code -- it just takes its
@@ -1919,54 +1919,34 @@ static void build_sections(void) {
          * out only as wide as it needs to be. It used to clear 2.4 a side off the longest bay
          * with an 8.5 floor under it, which on a short bay left the whole middle of the shop
          * as bare carpet. 1.5 a side is a walkway; the rest was floor to cross. */
-        /* Past six sections a third column runs down the middle of the room, so the floor has
-         * to carry three bays across instead of two: bay, aisle, bay, aisle, bay. */
-        /* Who stands where. Genres take the walls first, biggest first. The centre column is
-         * only built for two or more -- one bay alone in the middle of the floor was a big
-         * OTHER standing by the door with nothing either side. A single extra genre goes to
-         * the back wall instead, beside OTHER. */
-        int at[SLOT_FRONT + 1];
-        for (int j = 0; j <= SLOT_FRONT; j++) at[j] = -1;
+        /* Who stands where: NEW RELEASES front left, OTHER front right, as you walk in; then
+         * the genres, biggest first, in left/right pairs down the room. */
+        int at[MAX_ROWS * 2];
+        for (int j = 0; j < MAX_ROWS * 2; j++) at[j] = -1;
         {
-            int ng = 0;
-            for (int k = 0; k < g_nsec; k++) if (k != g_new_idx && k != other_idx) ng++;
-            int extra = ng > 6 ? ng - 6 : 0;
-            int ncentre = extra >= 2 ? (extra > 3 ? 3 : extra) : 0;
-            int j = 0;
-            for (int k = 0; k < g_nsec; k++) {
-                if (k == g_new_idx || k == other_idx) continue;
-                g_sec[k].slot = (j < 6) ? j : (j - 6 < ncentre) ? 6 + (j - 6) : SLOT_BACK_R;
-                j++;
-            }
-            g_sec[other_idx].slot = SLOT_BACK_L;
-            if (g_new_idx >= 0) g_sec[g_new_idx].slot = SLOT_FRONT;
+            int j = 2;
+            for (int k = 0; k < g_nsec; k++)
+                g_sec[k].slot = (k == g_new_idx) ? 0 : (k == other_idx) ? 1 : j++;
             for (int k = 0; k < g_nsec; k++) at[g_sec[k].slot] = k;
         }
-        int centre = (at[6] >= 0);
-        g_hx = centre ? (maxlen * 1.5f + 1.6f) : (maxlen + 1.5f);
+        g_hx = maxlen + 1.5f;
         if (g_hx < 7.2f)  g_hx = 7.2f;
         /* ...and wide enough to walk through, measured from what each bay actually puts on the
          * floor. A wall bay reaches its length in from the wall, and a whole unit further when
          * it has an L return on the end. The formula above knew nothing of the returns: two
-         * facing across the walkway left 0.7 m, and beside the centre column it was shut. */
-        float reach[6], hasL[6];
-        for (int j = 0; j < 6; j++) {
-            int k = at[j];
-            hasL[j]  = (k >= 0 && bay_wants_L(k)) ? 1.0f : 0.0f;
-            reach[j] = (k >= 0) ? g_sec[k].len + 0.15f + hasL[j] * UNIT_DEPTH : 0.0f;
-        }
-        for (int r = 0; r < 3; r++) {
-            float rl = reach[2 * r], rr = reach[2 * r + 1];
-            float need = (rl + rr + AISLE) * 0.5f;                 /* wall bay, aisle, wall bay */
-            if (at[6 + r] >= 0)                                    /* bay, aisle, CENTRE, aisle, bay */
-                need = (rl > rr ? rl : rr) + g_sec[at[6 + r]].len * 0.5f + AISLE;
+         * facing across the walkway left 0.7 m. */
+        int rows = 1;
+        for (int j = 0; j < MAX_ROWS * 2; j++) if (at[j] >= 0 && j / 2 + 1 > rows) rows = j / 2 + 1;
+        for (int r = 0; r < rows; r++) {
+            float rr[2];
+            for (int sd = 0; sd < 2; sd++) {
+                int k = at[2 * r + sd];
+                rr[sd] = (k < 0) ? 0.0f
+                       : g_sec[k].len + 0.15f + (bay_wants_L(k) ? UNIT_DEPTH : 0.0f);
+            }
+            float need = (rr[0] + rr[1] + AISLE) * 0.5f;          /* wall bay, aisle, wall bay */
             if (g_hx < need) g_hx = need;
         }
-        /* the back run stops short of the staff door and its crates, 2.3 in from the right */
-        if (at[SLOT_BACK_R] >= 0 && g_hx < g_sec[at[SLOT_BACK_R]].len + 1.4f + 3.1f)
-            g_hx = g_sec[at[SLOT_BACK_R]].len + 1.4f + 3.1f;
-        int rows = 1;                               /* they fill in left/right pairs */
-        for (int j = 0; j < 9; j++) if (at[j] >= 0) { int r = (j < 6) ? j / 2 : j - 6; if (r + 1 > rows) rows = r + 1; }
         g_depth = (STORE_Z0 - ROW0_Z) + rows * ROW_PITCH + 1.0f;   /* door end + aisles + the back run */
         if (g_depth < 13.0f) g_depth = 13.0f;
     }
@@ -1975,54 +1955,19 @@ static void build_sections(void) {
      * their far end against the wall, leaving a clear walkway up the middle of the room that
      * reaches every section. Islands floating in open carpet read as crates; this reads as a
      * shop you can navigate. The back corners turn in to close the room off. */
-    /* left column, right column, then a pair across the back -- spaced to the room's depth */
-    float rowz[3];
-    for (int r = 0; r < 3; r++) rowz[r] = ROW0_Z - r * ROW_PITCH;
+    float rowz[MAX_ROWS];
+    for (int r = 0; r < MAX_ROWS; r++) rowz[r] = ROW0_Z - r * ROW_PITCH;
     g_gapz[0] = (rowz[0] + rowz[1]) * 0.5f;   /* midway between rows: where wall art hangs */
     g_gapz[1] = (rowz[1] + rowz[2]) * 0.5f;
     /* left, right, left, right... A column-at-a-time order put the first three bays all on
      * one wall, so a shop with three sections had a bare side. */
-    /* Left and right walls first, because a shop with a bare side reads as unfinished, then
-     * the centre column, then the back wall. An x sign of 0 IS the centre: cx works out to
-     * zero through the same expression the wall bays use, with no special case. */
-    const float PLAN[9][3] = {          /* x sign, z, rotation */
-        { -1.0f, rowz[0], 0.0f },
-        {  1.0f, rowz[0], 0.0f },
-        { -1.0f, rowz[1], 0.0f },
-        {  1.0f, rowz[1], 0.0f },
-        { -1.0f, rowz[2], 0.0f },
-        {  1.0f, rowz[2], 0.0f },
-        {  0.0f, rowz[0], 0.0f },                  /* the centre column */
-        {  0.0f, rowz[1], 0.0f },
-        {  0.0f, rowz[2], 0.0f },
-    };
     for (int i = 0; i < g_nsec; i++) {
         /* the far end sits against the wall; the near end reaches toward the walkway by
          * however long this bay needs to be */
-        if (g_sec[i].slot == SLOT_FRONT) {
-            /* Out on the floor facing the door, the first thing you see walking in -- where
-             * a rental shop puts the new releases. Square to the room like everything else:
-             * the sign and poster code both assume a bay faces the way the room does. */
-            g_sec[i].cx  = 0.0f;
-            g_sec[i].cz  = FRONT_Z;
-            g_sec[i].rot = 0.0f;
-            g_sec[i].facedir = 1.0f;
-            g_sec[i].has_L = 0;
-            make_sign_tex(&g_sec[i].sign, g_sec[i].name);
-            g_sec[i].sign_ok = 1;
-            continue;
-        }
         int   slot = g_sec[i].slot;
-        int   back = (slot == SLOT_BACK_L || slot == SLOT_BACK_R);
-        float side = back ? (slot == SLOT_BACK_L ? -1.0f : 1.0f) : PLAN[slot][0];
-        float pz   = back ? 0.0f : PLAN[slot][1];
-        if (back) { g_sec[i].cx = side * (g_sec[i].len * 0.5f + 1.4f);
-                    g_sec[i].cz = STORE_Z0 - STORE_DEPTH + UNIT_DEPTH * 0.5f + 0.06f; }
-                    /* Flush to the wall. Standing it off left a strip of floor you could see
-                     * but not use, which reads worse than no gap at all -- and these face
-                     * forward, so there is nothing behind them to reach. */
-        else      { g_sec[i].cx = side * (STORE_HX - g_sec[i].len * 0.5f - 0.15f);
-                    g_sec[i].cz = pz; }
+        float side = (slot & 1) ? 1.0f : -1.0f;
+        g_sec[i].cx  = side * (STORE_HX - g_sec[i].len * 0.5f - 0.15f);
+        g_sec[i].cz  = rowz[slot / 2];
         g_sec[i].rot = 0.0f;
         /* Every bay faces the door. Alternating them meant half the shop had its stock on
          * the far side, so you walked past a plain wooden back and had to go round to see
@@ -2034,7 +1979,7 @@ static void build_sections(void) {
         /* An L return doubles what a bay can hold, so it only goes on where the stock would
          * otherwise overflow. Adding one to a bay that was already going to be short just
          * bought twelve more empty slots. */
-        g_sec[i].has_L   = bay_wants_L(i) && !back;
+        g_sec[i].has_L   = bay_wants_L(i);
         /* the return runs along z at the inner end, facing the walkway */
         float inner = g_sec[i].cx + ((g_sec[i].cx < 0) ? g_sec[i].len * 0.5f : -g_sec[i].len * 0.5f);
         g_sec[i].Llen = 3.2f;
@@ -2181,7 +2126,7 @@ static void build_sections(void) {
          * only page one was ever topped up. Every page is a shelf someone looks at. */
         int want = g_sec[k].pages * g_sec[k].cap;
         if (g_sec[k].n == 0 || g_sec[k].n >= want) continue;
-        int named = strcasecmp(g_sec[k].name, "OTHER") && strcasecmp(g_sec[k].name, "GENERAL");
+        int named = strcasecmp(g_sec[k].name, CATCH_ALL) && strcasecmp(g_sec[k].name, "GENERAL");
         int base = g_nposters;                     /* snapshot: we are appending as we go */
         if (named)
             for (int i = 0; i < base && g_sec[k].n < want; i++)
