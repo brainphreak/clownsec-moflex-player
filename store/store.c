@@ -113,6 +113,7 @@ static float g_depth = 24.0f;
  * because there are only five shows would hide the one section a viewer goes straight to. It
  * simply ends up the shortest bay in the room, which is what it looks like in a real shop. */
 #define TV_SECTION    "TV SHOWS"
+#define MUSIC_SECTION "MUSIC"     /* the same rule as TV: shown whenever there is any */
 #define MAX_COPIES    3         /* extra facings of one title: four on the shelf, never twelve */
 #define BAY_MAX      32
 #define PER_ROW      22         /* the most cases a full-length bay holds in a row */
@@ -382,13 +383,15 @@ static int season_key(const char *nm, char *key, size_t kcap, char *show, size_t
     return 0;
 }
 
-/* music videos are not what anyone walks into a rental shop for */
+/* Music videos, concerts and musicals all go on one MUSIC shelf, like television: a category
+ * of its own, not a genre among the films. The category "Music"/"Music Video", or a genre
+ * naming Music, Musical or Concert anywhere in the list. Only the start of a word counts, so
+ * "Music" also catches "Musical" and "Concert" catches "Concerts". */
 static int is_music(const Poster *p) {
-    /* "Music", "Music Video", "Music Videos" -- and a genre naming it anywhere in the list,
-     * not only first. Matching the exact word "Music" let most of them straight onto a shelf. */
     if (!strncasecmp(p->category, "Music", 5)) return 1;
     for (const char *q = p->genres; *q; q++)
-        if ((q == p->genres || q[-1] == ',' || q[-1] == ' ') && !strncasecmp(q, "Music", 5)) return 1;
+        if ((q == p->genres || q[-1] == ',' || q[-1] == ' ') &&
+            (!strncasecmp(q, "Music", 5) || !strncasecmp(q, "Concert", 7))) return 1;
     return 0;
 }
 
@@ -503,15 +506,18 @@ static int scan_dir(const char *dir, int fixed_w, int fixed_h, int with_nfo, int
             read_nfo(nfo, p);
         }
         /* by here the .nfo has been read, so the category and the real title are known */
-        if (is_music(p)) { memset(p, 0, sizeof *p); continue; }
         /* Television goes on its own shelf rather than in among the films. The category says
          * so plainly, so it is put at the head of the genre list and the ordinary section
-         * machinery does the rest: it earns a bay like any other genre, and if there are too
-         * few episodes to fill one they fall back to Animation or Comedy as before. */
-        if (!strncasecmp(p->category, "TV", 2)) {
-            char g2[80]; snprintf(g2, sizeof g2, "%s", p->genres);
-            if (g2[0]) snprintf(p->genres, sizeof p->genres, "TV SHOWS, %.60s", g2);
-            else       snprintf(p->genres, sizeof p->genres, "TV SHOWS");
+         * machinery does the rest: it gets a bay however few there are. Music is the same,
+         * checked second so a series about a band stays with the television. */
+        {
+            const char *cat = !strncasecmp(p->category, "TV", 2) ? TV_SECTION
+                            : is_music(p)                         ? MUSIC_SECTION : NULL;
+            if (cat) {
+                char g2[80]; snprintf(g2, sizeof g2, "%s", p->genres);
+                if (g2[0]) snprintf(p->genres, sizeof p->genres, "%s, %.60s", cat, g2);
+                else       snprintf(p->genres, sizeof p->genres, "%s", cat);
+            }
         }
         {   char sk[128], show[80];
             if (season_key(key, sk, sizeof sk, show, sizeof show) ||
@@ -1046,7 +1052,7 @@ static int     g_detail_ok = 0, g_detail_for = -1;
  * it -- 64 KB a title would make every library change rewrite tens of MB; the near-cover loader
  * reads them from their own files on a thread instead. */
 #define PAK_MAGIC   0x4B505343u        /* "CSPK" */
-#define PAK_VERSION 1
+#define PAK_VERSION 2         /* 2: music titles are stocked, not dropped */
 #define DET_BYTES   ((size_t)DET_W * DET_H * 2)
 typedef struct { u32 magic, version, posz, n, sig, ncov, from_data, collapsed; } PakHdr;
 
@@ -1789,7 +1795,8 @@ static void build_sections(void) {
     int spare = MAX_SECTIONS;
     int other = 0;
     for (int i = 0; i < uniq && spare > 2; i++) {   /* two held back: OTHER and NEW RELEASES */
-        if (count[i] < BAY_MIN && strcasecmp(names[i], TV_SECTION)) { other += count[i]; continue; }
+        if (count[i] < BAY_MIN && strcasecmp(names[i], TV_SECTION) &&
+            strcasecmp(names[i], MUSIC_SECTION)) { other += count[i]; continue; }
         /* A genre may take a SECOND bay when it has the stock for one, but never a third --
          * that is what once turned ten genres into seventeen bays and a great deal of floor to
          * cross. Two is what fills the centre column without the room running away. Anything
@@ -2071,6 +2078,7 @@ static void build_sections(void) {
     for (int k = 0; k < g_nsec; k++) {
         if (k == g_new_idx || g_sec[k].n == 0 || g_sec[k].n >= BAY_MIN) continue;
         if (!strcasecmp(g_sec[k].name, TV_SECTION)) continue;   /* television keeps its shelf */
+        if (!strcasecmp(g_sec[k].name, MUSIC_SECTION)) continue;   /* and so does music */
         int big = -1;
         for (int j = 0; j < g_nsec; j++) {
             if (j == k || j == g_new_idx || g_sec[j].n < BAY_MIN) continue;
