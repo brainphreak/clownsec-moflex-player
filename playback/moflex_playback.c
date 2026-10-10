@@ -774,6 +774,10 @@ static int ass_ts(const char *p, int64_t *us) {
     return 1;
 }
 #define ASS_MAXSTY 64
+/* An embedded subtitle section bigger than this is ignored. Raw fansub ASS with per-syllable
+ * karaoke reaches 1.4 MB (High School DxD S04E02); it is copied out in chunks and filtered as
+ * it loads, so the cap only guards against a corrupt length. */
+#define TRA_SUB_MAX (8 * 1024 * 1024)
 #define ASS_FX_SHORT 250000      /* us: per-frame karaoke is 40 ms, real dialogue never this short */
 #define ASS_LINE 2048            /* karaoke lines run long; a cut line would leak into the next */
 typedef struct { char name[40]; u32 col; u8 ital, bold, an; } AssStyle;
@@ -789,7 +793,18 @@ static int subs_load_ass(FILE *f) {
     /* field indices from the Format lines (defaults = the standard V4+ order) */
     int sN = 0, sCol = 3, sBo = 7, sIt = 8, sAl = 18, sCnt = 23;
     int eSt = 1, eEn = 2, eSy = 3, eTx = 9, eCnt = 10;
+    static u8 fx[ASS_MAXSTY + 1];
     memset(st_n, 0, sizeof st_n); memset(st_short, 0, sizeof st_short); memset(st_tiny, 0, sizeof st_tiny);
+    /* Two passes. The first only counts, per style, to find the effect layers; the second
+     * stores the cues that are not in one. Filtering after storing let a raw fansub file fill
+     * all SUB_MAX slots with opening karaoke and cut the dialogue off at 2:08. */
+    for (int pass = 0; pass < 2; pass++) {
+    if (pass) {
+        for (int k = 0; k <= ASS_MAXSTY; k++)
+            fx[k] = st_n[k] >= 50 && (st_short[k] * 2 > st_n[k] || st_tiny[k] * 2 > st_n[k]);
+        rewind(f);
+        sec = 0;
+    }
     while (fgets(line, sizeof line, f)) {
         char *l = sub_trim(line);
         if ((u8)l[0] == 0xEF && (u8)l[1] == 0xBB && (u8)l[2] == 0xBF) l += 3;
@@ -821,7 +836,7 @@ static int subs_load_ass(FILE *f) {
                 eCnt = n;
             }
         }
-        else if (sec == 2 && !strcasecmp(key, "Style") && nsty < ASS_MAXSTY) {
+        else if (sec == 2 && !strcasecmp(key, "Style") && nsty < ASS_MAXSTY && !pass) {
             char *fl[32]; int n = ass_split(val, fl, sCnt < 32 ? sCnt : 32);
             if (n <= sN) continue;
             AssStyle *s = &sty[nsty++];
@@ -843,15 +858,16 @@ static int subs_load_ass(FILE *f) {
             int si = ASS_MAXSTY;                                /* unknown style -> its own bucket */
             if (eSy < n) { char *nm = sub_trim(fl[eSy]); if (*nm == '*') nm++;
                            for (int k = 0; k < nsty; k++) if (!strcasecmp(sty[k].name, nm)) { si = k; break; } }
-            st_n[si]++;
-            if (e - s < ASS_FX_SHORT) { st_short[si]++; continue; }
+            if (pass && fx[si]) continue;                       /* an effect layer */
+            if (!pass) st_n[si]++;
+            if (e - s < ASS_FX_SHORT) { if (!pass) st_short[si]++; continue; }
             SubTags tg; sub_tags_init(&tg);
             sub_tags(fl[eTx], raw, sizeof raw, &tg);
             char clean[SUB_TXT]; sub_clean(raw, clean, sizeof clean);
             char *t = sub_trim(clean);
             if (!*t) continue;                                  /* a drawing, or tags with no text */
             int cps = 0; for (const char *q = t; *q; ) { uint32_t cp = u8_next(&q); if (cp > ' ') cps++; }
-            if (cps <= 2) st_tiny[si]++;
+            if (!pass) { if (cps <= 2) st_tiny[si]++; continue; }   /* pass 1 only counts */
             int an = tg.an ? tg.an : (si < nsty ? sty[si].an : 2);
             SubCue *c = &g_subs[g_nsubs];
             c->s = s; c->e = e; c->ord = (u16)g_nsubs; c->sty = (u8)si;
@@ -863,15 +879,10 @@ static int subs_load_ass(FILE *f) {
             g_nsubs++;
         }
     }
-    /* effect layers: a style with 50+ events, most of them too short to read or a glyph or two
-     * long, is karaoke/typesetting animation, not subtitles (ass_to_srt.karaoke_styles) */
-    int w = 0;
-    for (int i = 0; i < g_nsubs; i++) {
-        int k = g_subs[i].sty, n = st_n[k];
-        int fx = n >= 50 && (st_short[k] * 2 > n || st_tiny[k] * 2 > n);
-        if (!fx) { if (w != i) g_subs[w] = g_subs[i]; w++; }
     }
-    g_nsubs = w;
+    /* (fx above) effect layers: a style with 50+ events, most of them too short to read or a
+     * glyph or two long, is karaoke/typesetting animation, not subtitles -- the same rule as the
+     * builder's ass_to_srt.karaoke_styles */
     return g_nsubs;
 }
 static int subs_load(const char *path) {
@@ -988,11 +999,11 @@ static void trailer_probe(FILE *f) {
         if (fread(h, 1, 8, f) != 8) break;
         u32 len = h[4] | (h[5] << 8) | ((u32)h[6] << 16) | ((u32)h[7] << 24);
         if (len == 0 || p + 8 + (s64)len > end) break;   /* zero/overrun = corrupt trailer: stop */
-        if (!memcmp(h, "SUB0", 4) && len > 0 && len <= 1024 * 1024 && g_tra.sub_n < 16) {
+        if (!memcmp(h, "SUB0", 4) && len > 0 && len <= TRA_SUB_MAX && g_tra.sub_n < 16) {
             int k = g_tra.sub_n++;
             g_tra.sub_off[k] = p + 8; g_tra.sub_len[k] = len; g_tra.sub_lang[k][0] = 0;
         }
-        else if (!memcmp(h, "SUB1", 4) && len > 4 && len <= 1024 * 1024 && g_tra.sub_n < 16) {
+        else if (!memcmp(h, "SUB1", 4) && len > 4 && len <= TRA_SUB_MAX && g_tra.sub_n < 16) {
             u8 l[4]; int k = g_tra.sub_n++;
             if (fread(l, 1, 4, f) == 4) { memcpy(g_tra.sub_lang[k], l, 3); g_tra.sub_lang[k][3] = 0; }
             g_tra.sub_off[k] = p + 12; g_tra.sub_len[k] = len - 4;
@@ -1032,15 +1043,25 @@ static int trsub_stash(const char *path, int k) {
     if (k < 0 || k >= g_tra.sub_n) return 0;
     FILE *sf = fopen(path, "rb");
     if (!sf) return 0;
-    char *buf = (char *)malloc(g_tra.sub_len[k]);
+    /* in chunks: a raw fansub track can run to megabytes, and the heap is needed for video */
+    static char buf[32 * 1024];
     int ok = 0;
-    if (buf && !fseeko(sf, g_tra.sub_off[k], SEEK_SET) &&
-        fread(buf, 1, g_tra.sub_len[k], sf) == g_tra.sub_len[k]) {
+    if (!fseeko(sf, g_tra.sub_off[k], SEEK_SET)) {
         mkdir("sdmc:/moflex_player", 0777);
         FILE *o = fopen(EMB_SRT, "wb");
-        if (o) { fwrite(buf, 1, g_tra.sub_len[k], o); fclose(o); ok = 1; }
+        if (o) {
+            u32 left = g_tra.sub_len[k];
+            while (left) {
+                size_t n = left < sizeof buf ? left : sizeof buf;
+                if (fread(buf, 1, n, sf) != n || fwrite(buf, 1, n, o) != n) break;
+                left -= (u32)n;
+            }
+            fclose(o);
+            ok = (left == 0);
+            if (!ok) remove(EMB_SRT);                   /* never leave half a track to load */
+        }
     }
-    free(buf); fclose(sf);
+    fclose(sf);
     return ok;
 }
 
