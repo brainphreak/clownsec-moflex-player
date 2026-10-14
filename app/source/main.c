@@ -3844,7 +3844,8 @@ static int scr_find(const char *moviepath, const char *lstem, const char *hint, 
     int first = -1, year0 = 0, mixed = 0;
     for (int i = 0; i < nc; i++) {
         int r = scr_match(lstem, &cat[i]);
-        if (r != 1 && hint && hint[0]) { int h = scr_match(hint, &cat[i]); if (h) r = r ? (h < r ? h : r) : h; }
+        if (!r && hint && hint[0]) r = scr_match(hint, &cat[i]);   /* hint only when the file says nothing:
+                                                                     * it is the CACHED name, maybe the wrong film's */
         if (r == 1) return i;
         if (r != 2) continue;
         if (first < 0) first = i;
@@ -3857,7 +3858,7 @@ static int scr_find(const char *moviepath, const char *lstem, const char *hint, 
     int pick = -1, pick_year = 0;
     for (int i = first; i < nc; i++) {
         int r = scr_match(lstem, &cat[i]);
-        if (r != 2 && hint && hint[0]) r = scr_match(hint, &cat[i]);
+        if (!r && hint && hint[0]) r = scr_match(hint, &cat[i]);
         if (r != 2 || cat[i].runtime <= 0) continue;
         int tol = cat[i].runtime / 10; if (tol < 3) tol = 3;
         if (abs(mins - cat[i].runtime) > tol) continue;
