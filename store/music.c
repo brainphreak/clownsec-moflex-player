@@ -260,8 +260,7 @@ int music_init(const char *dir) {
     g_stage = (u8 *)malloc((size_t)MUS_FRAMES * 2);    /* MUS_FRAMES stereo frames at 4 bits */
     if (!g_stage) { music_exit(); return 0; }
     LightLock_Init(&g_lock);
-    int tries = 0;
-    while (tries++ < g_n && !start_track(0)) { }
+    for (int k = 0; k < g_n && !start_track(k); k++) { }   /* a bad first file: try the next, not it again */
     if (!g_f) { music_exit(); return 0; }
 
     g_run = 1;

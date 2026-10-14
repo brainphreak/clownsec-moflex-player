@@ -1067,7 +1067,7 @@ static int     g_detail_ok = 0, g_detail_for = -1;
  * it -- 64 KB a title would make every library change rewrite tens of MB; the near-cover loader
  * reads them from their own files on a thread instead. */
 #define PAK_MAGIC   0x4B505343u        /* "CSPK" */
-#define PAK_VERSION 2         /* 2: music titles are stocked, not dropped */
+#define PAK_VERSION 3         /* 2: music titles are stocked, not dropped; 3: same title, other year = 2 cases */
 #define DET_BYTES   ((size_t)DET_W * DET_H * 2)
 typedef struct { u32 magic, version, posz, n, sig, ncov, from_data, collapsed; } PakHdr;
 
