@@ -1090,6 +1090,33 @@ static u32 pak_sig(void) {
     return h ^ (u32)n;
 }
 
+/* Covers made before Get Info cleared them on a rewrite can show the wrong film (a re-scraped
+ * Lion King kept the 2019 cover). Throw every scaled cover away once, so each is remade from the
+ * poster in moviedata/ as it is now. Bump COVERS_VER to do it again. */
+#define COVERS_VER "2"
+static void covers_reset_once(void) {
+    char mark[128]; snprintf(mark, sizeof mark, "%s/covers.ver", CACHE_DIR);
+    char v[8] = ""; FILE *f = fopen(mark, "rb");
+    if (f) { if (!fgets(v, sizeof v, f)) v[0] = 0; fclose(f); }
+    if (!strcmp(v, COVERS_VER)) return;
+    DIR *d = opendir(CACHE_DIR);
+    if (d) {
+        struct dirent *e; char p[400];
+        while ((e = readdir(d))) {
+            size_t L = strlen(e->d_name);
+            if (L < 6 || (strcmp(e->d_name + L - 5, ".w565") && strcmp(e->d_name + L - 5, ".t565") &&
+                          strcmp(e->d_name + L - 5, ".s565"))) continue;
+            if (!strcmp(e->d_name, "restock.w565")) continue;    /* built-in art, not a movie */
+            snprintf(p, sizeof p, "%s/%s", CACHE_DIR, e->d_name); remove(p);
+            load_poll();
+        }
+        closedir(d);
+    }
+    remove(STORE_PACK);                   /* the pack carries shelf covers too */
+    mkdir(CACHE_DIR, 0777);
+    if ((f = fopen(mark, "wb"))) { fputs(COVERS_VER, f); fclose(f); }
+}
+
 /* 1 = the shop came out of the pack (g_pos filled, shelf covers uploaded), 0 = do it the long way */
 static int pak_load(u32 sig) {
     FILE *f = fopen(STORE_PACK, "rb");
@@ -3112,6 +3139,7 @@ int store_run(int (*resolve)(const char *key, char *out, size_t cap), char *out,
     int built = 0;
     u64 t_load0 = osGetTime();
     load_step("checking your library");
+    covers_reset_once();
     u32 sig = pak_sig();
     int from_pak = !s_load_abort && pak_load(sig);
     if (!from_pak) load_step("reading your library");

@@ -5398,6 +5398,17 @@ static int store_resolve(const char *key, char *out, size_t cap) {
 }
 /* 1 = picked a movie (out set), 0 = walked out, -1 = app closing */
 static int store_pick(char *out, size_t cap) {
+    /* The store stocks only movies that are in the library AND have info. Coming here before
+     * ever opening LIBRARY meant no library list at all, so every case was filtered out and the
+     * shelves stood empty: scan first, exactly as LIBRARY does on its first visit. */
+    if (lib_load() <= 0) { msg_screen("WALK THE AISLE", "No movies found on the SD card."); return 0; }
+    int have = 0;
+    for (int i = 0; i < g_lib_n && !have; i++) have = movieinfo_have(g_lib[i].url);
+    if (!have) {
+        msg_screen("WALK THE AISLE", "Your movies have no info yet, so the\nshelves would be empty.\n\n"
+                                     "Open LIBRARY and use GET INFO,\nthen come back.");
+        return 0;
+    }
     int r = store_run(store_resolve, out, cap);
     consoleInit(GFX_BOTTOM, NULL);            /* the store drew the bottom as a console */
     gfxSetDoubleBuffering(GFX_BOTTOM, false);
