@@ -125,6 +125,8 @@ This is the short tour — the complete list of everything the player does lives
   Light, Amber, Ice) or build your own with the **Custom** color editor (R/G/B sliders for each
   of the accents, text, and background). Open it from the swatch chip on the home screen or press
   **Y**; your choice is saved and applied everywhere. See [Themes](#themes).
+- **Walk the Aisle** — browse your library as a walkable 3D video store, with a jukebox you can
+  fill with your own songs. See [Walk the Aisle](#walk-the-aisle--adding-your-own-music).
 - **Turn off the bottom screen** during playback — tap the **moon** button on the player to power
   off the bottom backlight while the movie keeps playing up top (saves battery / kills the glow in
   the dark). Any button press wakes it back up.
@@ -368,6 +370,49 @@ During playback, tap **CC** on the bottom screen (or press **SELECT**) to open s
   sidecar isn't named to match)
 
 Position, size, and depth are remembered across movies; the delay resets per movie.
+
+## Walk the Aisle — adding your own music
+
+**WALK THE AISLE** on the home screen opens a 3D video store stocked with your library. The store
+has a jukebox, and you can load it with your own songs.
+
+**Where they go:** copy `.wav` files to
+
+```
+sdmc:/moflex_player/music/
+```
+
+Create the `music` folder if it isn't there. The next time you enter the store, your songs are
+added to the built-in track and played in shuffled order. Press **ZR** anywhere in the store, or
+stand at the jukebox and press **A**, to skip to the next song. The jukebox shows the filename
+(without `.wav`) as the song title, so name files the way you want them to appear, e.g.
+`Take on Me.wav`. Up to 64 songs are read.
+
+**The format matters.** Songs must be **WAV**, encoded as one of:
+
+- **16-bit PCM** (the standard uncompressed WAV), or
+- **IMA ADPCM** (about a quarter of the size of PCM)
+
+Mono or stereo, at any sample rate. **MP3, AAC, FLAC, 8-bit, 24-bit and 32-bit float WAVs are
+skipped.** MP3 is deliberately not supported: decoding it would cost frame rate while you walk the
+store.
+
+The easiest way to convert a song is [ffmpeg](https://ffmpeg.org/):
+
+```
+# 16-bit PCM, mono 32 kHz (~3.8 MB a minute)
+ffmpeg -i "Take on Me.mp3" -ac 1 -ar 32000 -c:a pcm_s16le "Take on Me.wav"
+
+# smaller: IMA ADPCM (~1 MB a minute)
+ffmpeg -i "Take on Me.mp3" -ac 1 -ar 32000 -c:a adpcm_ima_wav "Take on Me.wav"
+```
+
+Use `-ac 2` instead of `-ac 1` for stereo (twice the size). In Audacity, *File → Export Audio*
+with *WAV (Microsoft)* and *Signed 16-bit PCM* works too.
+
+The music needs the 3DS sound firmware (`sdmc:/3ds/dspfirm.cdc`), which most homebrew setups
+already have (dump it with [DSP1](https://github.com/zoogie/DSP1) if not). Without it the store is
+simply silent.
 
 ## Themes
 
