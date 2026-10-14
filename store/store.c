@@ -565,15 +565,16 @@ static int scan_dir(const char *dir, int fixed_w, int fixed_h, int with_nfo, int
  * convention. So after the tag pass, anything left sharing a name with something already
  * shelved is a second copy of it by another route, and one is enough.
  *
- * Two genuinely different films with identical titles would collapse too. That is rare, and a
- * shop showing one of them beats a shelf of thirteen identical covers. */
+ * The year must agree too: "The Lion King" 1994 and 2019 are two films, not two copies. A case
+ * with no year (0) still collapses on the name alone -- episodes share their show's year anyway. */
 static int collapse_same_title(void) {
     int w = 0;
     for (int i = 0; i < g_nposters; i++) {
         int dup = 0;
         if (g_pos[i].name[0])
             for (int j = 0; j < w && !dup; j++)
-                if (!strcasecmp(g_pos[j].name, g_pos[i].name)) dup = 1;
+                if (!strcasecmp(g_pos[j].name, g_pos[i].name) &&
+                    (g_pos[j].year == g_pos[i].year || !g_pos[j].year || !g_pos[i].year)) dup = 1;
         if (dup) continue;
         if (w != i) g_pos[w] = g_pos[i];
         w++;

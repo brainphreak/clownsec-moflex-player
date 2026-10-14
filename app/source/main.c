@@ -3802,8 +3802,9 @@ static int scr_match(const char *localstem, const CatEntry *e) {
     if (e->year > 0) snprintf(ts, sizeof ts, "%s%d", tt, e->year);   /* title[] has no year -> use the year field */
     else             snprintf(ts, sizeof ts, "%s%s", tt, ty);
     if (!strcmp(ls, es) || !strcmp(ls, fs) || !strcmp(ls, ts)) return 1;   /* title+year match (movies & TV) */
-    /* no year in the filename -> match title only (remakes may pick the wrong year; add a year to be exact) */
-    if (!ly[0] && strlen(lt) >= 4 && (!strcmp(lt, et) || !strcmp(lt, ft) || !strcmp(lt, tt))) return 1;
+    /* no year in the filename -> title-only match (2). A remake shares the title, so scr_find()
+     * decides between same-titled entries of different years instead of taking the first. */
+    if (!ly[0] && strlen(lt) >= 4 && (!strcmp(lt, et) || !strcmp(lt, ft) || !strcmp(lt, tt))) return 2;
     /* TV folders carry qualifiers the catalog title lacks ("Uzumaki - Season 1"): cut the name at a
      * word-boundary "Season" and retry everything with the shorter stem. Titles that BEGIN with
      * "Season" ("Season of the Witch") are untouched -- the cut must leave a real prefix. */
@@ -3818,6 +3819,53 @@ static int scr_match(const char *localstem, const CatEntry *e) {
             break;
         }
     return 0;
+}
+/* A catalog entry's year: the year field, else whatever its name carries. 0 = unknown. */
+static int cat_year(const CatEntry *e) {
+    if (e->year > 0) return e->year;
+    char t[256], y[5]; parse_title_year(e->name, t, sizeof t, y);
+    return y[0] ? atoi(y) : 0;
+}
+/* Length of a local moflex in whole minutes (0 = unknown: a folder, an mp4, unreadable). */
+static int file_minutes(const char *path) {
+    static MfxDemux m;
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    int64_t us = 0;
+    if (mfx_open_auto(&m, f, path) == 0) { us = m.duration_us; mfx_close(&m); }
+    fclose(f);
+    return us > 0 ? (int)((us + 30000000) / 60000000) : 0;
+}
+/* Pick the catalog entry for a local movie, or -1. A title+year match wins outright. A yearless
+ * file that matches same-titled entries of DIFFERENT years ("The Lion King" 1994 and 2019) is a
+ * remake collision: the file's own length picks the film (runtime within 10%), and if that cannot
+ * single one out it stays unmatched -- no info beats the wrong film's poster and description. */
+static int scr_find(const char *moviepath, const char *lstem, const char *hint, const CatEntry *cat, int nc) {
+    int first = -1, year0 = 0, mixed = 0;
+    for (int i = 0; i < nc; i++) {
+        int r = scr_match(lstem, &cat[i]);
+        if (r != 1 && hint && hint[0]) { int h = scr_match(hint, &cat[i]); if (h) r = r ? (h < r ? h : r) : h; }
+        if (r == 1) return i;
+        if (r != 2) continue;
+        if (first < 0) first = i;
+        int y = cat_year(&cat[i]);
+        if (y) { if (!year0) year0 = y; else if (y != year0) mixed = 1; }
+    }
+    if (first < 0 || !mixed) return first;              /* none, or one film listed more than once */
+    int mins = file_minutes(moviepath);
+    if (mins <= 0) return -1;
+    int pick = -1, pick_year = 0;
+    for (int i = first; i < nc; i++) {
+        int r = scr_match(lstem, &cat[i]);
+        if (r != 2 && hint && hint[0]) r = scr_match(hint, &cat[i]);
+        if (r != 2 || cat[i].runtime <= 0) continue;
+        int tol = cat[i].runtime / 10; if (tol < 3) tol = 3;
+        if (abs(mins - cat[i].runtime) > tol) continue;
+        int y = cat_year(&cat[i]);
+        if (pick < 0) { pick = i; pick_year = y; }
+        else if (y != pick_year) return -1;                /* two films of that length too: don't guess */
+    }
+    return pick;
 }
 /* Fetch a catalog entry's poster into pb, with one retry for transient network failures.
  * Returns 1 if a poster was decoded, 0 if there's no art or the download kept failing. */
@@ -3849,13 +3897,12 @@ static int scrape_one_stem(const char *moviepath, const char *name_hint) {
         fetched = 1;
         int nc = catalog_parse(json, sources[s].kind, sources[s].dl_base, sources[s].art_base, cat, cap);
         free(json);
-        for (int i = 0; i < nc; i++) if (scr_match(lstem, &cat[i]) ||
-                                          (name_hint && name_hint[0] && scr_match(name_hint, &cat[i]))) {
+        int i = scr_find(moviepath, lstem, name_hint, cat, nc);
+        if (i >= 0) {
             int poster_ok = fetch_poster(&cat[i], pb);
             movieinfo_save(moviepath, &cat[i], poster_ok ? pb : NULL, POSTER_W, POSTER_H);
             s_scrape_sub = fetch_sub(moviepath, cat[i].sub);   /* subs without redownloading */
             found = poster_ok ? 1 : 2;
-            break;
         }
     }
     free(pb); free(cat);
@@ -3907,11 +3954,12 @@ static void scrape_folder(void) {
             gfxFlushBuffers(); gfxSwapBuffers();
             char full[PATHLEN + NAMELEN]; snprintf(full, sizeof full, "%s%s", cwd, entries[i].name);
             char lstem[192]; local_stem(full, lstem, sizeof lstem);
-            for (int c = 0; c < nc; c++) if (scr_match(lstem, &cat[c])) {
+            int c = scr_find(full, lstem, NULL, cat, nc);
+            if (c >= 0) {
                 int poster_ok = fetch_poster(&cat[c], pb);
                 movieinfo_save(full, &cat[c], poster_ok ? pb : NULL, POSTER_W, POSTER_H);
                 fetch_sub(full, cat[c].sub);
-                done[i] = 1; got++; break;   /* matched (priority-first); a missing poster is
+                done[i] = 1; got++;          /* matched (priority-first); a missing poster is
                                               * refetched next run since movieinfo_have needs one */
             }
         }
@@ -4002,12 +4050,13 @@ static void lib_scrape_missing(int *idx, int ni) {
                    sources[s].name, got, todo, scanned, g_lib[idx[i]].name);
             gfxFlushBuffers(); gfxSwapBuffers();
             char lstem[192]; local_stem(g_lib[idx[i]].url, lstem, sizeof lstem);
-            for (int c = 0; c < nc; c++) if (scr_match(lstem, &cat[c])) {
+            int c = scr_find(g_lib[idx[i]].url, lstem, NULL, cat, nc);
+            if (c >= 0) {
                 int poster_ok = fetch_poster(&cat[c], pb);
                 movieinfo_save(g_lib[idx[i]].url, &cat[c], poster_ok ? pb : NULL, POSTER_W, POSTER_H);
                 fetch_sub(g_lib[idx[i]].url, cat[c].sub);
                 lib_refresh_entry(idx[i]);
-                done[i] = 1; got++; break;
+                done[i] = 1; got++;
             }
         }
     }
