@@ -4749,13 +4749,34 @@ static MoflexResult play_movie(const char *path) {
           lib_note_renamed(path, fixed);   /* keep the library entry pointed at the new name */
           path = fixed;
       } }
+    {   /* a library / recently-played entry still pointing where the file USED to be */
+        struct stat st0;
+        if (stat(path, &st0) != 0) {
+            msg_screen("FILE NOT FOUND", "This video is not where it was. It may\nhave been moved, renamed or deleted.\n\n"
+                       "If you moved it: Library > Rescan\nLibrary, or open it from Filesystem.");
+            branding_show();
+            return MOFLEX_QUIT_BACK;
+        } }
     cia_clear_selection();
     const char *title_src = path; char titlebuf[NAMELEN];
     if (cia_is_cia(path)) {
         CiaMoflex list[64];
         int nc = cia_list_moflex(path, list, 64);
         if (nc == 0) {
-            msg_screen("NOT A MOVIE", "This CIA has no playable video inside\n(it's an app, or the content is encrypted).");
+            int why = cia_last_error();
+            if (why == CIA_ERR_OPEN)
+                msg_screen("FILE NOT FOUND", "This CIA could not be opened. It may\nhave been moved, renamed or deleted.\n\n"
+                           "If you moved it: Library > Rescan\nLibrary, or open it from Filesystem.");
+            else if (why == CIA_ERR_SHORT)
+                msg_screen("INCOMPLETE FILE", "This CIA is shorter than it should be:\nthe download or copy did not finish.\n\n"
+                           "Copy or download it again.");
+            else if (why == CIA_ERR_ENCRYPTED)
+                msg_screen("ENCRYPTED CIA", "This CIA's content is encrypted, so\nthe video inside cannot be read.\n\n"
+                           "Only unencrypted movie CIAs play.");
+            else if (why == CIA_ERR_NOT_CIA)
+                msg_screen("NOT A CIA", "This file is named .cia but is not a\nCIA (or it is damaged).\n\nDownload it again.");
+            else
+                msg_screen("NOT A MOVIE", "This CIA has no video inside --\nit is an app or a game, not a movie.");
             branding_show();
             return MOFLEX_QUIT_BACK;
         }
