@@ -788,6 +788,21 @@ static bool file_is_zip(const char *path) {
     return n == 4 && h[0] == 'P' && h[1] == 'K' && (h[2] == 3 || h[2] == 5 || h[2] == 7);
 }
 
+/* Would Filesystem hide this folder (or anything inside it) until Y is pressed? Any part of the
+ * path being a system folder or a dot-folder hides it. SAVE TO marks these, so a download isn't
+ * put somewhere it then seems to have vanished from. */
+static int path_hidden(const char *dir) {
+    const char *p = strncmp(dir, "sdmc:/", 6) ? dir : dir + 6;
+    while (*p) {
+        const char *e = strchr(p, '/'); size_t n = e ? (size_t)(e - p) : strlen(p);
+        char part[NAMELEN]; snprintf(part, sizeof part, "%.*s", (int)(n < NAMELEN ? n : NAMELEN - 1), p);
+        if (part[0] == '.' || (n && is_hidden_dir(part))) return 1;
+        if (!e) break;
+        p = e + 1;
+    }
+    return 0;
+}
+
 /* Pick (and optionally create) a destination folder under sdmc:/, starting at cwd.
  * Returns 1 with `out` = chosen dir (trailing '/'), or 0 if cancelled. */
 static int pick_folder(char *out, size_t cap) {
@@ -824,7 +839,7 @@ static int pick_folder(char *out, size_t cap) {
         hidScanInput();
         u32 k = hidKeysDown(), kh = hidKeysHeld(), ku = hidKeysUp();
         static int td = 0, tx0 = 0, ty0 = 0, tsc0 = 0, tmv = 0;
-        const int VIS = 5, ry0 = 54, rh = 28, gap = 4;
+        const int VIS = 4, ry0 = 54, rh = 28, gap = 4;   /* 4 rows: room for the hidden-folder note */
         if (nav_repeat(k, kh, NAV_DOWN, &hd)) { if (psel < total - 1) psel++; redraw = 1; }
         if (nav_repeat(k, kh, NAV_UP,   &hu)) { if (psel > 0) psel--;         redraw = 1; }
         if (k & KEY_B) return 0;
@@ -875,16 +890,27 @@ static int pick_folder(char *out, size_t cap) {
             else snprintf(pth, sizeof pth, "%s", dir);
             ui_text(10, 34, 1, UI_DIM, pth);
             ui_fill_round(8, 46, UI_W - 16, 1, 0, TH_LINE);
+            /* "hidden" = Filesystem only shows it after Y; the Library never scans it */
+            int hid_here = path_hidden(dir);
+            ui_text(10, 190, 1, UI_DIM, hid_here ? "Hidden in Filesystem (Y shows it)"
+                                                 : "\"hidden\" = Filesystem needs Y to show");
             for (int r = 0; r < VIS; r++) { int i = pscroll + r; if (i >= total) break;
                 int by = ry0 + r * (rh + gap), selrow = (i == psel), rw = UI_W - 16;
                 if (selrow) { ui_glow_round(8, by, rw, rh, 7, UI_NEON, 3, 16);
                     ui_vgrad_round(8, by, rw, rh, 7, TH_SEL, TH_SELLO);
                     ui_frame_round(8, by, rw, rh, 7, UI_NEON, 1); }
                 char lb[NAMELEN]; int textx = 18; u16 tc = selrow ? UI_WHITE : UI_INK;
-                if (i == 0) { snprintf(lb, sizeof lb, "Save in this folder"); tc = UI_NEON; }
+                int hid = 0;
+                if (i == 0) { hid = path_hidden(dir);
+                              snprintf(lb, sizeof lb, "%s", hid ? "Save here (hidden)" : "Save in this folder"); tc = UI_NEON; }
                 else if (!is_root && i == 1) snprintf(lb, sizeof lb, ".. (up a folder)");
-                else { snprintf(lb, sizeof lb, "%s", list[i - base]); icon_folder(18, by + (rh - 16) / 2, UI_RGB(240, 205, 110)); textx = 46; }
+                else { const char *fn = list[i - base];
+                       hid = !hid_here && (fn[0] == '.' || is_hidden_dir(fn));
+                       snprintf(lb, sizeof lb, "%.*s", hid ? 24 : NAMELEN - 1, fn);
+                       icon_folder(18, by + (rh - 16) / 2, UI_RGB(240, 205, 110)); textx = 46;
+                       if (hid && !selrow) tc = UI_DIM; }
                 ui_text(textx, by + (rh - 8) / 2, 1, tc, lb);
+                if (hid && i != 0) ui_text(UI_W - 16 - 8 - 48, by + (rh - 8) / 2, 1, UI_NEONP, "hidden");
             }
             if (total > VIS) { int th = VIS * (rh + gap) - gap, ty = ry0, maxs = total - VIS;
                 int hh = th * VIS / total; if (hh < 12) hh = 12; int hy = ty + (th - hh) * pscroll / maxs;
