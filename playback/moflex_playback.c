@@ -779,7 +779,11 @@ static int ass_ts(const char *p, int64_t *us) {
  * it loads, so the cap only guards against a corrupt length. */
 #define TRA_SUB_MAX (8 * 1024 * 1024)
 #define ASS_FX_SHORT 250000      /* us: per-frame karaoke is 40 ms, real dialogue never this short */
-#define ASS_LINE 2048            /* karaoke lines run long; a cut line would leak into the next */
+/* A fansub can animate a line in letter by letter, ~50 bytes of \alpha\t tags per LETTER: High School
+ * DxD BorN's OP translation runs 2.5 KB a line, and at 2048 the last few letters were cut off
+ * ("...again and agai"). 16 KB is room for 300+ such letters; anything longer is cut, and the
+ * rest of it drained, not read as the next line. */
+#define ASS_LINE 16384
 typedef struct { char name[40]; u32 col; u8 ital, bold, an; } AssStyle;
 /* ASS/SSA -> cues. Same filtering as the builder's ass_to_srt.py, so a raw fansub file loaded off
  * the SD card does not strobe its karaoke: drawings, events too short to read and whole styles
@@ -806,6 +810,7 @@ static int subs_load_ass(FILE *f) {
         sec = 0;
     }
     while (fgets(line, sizeof line, f)) {
+        if (!strchr(line, '\n')) { int ch; while ((ch = fgetc(f)) != EOF && ch != '\n') { } }   /* drain an over-long line */
         char *l = sub_trim(line);
         if ((u8)l[0] == 0xEF && (u8)l[1] == 0xBB && (u8)l[2] == 0xBF) l += 3;
         if (l[0] == '[') {
