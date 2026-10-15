@@ -888,12 +888,12 @@ static int pick_folder(char *out, size_t cap) {
             ui_begin(GFX_BOTTOM);
             ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
             ui_text_center(UI_W / 2, 12, 2, UI_NEON, "SAVE TO");
-            char pth[64]; int mc = (UI_W - 20) / 8;
+            char pth[64]; int mc = (UI_W - 20 - 96) / 8;   /* room for the Y hint on this line */
             if ((int)strlen(dir) > mc) snprintf(pth, sizeof pth, "...%s", dir + strlen(dir) - (mc - 3));
             else snprintf(pth, sizeof pth, "%s", dir);
             ui_text(10, 34, 1, UI_DIM, pth);
             ui_fill_round(8, 46, UI_W - 16, 1, 0, TH_LINE);
-            ui_text(UI_W - 98, 16, 1, s_show_hidden ? UI_NEONP : UI_DIM, s_show_hidden ? "Y: hide sys" : "Y: show all");
+            ui_text(UI_W - 98, 34, 1, s_show_hidden ? UI_NEONP : UI_DIM, s_show_hidden ? "Y: hide sys" : "Y: show all");
             /* "hidden" = Filesystem only shows it after Y; the Library never scans it */
             int hid_here = path_hidden(dir);
             for (int r = 0; r < VIS; r++) { int i = pscroll + r; if (i >= total) break;
@@ -4909,10 +4909,10 @@ static void browser_draw_gfx(int mode) {
     ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
     ui_text(10, 8, 2, UI_NEON, manage ? "MANAGE" : "FILESYSTEM");
     if (manage && move_pending) ui_text(UI_W - 96, 9, 1, UI_NEONC, "MOVE ready");
-    else if (!manage) ui_text(UI_W - 98, 9, 1, s_show_hidden ? UI_NEONP : UI_DIM,
-                              s_show_hidden ? "Y: hide sys" : "Y: show all");
-    /* current path (tail-trimmed to fit) */
-    char pth[64]; int mc = (UI_W - 20) / 8;
+    else if (!manage) ui_text(UI_W - 98, 30, 1, s_show_hidden ? UI_NEONP : UI_DIM,
+                              s_show_hidden ? "Y: hide sys" : "Y: show all");   /* on the path line */
+    /* current path (tail-trimmed to fit; play mode leaves room for the Y hint) */
+    char pth[64]; int mc = (UI_W - 20 - (manage ? 0 : 96)) / 8;
     if ((int)strlen(cwd) > mc) snprintf(pth, sizeof pth, "...%s", cwd + strlen(cwd) - (mc - 3));
     else snprintf(pth, sizeof pth, "%s", cwd);
     ui_text(10, 30, 1, UI_DIM, pth);
