@@ -809,6 +809,7 @@ static int pick_folder(char *out, size_t cap) {
     static char dir[PATHLEN];
     static char list[256][NAMELEN];
     snprintf(dir, sizeof(dir), "%s", cwd);
+    if (path_hidden(dir)) s_show_hidden = 1;   /* starting inside one: don't hide where we are */
     int nd = 0, psel = 0, pscroll = 0, redraw = 1, rescan = 1, hu = 0, hd = 0;
     char backto[NAMELEN] = "";   /* after [..], land on the folder we just left */
     while (aptMainLoop()) {
@@ -818,8 +819,9 @@ static int pick_folder(char *out, size_t cap) {
             if (d) {
                 struct dirent *de;
                 while ((de = readdir(d)) && nd < 256)
-                    if (de->d_type == DT_DIR && strcmp(de->d_name, ".") && strcmp(de->d_name, ".."))
-                        snprintf(list[nd++], NAMELEN, "%s", de->d_name);
+                    if (de->d_type == DT_DIR && strcmp(de->d_name, ".") && strcmp(de->d_name, "..")
+                        && (s_show_hidden || (de->d_name[0] != '.' && !is_hidden_dir(de->d_name))))
+                        snprintf(list[nd++], NAMELEN, "%s", de->d_name);   /* same Y toggle as Filesystem */
                 closedir(d);
             }
             if (backto[0]) {   /* just went up: highlight the folder we exited */
@@ -839,10 +841,11 @@ static int pick_folder(char *out, size_t cap) {
         hidScanInput();
         u32 k = hidKeysDown(), kh = hidKeysHeld(), ku = hidKeysUp();
         static int td = 0, tx0 = 0, ty0 = 0, tsc0 = 0, tmv = 0;
-        const int VIS = 4, ry0 = 54, rh = 28, gap = 4;   /* 4 rows: room for the hidden-folder note */
+        const int VIS = 5, ry0 = 54, rh = 28, gap = 4;
         if (nav_repeat(k, kh, NAV_DOWN, &hd)) { if (psel < total - 1) psel++; redraw = 1; }
         if (nav_repeat(k, kh, NAV_UP,   &hu)) { if (psel > 0) psel--;         redraw = 1; }
         if (k & KEY_B) return 0;
+        if (k & KEY_Y) { s_show_hidden = !s_show_hidden; psel = 0; pscroll = 0; rescan = 1; continue; }
         int newf = (k & KEY_X) ? 1 : 0, act = (k & KEY_A) ? psel : -1;
         touchPosition tp; hidTouchRead(&tp);
         if (k & KEY_TOUCH) { td = 1; tx0 = tp.px; ty0 = tp.py; tsc0 = pscroll; tmv = 0; }
@@ -890,10 +893,9 @@ static int pick_folder(char *out, size_t cap) {
             else snprintf(pth, sizeof pth, "%s", dir);
             ui_text(10, 34, 1, UI_DIM, pth);
             ui_fill_round(8, 46, UI_W - 16, 1, 0, TH_LINE);
+            ui_text(UI_W - 98, 16, 1, s_show_hidden ? UI_NEONP : UI_DIM, s_show_hidden ? "Y: hide sys" : "Y: show all");
             /* "hidden" = Filesystem only shows it after Y; the Library never scans it */
             int hid_here = path_hidden(dir);
-            ui_text(10, 190, 1, UI_DIM, hid_here ? "Hidden in Filesystem (Y shows it)"
-                                                 : "\"hidden\" = Filesystem needs Y to show");
             for (int r = 0; r < VIS; r++) { int i = pscroll + r; if (i >= total) break;
                 int by = ry0 + r * (rh + gap), selrow = (i == psel), rw = UI_W - 16;
                 if (selrow) { ui_glow_round(8, by, rw, rh, 7, UI_NEON, 3, 16);
@@ -4907,7 +4909,8 @@ static void browser_draw_gfx(int mode) {
     ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
     ui_text(10, 8, 2, UI_NEON, manage ? "MANAGE" : "FILESYSTEM");
     if (manage && move_pending) ui_text(UI_W - 96, 9, 1, UI_NEONC, "MOVE ready");
-    else if (!manage && s_show_hidden) ui_text(UI_W - 74, 9, 1, UI_NEONP, "SYS on");
+    else if (!manage) ui_text(UI_W - 98, 9, 1, s_show_hidden ? UI_NEONP : UI_DIM,
+                              s_show_hidden ? "Y: hide sys" : "Y: show all");
     /* current path (tail-trimmed to fit) */
     char pth[64]; int mc = (UI_W - 20) / 8;
     if ((int)strlen(cwd) > mc) snprintf(pth, sizeof pth, "...%s", cwd + strlen(cwd) - (mc - 3));

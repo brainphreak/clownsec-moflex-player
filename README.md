@@ -119,8 +119,10 @@ This is the short tour — the complete list of everything the player does lives
   movies-only toggle).
 - **Local artwork + info** — poster and details show on the top screen for your own movies in
   Open Video, and a **Get Info** action fetches them from the catalogs for anything missing.
-- **Hidden system folders** — the browser hides `3DS`, `DCIM`, `Nintendo 3DS`, etc. by default
-  (press **Y** to reveal them), so you only see your movies and folders.
+- **Hidden system folders** — Filesystem and the download **SAVE TO** picker hide `3DS`, `DCIM`,
+  `Nintendo 3DS`, `ROMS`, `luma`, `cias`, dot-folders etc. by default. Press **Y** (shown top-right)
+  to reveal them; the setting is shared by both screens. The Library never scans these folders,
+  so keep movies elsewhere.
 - **Themes** — recolor the whole UI. Pick from built-in themes (Clownsec, Matrix, Nintendo,
   Light, Amber, Ice) or build your own with the **Custom** color editor (R/G/B sliders for each
   of the accents, text, and background). Open it from the swatch chip on the home screen or press
