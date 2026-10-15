@@ -262,7 +262,8 @@ static int s_show_hidden = 0;          /* play-mode toggle (Y): reveal system/hi
 static int is_hidden_dir(const char *n) {
     static const char *sys[] = {
         "3ds", "dcim", "fbi", "gm9", "cheats", "cias", "luma", "nintendo 3ds",
-        "roms", "system volume information", "themes", "moviedata", "moflex_player", NULL
+        "roms", "system volume information", "themes", "moviedata", "moflex_player",
+        "_nds", "config", "splashes", "nimbus", "retroarch", NULL
     };
     for (int i = 0; sys[i]; i++) if (!strcasecmp(n, sys[i])) return 1;
     return 0;
