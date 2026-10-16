@@ -2492,10 +2492,12 @@ static int show_pick_episode(const char *showname, const char *url, char *out, s
 }
 
 static int s_scan_stop;   /* lid closed mid-scan -> abort cleanly (checked ~2x/s) */
+static int s_scan_btn = 0;   /* set while the library scan's own screen is up (B may stop it) */
 static int scan_should_stop(void) {
     static u64 last;
     u64 now = osGetTime();
     if (now - last >= 500) { last = now; if (dl_lid_closed()) s_scan_stop = 1; }
+    if (s_scan_btn) { hidScanInput(); if (hidKeysDown() & KEY_B) s_scan_stop = 1; }   /* B = stop, cleanly */
     return s_scan_stop;
 }
 /* ---- scan crash recovery ------------------------------------------------------------------
@@ -2517,8 +2519,15 @@ static char s_skip[SKIP_MAX][PATHLEN + NAMELEN];
 static long long s_skip_sz[SKIP_MAX];                  /* the size it had when it crashed */
 static int  s_skip_n = 0, s_skip_loaded = 0, s_scan_recovery = 0;
 static long long file_size(const char *path) { struct stat st; return stat(path, &st) ? -1 : (long long)st.st_size; }
+#define SKIP_VER "sdmc:/moflex_player/scan_skip.v2"
 static void skip_load(void) {
     s_skip_n = 0; s_skip_loaded = 1;
+    /* Before v2 the marker kept naming a file after it had been read safely, so whatever stopped a
+     * recovery scan later (closing the app, a slow folder) was pinned on the last file opened --
+     * usually an innocent CIA. Those entries can't be trusted: drop them once. */
+    FILE *v = fopen(SKIP_VER, "rb");
+    if (v) fclose(v);
+    else { remove(SCAN_SKIP); v = fopen(SKIP_VER, "wb"); if (v) fclose(v); }
     FILE *f = fopen(SCAN_SKIP, "rb");
     if (!f) return;
     char line[PATHLEN + NAMELEN + 24];
@@ -2544,6 +2553,13 @@ static void scan_guard(const char *path) {
     FILE *f = fopen(SCAN_MARK, "wb");
     if (f) { fprintf(f, "R\n%s\n", path); fclose(f); }
 }
+/* ...and clear it again once the file has been read: a scan that dies AFTER this (closed from
+ * HOME, powered off in a slow folder) is no file's fault, and must not blame the last one opened */
+static void scan_guard_done(void) {
+    if (!s_scan_recovery) return;
+    FILE *f = fopen(SCAN_MARK, "wb");
+    if (f) { fputs("R\n", f); fclose(f); }
+}
 static void scan_begin(void) {
     mkdir("sdmc:/moflex_player", 0777);
     s_scan_recovery = 0;
@@ -2559,11 +2575,13 @@ static void scan_begin(void) {
             FILE *s = fopen(SCAN_SKIP, "ab");
             if (s) { fprintf(s, "%lld %s\n", sz, path); fclose(s); }
             if (s_skip_n < SKIP_MAX) { s_skip_sz[s_skip_n] = sz; snprintf(s_skip[s_skip_n++], sizeof s_skip[0], "%s", path); }
-            const char *b = strrchr(path, '/'); b = b ? b + 1 : path;
-            char body[400];
-            snprintf(body, sizeof body, "This file crashed the library scan,\nso it will be skipped from now on:\n\n%.120s\n\n"
-                     "It may be corrupt. Delete it or\ndownload it again.", b);
-            msg_screen("FILE SKIPPED", body);
+            if (!cia_is_cia(path)) {   /* a CIA is skipped silently: most are games, never listed */
+                const char *b = strrchr(path, '/'); b = b ? b + 1 : path;
+                char body[400];
+                snprintf(body, sizeof body, "This file crashed the library scan,\nso it will be skipped from now on:\n\n%.120s\n\n"
+                         "It may be corrupt. Delete it or\ndownload it again.", b);
+                msg_screen("FILE SKIPPED", body);
+            }
         } else s_scan_recovery = 1;                      /* died somewhere unknown: find where */
     }
     f = fopen(SCAN_MARK, "wb");
@@ -2578,6 +2596,22 @@ static void lib_scan_dir(const char *dir, int depth) {
     int shows_done = 0;   /* episode grouping runs once per directory */
     struct dirent *e;
     while ((e = readdir(d)) && g_lib_n < LIB_MAX && !scan_should_stop()) {
+        static u64 last_draw;   /* live progress on a clock, not per movie found: a big folder with
+                                 * no movies in it used to leave the screen still, and looked frozen */
+        u64 now = osGetTime();
+        if (now - last_draw >= 250) {
+            last_draw = now;
+            ui_begin(GFX_BOTTOM); ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
+            ui_text_center(UI_W / 2, 96, 2, UI_NEON, "Scanning...");
+            char m[32]; snprintf(m, sizeof m, "%d found", g_lib_n);
+            ui_text_center(UI_W / 2, 128, 1, UI_DIM, m);
+            char pth[64]; int mc = (UI_W - 20) / 8;
+            if ((int)strlen(dir) > mc) snprintf(pth, sizeof pth, "...%s", dir + strlen(dir) - (mc - 3));
+            else snprintf(pth, sizeof pth, "%s", dir);
+            ui_text_center(UI_W / 2, 148, 1, UI_DIM, pth);
+            ui_text_center(UI_W / 2, 200, 1, UI_DIM, "B: stop (keeps your old library)"); ui_present();
+            gfxFlushBuffers(); gfxSwapBuffers();
+        }
         if (e->d_name[0] == '.') continue;
         char full[PATHLEN + NAMELEN];
         snprintf(full, sizeof full, "%s%s", dir, e->d_name);
@@ -2604,11 +2638,14 @@ static void lib_scan_dir(const char *dir, int depth) {
             CatEntry *c = &g_lib[g_lib_n];
             if (scan_skipped(full)) {                        /* crashed a scan before: list it by
                                                                * name only, never open it */
+                if (cia_is_cia(e->d_name)) continue;          /* ...unless a CIA: can't tell a game from a movie */
                 memset(c, 0, sizeof *c); c->is3d = -1;
             } else {
                 scan_guard(full);
-                if (cia_is_cia(e->d_name) && !cia_has_moflex(full)) continue;   /* skip non-movie CIAs */
-                movieinfo_load(full, c);                      /* name/genres/category/year/is3d from .nfo, if any */
+                int game = cia_is_cia(e->d_name) && !cia_has_moflex(full);
+                if (!game) movieinfo_load(full, c);           /* name/genres/category/year/is3d from .nfo, if any */
+                scan_guard_done();
+                if (game) continue;                           /* skip non-movie CIAs */
             }
             snprintf(c->url, sizeof c->url, "%s", full);      /* the path we play + the poster key */
             snprintf(c->fname, sizeof c->fname, "%s", e->d_name);
@@ -2619,13 +2656,6 @@ static void lib_scan_dir(const char *dir, int depth) {
             time_t mt = st.st_mtime; struct tm *tmv = localtime(&mt);
             if (tmv) strftime(c->date, sizeof c->date, "%Y-%m-%d", tmv);   /* file date -> "sort by date added" */
             g_lib_n++;
-            if ((g_lib_n & 7) == 0) {                          /* live progress */
-                ui_begin(GFX_BOTTOM); ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
-                ui_text_center(UI_W / 2, 96, 2, UI_NEON, "Scanning...");
-                char m[32]; snprintf(m, sizeof m, "%d found", g_lib_n);
-                ui_text_center(UI_W / 2, 128, 1, UI_DIM, m); ui_present();
-                gfxFlushBuffers(); gfxSwapBuffers();
-            }
         }
     }
     closedir(d);
@@ -2717,7 +2747,9 @@ static void lib_rescan(void) {
     ui_text_center(UI_W / 2, 128, 1, UI_DIM, "searching the SD card for movies"); ui_present();
     gfxFlushBuffers(); gfxSwapBuffers();
     scan_begin();                                 /* crash recovery: see scan_guard() */
+    s_scan_btn = 1;
     lib_scan_dir("sdmc:/", 0);
+    s_scan_btn = 0;
     if (s_scan_stop) { g_lib_n = 0; lib_load_cache_only(); }   /* aborted -> keep the OLD library,
                                                                 * never save a truncated cache */
     else {
@@ -2745,6 +2777,7 @@ static void lib_rescan(void) {
                 snprintf(g_lib[i].audio_langs, sizeof g_lib[i].audio_langs, "%s", au);
                 snprintf(g_lib[i].sub_langs, sizeof g_lib[i].sub_langs, "%s", sb);
             }
+            scan_guard_done();   /* done with this file */
         }
         lib_save_cache();
     }
