@@ -474,6 +474,17 @@ static const char *sub_glyph(uint32_t cp) {
 
 #define SUB_MAX 4000
 #define SUB_TXT 256   /* bytes: UTF-8 cues run longer than their glyph count */
+/* GPU draw budget. The caption is drawn with an 8-way black outline (9 passes a line) and again for
+ * the SECOND eye in 3D -- ~18 textured quads per glyph -- and the whole frame (both eyes + the bottom
+ * panel) batches into ONE citro2d object buffer before C3D_FrameEnd flushes it. A pathological cue
+ * (e.g. High School DxD S02e12's "Boost! " x32 line) fills ~4 lines of text, which at the default
+ * 4096-object cap tips the buffer over mid-frame: citro2d's auto-flush then fires between the two 3D
+ * targets and HARD-LOCKS the GPU (a glitched frame, then a power-off). Two guards, belt and braces:
+ *   - a roomier object cap so a normal frame never reaches the auto-flush ceiling, and
+ *   - SUB_DRAW_MAX: a hard limit on the visible bytes of ONE block, so no single cue can exceed the
+ *     budget however long it is. 200 B is well past any legible line; only a spam line is clipped. */
+#define SUB_C2D_OBJECTS 8192
+#define SUB_DRAW_MAX 200   /* bytes of one on-screen block actually drawn (the rest is dropped) */
 /* What a cue carries besides its text. Plain SRT gets the defaults; ASS fills them from its style
  * and its leading override tags, and an SRT's own {\an8} / <i> are honoured the same way.
  *   top  -- drawn in the TOP block (signs, \an4-9, or positioned in the upper half), not the bottom
@@ -947,6 +958,19 @@ static void sub_block_add(SubBlock *b, const SubCue *c) {
     if (b->ital != c->ital) b->ital = 0;
     if (b->bold != c->bold) b->bold = 0;
 }
+/* Cap one block's drawn text at SUB_DRAW_MAX bytes so a spam cue can't blow the GPU object budget.
+ * Cut on a space when there is one near the limit (don't split a word), and never inside a UTF-8
+ * multi-byte glyph (back up over 10xxxxxx continuation bytes). A legible line is far shorter than
+ * this, so nothing real is touched; the "Boost! x32" line loses only its tail. */
+static void sub_block_clamp(SubBlock *b) {
+    size_t n = strlen(b->t);
+    if (n <= SUB_DRAW_MAX) return;
+    size_t cut = SUB_DRAW_MAX;
+    while (cut > 0 && ((unsigned char)b->t[cut] & 0xC0) == 0x80) cut--;   /* not mid-codepoint */
+    for (size_t k = cut; k > SUB_DRAW_MAX - 24 && k > 0; k--)             /* prefer a word boundary */
+        if (b->t[k] == ' ') { cut = k; break; }
+    b->t[cut] = 0;
+}
 static int subs_view(int64_t us, SubBlock *bot, SubBlock *top) {
     bot->t[0] = 0; bot->col = 0; bot->ital = 0; bot->bold = 0;
     top->t[0] = 0; top->col = 0; top->ital = 0; top->bold = 0;
@@ -960,6 +984,7 @@ static int subs_view(int64_t us, SubBlock *bot, SubBlock *top) {
         const SubCue *c = &g_subs[i];
         if (c->top && u < c->e) sub_block_add(top, c);
     }
+    sub_block_clamp(bot); sub_block_clamp(top);   /* keep the GPU draw budget bounded (see SUB_DRAW_MAX) */
     return bot->t[0] || top->t[0];
 }
 /* ---- per-movie subtitle settings ----------------------------------------------------------
@@ -2781,7 +2806,7 @@ static MoflexResult moflex_play_gpu(const char *path) {
     gfxSetScreenFormat(GFX_TOP, GSP_BGR8_OES);
     gfxSetScreenFormat(GFX_BOTTOM, GSP_BGR8_OES);
     gfxSet3D(is3d);
-    C3D_Init(C3D_DEFAULT_CMDBUF_SIZE); C2D_Init(C2D_DEFAULT_MAX_OBJECTS); C2D_Prepare();
+    C3D_Init(C3D_DEFAULT_CMDBUF_SIZE); C2D_Init(SUB_C2D_OBJECTS); C2D_Prepare();
     C3D_RenderTarget *topL = C2D_CreateScreenTarget(GFX_TOP, GFX_LEFT);
     C3D_RenderTarget *topR = C2D_CreateScreenTarget(GFX_TOP, GFX_RIGHT);
     C3D_RenderTarget *bot  = C2D_CreateScreenTarget(GFX_BOTTOM, GFX_LEFT);
@@ -3980,7 +4005,7 @@ static MoflexResult moflex_play_ring(const char *path) {
         mobi_close(&ctx); free(ctx.priv_data); mfx_close(&m); fclose(f);
         return MOFLEX_FALLBACK;
     }
-    if (!C2D_Init(C2D_DEFAULT_MAX_OBJECTS)) {   /* unchecked before: silent no-op draws = dark screens */
+    if (!C2D_Init(SUB_C2D_OBJECTS)) {   /* unchecked before: silent no-op draws = dark screens */
         aptUnhook(&g_ring_apt_cookie);
         gpu_park_program(); C3D_Fini();
         gfxSet3D(false); av_frame_free(&fL); av_frame_free(&fR);
