@@ -884,10 +884,16 @@ static int subs_load_ass(FILE *f) {
             if (!*t) continue;                                  /* a drawing, or tags with no text */
             int cps = 0; for (const char *q = t; *q; ) { uint32_t cp = u8_next(&q); if (cp > ' ') cps++; }
             if (!pass) { if (cps <= 2) st_tiny[si]++; continue; }   /* pass 1 only counts */
-            int an = tg.an ? tg.an : (si < nsty ? sty[si].an : 2);
+            int san = (si < nsty ? sty[si].an : 2);            /* the style's own alignment */
+            int an = tg.an ? tg.an : san;
             SubCue *c = &g_subs[g_nsubs];
             c->s = s; c->e = e; c->ord = (u16)g_nsubs; c->sty = (u8)si;
             c->top  = tg.pos ? (tg.posy < play_y / 2) : (an >= 4);
+            /* Karaoke romaji is typically a TOP-aligned style (\an7-9) whose lines carry a
+             * per-line \an1-3 nudge (a template artifact). In the player's two-band layout that
+             * line still belongs in the TOP band, so a top style wins over a within-cue bottom
+             * \an -- otherwise the romaji drops to the bottom, stacked above the English line. */
+            if (!tg.pos && san >= 4 && tg.an >= 1 && tg.an <= 3) c->top = 1;
             c->ital = tg.ital >= 0 ? (u8)tg.ital : (si < nsty ? sty[si].ital : 0);
             c->bold = tg.bold >= 0 ? (u8)tg.bold : (si < nsty ? sty[si].bold : 0);
             c->col  = tg.col ? tg.col : (si < nsty ? sty[si].col : 0);
