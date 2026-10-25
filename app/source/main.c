@@ -13,6 +13,7 @@
 #include <time.h>
 #include <locale.h>
 #include <unistd.h>
+#include <mbedtls/md5.h>
 
 #include "moflex_playback.h"
 #include "mp4_play.h"
@@ -4181,6 +4182,9 @@ static int startup_detect_poll(void);
 #define LATEST_URL_BETA   "https://github.com/brainphreak/clownsec-moflex-player/releases/download/v1.1.0-beta/latest.txt"
 #define LATEST_URL_MP4    "https://github.com/brainphreak/clownsec-moflex-player/releases/download/mp4-beta/latest.txt"
 static const char *latest_url(void) {
+#ifdef UPDATE_TEST_URL
+    return UPDATE_TEST_URL;
+#endif
     u64 tid = 0;
     APT_GetProgramID(&tid);
     u32 uid = (u32)((tid >> 8) & 0xFFFFF);
@@ -4189,6 +4193,8 @@ static const char *latest_url(void) {
     return LATEST_URL_STABLE;
 }
 static char s_upd[24] = ""; static int s_upd_shown = 0;
+static char s_upd_md5[33] = "";   /* latest.txt line 2 (optional): MD5 of the channel's .cia */
+static int s_upd_quit = 0;        /* an update installed: home_gui returns so main() exits */
 static volatile int s_dtw_exit = 1;   /* worker thread fully finished (fetch included) */
 /* Parse a leading "MAJOR.MINOR" out of s WITHOUT scanf (no newlib locale involvement). */
 static void ver_parse(const char *s, int *a, int *b) {
@@ -4215,6 +4221,19 @@ static void update_check(void) {   /* worker thread; printf-free so it can't hit
                 if ((*pp >= '0' && *pp <= '9') || *pp == '.') s_upd[j++] = *pp; else break;
             }
             s_upd[j] = 0;
+            /* line 2, when published: the CIA's MD5. Builds before the self-updater read only the
+             * leading number, so the extra line never confused them. */
+            const char *nl = strchr(buf, '\n');
+            if (nl) {
+                int k = 0;
+                for (const char *pp = nl + 1; *pp && k < 32; pp++) {
+                    char c = *pp;
+                    if (c >= 'A' && c <= 'F') c = (char)(c - 'A' + 'a');
+                    if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) s_upd_md5[k++] = c;
+                    else if (k) break;
+                }
+                s_upd_md5[k == 32 ? 32 : 0] = 0;
+            }
         }
         free(buf);
         return;
@@ -4265,13 +4284,155 @@ static void startup_new_movie_check(void) {
     }
 }
 
+/* ---- self-update: fetch this channel's CIA, check it, install it over ourselves, restart ----
+ * The asset sits beside latest.txt in the same release, named per channel. A .3dsx run from the
+ * Homebrew Launcher cannot install a CIA (and has no title to relaunch), so it overwrites its own
+ * .3dsx instead -- the path HBL launched it from is argv[0]. */
+#define UPD_CIA_TMP  "sdmc:/moflex_player/update.cia"
+#define UPD_3DSX_TMP "sdmc:/moflex_player/update.3dsx"
+extern int __system_argc;
+extern char **__system_argv;
+static void upd_asset_url(char *out, size_t n, const char *ext) {
+    const char *lu = latest_url(), *sl = strrchr(lu, '/');
+    int base = sl ? (int)(sl - lu) + 1 : 0;
+    u64 tid = 0; APT_GetProgramID(&tid);
+    u32 uid = (u32)((tid >> 8) & 0xFFFFF);
+    const char *nm = uid == 0xf8a2d ? "clownsec_player_beta" : uid == 0xf8a2e ? "clownsec_player_mp4" : "clownsec_player";
+    snprintf(out, n, "%.*s%s%s", base, lu, nm, ext);
+}
+static void upd_screen(const char *title, const char *line, int pct) {
+    ui_begin(GFX_BOTTOM);
+    ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
+    ui_text_center(UI_W / 2, 12, 2, UI_NEON, title);
+    ui_glow_round(28, 40, UI_W - 56, 2, 1, UI_NEON, 3, 30);
+    ui_fill_round(28, 40, UI_W - 56, 2, 1, UI_NEON);
+    ui_text_center(UI_W / 2, 68, 1, UI_NEONC, line);
+    if (pct >= 0) {
+        int bx = 20, bw = UI_W - 40, by = 104, bh = 16;
+        ui_fill_round(bx, by, bw, bh, bh / 2, TH_TRACK);
+        int fw = bw * pct / 100; if (fw > 0) ui_fill_round(bx, by, fw, bh, bh / 2, UI_NEON);
+        char pl[16]; snprintf(pl, sizeof pl, "%d%%", pct);
+        ui_text_center(UI_W / 2, by + bh + 8, 1, UI_INK, pl);
+    }
+    ui_text_center(UI_W / 2, 180, 1, UI_DIM, "Do not turn off the system.");
+    ui_present();
+    gfxFlushBuffers(); gfxSwapBuffers();
+}
+/* 1 when the file's MD5 matches the 32-hex `want`, or when no MD5 was published (AM still checks
+ * every content hash in the CIA against its TMD, so a damaged CIA fails the install either way). */
+static int upd_md5_ok(const char *path, const char *want) {
+    if (!want[0]) return 1;
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    unsigned char *buf = (unsigned char *)malloc(64 * 1024), dg[16];
+    if (!buf) { fclose(f); return 0; }
+    mbedtls_md5_context c; mbedtls_md5_init(&c); mbedtls_md5_starts_ret(&c);
+    size_t n;
+    while ((n = fread(buf, 1, 64 * 1024, f)) > 0) mbedtls_md5_update_ret(&c, buf, n);
+    mbedtls_md5_finish_ret(&c, dg); mbedtls_md5_free(&c);
+    free(buf); fclose(f);
+    char hex[33];
+    for (int i = 0; i < 16; i++) snprintf(hex + i * 2, 3, "%02x", dg[i]);
+    return strcmp(hex, want) == 0;
+}
+static int upd_cia_install(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    const size_t CH = 128 * 1024;
+    u8 *buf = (u8 *)malloc(CH);
+    if (!buf || sz <= 0 || R_FAILED(amInit())) { free(buf); fclose(f); return 0; }
+    Handle h; int ok = 0;
+    if (R_SUCCEEDED(AM_StartCiaInstall(MEDIATYPE_SD, &h))) {
+        u64 off = 0; ok = 1; u64 last = 0;
+        size_t n;
+        while ((n = fread(buf, 1, CH, f)) > 0) {
+            u32 wr = 0;
+            if (R_FAILED(FSFILE_Write(h, &wr, off, buf, (u32)n, 0)) || wr != n) { ok = 0; break; }
+            off += n;
+            u64 now = osGetTime();
+            if (now - last >= 100) { last = now; upd_screen("INSTALLING", "Clownsec Player", (int)(off * 100 / (u64)sz)); }
+        }
+        if (ok && (long)off != sz) ok = 0;
+        if (ok) ok = R_SUCCEEDED(AM_FinishCiaInstall(h));
+        else AM_CancelCIAInstall(h);
+    }
+    amExit(); free(buf); fclose(f);
+    return ok;
+}
+/* Returns 1 when the new build is on the card and the app should exit (it relaunches itself). */
+static int self_update(void) {
+    int hbl = envIsHomebrew();
+    const char *self = (hbl && __system_argc > 0 && __system_argv && __system_argv[0] &&
+                        !strncmp(__system_argv[0], "sdmc:/", 6)) ? __system_argv[0] : NULL;
+    if (hbl && !self) {
+        msg_screen("UPDATE", "Can't find this .3dsx on the SD card.\nRedownload it via the QR / FBI.");
+        return 0;
+    }
+    {   /* a power cut mid-install leaves no working player: insist on charge */
+        u8 lvl = 5, chg = 1;
+        if (R_SUCCEEDED(ptmuInit())) { PTMU_GetBatteryLevel(&lvl); PTMU_GetBatteryChargeState(&chg); ptmuExit(); }
+        if (lvl < 2 && !chg) { msg_screen("UPDATE", "Battery is low.\nPlug in the charger and try again."); return 0; }
+    }
+    char url[256];
+    upd_asset_url(url, sizeof url, hbl ? ".3dsx" : ".cia");
+    const char *tmp = hbl ? UPD_3DSX_TMP : UPD_CIA_TMP;
+    mkdir("sdmc:/moflex_player", 0777);
+    remove(tmp);
+    download_discard_partial(url);   /* same URL every release: never resume an older build's bytes */
+    snprintf(g_dl_name, sizeof g_dl_name, "Clownsec Player %s", s_upd);
+    g_last_prog = 0;
+    s_sleep_pending = 0;
+    aptSetSleepAllowed(false);
+    dl_wifi_hold(1);
+    bool got = download_to_file(url, tmp, dl_progress, NULL);
+    dl_wifi_hold(0);
+    if (!got) {
+        sleep_reallow();
+        download_discard_partial(url);
+        long http = download_last_http();
+        char m[96];
+        if (http == 404) snprintf(m, sizeof m, "The update file isn't published yet.\nTry again later.");
+        else snprintf(m, sizeof m, "The download stopped.\nNothing was changed.");
+        msg_screen("UPDATE", m);
+        return 0;
+    }
+    upd_screen("CHECKING", "Clownsec Player", -1);
+    if (!upd_md5_ok(tmp, s_upd_md5)) {
+        sleep_reallow(); remove(tmp);
+        msg_screen("UPDATE", "The download was damaged.\nNothing was changed. Try again.");
+        return 0;
+    }
+    int ok;
+    if (hbl) {   /* swap the .3dsx in place; the old one stays until the new one is whole */
+        char bak[PATHLEN + NAMELEN];
+        snprintf(bak, sizeof bak, "%s.old", self);
+        remove(bak);
+        ok = rename(self, bak) == 0;
+        if (ok && rename(tmp, self) != 0) { rename(bak, self); ok = 0; }
+        if (ok) remove(bak);
+    } else {
+        upd_screen("INSTALLING", "Clownsec Player", 0);
+        ok = upd_cia_install(tmp);
+    }
+    remove(tmp);
+    sleep_reallow();
+    if (!ok) { msg_screen("UPDATE", "The install failed.\nThe current version is unchanged."); return 0; }
+    char m[96];
+    if (hbl) snprintf(m, sizeof m, "Updated to %s.\nStart it again from the\nHomebrew Launcher.", s_upd);
+    else { snprintf(m, sizeof m, "Updated to %s.\nThe player will now restart.", s_upd); aptSetChainloaderToSelf(); }
+    msg_screen_btn("UPDATE INSTALLED", m, "OKAY");
+    return 1;
+}
+
 /* Home screen polls this once per frame; runs the prompts when the background walk lands. */
 static int startup_detect_poll(void) {
     if (s_upd[0] && !s_upd_shown) {   /* newer build published */
         s_upd_shown = 1;
         char um[96];
-        snprintf(um, sizeof um, "A newer build is available:\n%s (you have %s).\nRedownload via the QR / FBI.", s_upd, BUILD_TAG);
-        msg_screen_btn("UPDATE AVAILABLE", um, "OKAY");   /* once per session; the tag stays after */
+        snprintf(um, sizeof um, "A newer build is available:\n%s (you have %s).\nInstall it now?", s_upd, BUILD_TAG);
+        if (prompt2("UPDATE AVAILABLE", um, "UPDATE", "LATER") == 0 && self_update())   /* once per session */
+            s_upd_quit = 1;
         return 1;
     }
     if (s_dt_consumed || !s_dt_done) return 0;
@@ -5359,6 +5520,7 @@ static int home_gui(void) {
     long long rpos = g_now_playing_path[0] ? moflex_resume_get(g_now_playing_path) : 0;
     while (aptMainLoop()) {
         if (startup_detect_poll()) redraw = 1;
+        if (s_upd_quit) return -1;   /* new build installed: exit so it can relaunch */
         if (dlw_poll()) redraw = 1;   /* finalize background downloads while on home */
         if (s_dlw_resume_ask) {
             s_dlw_resume_ask = 0;

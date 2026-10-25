@@ -1357,46 +1357,76 @@ static int sub_budget_px(int dep) {
     return w < 64 ? 64 : w;
 }
 
-/* Wrap a cue into display lines: keep the SRT's own line breaks (dialogue dashes),
- * and word-wrap only within each of those lines. Returns line count. */
-/* `width` measures one codepoint in whatever unit `maxw` is given in: cells for the classic
+/* Greedy-wrap ONE source line [seg,segend) at width maxw into out[]. Returns the line count, or
+ * SUB_MAXLN + 1 when it needs more lines than out[] holds (out[] then has the first SUB_MAXLN).
+ * `width` measures one codepoint in whatever unit `maxw` is given in: cells for the classic
  * framebuffer blit, PIXELS for the proportional texture path. The byte budget is enforced
- * separately (maxcp) so a pixel budget can be large without overrunning the line buffer. */
+ * separately (maxcp) so a pixel budget can be large without overrunning the line buffer.
+ * *widest (when given) gets the widest word, which is as narrow as a balanced wrap may go. */
+static int seg_wrap_u(const char *seg, const char *segend, char out[SUB_MAXLN][SUB_LNW], int maxw,
+                      int (*width)(uint32_t), int *widest) {
+    const int maxcp = (SUB_LNW - 1) / 3;         /* UTF-8 worst case: guard the byte buffer */
+    int nl = 0;
+    char cur[SUB_LNW]; int cb = 0, cw = 0, cn = 0;  /* current line: bytes, width, codepoints */
+    if (widest) *widest = 0;
+    for (const char *p = seg; p < segend; ) {
+        while (p < segend && (*p == ' ' || *p == '\t' || *p == '\r')) p++;
+        if (p >= segend) break;
+        const char *w = p; int ww = 0, wn = 0;      /* word: byte range [w,p), ww wide, wn cps */
+        while (p < segend && *p != ' ' && *p != '\t' && *p != '\r') {
+            const char *q = p; uint32_t cp = u8_next(&q);
+            if (ww > 0 && (ww + width(cp) > maxw || wn >= maxcp)) break;   /* CJK: no spaces to
+                                                                  * break on, so break inside
+                                                                  * the run rather than
+                                                                  * truncating it */
+            p = q; ww += width(cp); wn++;
+        }
+        if (widest && ww > *widest) *widest = ww;
+        int wb = (int)(p - w), sp = width(' ');
+        if (cw == 0) { memcpy(cur, w, wb); cb = wb; cw = ww; cn = wn; }
+        else if (cw + sp + ww <= maxw && cn + 1 + wn <= maxcp) {
+            cur[cb++] = ' '; memcpy(cur + cb, w, wb); cb += wb; cw += sp + ww; cn += 1 + wn; }
+        else { if (nl >= SUB_MAXLN) return SUB_MAXLN + 1;
+               cur[cb] = 0; snprintf(out[nl++], SUB_LNW, "%s", cur);
+               memcpy(cur, w, wb); cb = wb; cw = ww; cn = wn; }
+    }
+    if (cb > 0) {
+        if (nl >= SUB_MAXLN) return SUB_MAXLN + 1;   /* a pending line with nowhere to go */
+        cur[cb] = 0; snprintf(out[nl++], SUB_LNW, "%s", cur);
+    }
+    return nl;
+}
+/* Wrap a cue into display lines: keep the SRT's own line breaks (dialogue dashes),
+ * and word-wrap only within each of those lines. Returns line count.
+ * BALANCED: a source line that needs k lines is re-wrapped at the narrowest width that still gives
+ * k, so a cue one word too long becomes two even halves instead of a full-width line over a lone
+ * word. The width never goes below the widest word, so balancing never splits a word. */
 static int sub_wrap_u(const char *t, char lines[SUB_MAXLN][SUB_LNW], int maxw,
                       int (*width)(uint32_t)) {
-    const int maxcp = (SUB_LNW - 1) / 3;         /* UTF-8 worst case: guard the byte buffer */
     if (maxw < 1) maxw = 1;
     int nl = 0;
     g_sub_wrap_cut = 0;
+    char tmp[SUB_MAXLN][SUB_LNW];
     for (const char *seg = t; *seg; ) {
         if (nl >= SUB_MAXLN) {                       /* out of lines: anything left with ink is lost */
             for (const char *q = seg; *q; q++) if (*q != ' ' && *q != '\t' && *q != '\r' && *q != '\n') { g_sub_wrap_cut = 1; break; }
             break;
         }
         const char *segend = seg; while (*segend && *segend != '\n') segend++;   /* one source line */
-        char cur[SUB_LNW]; int cb = 0, cw = 0, cn = 0;  /* current line: bytes, width, codepoints */
-        for (const char *p = seg; p < segend && nl < SUB_MAXLN; ) {
-            while (p < segend && (*p == ' ' || *p == '\t' || *p == '\r')) p++;
-            if (p >= segend) break;
-            const char *w = p; int ww = 0, wn = 0;      /* word: byte range [w,p), ww wide, wn cps */
-            while (p < segend && *p != ' ' && *p != '\t' && *p != '\r') {
-                const char *q = p; uint32_t cp = u8_next(&q);
-                if (ww > 0 && (ww + width(cp) > maxw || wn >= maxcp)) break;   /* CJK: no spaces to
-                                                                      * break on, so break inside
-                                                                      * the run rather than
-                                                                      * truncating it */
-                p = q; ww += width(cp); wn++;
+        int widest = 0;
+        int k = seg_wrap_u(seg, segend, tmp, maxw, width, &widest);
+        if (k >= 2 && k <= SUB_MAXLN && widest < maxw) {
+            int lo = widest, hi = maxw;              /* line count only falls as width grows */
+            while (lo < hi) {
+                int mid = lo + (hi - lo) / 2;
+                if (seg_wrap_u(seg, segend, tmp, mid, width, NULL) == k) hi = mid; else lo = mid + 1;
             }
-            int wb = (int)(p - w), sp = width(' ');
-            if (cw == 0) { memcpy(cur, w, wb); cb = wb; cw = ww; cn = wn; }
-            else if (cw + sp + ww <= maxw && cn + 1 + wn <= maxcp) {
-                cur[cb++] = ' '; memcpy(cur + cb, w, wb); cb += wb; cw += sp + ww; cn += 1 + wn; }
-            else { cur[cb] = 0; snprintf(lines[nl++], SUB_LNW, "%s", cur);
-                   memcpy(cur, w, wb); cb = wb; cw = ww; cn = wn; }
+            seg_wrap_u(seg, segend, tmp, hi, width, NULL);
         }
-        if (cb > 0) {
-            if (nl < SUB_MAXLN) { cur[cb] = 0; snprintf(lines[nl++], SUB_LNW, "%s", cur); }
-            else g_sub_wrap_cut = 1;                 /* a pending line with nowhere to go */
+        for (int i = 0; i < k; i++) {
+            if (nl >= SUB_MAXLN) { g_sub_wrap_cut = 1; break; }
+            if (i >= SUB_MAXLN) { g_sub_wrap_cut = 1; break; }
+            memcpy(lines[nl++], tmp[i], SUB_LNW);
         }
         seg = (*segend == '\n') ? segend + 1 : segend;
     }
@@ -3513,47 +3543,77 @@ static float sys_line_w(const char *s, float sc) {
     C2D_TextGetDimensions(&t, sc, sc, &w, NULL);
     return w;
 }
+/* Word-wrap ONE source line for the system font on measured widths, splitting INSIDE a word only
+ * when the word alone is wider than a line (CJK runs have no spaces). Same contract as seg_wrap_u:
+ * the line count, or SUB_MAXLN + 1 when out[] cannot hold it; *widest gets the widest word. */
+static int sys_seg_wrap(const char *seg, const char *segend, char out[SUB_MAXLN][SUB_LNW],
+                        float maxw, float sc, float *widest) {
+    int nl = 0;
+    char cur[SUB_LNW]; int cb = 0;
+#define SYS_EMIT() do { if (nl >= SUB_MAXLN) return SUB_MAXLN + 1; \
+                        cur[cb] = 0; memcpy(out[nl++], cur, cb + 1); cb = 0; } while (0)
+    if (widest) *widest = 0.0f;
+    for (const char *p = seg; p < segend; ) {
+        while (p < segend && (*p == ' ' || *p == '\t' || *p == '\r')) p++;
+        if (p >= segend) break;
+        const char *w = p;
+        while (p < segend && *p != ' ' && *p != '\t' && *p != '\r') p++;
+        int wb = (int)(p - w), at = cb ? cb + 1 : 0;
+        if (widest && wb < SUB_LNW) {
+            char wd[SUB_LNW]; memcpy(wd, w, wb); wd[wb] = 0;
+            float ww = sys_line_w(wd, sc);
+            if (ww > *widest) *widest = ww;
+        }
+        if (at + wb < SUB_LNW) {                          /* the whole word on this line? */
+            char cand[SUB_LNW];
+            memcpy(cand, cur, cb); if (cb) cand[cb] = ' ';
+            memcpy(cand + at, w, wb); cand[at + wb] = 0;
+            if (sys_line_w(cand, sc) <= maxw) { memcpy(cur, cand, at + wb + 1); cb = at + wb; continue; }
+        }
+        if (cb) SYS_EMIT();                               /* no: close this line first */
+        for (const char *q = w; q < p; ) {                /* lay the word down, splitting it at
+                                                           * codepoints only if it must */
+            const char *r = q; u8_next(&r);
+            int cl = (int)(r - q);
+            if (cb + cl < SUB_LNW) {
+                memcpy(cur + cb, q, cl); cur[cb + cl] = 0;
+                if (cb == 0 || sys_line_w(cur, sc) <= maxw) { cb += cl; q = r; continue; }
+            }
+            SYS_EMIT();
+        }
+    }
+    if (cb) SYS_EMIT();
+#undef SYS_EMIT
+    return nl;
+}
 /* Word-wrap a cue for the system font. This path used to split on the SRT's own line breaks and
  * nothing else, so a long single-line cue was drawn as one line wider than the panel and lost both
- * ends. Keeps those breaks, wraps inside each on measured widths, and splits INSIDE a word only when
- * the word alone is wider than a line (CJK runs have no spaces). Sets g_sub_wrap_cut like
- * sub_wrap_u when the cue needs more than SUB_MAXLN lines. Runs once per cue, not per frame. */
+ * ends. Keeps those breaks and wraps inside each on measured widths, BALANCED like sub_wrap_u: the
+ * narrowest width (never below the widest word) that keeps the same line count. Sets
+ * g_sub_wrap_cut like sub_wrap_u when the cue needs more than SUB_MAXLN lines. Runs once per cue,
+ * not per frame. */
 static int sys_wrap(const char *t, char lines[SUB_MAXLN][SUB_LNW], float maxw, float sc) {
     int nl = 0;
     g_sub_wrap_cut = 0;
-#define SYS_EMIT() do { if (nl >= SUB_MAXLN) { g_sub_wrap_cut = 1; return nl; } \
-                        cur[cb] = 0; memcpy(lines[nl++], cur, cb + 1); cb = 0; } while (0)
+    char tmp[SUB_MAXLN][SUB_LNW];
     for (const char *seg = t; *seg; ) {
         const char *segend = seg; while (*segend && *segend != '\n') segend++;   /* one source line */
-        char cur[SUB_LNW]; int cb = 0;
-        for (const char *p = seg; p < segend; ) {
-            while (p < segend && (*p == ' ' || *p == '\t' || *p == '\r')) p++;
-            if (p >= segend) break;
-            const char *w = p;
-            while (p < segend && *p != ' ' && *p != '\t' && *p != '\r') p++;
-            int wb = (int)(p - w), at = cb ? cb + 1 : 0;
-            if (at + wb < SUB_LNW) {                          /* the whole word on this line? */
-                char cand[SUB_LNW];
-                memcpy(cand, cur, cb); if (cb) cand[cb] = ' ';
-                memcpy(cand + at, w, wb); cand[at + wb] = 0;
-                if (sys_line_w(cand, sc) <= maxw) { memcpy(cur, cand, at + wb + 1); cb = at + wb; continue; }
+        float widest = 0.0f;
+        int k = sys_seg_wrap(seg, segend, tmp, maxw, sc, &widest);
+        if (k >= 2 && k <= SUB_MAXLN && widest < maxw) {
+            float lo = widest, hi = maxw;                 /* 8 halvings: well under a pixel */
+            for (int it = 0; it < 8 && hi - lo > 1.0f; it++) {
+                float mid = (lo + hi) * 0.5f;
+                if (sys_seg_wrap(seg, segend, tmp, mid, sc, NULL) == k) hi = mid; else lo = mid;
             }
-            if (cb) SYS_EMIT();                               /* no: close this line first */
-            for (const char *q = w; q < p; ) {                /* lay the word down, splitting it at
-                                                               * codepoints only if it must */
-                const char *r = q; u8_next(&r);
-                int cl = (int)(r - q);
-                if (cb + cl < SUB_LNW) {
-                    memcpy(cur + cb, q, cl); cur[cb + cl] = 0;
-                    if (cb == 0 || sys_line_w(cur, sc) <= maxw) { cb += cl; q = r; continue; }
-                }
-                SYS_EMIT();
-            }
+            sys_seg_wrap(seg, segend, tmp, hi, sc, NULL);
         }
-        if (cb) SYS_EMIT();
+        for (int i = 0; i < k; i++) {
+            if (nl >= SUB_MAXLN || i >= SUB_MAXLN) { g_sub_wrap_cut = 1; return nl; }
+            memcpy(lines[nl++], tmp[i], SUB_LNW);
+        }
         seg = (*segend == '\n') ? segend + 1 : segend;
     }
-#undef SYS_EMIT
     return nl;
 }
 /* Lay a cue out so it FITS: wrap to the width left after the margins, the outline and the 3D

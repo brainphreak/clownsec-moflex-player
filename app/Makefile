@@ -23,6 +23,11 @@ export BUILD_TAG
 CFLAGS  := -w -Wreturn-type -O3 -mword-relocations -ffunction-sections -D__3DS__ -D_GNU_SOURCE \
 	-DBUILD_TAG=\"$(BUILD_TAG)\" \
 	-Wno-error=implicit-function-declaration $(ARCH) $(INCLUDE)
+# Test builds only: UPDATE_TEST_URL=https://.../latest.txt points the update check (and the
+# self-updater's download, which sits beside it) somewhere other than the public release.
+ifneq ($(UPDATE_TEST_URL),)
+CFLAGS  += -DUPDATE_TEST_URL=\"$(UPDATE_TEST_URL)\"
+endif
 LDFLAGS := -specs=3dsx.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
 LIBS    := -lcurl -lmbedtls -lmbedx509 -lmbedcrypto -lz -lcitro2d -lcitro3d -lctru -lm
 LIBDIRS := $(CTRULIB) $(DEVKITPRO)/portlibs/3ds
