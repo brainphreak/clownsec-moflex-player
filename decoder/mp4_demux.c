@@ -117,100 +117,154 @@ static uint32_t clamp_cnt(uint32_t n, int64_t avail, int stride) {
     uint32_t max = (uint32_t)(avail / stride);
     return n > max ? max : n;
 }
+int mp4_open_error = MP4_ERR_NONE;
+static int g_oom;      /* an allocation failed somewhere in this open */
+static void *xmalloc(size_t n) { void *p = malloc(n); if (!p) g_oom = 1; return p; }
+
 static void parse_stbl_leaf_mem(const uint8_t *b, uint32_t type, int64_t body, int64_t bend, Trak *t) {
     if (body + 8 > bend) return;
     const uint8_t *p = b + body;
     int64_t avail = bend - body - 8;
     if (type == BOX('s','t','t','s')) {
         uint32_t n = clamp_cnt(mu32(p + 4), avail, 8);
-        t->stts_n = malloc((size_t)n * 4 + 4); t->stts_d = malloc((size_t)n * 4 + 4); t->stts_cnt = n;
+        t->stts_n = xmalloc((size_t)n * 4 + 4); t->stts_d = xmalloc((size_t)n * 4 + 4);
+        if (!t->stts_n || !t->stts_d) return;
+        t->stts_cnt = n;
         for (uint32_t i = 0; i < n; i++) { t->stts_n[i] = mu32(p + 8 + i*8); t->stts_d[i] = mu32(p + 8 + i*8 + 4); }
     } else if (type == BOX('s','t','s','c')) {
         uint32_t n = clamp_cnt(mu32(p + 4), avail, 12);
-        t->stsc_first = malloc((size_t)n * 4 + 4); t->stsc_spc = malloc((size_t)n * 4 + 4); t->stsc_cnt = n;
+        t->stsc_first = xmalloc((size_t)n * 4 + 4); t->stsc_spc = xmalloc((size_t)n * 4 + 4);
+        if (!t->stsc_first || !t->stsc_spc) return;
+        t->stsc_cnt = n;
         for (uint32_t i = 0; i < n; i++) { t->stsc_first[i] = mu32(p + 8 + i*12); t->stsc_spc[i] = mu32(p + 8 + i*12 + 4); }
     } else if (type == BOX('s','t','s','z')) {
         t->stsz_uniform = mu32(p + 4);
         uint32_t n = mu32(p + 8);
-        if (t->stsz_uniform == 0) n = clamp_cnt(n, avail - 4, 4);
+        if (t->stsz_uniform == 0) {
+            n = clamp_cnt(n, avail - 4, 4);
+            t->stsz = xmalloc((size_t)n * 4 + 4);
+            if (!t->stsz) return;
+            for (uint32_t i = 0; i < n; i++) t->stsz[i] = mu32(p + 12 + i*4);
+        }
         t->stsz_cnt = n;
-        if (t->stsz_uniform == 0) { t->stsz = malloc((size_t)n * 4 + 4); for (uint32_t i = 0; i < n; i++) t->stsz[i] = mu32(p + 12 + i*4); }
     } else if (type == BOX('s','t','c','o')) {
         uint32_t n = clamp_cnt(mu32(p + 4), avail, 4);
-        t->stco = malloc((size_t)n * 8 + 8); t->stco_cnt = n;
+        t->stco = xmalloc((size_t)n * 8 + 8);
+        if (!t->stco) return;
+        t->stco_cnt = n;
         for (uint32_t i = 0; i < n; i++) t->stco[i] = mu32(p + 8 + i*4);
     } else if (type == BOX('c','o','6','4')) {
         uint32_t n = clamp_cnt(mu32(p + 4), avail, 8);
-        t->stco = malloc((size_t)n * 8 + 8); t->stco_cnt = n;
+        t->stco = xmalloc((size_t)n * 8 + 8);
+        if (!t->stco) return;
+        t->stco_cnt = n;
         for (uint32_t i = 0; i < n; i++) t->stco[i] = mu64(p + 8 + i*8);
     } else if (type == BOX('s','t','s','s')) {
         uint32_t n = clamp_cnt(mu32(p + 4), avail, 4);
-        t->stss = malloc((size_t)n * 4 + 4); t->stss_cnt = n;
+        t->stss = xmalloc((size_t)n * 4 + 4);
+        if (!t->stss) return;
+        t->stss_cnt = n;
         for (uint32_t i = 0; i < n; i++) t->stss[i] = mu32(p + 8 + i*4);
     } else if (type == BOX('c','t','t','s')) {
         uint32_t n = clamp_cnt(mu32(p + 4), avail, 8);
-        t->ctts_n = malloc((size_t)n * 4 + 4); t->ctts_d = malloc((size_t)n * 4 + 4); t->ctts_cnt = n;
+        t->ctts_n = xmalloc((size_t)n * 4 + 4); t->ctts_d = xmalloc((size_t)n * 4 + 4);
+        if (!t->ctts_n || !t->ctts_d) return;
+        t->ctts_cnt = n;
         /* version 0 stores unsigned offsets, version 1 signed -- reading as s32 handles both */
         for (uint32_t i = 0; i < n; i++) { t->ctts_n[i] = mu32(p + 8 + i*8); t->ctts_d[i] = (int32_t)mu32(p + 8 + i*8 + 4); }
     }
-}
-
-static Mp4Sample *assemble(Trak *t, int *count) {
-    int n = (int)t->stsz_cnt; if (n <= 0) { *count = 0; return NULL; }
-    Mp4Sample *s = (Mp4Sample *)malloc((size_t)n * sizeof(Mp4Sample));
-    if (!s) { *count = 0; return NULL; }
-    for (int i = 0; i < n; i++) s[i].size = t->stsz_uniform ? t->stsz_uniform : t->stsz[i];
-    int si = 0;
-    for (int c = 0; c < t->stco_cnt && si < n; c++) {
-        int spc = 1;
-        for (int r = 0; r < t->stsc_cnt; r++) { if ((int)t->stsc_first[r] - 1 <= c) spc = (int)t->stsc_spc[r]; else break; }
-        int64_t off = (int64_t)t->stco[c];
-        for (int k = 0; k < spc && si < n; k++) { s[si].offset = off; off += s[si].size; si++; }
-    }
-    for (; si < n; si++) s[si].offset = 0;
-    int64_t dts = 0; int idx = 0;
-    for (int e = 0; e < t->stts_cnt && idx < n; e++)
-        for (uint32_t k = 0; k < t->stts_n[e] && idx < n; k++) { s[idx].dts = dts; dts += t->stts_d[e]; idx++; }
-    for (; idx < n; idx++) s[idx].dts = dts;
-    /* composition times: dts + ctts run-length offsets (no ctts box = no B-frames = cts == dts) */
-    idx = 0;
-    for (int e = 0; e < t->ctts_cnt && idx < n; e++)
-        for (uint32_t k = 0; k < t->ctts_n[e] && idx < n; k++) { s[idx].cts = s[idx].dts + t->ctts_d[e]; idx++; }
-    for (; idx < n; idx++) s[idx].cts = s[idx].dts;
-    if (t->stss_cnt > 0) {
-        for (int i = 0; i < n; i++) s[i].keyframe = 0;
-        for (int i = 0; i < t->stss_cnt; i++) { int k = (int)t->stss[i] - 1; if (k >= 0 && k < n) s[k].keyframe = 1; }
-    } else for (int i = 0; i < n; i++) s[i].keyframe = 1;
-    *count = n;
-    return s;
 }
 
 static void trak_free_tables(Trak *t) {
     free(t->stts_n); free(t->stts_d); free(t->stsc_first); free(t->stsc_spc);
     free(t->stsz); free(t->stco); free(t->stss);
     free(t->ctts_n); free(t->ctts_d);
+    t->stts_n = t->stts_d = t->stsc_first = t->stsc_spc = t->stsz = t->stss = t->ctts_n = NULL;
+    t->stco = NULL; t->ctts_d = NULL;
 }
+#define FREE0(p) do { free(p); (p) = NULL; } while (0)
+/* Build the per-sample table, freeing each raw table as soon as its pass is done, so the raw
+ * index and the finished table never both sit in memory at full size. Returns NULL with
+ * *count 0 on failure; g_oom says whether memory was the reason. */
+static Mp4Sample *assemble(Trak *t, int *count, int *shift) {
+    *count = 0; *shift = 0;
+    int n = (int)t->stsz_cnt; if (n <= 0) return NULL;
+    /* Times are stored in 32 bits. Find the shift that keeps the whole span in range: 0 for any
+     * ordinary file (90 kHz ticks fit 6.6 hours), more only for a huge timescale. */
+    uint64_t span = 0; int64_t cmax = 0;
+    for (int e = 0; e < t->stts_cnt; e++) span += (uint64_t)t->stts_n[e] * t->stts_d[e];
+    for (int e = 0; e < t->ctts_cnt; e++) {
+        int64_t c = t->ctts_d[e] < 0 ? -(int64_t)t->ctts_d[e] : t->ctts_d[e];
+        if (c > cmax) cmax = c;
+    }
+    int sh = 0;
+    while (((span + (uint64_t)cmax) >> sh) > 0x7FFFFFFFu) sh++;
+    Mp4Sample *s = (Mp4Sample *)xmalloc((size_t)n * sizeof(Mp4Sample));
+    if (!s) return NULL;
+    for (int i = 0; i < n; i++) {
+        s[i].size = (t->stsz_uniform ? t->stsz_uniform : t->stsz[i]) & ~MP4_KEYFLAG;
+        s[i].ctso = 0;
+    }
+    int si = 0;
+    for (int c = 0; c < t->stco_cnt && si < n; c++) {
+        int spc = 1;
+        for (int r = 0; r < t->stsc_cnt; r++) { if ((int)t->stsc_first[r] - 1 <= c) spc = (int)t->stsc_spc[r]; else break; }
+        uint64_t off = t->stco[c];
+        for (int k = 0; k < spc && si < n; k++) {
+            if (off > 0xFFFFFFFFu) { free(s); return NULL; }   /* past 4 GiB: not on a FAT32 card */
+            s[si].offset = (uint32_t)off; off += s[si].size; si++;
+        }
+    }
+    for (; si < n; si++) s[si].offset = 0;
+    FREE0(t->stsz); FREE0(t->stco); FREE0(t->stsc_first); FREE0(t->stsc_spc);
+    int64_t dts = 0; int idx = 0;
+    for (int e = 0; e < t->stts_cnt && idx < n; e++)
+        for (uint32_t k = 0; k < t->stts_n[e] && idx < n; k++) { s[idx].dts = (uint32_t)(dts >> sh); dts += t->stts_d[e]; idx++; }
+    for (; idx < n; idx++) s[idx].dts = (uint32_t)(dts >> sh);
+    FREE0(t->stts_n); FREE0(t->stts_d);
+    /* composition offsets (no ctts box = no B-frames = cts == dts) */
+    idx = 0;
+    for (int e = 0; e < t->ctts_cnt && idx < n; e++)
+        for (uint32_t k = 0; k < t->ctts_n[e] && idx < n; k++) { s[idx].ctso = t->ctts_d[e] >> sh; idx++; }
+    FREE0(t->ctts_n); FREE0(t->ctts_d);
+    if (t->stss_cnt > 0) {
+        for (int i = 0; i < t->stss_cnt; i++) { int k = (int)t->stss[i] - 1; if (k >= 0 && k < n) s[k].size |= MP4_KEYFLAG; }
+    } else for (int i = 0; i < n; i++) s[i].size |= MP4_KEYFLAG;
+    FREE0(t->stss);
+    *count = n; *shift = sh;
+    return s;
+}
+
 static void finalize_trak(Mp4 *m, Trak *t) {
     if (t->is_video && !m->has_video) {
         m->has_video = 1; m->width = t->width; m->height = t->height; m->v_timescale = t->timescale ? t->timescale : 1;
         m->vfourcc = t->vfourcc;
         memcpy(m->avcc, t->avcc, sizeof m->avcc); m->avcc_len = t->avcc_len; m->nal_length_size = t->nal_len_size ? t->nal_len_size : 4;
-        m->vsamples = assemble(t, &m->v_count);
+        m->vsamples = assemble(t, &m->v_count, &m->v_shift);
     } else if (t->is_audio && !m->has_audio) {
         m->has_audio = 1; m->a_timescale = t->timescale ? t->timescale : 1; m->a_rate = t->a_rate; m->a_channels = t->a_channels;
         memcpy(m->asc, t->asc, sizeof m->asc); m->asc_len = t->asc_len;
-        m->asamples = assemble(t, &m->a_count);
+        m->asamples = assemble(t, &m->a_count, &m->a_shift);
     }
     trak_free_tables(t);
 }
 
-static void walk_mem(Mp4 *m, Trak *t, const uint8_t *b, int64_t pos, int64_t end) {
+/* While the moov buffer is walked, the first video and first audio trak are only PARSED and
+ * kept here; they are assembled after the buffer is freed (it is ~6 MB for a 2 h film). */
+typedef struct { Trak v, a; } Keep;
+
+static void walk_mem(Keep *kp, Trak *t, const uint8_t *b, int64_t pos, int64_t end) {
     uint32_t type; int64_t body, bend;
     while (mbox(b, pos, end, &type, &body, &bend)) {
         switch (type) {
             case BOX('m','d','i','a'): case BOX('m','i','n','f'): case BOX('s','t','b','l'):
-                walk_mem(m, t, b, body, bend); break;
-            case BOX('t','r','a','k'): { Trak nt; memset(&nt, 0, sizeof nt); walk_mem(m, &nt, b, body, bend); finalize_trak(m, &nt); break; }
+                walk_mem(kp, t, b, body, bend); break;
+            case BOX('t','r','a','k'): {
+                Trak nt; memset(&nt, 0, sizeof nt); walk_mem(kp, &nt, b, body, bend);
+                if (nt.is_video && !kp->v.is_video) kp->v = nt;          /* tables move with it */
+                else if (nt.is_audio && !nt.is_video && !kp->a.is_audio) kp->a = nt;
+                else trak_free_tables(&nt);
+                break; }
             case BOX('m','d','h','d'): { if (body + 24 <= bend) { uint32_t vf = mu32(b + body);
                     t->timescale = ((vf >> 24) == 1) ? mu32(b + body + 4 + 16) : mu32(b + body + 4 + 8); } break; }
             case BOX('h','d','l','r'): { if (body + 12 <= bend) { uint32_t h = mu32(b + body + 8);
@@ -241,6 +295,7 @@ static int fbox(FILE *f, int64_t pos, int64_t end, uint32_t *type, int64_t *body
 
 int mp4_open(Mp4 *m, const char *path) {
     memset(m, 0, sizeof *m);
+    mp4_open_error = MP4_ERR_FORMAT; g_oom = 0;
     m->f = fopen(path, "rb");
     if (!m->f) return 0;
     setvbuf(m->f, NULL, _IOFBF, 128 * 1024);   /* SD reads are the frame budget: buffer big */
@@ -264,14 +319,27 @@ int mp4_open(Mp4 *m, const char *path) {
     int64_t msz = moov_end - moov_body;
     if (msz <= 0 || msz > 64 * 1024 * 1024) { mp4_close(m); return 0; }
     uint8_t *buf = (uint8_t *)malloc((size_t)msz);
-    if (!buf) { mp4_close(m); return 0; }
+    if (!buf) { mp4_open_error = MP4_ERR_NOMEM; mp4_close(m); return 0; }
     if (fseeko(m->f, moov_body, SEEK_SET) || (int64_t)fread(buf, 1, (size_t)msz, m->f) != msz) {
         free(buf); mp4_close(m); return 0;
     }
 
-    walk_mem(m, NULL, buf, 0, msz);
-    free(buf);
+    Keep kp; memset(&kp, 0, sizeof kp);
+    walk_mem(&kp, NULL, buf, 0, msz);
+    free(buf);                                 /* before assembling: the two never overlap */
+    if (kp.v.is_video) finalize_trak(m, &kp.v);
+    if (kp.a.is_audio) finalize_trak(m, &kp.a);
+    /* a track that failed to assemble is no track: the player must not index an empty table */
+    if (m->has_video && (!m->vsamples || m->v_count <= 0) && m->vfourcc == BOX('a','v','c','1')) {
+        if (g_oom) mp4_open_error = MP4_ERR_NOMEM;
+        mp4_close(m); return 0;
+    }
+    if (m->has_audio && (!m->asamples || m->a_count <= 0)) {
+        if (g_oom) { mp4_open_error = MP4_ERR_NOMEM; mp4_close(m); return 0; }
+        m->has_audio = 0;                      /* an empty/unreadable audio track: play silent */
+    }
     if (!m->has_video) { mp4_close(m); return 0; }
+    mp4_open_error = MP4_ERR_NONE;
     return 1;
 }
 
@@ -283,26 +351,26 @@ void mp4_close(Mp4 *m) {
 }
 
 int mp4_read_sample(Mp4 *m, const Mp4Sample *s, uint8_t *buf) {
-    if (fseeko(m->f, s->offset, SEEK_SET)) return 0;
-    return (int)fread(buf, 1, s->size, m->f);
+    if (fseeko(m->f, (off_t)s->offset, SEEK_SET)) return 0;
+    return (int)fread(buf, 1, mp4_s_size(s), m->f);
 }
 int mp4_read_sample_audio(Mp4 *m, const Mp4Sample *s, uint8_t *buf) {
     FILE *f = m->fa ? m->fa : m->f;
-    if (fseeko(f, s->offset, SEEK_SET)) return 0;
-    return (int)fread(buf, 1, s->size, f);
+    if (fseeko(f, (off_t)s->offset, SEEK_SET)) return 0;
+    return (int)fread(buf, 1, mp4_s_size(s), f);
 }
 
 int mp4_keyframe_before(const Mp4 *m, int64_t dts) {
     int best = 0;
     for (int i = 0; i < m->v_count; i++) {
-        if (m->vsamples[i].dts > dts) break;
-        if (m->vsamples[i].keyframe) best = i;
+        if (mp4_v_dts(m, i) > dts) break;
+        if (mp4_s_key(&m->vsamples[i])) best = i;
     }
     return best;
 }
 
 double mp4_duration_s(const Mp4 *m) {
     if (!m->has_video || m->v_count == 0 || m->v_timescale == 0) return 0;
-    int64_t last = m->vsamples[m->v_count - 1].dts;
+    int64_t last = mp4_v_dts(m, m->v_count - 1);
     return (double)last / (double)m->v_timescale;
 }

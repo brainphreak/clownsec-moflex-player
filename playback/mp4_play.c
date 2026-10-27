@@ -123,11 +123,11 @@ static void fmt_time(int64_t us, char *o, size_t n) {
 /* time of a sample in microseconds */
 static int64_t v_time_us(Mp4 *m, int i) {
     if (m->v_timescale <= 0) return 0;
-    return (int64_t)(m->vsamples[i].dts * 1000000LL / (int64_t)m->v_timescale);
+    return (int64_t)(mp4_v_dts(m, i) * 1000000LL / (int64_t)m->v_timescale);
 }
 static int64_t v_cts_us(Mp4 *m, int i) {   /* DISPLAY time: with B-frames this != decode time */
     if (m->v_timescale <= 0) return 0;
-    return (int64_t)(m->vsamples[i].cts * 1000000LL / (int64_t)m->v_timescale);
+    return (int64_t)(mp4_v_cts(m, i) * 1000000LL / (int64_t)m->v_timescale);
 }
 /* B-frame reorder queue: decoded frames wait here (by slot) until their DISPLAY time comes up.
  * Depth 4 covers x264's default reorder distance with margin; adds ~4 frames of start latency. */
@@ -162,7 +162,7 @@ static int g_present_log = 12;   /* countdown: log the first presents after star
 
 static int64_t a_time_us(Mp4 *m, int i) {
     if (m->a_timescale <= 0) return 0;
-    return (int64_t)(m->asamples[i].dts * 1000000LL / (int64_t)m->a_timescale);
+    return (int64_t)(mp4_a_dts(m, i) * 1000000LL / (int64_t)m->a_timescale);
 }
 
 /* current media position (us). Audio is the master when present; otherwise a wall clock. */
@@ -184,7 +184,7 @@ static void pump_audio(Mp4 *m, uint8_t *atmp) {
         if (g_a_next >= m->a_count) continue;
         Mp4Sample *as = &m->asamples[g_a_next];
         int n  = mp4_read_sample_audio(m, as, atmp);
-        int sp = (n == (int)as->size) ? mp4_aac_decode(&g_aac, atmp, n, g_abuf[i]) : 0;
+        int sp = (n == (int)mp4_s_size(as)) ? mp4_aac_decode(&g_aac, atmp, n, g_abuf[i]) : 0;
         g_a_next++;
         if (sp <= 0) continue;
         if (g_pvol != 1.0f) {
@@ -282,7 +282,7 @@ static void do_seek(Mp4 *m, uint8_t *vbuf, uint8_t *atmp, int sbs, int64_t dur_u
         int c = 0;
         while (mp4_mvd_pending()) { if (!mp4_mvd_pump(NULL, 0, &c)) break; prod++; }   /* drain */
         int nn = mp4_read_sample(m, &m->vsamples[j], vbuf);
-        int r = (nn == (int)m->vsamples[j].size) ? mp4_mvd_pump(vbuf, nn, &c) : 0;
+        int r = (nn == (int)mp4_s_size(&m->vsamples[j])) ? mp4_mvd_pump(vbuf, nn, &c) : 0;
         if (r) { got = r; prod++; }
     }
     mvd_log("SEEK to=%llds kf=%d tvi=%d decoded=%d produced=%d took=%lums",
@@ -325,7 +325,12 @@ MoflexResult mp4_play(const char *path) {
     if (!isnew) { mp4_msg("MP4 needs a New 3DS (hardware H.264)."); return MOFLEX_QUIT_BACK; }
 
     Mp4 m;
-    if (!mp4_open(&m, path)) { mp4_msg("Could not open the MP4 (no H.264 track)."); return MOFLEX_QUIT_BACK; }
+    if (!mp4_open(&m, path)) {
+        mp4_msg(mp4_open_error == MP4_ERR_NOMEM
+                    ? "Not enough memory to load this\nMP4's index. Close other apps\nand try again."
+                    : "Could not open the MP4 (no H.264 track).");
+        return MOFLEX_QUIT_BACK;
+    }
 
     /* Side-by-side 3D = a double-wide frame. Detect by ASPECT, not absolute width, so any
      * resolution works: two 16:9 halves = 3.55:1, two 400x240 halves = 3.33:1, while normal 2D
@@ -413,7 +418,7 @@ MoflexResult mp4_play(const char *path) {
     }
 
     uint32_t maxsz = 1;
-    for (int i = 0; i < m.v_count; i++) if (m.vsamples[i].size > maxsz) maxsz = m.vsamples[i].size;
+    for (int i = 0; i < m.v_count; i++) if (mp4_s_size(&m.vsamples[i]) > maxsz) maxsz = mp4_s_size(&m.vsamples[i]);
     uint8_t *buf = (uint8_t *)malloc(maxsz + 16);
     if (!buf) { mp4_mvd_exit(); mp4_close(&m); return MOFLEX_ERROR; }
 
@@ -423,7 +428,7 @@ MoflexResult mp4_play(const char *path) {
     g_have_audio = 0; g_a_next = 0; g_a_played = 0; g_a_started = 0; g_a_base_us = 0;
     if (m.has_audio && mp4_aac_open(&g_aac, m.asc, m.asc_len, m.a_rate, m.a_channels)) {
         uint32_t amax = 1;
-        for (int i = 0; i < m.a_count; i++) if (m.asamples[i].size > amax) amax = m.asamples[i].size;
+        for (int i = 0; i < m.a_count; i++) if (mp4_s_size(&m.asamples[i]) > amax) amax = mp4_s_size(&m.asamples[i]);
         atmp = (uint8_t *)malloc(amax + 16);
         int ok = (atmp != NULL);
         for (int i = 0; i < NWB && ok; i++) {
@@ -606,7 +611,7 @@ MoflexResult mp4_play(const char *path) {
                 t1 = osGetTime();
                 if (g_ftn < FT_MAX) { g_ft[g_ftn++] = v_cts_us(&m, vi); g_ft_push++; }
                 else g_ft_full++;                       /* timestamp DROPPED, frame still decoded */
-                r = (n == (int)s->size) ? mp4_mvd_pump(buf, n, &consumed) : 0;
+                r = (n == (int)mp4_s_size(s)) ? mp4_mvd_pump(buf, n, &consumed) : 0;
                 vi++;
             } else {
                 r = mp4_mvd_pump(NULL, 0, &consumed);   /* drain a held picture */
