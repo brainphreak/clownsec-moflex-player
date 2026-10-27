@@ -13,13 +13,28 @@
 * Volume boost to 400%
 * Locking screen to avoid accidental touch
 * Bottom screen toggles off during playback
-* HQ color toggle (Old 3DS performance boost)
+* HQ color toggle (Old 3DS performance boost), in the VIDEO menu
+* VIDEO menu: framing/zoom, 3D strength, ghost fix, brightness, contrast
+* SOUND menu: volume and auto-levelling
+* Next episode plays automatically after a 5-second countdown
+* Old 3DS: hand any .moflex to Nintendo's 3D Movie Player for smooth 3D (ask, or always, per 2D/3D)
+* Long MP4 films (2 h+) load and play
 
 ## Subtitles
 
-* External SubRip (`.srt`) subtitles
-* Auto-load subtitles with movie name, or load any SRT
+* SubRip (`.srt`) and styled ASS/SSA (`.ass`/`.ssa`) subtitles, external or embedded
+* Several embedded subtitle languages in a SUPER MOFLEX, picked from the CC menu
+* Auto-load subtitles with movie name, or load any subtitle file
+* Long lines split into two even lines; oversized cues shrink to fit
+* System or Pixel font; Japanese, Korean, Greek, Cyrillic and Turkish glyphs
 * Subtitle settings for depth, location, language and delay saved per movie
+
+## SUPER MOFLEX
+
+* Second audio language, switched in place with the AUDIO button
+* Embedded subtitle tracks in several languages
+* Embedded poster and info, read by the library offline
+* SUPER badge and filter in the library and catalogs
 
 ## Library
 
@@ -28,6 +43,7 @@
 * Scrape movie information from online catalog
 * Manually update metadata for custom genres and info
 * Hide or show system files and non-movie files for cleanliness
+* System and app folders (3ds, cias, luma, Nintendo 3DS, moflex_player...) are never scanned -- keep movies elsewhere
 
 ## Downloads
 
@@ -38,6 +54,8 @@
 * Subtitles download automatically with the movie when the catalog has them
 * TV Season zips extract themselves
 * Direct URL download
+* TV shows browse as Show -> Season -> Parts
+* Files over the 4 GB FAT32 limit refused up front
 * Download auto-retry on failure
 
 ## Battery & Power
@@ -53,4 +71,5 @@
 * File manager to browse, rename, move and delete files
 * Default themes and custom color picker for custom user themes
 * Recently played list for quick access
-* Automatic update checks for new releases
+* Updates itself: offers new builds and installs them in place, then restarts
+* Walk the Aisle: a 3D video store of your library, with a jukebox for your own songs
