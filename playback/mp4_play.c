@@ -75,6 +75,8 @@ static void clk_resume(void) { if (!g_clk_running) { g_clk_t0 = osGetTime(); g_c
  * moflex engines learned this the hard way) -- release it when HOME opens, re-acquire on
  * return; pause/resume audio alongside. ---- */
 static aptHookCookie g_mp4_apt_cookie;
+static int g_apt_sbs = 0;   /* current 3D mode, so the hook can re-apply it after HOME/sleep */
+static u32 g_wait_kd = 0;   /* tap edge scanned by the wait loop, replayed at the top of the loop */
 static void mp4_apt_hook(APT_HookType t, void *u) {
     (void)u;
     switch (t) {
@@ -82,17 +84,24 @@ static void mp4_apt_hook(APT_HookType t, void *u) {
             if (g_screen_off) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; }
             if (g_lcd_ok) { gspLcdExit(); g_lcd_ok = 0; }
             if (g_have_audio) ndspChnSetPaused(0, true);
+            else clk_pause();                /* silent file: the wall clock must not run under HOME
+                                              * or the player fast-forwards to catch up on return */
+            gfxSet3D(false);                 /* the applet renders flat (same as the moflex hooks) */
             break;
         case APTHOOK_ONRESTORE: case APTHOOK_ONWAKEUP:
+            gfxSetScreenFormat(GFX_TOP, GSP_BGR8_OES);   /* keep 24-bit after HOME (blit is 3B/px --
+                                                          * a reverted 2B/px format would overrun) */
+            gfxSet3D(g_apt_sbs);
             if (!g_lcd_ok) g_lcd_ok = R_SUCCEEDED(gspLcdInit());
             if (g_have_audio && g_playing) ndspChnSetPaused(0, false);
+            else if (g_playing) clk_resume();
             break;
         default: break;
     }
 }
 
 /* ---- battery (local; New-3DS panel) ---- */
-static int  g_batt = -1, g_batt_chg = 0, g_mcu_ok = 0;
+static int  g_batt = -1, g_batt_chg = 0, g_mcu_ok = 0, g_ptm_ok = 0;
 static u64  g_batt_next = 0;
 static void batt_refresh(void) {
     u64 now = osGetTime();
@@ -114,11 +123,11 @@ static void fmt_time(int64_t us, char *o, size_t n) {
 /* time of a sample in microseconds */
 static int64_t v_time_us(Mp4 *m, int i) {
     if (m->v_timescale <= 0) return 0;
-    return (int64_t)(m->vsamples[i].dts * 1000000LL / (int64_t)m->v_timescale);
+    return (int64_t)(mp4_v_dts(m, i) * 1000000LL / (int64_t)m->v_timescale);
 }
 static int64_t v_cts_us(Mp4 *m, int i) {   /* DISPLAY time: with B-frames this != decode time */
     if (m->v_timescale <= 0) return 0;
-    return (int64_t)(m->vsamples[i].cts * 1000000LL / (int64_t)m->v_timescale);
+    return (int64_t)(mp4_v_cts(m, i) * 1000000LL / (int64_t)m->v_timescale);
 }
 /* B-frame reorder queue: decoded frames wait here (by slot) until their DISPLAY time comes up.
  * Depth 4 covers x264's default reorder distance with margin; adds ~4 frames of start latency. */
@@ -130,8 +139,19 @@ static int g_pq_n = 0;
  * pairing each SURFACED picture with the SMALLEST pooled display time keeps the presented
  * timeline gapless no matter how the decoder delays -- labeling outputs with the fed
  * frame's own cts dropped 2 of 3 frames (measured: 125ms present gaps at 41.7ms content). */
-static int64_t g_ft[16];
+/* Pending display times, one per frame FED to the decoder, popped smallest-first as pictures
+ * come back out. The pairing is an invariant: one push per frame in, one pop per picture out.
+ * MVD holds a whole reorder buffer of frames before it emits the first, so this must be deep
+ * enough for the worst DPB in the wild -- 16 was not, and overflowing it silently DROPPED a
+ * timestamp while the frame still went to the decoder. Every lost entry slides the whole
+ * mapping by one frame, which is why MP4 drifted further out of sync the longer it played
+ * and why starting over fixed it. */
+#define FT_MAX 16
+static int64_t g_ft[FT_MAX];
 static int     g_ftn = 0;
+static int     g_ft_full = 0;      /* display times DROPPED because the pool was full */
+static int     g_ft_dry = 0;       /* pictures that surfaced with no display time left */
+static long    g_ft_push = 0, g_ft_pop = 0;   /* frames fed vs pictures surfaced */
 static int64_t ft_pop_min(void) {
     int mi = 0;
     for (int i = 1; i < g_ftn; i++) if (g_ft[i] < g_ft[mi]) mi = i;
@@ -142,7 +162,7 @@ static int g_present_log = 12;   /* countdown: log the first presents after star
 
 static int64_t a_time_us(Mp4 *m, int i) {
     if (m->a_timescale <= 0) return 0;
-    return (int64_t)(m->asamples[i].dts * 1000000LL / (int64_t)m->a_timescale);
+    return (int64_t)(mp4_a_dts(m, i) * 1000000LL / (int64_t)m->a_timescale);
 }
 
 /* current media position (us). Audio is the master when present; otherwise a wall clock. */
@@ -164,7 +184,7 @@ static void pump_audio(Mp4 *m, uint8_t *atmp) {
         if (g_a_next >= m->a_count) continue;
         Mp4Sample *as = &m->asamples[g_a_next];
         int n  = mp4_read_sample_audio(m, as, atmp);
-        int sp = (n == (int)as->size) ? mp4_aac_decode(&g_aac, atmp, n, g_abuf[i]) : 0;
+        int sp = (n == (int)mp4_s_size(as)) ? mp4_aac_decode(&g_aac, atmp, n, g_abuf[i]) : 0;
         g_a_next++;
         if (sp <= 0) continue;
         if (g_pvol != 1.0f) {
@@ -262,7 +282,7 @@ static void do_seek(Mp4 *m, uint8_t *vbuf, uint8_t *atmp, int sbs, int64_t dur_u
         int c = 0;
         while (mp4_mvd_pending()) { if (!mp4_mvd_pump(NULL, 0, &c)) break; prod++; }   /* drain */
         int nn = mp4_read_sample(m, &m->vsamples[j], vbuf);
-        int r = (nn == (int)m->vsamples[j].size) ? mp4_mvd_pump(vbuf, nn, &c) : 0;
+        int r = (nn == (int)mp4_s_size(&m->vsamples[j])) ? mp4_mvd_pump(vbuf, nn, &c) : 0;
         if (r) { got = r; prod++; }
     }
     mvd_log("SEEK to=%llds kf=%d tvi=%d decoded=%d produced=%d took=%lums",
@@ -305,7 +325,12 @@ MoflexResult mp4_play(const char *path) {
     if (!isnew) { mp4_msg("MP4 needs a New 3DS (hardware H.264)."); return MOFLEX_QUIT_BACK; }
 
     Mp4 m;
-    if (!mp4_open(&m, path)) { mp4_msg("Could not open the MP4 (no H.264 track)."); return MOFLEX_QUIT_BACK; }
+    if (!mp4_open(&m, path)) {
+        mp4_msg(mp4_open_error == MP4_ERR_NOMEM
+                    ? "Not enough memory to load this\nMP4's index. Close other apps\nand try again."
+                    : "Could not open the MP4 (no H.264 track).");
+        return MOFLEX_QUIT_BACK;
+    }
 
     /* Side-by-side 3D = a double-wide frame. Detect by ASPECT, not absolute width, so any
      * resolution works: two 16:9 halves = 3.55:1, two 400x240 halves = 3.33:1, while normal 2D
@@ -345,6 +370,36 @@ MoflexResult mp4_play(const char *path) {
         mp4_msg("Video stream is not valid H.264\n(mislabeled file?). Re-encode\nwith x264 (H.264/AVC).");
         mp4_close(&m); return MOFLEX_QUIT_BACK;
     }
+    /* PROFILE. MVD is 8-bit 4:2:0 only, and nothing above checks for that. A 10-bit encode --
+     * which is what you get by transcoding a 10-bit HEVC source without forcing the pixel
+     * format -- is High 10, passes every test above, initialises the hardware happily, and then
+     * NEVER RETURNS A PICTURE. On screen that is a frozen frame whose timeline still moves when
+     * you seek, which tells the user nothing. Name the reason instead.
+     * avcC byte 1 is AVCProfileIndication. */
+    {
+        int prof = m.avcc[1];
+        if (prof != 66 && prof != 77 && prof != 88 && prof != 100) {
+            const char *what;
+            switch (prof) {
+                case 110: what = "10-bit (High 10)";      break;
+                case 122: what = "4:2:2 (High 4:2:2)";    break;
+                case 244: what = "4:4:4 (High 4:4:4)";    break;
+                case 44:  what = "CAVLC 4:4:4 Intra";     break;
+                default:  what = NULL;                    break;
+            }
+            char msg[160];
+            if (what)
+                snprintf(msg, sizeof msg,
+                         "This is %s H.264.\nThe 3DS decoder is 8-bit 4:2:0 only.\n"
+                         "Re-encode with -pix_fmt yuv420p", what);
+            else
+                snprintf(msg, sizeof msg,
+                         "H.264 profile %d is not supported\n(8-bit 4:2:0 only). Re-encode with\n"
+                         "-profile:v high -pix_fmt yuv420p", prof);
+            mp4_msg(msg);
+            mp4_close(&m); return MOFLEX_QUIT_BACK;
+        }
+    }
     /* ANY resolution the hardware can decode is accepted -- the present step aspect-fits each
      * frame (or each SBS half) into the 400x240 screen, so 480p/720p/1080p files just work.
      * Only refuse what MVD itself cannot do (H.264 level 4.x frame limit). */
@@ -363,7 +418,7 @@ MoflexResult mp4_play(const char *path) {
     }
 
     uint32_t maxsz = 1;
-    for (int i = 0; i < m.v_count; i++) if (m.vsamples[i].size > maxsz) maxsz = m.vsamples[i].size;
+    for (int i = 0; i < m.v_count; i++) if (mp4_s_size(&m.vsamples[i]) > maxsz) maxsz = mp4_s_size(&m.vsamples[i]);
     uint8_t *buf = (uint8_t *)malloc(maxsz + 16);
     if (!buf) { mp4_mvd_exit(); mp4_close(&m); return MOFLEX_ERROR; }
 
@@ -373,7 +428,7 @@ MoflexResult mp4_play(const char *path) {
     g_have_audio = 0; g_a_next = 0; g_a_played = 0; g_a_started = 0; g_a_base_us = 0;
     if (m.has_audio && mp4_aac_open(&g_aac, m.asc, m.asc_len, m.a_rate, m.a_channels)) {
         uint32_t amax = 1;
-        for (int i = 0; i < m.a_count; i++) if (m.asamples[i].size > amax) amax = m.asamples[i].size;
+        for (int i = 0; i < m.a_count; i++) if (mp4_s_size(&m.asamples[i]) > amax) amax = mp4_s_size(&m.asamples[i]);
         atmp = (uint8_t *)malloc(amax + 16);
         int ok = (atmp != NULL);
         for (int i = 0; i < NWB && ok; i++) {
@@ -394,10 +449,12 @@ MoflexResult mp4_play(const char *path) {
     }
 
     g_mcu_ok = R_SUCCEEDED(mcuHwcInit());
+    g_ptm_ok = R_SUCCEEDED(ptmuInit());   /* battery charge state (PTMU with no session always failed) */
+    g_apt_sbs = sbs;                      /* the APT hook re-applies 3D after HOME/sleep */
     g_lcd_ok = R_SUCCEEDED(gspLcdInit()); g_screen_off = 0;   /* bottom-screen-off button */
     aptHook(&g_mp4_apt_cookie, mp4_apt_hook, NULL);   /* HOME/sleep must release gsp::Lcd */
     g_pvol = moflex_vol_get();
-    g_playing = 1;
+    g_playing = 1; g_wait_kd = 0;
 
     /* title = filename without extension */
     char title[128];
@@ -417,7 +474,7 @@ MoflexResult mp4_play(const char *path) {
     g_pq_n = 0;        /* the reorder queue is static: entries from a PREVIOUS session (B-exit
                         * leaves up to 4 queued) would present as phantom frames with stale
                         * timestamps -- the frozen-bar + fast-forward-catch-up bug */
-    g_ftn = 0;
+    g_ftn = 0; g_ft_full = 0; g_ft_dry = 0; g_ft_push = 0; g_ft_pop = 0;
     g_present_log = 12;
 
     /* auto-resume (like moflex): jump to the saved position if any */
@@ -437,8 +494,28 @@ MoflexResult mp4_play(const char *path) {
     while (aptMainLoop() && !quit) {
         /* ---- input ---- */
         hidScanInput();
-        u32 kd = hidKeysDown(), kh = hidKeysHeld();
+        u32 kd = hidKeysDown() | g_wait_kd, kh = hidKeysHeld();
+        g_wait_kd = 0;
         touchPosition tp; hidTouchRead(&tp);
+
+        /* Lid watchdog: with sleep denied (background downloads) a lid close/reopen fires no
+         * wake event -- force the backlights on at the closed->open transition (same fix as the
+         * moflex player; a missed system relight otherwise leaves both LCDs black, audio on). */
+        {
+            static u64 s_lid_t; static int s_lid_closed = -1;
+            u64 lnow = osGetTime();
+            if (lnow - s_lid_t >= 500) {
+                s_lid_t = lnow;
+                u8 shell = 1;
+                if (R_SUCCEEDED(ptmuInit())) { PTMU_GetShellState(&shell); ptmuExit(); }
+                if (s_lid_closed == 1 && shell != 0) {
+                    if (g_lcd_ok) GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTH);
+                    else if (R_SUCCEEDED(gspLcdInit())) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTH); gspLcdExit(); }
+                    g_screen_off = 0;
+                }
+                s_lid_closed = (shell == 0) ? 1 : 0;
+            }
+        }
 
         /* bottom screen off: any input wakes it (and is swallowed so it doesn't hit a control) */
         if (g_screen_off) {
@@ -450,12 +527,16 @@ MoflexResult mp4_play(const char *path) {
         if (kd & KEY_A) { g_playing = !g_playing; }
         if (kd & KEY_UP)   { int s = (int)(g_pvol / 0.25f + 0.0001f); g_pvol = (s + 1) * 0.25f; if (g_pvol > 4.0f) g_pvol = 4.0f; vol_dirty = 1; }
         if (kd & KEY_DOWN) { int s = (int)(g_pvol / 0.25f + 0.9999f); g_pvol = (s - 1) * 0.25f; if (g_pvol < 0.25f) g_pvol = 0.25f; vol_dirty = 1; }
-        /* L/R (hold to repeat) = seek -/+ 10s */
+        /* L/R (hold to repeat): ACCUMULATE the target while held (bar previews it); the seek
+         * fires on RELEASE below -- one landing, no seek->play->seek jumping (ring parity). */
         { int lr = (kh & KEY_LEFT) ? -1 : (kh & KEY_RIGHT) ? 1 : 0;
           if (!lr) hrep = 0;
           else { int fire = (kd & (KEY_LEFT | KEY_RIGHT)) ? 1 : 0;
                  if (!fire) { hrep++; if (hrep > 8 && hrep % 4 == 0) fire = 1; }
-                 if (fire) { seek_req = 1; seek_to = cur_us + lr * SEEK_STEP_US; } } }
+                 if (fire) { seek_to = (seek_req ? seek_to : cur_us) + lr * SEEK_STEP_US;
+                             if (seek_to < 0) seek_to = 0;
+                             if (dur_us > 0 && seek_to > dur_us) seek_to = dur_us;
+                             seek_req = 1; last_sig = -1; } } }
 
         /* touch */
         if (kh & KEY_TOUCH) {
@@ -494,7 +575,7 @@ MoflexResult mp4_play(const char *path) {
         }
         if (scrub && !(kh & KEY_TOUCH)) { seek_req = 1; seek_to = scrub_us; scrub = 0; }   /* commit on release */
 
-        if (seek_req) { do_seek(&m, buf, atmp, sbs, dur_us, seek_to, &vi); cur_us = seek_to; seek_req = 0; }
+        if (seek_req && !(kh & (KEY_LEFT | KEY_RIGHT))) { do_seek(&m, buf, atmp, sbs, dur_us, seek_to, &vi); cur_us = seek_to; seek_req = 0; }
 
         /* ---- paused: hold, keep panel live, defer SD writes to here ---- */
         if (!g_playing) {
@@ -505,7 +586,7 @@ MoflexResult mp4_play(const char *path) {
                 if (cur_us > 3000000 && (dur_us <= 0 || cur_us < dur_us - 5000000)) moflex_resume_save(path, cur_us);
                 was_paused = 1;
             }
-            int64_t shown = scrub ? scrub_us : cur_us;
+            int64_t shown = scrub ? scrub_us : (seek_req ? seek_to : cur_us);
             draw_panel(title, shown, dur_us);
             gspWaitForVBlank();
             continue;
@@ -528,8 +609,9 @@ MoflexResult mp4_play(const char *path) {
                 Mp4Sample *s = &m.vsamples[vi];
                 int n = mp4_read_sample(&m, s, buf);
                 t1 = osGetTime();
-                if (g_ftn < 16) g_ft[g_ftn++] = v_cts_us(&m, vi);   /* pool the display time */
-                r = (n == (int)s->size) ? mp4_mvd_pump(buf, n, &consumed) : 0;
+                if (g_ftn < FT_MAX) { g_ft[g_ftn++] = v_cts_us(&m, vi); g_ft_push++; }
+                else g_ft_full++;                       /* timestamp DROPPED, frame still decoded */
+                r = (n == (int)mp4_s_size(s)) ? mp4_mvd_pump(buf, n, &consumed) : 0;
                 vi++;
             } else {
                 r = mp4_mvd_pump(NULL, 0, &consumed);   /* drain a held picture */
@@ -544,29 +626,55 @@ MoflexResult mp4_play(const char *path) {
                     mvd_log("SPIKE f=%d read=%lums pump=%lums audio=%lums",
                             vi, (unsigned long)rd, (unsigned long)dec, (unsigned long)aud);
             }
-            if (r && g_ftn > 0) { g_pq[g_pq_n].cts = ft_pop_min(); g_pq[g_pq_n].slot = r - 1; g_pq_n++; }
-            else if (!r && !consumed) break;   /* dry + nothing fed: nothing more this pass */
+            if (r && g_ftn > 0) { g_pq[g_pq_n].cts = ft_pop_min(); g_ft_pop++; g_pq[g_pq_n].slot = r - 1; g_pq_n++; }
+            else if (r) g_ft_dry++;            /* picture surfaced with no display time to give it */
+            else if (!consumed) break;         /* dry + nothing fed: nothing more this pass */
         }
         if (g_pq_n == 0) continue;   /* nothing display-ready yet (decoder still priming) */
         int mi = 0;
         for (int i = 1; i < g_pq_n; i++) if (g_pq[i].cts < g_pq[mi].cts) mi = i;
         cur_us = g_pq[mi].cts;
 
+        /* A/V drift readout, once a minute. Sync complaints are about a number that grows
+         * slowly, and "looks fine to me" after two minutes proves nothing -- this makes the
+         * drift measurable instead of a matter of opinion. Negative = video behind the audio. */
+        if (g_have_audio) {
+            static int64_t s_drift_next = 60000000LL;
+            if (cur_us >= s_drift_next) {
+                extern void mvd_log(const char *fmt, ...);
+                mvd_log("AV t=%llds video-vs-audio=%+lldms pool=%d fed=%ld out=%ld lost=%d dropped_ts=%d",
+                        (long long)(cur_us / 1000000),
+                        (long long)((cur_us - media_now_us()) / 1000),
+                        g_ftn, g_ft_push, g_ft_pop, g_ft_dry, g_ft_full);
+                s_drift_next = cur_us + 60000000LL;
+            }
+        }
+
         /* ---- wait until this frame is due (audio-master), staying responsive ---- */
         for (;;) {
             pump_audio(&m, atmp);
             int64_t now = media_now_us();
-            int sig = (int)(cur_us / 250000) ^ (g_playing << 20) ^ ((int)(g_pvol * 4) << 22) ^ (g_batt << 24);
-            if (sig != last_sig) { draw_panel(title, scrub ? scrub_us : cur_us, dur_us); last_sig = sig; }
+            int64_t pnl = scrub ? scrub_us : (seek_req ? seek_to : cur_us);
+            int sig = (int)(pnl / 250000) ^ (g_playing << 20) ^ ((int)(g_pvol * 4) << 22) ^ (g_batt << 24);
+            if (sig != last_sig) { draw_panel(title, pnl, dur_us); last_sig = sig; }
             if (now >= cur_us) break;
             if (!aptMainLoop()) { quit = 1; break; }
             gspWaitForVBlank();
             /* poll for pause/seek/back so the wait doesn't feel laggy */
             hidScanInput();
             u32 wkd = hidKeysDown();
+            if (g_screen_off) {   /* dark bottom screen: any input only WAKES it (same as the
+                                   * top-of-loop rule -- B here used to exit the movie instead) */
+                if (wkd || (hidKeysHeld() & KEY_TOUCH)) {
+                    GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; last_sig = -1;
+                }
+                continue;
+            }
             if (wkd & KEY_B) { result = MOFLEX_QUIT_BACK; quit = 1; break; }
             if (wkd & KEY_A) { g_playing = 0; break; }
-            if (wkd & KEY_TOUCH) break;   /* re-handle taps at the top */
+            if (wkd & KEY_TOUCH) { g_wait_kd = wkd; break; }   /* carry the eaten tap edge to the
+                                                                * top-of-loop handler (one-shot
+                                                                * taps needed a second try) */
         }
         if (quit) break;
         if (!g_playing) continue;   /* got paused mid-wait -> re-handle */
@@ -600,6 +708,7 @@ MoflexResult mp4_play(const char *path) {
     if (g_screen_off) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; }
     if (g_lcd_ok) { gspLcdExit(); g_lcd_ok = 0; }
     if (g_mcu_ok) { mcuHwcExit(); g_mcu_ok = 0; }
+    if (g_ptm_ok) { ptmuExit(); g_ptm_ok = 0; }
     free(atmp);
     mp4_mvd_exit();
     free(buf);

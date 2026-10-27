@@ -13,16 +13,21 @@ include $(DEVKITARM)/3ds_rules
 TARGET   := clownsec_player
 BUILD    := build
 # our decoder + the unmodified FFmpeg support files + the app itself
-SOURCES  := source ../decoder ../ffmpeg_support ../playback ../net ../ui \
+SOURCES  := source ../decoder ../ffmpeg_support ../playback ../net ../ui ../store \
 	../thirdparty/cJSON ../thirdparty/zip ../thirdparty/helixaac
 FF_INC   := ../ffmpeg_support/include
 
 ARCH    := -march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft
 BUILD_TAG ?= $(shell ./buildnum.sh)
 export BUILD_TAG
-CFLAGS  := -w -O3 -mword-relocations -ffunction-sections -D__3DS__ -D_GNU_SOURCE \
+CFLAGS  := -w -Wreturn-type -O3 -mword-relocations -ffunction-sections -D__3DS__ -D_GNU_SOURCE \
 	-DBUILD_TAG=\"$(BUILD_TAG)\" \
 	-Wno-error=implicit-function-declaration $(ARCH) $(INCLUDE)
+# Test builds only: UPDATE_TEST_URL=https://.../latest.txt points the update check (and the
+# self-updater's download, which sits beside it) somewhere other than the public release.
+ifneq ($(UPDATE_TEST_URL),)
+CFLAGS  += -DUPDATE_TEST_URL=\"$(UPDATE_TEST_URL)\"
+endif
 LDFLAGS := -specs=3dsx.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
 LIBS    := -lcurl -lmbedtls -lmbedx509 -lmbedcrypto -lz -lcitro2d -lcitro3d -lctru -lm
 LIBDIRS := $(CTRULIB) $(DEVKITPRO)/portlibs/3ds
@@ -34,10 +39,15 @@ export VPATH   := $(foreach dir,$(SOURCES),$(CURDIR)/$(dir))
 export DEPSDIR := $(CURDIR)/$(BUILD)
 export CFILES  := $(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.c)))
 export SFILES  := $(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.s)))
-export OFILES  := $(CFILES:.c=.o) $(SFILES:.s=.o)
+# PICA vertex shaders. citro2d ships its own, so the player never needed these; the 3D store
+# browser does. 3ds_rules already knows how to run picasso -- this only has to find the files
+# and turn the resulting .shbin into an object plus a header.
+export PICAFILES := $(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.v.pica)))
+export OFILES  := $(CFILES:.c=.o) $(SFILES:.s=.o) $(PICAFILES:.v.pica=.shbin.o)
+export HFILES  := $(PICAFILES:.v.pica=_shbin.h)
 export INCLUDE := $(foreach dir,$(LIBDIRS),-I$(dir)/include) -I$(CURDIR)/$(BUILD) \
 	-I$(CURDIR)/$(FF_INC) -I$(CURDIR)/$(FF_INC)/libavcodec -I$(CURDIR)/../decoder \
-	-I$(CURDIR)/../playback -I$(CURDIR)/../net -I$(CURDIR)/../ui \
+	-I$(CURDIR)/../playback -I$(CURDIR)/../net -I$(CURDIR)/../ui -I$(CURDIR)/../store \
 	-I$(CURDIR)/../thirdparty/cJSON -I$(CURDIR)/../thirdparty/zip \
 	-I$(CURDIR)/../thirdparty/stb -I$(CURDIR)/../thirdparty/helixaac
 export LIBPATHS := $(foreach dir,$(LIBDIRS),-L$(dir)/lib)
@@ -47,6 +57,9 @@ export APP_DESCRIPTION := MOFLEX VIDEO PLAYER
 export APP_AUTHOR      := brAinphreAk
 export APP_ICON        := $(TOPDIR)/icon.png
 export _3DSXFLAGS      += --smdh=$(OUTPUT).smdh
+# files that ship inside the app, mounted at romfs:/ (the store's own song lives here). The CIA
+# takes the same folder through RomFs/RootPath in the .rsf files.
+export _3DSXFLAGS      += --romfs=$(TOPDIR)/romfs
 
 .PHONY: all clean $(BUILD)
 all: $(BUILD)
@@ -59,5 +72,12 @@ else
 DEPENDS := $(OFILES:.o=.d)
 $(OUTPUT).3dsx: $(OUTPUT).elf $(OUTPUT).smdh
 $(OUTPUT).elf: $(OFILES)
+$(OFILES): $(HFILES)        # a shader header must exist before anything that includes it
+
+.PRECIOUS: %.shbin
+%.shbin.o %_shbin.h : %.shbin
+	$(SILENTMSG) $(notdir $<)
+	$(bin2o)
+
 -include $(DEPENDS)
 endif

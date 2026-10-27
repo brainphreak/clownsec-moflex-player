@@ -14,9 +14,17 @@ decoder: any resolution up to 1920x1088 (aspect-fit to the screen), side-by-side
 auto-detected, B-frames handled, with the same subtitles, resume, seeking, and library
 features as moflex.
 
-Full speed on **New 3DS** (2D and 3D). On **Old 3DS**, 2D plays smoothly and **3D has been
-substantially sped up** — see **[3DS performance](#3ds-performance)** below for the HQ toggle
-and the one tip that makes the biggest difference on the older hardware.
+It also plays **SUPER MOFLEX** files — a `.moflex` that carries a second audio language,
+several subtitle tracks, and its own poster and info — switching languages and subtitles in
+place. See [SUPER MOFLEX](#super-moflex-languages-subtitles-and-info-inside-the-file).
+
+Full speed on **New 3DS** (2D and 3D). On **Old 3DS**, 2D plays smoothly; for 3D you can hand
+any movie to **Nintendo's own 3D Movie Player**, which plays it smoothly in hardware — see
+**[Old 3DS: play in the Nintendo Player](#old-3ds-play-in-the-nintendo-player)** and
+**[3DS performance](#3ds-performance)**.
+
+The player **updates itself**: when a new build is out it offers to download and install it,
+then restarts — no QR code or FBI needed. See [Updating](#updating).
 
 The decoder is a standalone port of FFmpeg's MobiClip/moflex path, verified **bit-exact
 against FFmpeg on PC** before ever touching hardware.
@@ -29,11 +37,13 @@ frame is decoded twice (once per eye):
 - **Faster decode + a decode-ahead engine.** The MobiClip decoder was hand-optimized and the
   3D player now decodes frames ahead of time and banks them, so it can absorb heavy scenes
   instead of stuttering on them. Most clips play smoothly on the Old 3DS now.
-- **HQ button (Old 3DS only).** To stay smooth by default, the Old 3DS plays in a lighter
-  **16-bit color** mode. Tap the on-screen **HQ** button — bottom-left of the player, opposite
-  the moon — to switch to **24-bit color** for cleaner gradients on a movie that can afford it.
-  Your choice is remembered across launches. (The New 3DS is always 24-bit, so it has no HQ
-  button.)
+- **HQ colour (Old 3DS only).** To stay smooth by default, the Old 3DS plays in a lighter
+  **16-bit color** mode. Open **VIDEO** on the player's bottom screen and toggle **HQ colour** to
+  switch to **24-bit color** for cleaner gradients on a movie that can afford it. Your choice is
+  remembered across launches. (The New 3DS is always 24-bit, so it has no HQ setting.)
+- **Or let Nintendo's player do it (Old 3DS).** The console's own 3D Movie Player decodes moflex
+  in hardware and plays 3D smoothly on an Old 3DS. The Clownsec Player can hand a movie to it —
+  see [Old 3DS: play in the Nintendo Player](#old-3ds-play-in-the-nintendo-player).
 - **Best performance: turn off the bottom screen.** Tap the **moon** button during playback to
   power off the bottom backlight — the movie keeps playing on top. This hands the console more
   time to spend on decoding and is the single biggest thing you can do to smooth out a demanding
@@ -48,6 +58,20 @@ no building required:
 - **`clownsec_player.3dsx`** — copy to your SD card's `/3ds/` folder and run from the
   Homebrew Launcher.
 - **`clownsec_player.cia`** — install with FBI (or any CIA installer) for a HOME-menu icon.
+
+### Updating
+
+From build **61024.4** on, the player keeps itself up to date. A few seconds after it starts
+(on Wi-Fi) it checks for a newer build; if there is one it shows **UPDATE AVAILABLE** with
+**UPDATE** / **LATER**. **UPDATE** downloads the new version, checks it, installs it over the
+old one and restarts into it — your library, settings, resume points and downloads are untouched.
+
+- It refuses to start with a low battery unless the charger is plugged in (a power cut
+  mid-install would leave no working player). A failed or damaged download changes nothing.
+- The **`.3dsx`** (Homebrew Launcher) build updates itself too: it replaces its own `.3dsx`,
+  then asks you to start it again from the Homebrew Launcher.
+- Builds **older than 61024.4** don't have the updater — install a current build once with the
+  QR code / FBI, and from then on updates happen inside the app.
 
 ### Testing in an emulator (Citra)
 
@@ -93,14 +117,30 @@ This is the short tour — the complete list of everything the player does lives
 - **Watched / Unwatched indicators** — movies you finish are marked as watched in the browser,
   so you can see at a glance what you've already seen; the rest keep their resume point.
 - **Software volume boost** up to 400% for quiet sources.
-- **Subtitles (closed captions)** — drop a `.srt` next to a movie (works on **2D and 3D**) and it
-  loads automatically. The in-player **CC** button toggles them and adjusts position, size,
-  timing/delay, and — on 3D video — the subtitle depth. See [Subtitles](#subtitles-closed-captions).
+- **Subtitles (closed captions)** — `.srt`, `.ass` and `.ssa`, on **2D and 3D**. A file next to
+  the movie loads automatically; a SUPER MOFLEX carries its own tracks in several languages.
+  ASS styling (positions, signs, karaoke lines) is rendered; long lines are split into
+  even-length lines. The **CC** button picks the track and sets position, size, delay, font and
+  — on 3D video — depth. See [Subtitles](#subtitles-closed-captions).
+- **SUPER MOFLEX** — second audio language (the **AUDIO** button switches in place), embedded
+  subtitle tracks, and embedded poster + info the library reads offline. Marked with a
+  **SUPER** badge in the library and catalogs. See
+  [SUPER MOFLEX](#super-moflex-languages-subtitles-and-info-inside-the-file).
+- **Picture and sound menus** — **VIDEO**: framing/zoom, 3D strength, a ghosting fix,
+  brightness and contrast (plus HQ colour on Old 3DS). **SOUND**: volume and auto-levelling.
+- **Next episode** — when an episode of a series ends, the next one starts after a five-second
+  countdown (moflex and MP4).
+- **Old 3DS: Nintendo Player hand-off** — play any `.moflex` in the console's own 3D Movie
+  Player for smooth 3D, per 2D/3D or asked each time. See
+  [Old 3DS: play in the Nintendo Player](#old-3ds-play-in-the-nintendo-player).
+- **Updates itself** — offers new builds and installs them in place. See [Updating](#updating).
 - **Catalog browser** — browse the Clownsec / Zackk archives from `catalog.json`, with a
   top-screen info panel (poster art, year, runtime, genres, file size, description, and a
   3D/2D badge).
 - **Downloader** — pull movies and TV seasons straight to the SD card (zips are extracted into
-  their own folder), or grab any file by direct URL, with a destination-folder picker.
+  their own folder), or grab any file by direct URL, with a destination-folder picker. TV shows
+  browse as **Show → Season → Parts**. Files over **4 GB** are refused up front: the SD card is
+  FAT32, which can't hold them.
 - **Download queue** — line up several movies or whole seasons and they download one after
   another in the background, with a live speed readout (Mbps / KB/s) showing real throughput.
   Every file you add picks its own destination folder. The **QUEUE** button jumps to the queue;
@@ -114,13 +154,16 @@ This is the short tour — the complete list of everything the player does lives
 - **Idle screen-off** — sitting in the menus untouched for 5 minutes (downloads or not) turns
   both backlights off to save battery; any button or touch wakes them, and the waking press
   isn't acted on. Video playback is never interrupted.
-- **Built-in web server** — upload any files to the console from a browser over Wi-Fi.
+- **Built-in web server** — upload any files to the console from a browser over Wi-Fi, with
+  live speed and ETA; an interrupted upload resumes, and uploaded movies join the library.
 - **File manager** — browse, move, delete, and create folders on the SD card (all files, with a
   movies-only toggle).
 - **Local artwork + info** — poster and details show on the top screen for your own movies in
   Open Video, and a **Get Info** action fetches them from the catalogs for anything missing.
-- **Hidden system folders** — the browser hides `3DS`, `DCIM`, `Nintendo 3DS`, etc. by default
-  (press **Y** to reveal them), so you only see your movies and folders.
+- **Hidden system folders** — Filesystem and the download **SAVE TO** picker hide system and
+  app folders (`3DS`, `Nintendo 3DS`, `luma`, `cias`, `retroarch`, `moflex_player`…) by
+  default; **Y** reveals them. **The Library never scans them — a movie inside one will not show
+  up.** See [Where to keep your movies](#where-to-keep-your-movies).
 - **Themes** — recolor the whole UI. Pick from built-in themes (Clownsec, Matrix, Nintendo,
   Light, Amber, Ice) or build your own with the **Custom** color editor (R/G/B sliders for each
   of the accents, text, and background). Open it from the swatch chip on the home screen or press
@@ -174,6 +217,74 @@ This is the short tour — the complete list of everything the player does lives
 <td align="center" colspan="2"><img src="screenshots/11-player-upload-to-3ds.png" width="340"><br><sub>Live upload progress on the 3DS as the file arrives</sub></td>
 </tr>
 </table>
+
+## Where to keep your movies
+
+The Library (and Walk the Aisle, which is stocked from it) scans the whole SD card **except**
+these folders, wherever they are on the card — at the root or inside another folder — and any
+folder whose name starts with a dot:
+
+`3ds` · `DCIM` · `fbi` · `gm9` · `cheats` · `cias` · `luma` · `Nintendo 3DS` · `roms` ·
+`System Volume Information` · `themes` · `moviedata` · `moflex_player` · `_nds` · `config` ·
+`splashes` · `nimbus` · `retroarch`
+
+(matched by name, ignoring case). They hold system files, other apps' data and the player's own
+caches — never movies — and skipping them is what keeps a scan quick. So:
+
+- **A movie put in one of them will not appear in the Library or the Aisle.** Use your own
+  folder instead — `sdmc:/movies/`, `sdmc:/moflex/`, `sdmc:/TV/Some Show/`, anything not on the
+  list. Folders can nest as deep as you like.
+- A `.moflex` downloaded to `cias/` because a guide said so is the usual surprise: move it out
+  with **Manage**, then **Rescan Library**.
+- **Filesystem** and the download **SAVE TO** picker hide these folders too, so you are never
+  offered one as a destination. Press **Y** to reveal them (the setting is shared by both
+  screens) — useful for finding a file that went into one by mistake.
+- The SD card is **FAT32**: no single file can be larger than 4 GB, and the downloader refuses
+  such files rather than failing at the end. Long TV seasons come as several zip parts for
+  this reason.
+- Files added from a computer or by Wi-Fi upload are picked up by **Rescan Library**.
+
+## Old 3DS: play in the Nintendo Player
+
+The Old 3DS's CPU can't decode 3D moflex fast enough in software, but the console's own
+**3D Movie Player** (the "Nintendo Player") decodes it in hardware and plays smoothly. On an
+Old 3DS, the Clownsec Player can hand a movie to it:
+
+- **When you press play**, a `.moflex` asks **NINTENDO** or **CLOWNSEC** (3D movies by default;
+  2D ones go straight to the Clownsec Player). Choose **ALWAYS** to stop being asked. To change
+  that later, press **X** on the home screen (**PLAY MOVIES WITH**) and set **3D MOVIES** and
+  **2D MOVIES** separately to *Ask every time*, *Always Clownsec Player* or *Always Nintendo
+  Player*.
+- **How it works:** the Nintendo Player only looks in the **root** of the SD card. So the player
+  moves that one file to `sdmc:/` (an instant rename, no copying), opens the Nintendo Player, and
+  the **next time you start the Clownsec Player it moves the file back** before the library
+  loads — you never see it missing.
+- **Root clean-up:** the Nintendo Player lists every `.moflex` in the root. If you use it, the
+  player offers at startup to move stray root movies (with their posters and subtitles) into
+  `sdmc:/moflex_movies/` so its list stays short.
+- **What you give up:** the Nintendo Player has **no subtitles and no second audio track**, and
+  keeps its own resume point. It plays plain `.moflex` files only — not movies inside a `.cia`,
+  and not MP4 (which needs a New 3DS anyway).
+- It needs Nintendo's 3D Movie Player on the console — the preinstalled US, European or
+  Japanese version, or a CIA-installed copy. If it isn't there, or a file of the same name is already in the root, the
+  movie plays in the Clownsec Player instead and tells you why.
+- The New 3DS plays everything smoothly itself, so the option only appears on an Old 3DS.
+
+## SUPER MOFLEX: languages, subtitles and info inside the file
+
+A SUPER MOFLEX (`(S)` in the name, **SUPER** badge in the library) is an ordinary `.moflex` with
+extras appended after the video — so it still plays everywhere, including Nintendo's player,
+which simply ignores them:
+
+- **Two audio languages.** The main track (usually English) is the one every player hears; the
+  second (often the original language) is selected with the **AUDIO** button during playback,
+  switching in place without restarting.
+- **Subtitle tracks** in several languages (text SRT or styled ASS), chosen from the **CC** menu.
+- **Its own poster and info** — title, year, runtime, genres, description, episode details. The
+  library reads them during a scan, so the file shows its art with no download and no Get Info.
+
+They are built from an encode plus the original video with the
+[SUPER MOFLEX Builder](https://github.com/brainphreak/3ds-super-moflex).
 
 ## Background downloads (close the lid and walk away)
 
@@ -261,6 +372,9 @@ cd app
 
 Produces `app/clownsec_player.cia`. Install with FBI or your CIA installer of choice.
 
+Publishing a release has rules the in-app updater depends on (a two-line `latest.txt` with the
+CIA's MD5, upload order, fixed asset names and title IDs) — see [RELEASING.md](RELEASING.md).
+
 > Note: the CIA exheader (`app/cia.rsf`) maps the DSP hardware registers
 > (`IORegisterMapping`) that `ndsp` audio writes to — without them a real 3DS throws a
 > data-abort at launch (emulators don't enforce this).
@@ -275,17 +389,20 @@ Produces `app/clownsec_player.cia`. Install with FBI or your CIA installer of ch
 | `app/` | The standalone player app (browser, catalog, downloader, web server, CIA build) |
 | `net/` | Downloader (libcurl), web server, catalog parser, poster/JPEG decode |
 | `ui/` | Tiny immediate-mode drawing, top-screen branding |
+| `store/` | Walk the Aisle — the 3D video store (citro3d) and its jukebox |
 | `thirdparty/` | Bundled cJSON, kuba--/zip, stb_image, font8x8 |
 | `pc_verify/` | PC harness to compare decode output bit-exact against FFmpeg |
 | `tools/` | `gen_logo.py` (banner→RGB565), CIA build binaries in `tools/bin/` |
 
 ## Roadmap
 
-- **Smooth 3D on Old 3DS.** 2D already plays well on Old 3DS; 3D delivers twice the frames and
-  the portable-C MobiClip decode can't sustain that in real time on the Old 3DS CPU. Hardware
-  color conversion (Y2R) and a decode-ahead pipeline are already in place, so the remaining gap
-  is raw decode throughput — likely closable only with hand-tuned ARM assembly for the hot
-  decode loops (as the official player does).
+- **Smooth 3D in the Clownsec Player on Old 3DS.** 2D already plays well on Old 3DS; 3D delivers
+  twice the frames and the portable-C MobiClip decode can't sustain that in real time on the Old
+  3DS CPU. Until it can, the [Nintendo Player hand-off](#old-3ds-play-in-the-nintendo-player)
+  gives smooth 3D (without subtitles or a second language). Hardware color conversion (Y2R) and
+  a decode-ahead pipeline are already in place, so the remaining gap is raw decode throughput —
+  likely closable only with hand-tuned ARM assembly for the hot decode loops (as the official
+  player does).
 
 ## Adding your own info & artwork (for movies not in a catalog)
 
@@ -338,38 +455,43 @@ Then just highlight the movie in **Open Video** and your poster + details appear
 
 ## Subtitles (closed captions)
 
-The player can overlay external **SubRip (`.srt`)** subtitles on any movie — **2D or 3D**. There is
-no embedded subtitle track in moflex, so subtitles always come from a sidecar file you supply.
+The player overlays subtitles on any movie — **2D or 3D** — from a sidecar file (**`.srt`**, or
+styled **`.ass`/`.ssa`**) or from the tracks embedded in a
+[SUPER MOFLEX](#super-moflex-languages-subtitles-and-info-inside-the-file). ASS positioning, signs
+and karaoke lines are drawn; a line too long for the screen is split into two lines of about
+equal length (never mid-word); and a cue that would need more than four lines steps the size down
+so nothing is lost.
 
 <p align="center"><img src="screenshots/13-player-subtitles.png" width="300"></p>
 
 ### Adding a subtitle file
 
-Name the `.srt` after the movie and put it in **either** place:
+Name the file after the movie (`.srt`, `.ass` or `.ssa`) and put it in **either** place:
 
 | File | Where |
 |------|-------|
 | `My Home Video (2024).srt`               | right next to the movie file |
 | `moviedata/My Home Video (2024).srt`     | in the hidden `sdmc:/moflex_player/moviedata/` folder |
 
-When you start the movie, a matching `.srt` is **loaded automatically** and turned on. You can copy
-files over the Wi-Fi upload page or straight onto the SD card. (Only 16-bit standard SubRip text is
-needed — the same `.srt` files used by any video player. UTF-8 smart quotes, dashes, accents, and
-the ♪ music note are handled.)
+When you start the movie, a matching file is **loaded automatically** and turned on. You can copy
+files over the Wi-Fi upload page or straight onto the SD card. Use **UTF-8** text — the same files
+any video player uses. Smart quotes, dashes, accents, the ♪ music note, Greek, Cyrillic, Turkish,
+Japanese and Korean are drawn; scripts the player has no glyphs for (Chinese, Arabic, Thai…)
+show as gaps or `?`.
 
 ### The CC button
 
 During playback, tap **CC** on the bottom screen (or press **SELECT**) to open subtitle options:
 
-- **Subtitles: on / off**
-- **Position: bottom / top** of the screen
-- **Size: small / medium / large**
-- **Delay:** shift subtitles earlier or later in **0.25 s** steps for lip-sync (per movie)
+- **Subtitles: on / off**, and on a SUPER MOFLEX the **track** (language)
+- **Position:** distance from the edge, bottom or top of the screen
+- **Size** in several steps, and the **font**: *System* (the console's own) or *Pixel*
+- **Delay:** shift subtitles earlier or later for lip-sync (per movie)
 - **Depth (3D):** push the captions into the screen or out toward you — *3D video only*
-- **Load SRT file…:** pick any `.srt` in the movie's folder or `moviedata/` (handy when the
-  sidecar isn't named to match)
+- **Load subtitle file…:** pick any subtitle file in the movie's folder or `moviedata/` (handy
+  when the sidecar isn't named to match), or go back to the file's own tracks
 
-Position, size, and depth are remembered across movies; the delay resets per movie.
+Position, size, and depth are remembered across movies; the delay is kept per movie.
 
 ## Walk the Aisle — adding your own music
 

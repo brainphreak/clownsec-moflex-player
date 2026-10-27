@@ -1,4 +1,5 @@
 #include "movieinfo.h"
+#include "store.h"
 #include "poster.h"
 #include <stdio.h>
 #include <string.h>
@@ -90,6 +91,13 @@ int movieinfo_poster(const char *moviepath, u16 *out, int pw, int ph) {
 }
 
 void movieinfo_save(const char *moviepath, const CatEntry *e, const u16 *poster, int pw, int ph) {
+    remove(STORE_PACK);   /* WALK THE AISLE's shelf cache now holds stale info: rebuild next visit */
+    {   /* ...and the store's own scaled copies of THIS poster, which it never rebuilds by itself:
+         * left alone, a corrected movie keeps the wrong film's cover on the shelf */
+        char stem[192], c[320]; stem_of(moviepath, stem, sizeof stem);
+        static const char *const ext[] = { ".w565", ".t565", ".s565" };
+        for (int i = 0; i < 3; i++) { snprintf(c, sizeof c, "sdmc:/moflex_player/store/%s%s", stem, ext[i]); remove(c); }
+    }
     mkdir("sdmc:/moflex_player", 0777);
     mkdir(MOVIEDATA_DIR, 0777);
 

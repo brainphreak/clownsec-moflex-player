@@ -143,6 +143,15 @@ static int moflex_read_sync(MfxDemux *m) {
             io_seek(m, 1, SEEK_CUR);
             break;
         default:
+            /* Unknown descriptor type: SKIP its payload (previously the bytes were re-parsed
+             * as descriptor entries -- derailed). If it declares a stream, register it as DATA
+             * so its packets accumulate (used by the embedded-subtitle experiment: an unknown
+             * type is invisible to the official player but carries our SRT). */
+            if (ssize >= 1) {
+                media_type = MFX_TYPE_DATA;
+                stream_index = io_r8(m);
+                if (ssize > 1) io_seek(m, (int64_t)(ssize - 1), SEEK_CUR);
+            }
             break;
         }
 

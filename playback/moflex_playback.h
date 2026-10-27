@@ -45,6 +45,13 @@ void  moflex_sub_overlay(int is3d, long long us);       /* draw the active cue o
 int   moflex_subs_on(void);                             /* subtitles currently enabled? (CC button) */
 
 /* Watched registry: videos finished to the end. */
+/* Auto-advance hook. The player normally STOPS on the last frame when a movie ends (A replays,
+ * B leaves) and only returns once B is pressed -- so the host never sees MOFLEX_EOF and cannot
+ * tell "finished" from "quit". Register a predicate and, for paths it accepts (a series episode
+ * with another episode to follow), reaching the end returns MOFLEX_EOF instead of parking.
+ * Films are untouched: with no callback, or a path it rejects, the stop-in-place stays. */
+void moflex_set_autonext(int (*has_next)(const char *path));
+
 int  moflex_watched(const char *path);
 void moflex_watched_set(const char *path, int on);
 /* Per-embedded-video (CIA) variants, keyed by the video's byte offset. */

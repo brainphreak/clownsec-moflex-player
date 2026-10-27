@@ -4,6 +4,10 @@ BasicInfo:
   ProductCode             : CTR-P-CSVM
   Logo                    : Homebrew
 
+RomFs:
+  # files shipped inside the app, mounted at romfs:/ (the store's song)
+  RootPath: romfs
+
 TitleInfo:
   Category                : Application
   UniqueId                : 0xf8a2e
@@ -69,6 +73,7 @@ AccessControlInfo:
   ServiceAccessControl:
    - APT:U
    - ac:i
+   - am:net
    - ac:u
    - cfg:i
    - cfg:s

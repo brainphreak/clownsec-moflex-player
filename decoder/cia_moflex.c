@@ -55,18 +55,30 @@ static int parse_titles(FILE *f, int64_t off, uint32_t sz, char titles[][128], i
     return nt;
 }
 
+static int g_cia_err = CIA_OK;
+int cia_last_error(void) { return g_cia_err; }
+
 int cia_list_moflex(const char *path, CiaMoflex *out, int max) {
+    g_cia_err = CIA_ERR_OPEN;
     FILE *f = fopen(path, "rb");
-    if (!f) return 0;
+    if (!f) return 0;                                                /* missing (moved?) or unreadable */
     int cnt = 0; int64_t toff = 0; uint32_t tsz = 0;   /* movie_title.csv location, if present */
     uint32_t hs = r32(f, 0), certs = r32(f, 8), tiks = r32(f, 12), tmds = r32(f, 16);
+    g_cia_err = CIA_ERR_NOT_CIA;
     if (hs != 0x2020) { fclose(f); return 0; }                       /* not a CIA */
     int64_t o = al(hs, 0x40); o = al(o + certs, 0x40); o = al(o + tiks, 0x40); o = al(o + tmds, 0x40);
+    {   /* a copy cut short (card pulled, transfer interrupted) is shorter than its own header says */
+        int64_t want = o + (int64_t)r64(f, 0x18), have = -1;
+        if (!fseeko(f, 0, SEEK_END)) have = (int64_t)ftello(f);
+        if (have >= 0 && want > 0 && have < want) { g_cia_err = CIA_ERR_SHORT; fclose(f); return 0; }
+    }
     uint8_t m[4];
     if (fseeko(f, (off_t)(o + 0x100), SEEK_SET) || fread(m, 1, 4, f) != 4 || memcmp(m, "NCCH", 4)) { fclose(f); return 0; }
     uint8_t fl;
     if (fseeko(f, (off_t)(o + 0x18F), SEEK_SET) || fread(&fl, 1, 1, f) != 1) { fclose(f); return 0; }
+    g_cia_err = CIA_ERR_ENCRYPTED;
     if (!(fl & 0x04)) { fclose(f); return 0; }                       /* encrypted content -> unsupported */
+    g_cia_err = CIA_ERR_NO_VIDEO;                                    /* readable: from here on, an app */
     int64_t romfs = o + (int64_t)r32(f, o + 0x1B0) * 0x200;
     uint8_t iv[4];
     if (fseeko(f, (off_t)romfs, SEEK_SET) || fread(iv, 1, 4, f) != 4 || memcmp(iv, "IVFC", 4)) { fclose(f); return 0; }
@@ -106,6 +118,7 @@ int cia_list_moflex(const char *path, CiaMoflex *out, int max) {
         p += al(0x20 + nlen, 4);
     }
     free(buf);
+    if (cnt > 0) g_cia_err = CIA_OK;
     /* replace filenames with the human-readable titles (row order = movie order in the native menu) */
     if (toff && cnt > 0) {
         char titles[64][128];

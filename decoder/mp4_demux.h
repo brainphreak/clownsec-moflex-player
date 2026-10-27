@@ -19,14 +19,18 @@
 #define MP4_MAX_W 1920
 #define MP4_MAX_H 1088
 
+/* One entry per video AND audio sample -- a 2h15m film at 48 fps has ~573,000 of them, so this
+ * stays at 16 bytes. At 40 bytes that film's index needed a 31 MB peak and the 64 MB-mode heap
+ * could not supply it: the allocations failed and the player crashed on load. Read the fields
+ * through the accessors below, never directly. */
 typedef struct {
-    int64_t offset;    /* absolute file offset of the sample */
-    uint32_t size;     /* sample size in bytes */
-    int64_t dts;       /* decode timestamp, in the track's timescale units */
-    int64_t cts;       /* COMPOSITION (display) timestamp: dts + ctts offset. With B-frames
-                        * decode order != display order -- present frames sorted by THIS. */
-    int keyframe;      /* 1 = sync sample (IDR); seek targets */
+    uint32_t offset;   /* absolute file offset: the 3DS SD card is FAT32, every file is < 4 GiB */
+    uint32_t size;     /* bytes in bits 0-30; bit 31 = keyframe (sync sample, seek target) */
+    uint32_t dts;      /* decode time in track ticks >> the track's shift (v_shift / a_shift) */
+    int32_t  ctso;     /* composition - decode time, same units. With B-frames decode order !=
+                        * display order -- present frames sorted by dts + ctso. */
 } Mp4Sample;
+#define MP4_KEYFLAG 0x80000000u
 
 typedef struct {
     FILE *f;    /* video sample reads */
@@ -42,6 +46,7 @@ typedef struct {
     int      nal_length_size;       /* 1/2/4: length prefix of NAL units in samples */
     Mp4Sample *vsamples;
     int      v_count;
+    int      v_shift;               /* vsamples' times are ticks >> v_shift (0 unless huge) */
 
     /* ---- audio (AAC / mp4a) ---- */
     int      has_audio;
@@ -51,7 +56,21 @@ typedef struct {
     int      asc_len;
     Mp4Sample *asamples;
     int      a_count;
+    int      a_shift;
 } Mp4;
+
+static inline uint32_t mp4_s_size(const Mp4Sample *s) { return s->size & ~MP4_KEYFLAG; }
+static inline int      mp4_s_key(const Mp4Sample *s)  { return (s->size & MP4_KEYFLAG) != 0; }
+/* times in the track's timescale ticks */
+static inline int64_t mp4_v_dts(const Mp4 *m, int i) { return (int64_t)m->vsamples[i].dts << m->v_shift; }
+static inline int64_t mp4_v_cts(const Mp4 *m, int i) {
+    return ((int64_t)m->vsamples[i].dts + m->vsamples[i].ctso) * ((int64_t)1 << m->v_shift);
+}
+static inline int64_t mp4_a_dts(const Mp4 *m, int i) { return (int64_t)m->asamples[i].dts << m->a_shift; }
+
+/* Why the last mp4_open() failed, so the player can say so instead of a generic message. */
+enum { MP4_ERR_NONE = 0, MP4_ERR_FORMAT, MP4_ERR_NOMEM };
+extern int mp4_open_error;
 
 /* Open + fully parse an MP4. Returns 1 on success (at least a video track found). */
 int  mp4_open(Mp4 *m, const char *path);

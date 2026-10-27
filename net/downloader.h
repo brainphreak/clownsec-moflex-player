@@ -48,4 +48,11 @@ bool download_to_mem(const char *url, char **out, size_t *out_len, size_t max_by
  * poster loads cancellable so scrolling stays fluid. Pass NULL to clear. */
 void download_set_abort(int (*abort_cb)(void));
 
+/* Double-buffered async SD committer (the catalog-download speed trick), reusable by any
+ * receive path: the caller positions f; the writer thread commits sequentially in slices. */
+typedef struct DlWBuf DlWBuf;
+DlWBuf *dl_wb_open(void *file);                    /* FILE*; NULL -> fall back to direct writes */
+size_t  dl_wb_write(DlWBuf *w, const void *p, size_t n);
+int     dl_wb_close(DlWBuf *w);                    /* drain + join; 0 = a write failed */
+
 #endif

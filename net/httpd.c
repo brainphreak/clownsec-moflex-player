@@ -1,4 +1,5 @@
 #include "httpd.h"
+#include "downloader.h"
 
 #include <3ds.h>
 #include <sys/socket.h>
@@ -19,10 +20,11 @@
 #define SOC_BUFSZ   0x100000
 #define PORT        8080
 #define HDRBUF      8192
-#define IOCHUNK     16384
+#define IOCHUNK     65536
 
 static u32 *g_soc_buf;
 static volatile int g_listen_fd = -1;
+static volatile int g_client_fd = -1;
 static volatile bool g_stop;
 static Thread g_thread;
 static char g_url[64] = "wifi off";
@@ -177,38 +179,82 @@ static void serve_listing(int fd, const char *dir) {
 
     send_str(fd, "</ul>");
 
-    /* JS: PUT uploads with a real progress bar (XHR upload.onprogress) + delete. */
+    /* JS: PUT uploads with progress, speed/ETA, and RESUME. Only the folder name is formatted
+     * in -- the rest goes out as literal chunks so a long script can never be truncated by a
+     * fixed snprintf buffer (and '%' needs no escaping here). */
     {
-        char dq[2200];
-        snprintf(dq, sizeof(dq),
-            "<script>const DIR=\"%s\";"
-            "function up(){const fs=document.getElementById('f').files;if(!fs.length)return;"
-            "let i=0;const log=document.getElementById('log');"
-            "(function nx(){if(i>=fs.length){location.reload();return;}"
-            "const f=fs[i],x=new XMLHttpRequest();"
-            "x.open('PUT','/up?path='+encodeURIComponent(DIR+f.name));"
-            "x.upload.onprogress=function(e){var p=e.lengthComputable?Math.floor(e.loaded*100/e.total):0;"
-            "log.innerHTML='Uploading '+(i+1)+'/'+fs.length+': '+f.name+"
-            "'<br><progress value='+e.loaded+' max='+e.total+'></progress> '+p+'%%'+"
-            "' ('+Math.floor(e.loaded/1048576)+'/'+Math.floor(e.total/1048576)+' MB)';};"
-            "x.onload=function(){log.textContent='Saved '+f.name;i++;nx();};"
-            "x.onerror=function(){log.textContent='Error uploading '+f.name;};"
-            "x.send(f);})();}"
-            "function rm(p){if(!confirm('Delete '+p+'?'))return;"
-            "fetch('/rm?path='+encodeURIComponent(p),{method:'GET'}).then(r=>location.reload());}"
-            "function mkd(){var n=document.getElementById('nf').value;if(!n)return;"
-            "fetch('/mkdir?path='+encodeURIComponent(DIR+n),{method:'GET'}).then(r=>location.reload());}"
-            "</script>", dir);
+        char dq[1200];
+        snprintf(dq, sizeof(dq), "<script>const DIR=\"%s\";", dir);
         send_str(fd, dq);
     }
+    send_str(fd,
+        "function hs(b){return b>=1073741824?(b/1073741824).toFixed(2)+' GB'"
+        ":(b/1048576).toFixed(1)+' MB';}"
+        "function ht(s){return s>=60?Math.floor(s/60)+'m '+(s%60)+'s':s+'s';}"
+        "function up(){var fs=document.getElementById('f').files;if(!fs.length)return;"
+        "var i=0,log=document.getElementById('log');"
+        "function nx(){if(i>=fs.length){location.reload();return;}"
+        /* ask the console how much of this file is already on the card, then send the rest */
+        "var f=fs[i],p=DIR+f.name,tries=0;"
+        "function probe(){fetch('/stat?path='+encodeURIComponent(p)).then(function(r){return r.text();})"
+        ".then(function(t){var o=parseInt(t)||0;send(o>=f.size?0:o);})"
+        ".catch(function(){send(0);});}"
+        "function send(off){var x=new XMLHttpRequest(),t0=Date.now(),sp=0;"
+        "x.open('PUT','/up?path='+encodeURIComponent(p)+(off?'&off='+off:''));"
+        "x.upload.onprogress=function(e){var done=off+e.loaded,el=(Date.now()-t0)/1000;"
+        "if(el>0.5){var v=e.loaded/el;sp=sp?sp*0.7+v*0.3:v;}"
+        "var eta=sp>0?Math.round((f.size-done)/sp):0;"
+        "log.innerHTML='Uploading '+(i+1)+'/'+fs.length+': '+f.name+(off?' (resumed)':'')+"
+        "'<br><progress value='+done+' max='+f.size+'></progress> '+"
+        "Math.floor(done*100/f.size)+'% '+hs(done)+' / '+hs(f.size)+"
+        "(sp>0?' - '+(sp/1048576).toFixed(2)+' MB/s, '+ht(eta)+' left':'');};"
+        "x.onload=function(){if(x.status==200){log.textContent='Saved '+f.name;i++;nx();}"
+        /* 409 = what is on the card no longer matches our offset: start that file clean */
+        "else if(x.status==409){log.textContent='Restarting '+f.name;send(0);}"
+        "else fail();};"
+        "x.onerror=fail;x.onabort=fail;"
+        "function fail(){if(++tries<=3){log.textContent='Link dropped - resuming '+f.name+"
+        "' ('+tries+'/3)';setTimeout(probe,1500);}"
+        "else log.textContent='Upload of '+f.name+' stalled - press Upload here again to resume';}"
+        "x.send(off?f.slice(off):f);}"
+        "probe();}"
+        "nx();}"
+        "function rm(p){if(!confirm('Delete '+p+'?'))return;"
+        "fetch('/rm?path='+encodeURIComponent(p),{method:'GET'}).then(r=>location.reload());}"
+        "function mkd(){var n=document.getElementById('nf').value;if(!n)return;"
+        "fetch('/mkdir?path='+encodeURIComponent(DIR+n),{method:'GET'}).then(r=>location.reload());}"
+        "</script>");
+}
+
+/* recv gated behind select(): returns like recv, or 0 on orderly close, -2 on timeout
+ * (caller polls g_stop / idle caps). Keeps the socket blocking for the send paths. */
+static int recv_wait(int fd, void *buf, int want) {
+    fd_set r; FD_ZERO(&r); FD_SET(fd, &r);
+    struct timeval tv = { 0, 500000 };                 /* 500ms per wait */
+    int sel = select(fd + 1, &r, NULL, NULL, &tv);
+    if (sel == 0) return -2;                           /* timeout: poll and come back */
+    if (sel < 0) return -1;
+    return recv(fd, buf, want, 0);
 }
 
 /* ---------- PUT upload ---------- */
 
 /* live upload progress, polled by the on-device UI (the web page has its own bar) */
+/* completed uploads, published to the UI thread (single writer, single reader) */
+#define UP_DONE_N 8
+static char g_done[UP_DONE_N][1024];
+static volatile unsigned g_done_wr = 0, g_done_rd = 0;
+
 static volatile long g_up_done = 0, g_up_total = 0;
 static volatile int  g_up_active = 0;
 static char g_up_name[128];
+int httpd_take_upload(char *path, int cap) {
+    if (g_done_rd == g_done_wr) return 0;
+    snprintf(path, cap, "%s", g_done[g_done_rd % UP_DONE_N]);
+    g_done_rd++;
+    return 1;
+}
+
 int httpd_upload_progress(long *done, long *total, char *name, int namecap) {
     if (!g_up_active) return 0;
     if (done)  *done  = g_up_done;
@@ -235,35 +281,65 @@ static void handle_put(int fd, const char *path, char *hdrbuf, int hdr_total, in
     }
     if (content_len < 0) { send_status(fd, "411 Length Required", "text/plain", "need length"); return; }
 
-    FILE *out = fopen(fpath, "wb");
+    /* RESUME: &off=N appends the remainder to an existing partial (the page probed /stat).
+     * The offset must equal the file's current size or the client restarts from scratch. */
+    char offs[24]; long long off = 0;
+    get_query(path, "off", offs, sizeof offs);
+    if (offs[0]) off = atoll(offs);
+    FILE *out = NULL;
+    if (off > 0) {
+        struct stat st;
+        if (stat(fpath, &st) != 0 || (long long)st.st_size != off) {
+            send_status(fd, "409 Conflict", "text/plain", "offset mismatch");
+            return;
+        }
+        out = fopen(fpath, "r+b");
+        if (out && fseeko(out, off, SEEK_SET)) { fclose(out); out = NULL; }
+    } else out = fopen(fpath, "wb");
     if (!out) { send_status(fd, "500 Error", "text/plain", "open failed"); return; }
 
     { const char *b = strrchr(fpath, '/'); b = b ? b + 1 : fpath; snprintf(g_up_name, sizeof g_up_name, "%s", b); }
-    g_up_total = content_len; g_up_done = 0; g_up_active = 1;   /* -> on-device progress bar */
+    g_up_total = off + content_len; g_up_done = off; g_up_active = 1;   /* -> on-device progress bar */
 
+    /* the catalog-download speed trick: recv() and SD commits overlap on two threads */
+    DlWBuf *wb = dl_wb_open(out);
+    int werr = 0;
     long remaining = content_len;
     /* bytes already read past the header */
     int have = hdr_total - body_start;
     if (have > 0) {
         int w = (int)((have < remaining) ? have : remaining);
-        fwrite(hdrbuf + body_start, 1, w, out);
+        if ((wb ? dl_wb_write(wb, hdrbuf + body_start, w) : fwrite(hdrbuf + body_start, 1, w, out)) != (size_t)w) werr = 1;
         remaining -= w; g_up_done += w;
     }
 
     char *buf = (char *)malloc(IOCHUNK);
-    while (remaining > 0 && buf) {
+    int idle = 0;                       /* consecutive 500ms select timeouts */
+    while (remaining > 0 && buf && !werr && !g_stop) {
         int want = (int)(remaining < IOCHUNK ? remaining : IOCHUNK);
-        int n = recv(fd, buf, want, 0);
+        int n = recv_wait(fd, buf, want);
+        if (n == -2) {                  /* timeout: poll the stop flag, ~30s dead-client cap */
+            if (g_stop || ++idle > 60) break;
+            continue;
+        }
         if (n <= 0) break;
-        fwrite(buf, 1, n, out);
+        idle = 0;
+        if ((wb ? dl_wb_write(wb, buf, n) : fwrite(buf, 1, n, out)) != (size_t)n) { werr = 1; break; }
         remaining -= n; g_up_done += n;
     }
     free(buf);
+    if (wb && !dl_wb_close(wb)) werr = 1;
     fclose(out);
     g_up_active = 0;
 
-    if (remaining == 0) send_status(fd, "200 OK", "text/plain", "ok");
-    else                send_status(fd, "500 Error", "text/plain", "incomplete");
+    if (remaining == 0 && !werr) {
+        /* hand the finished path to the UI thread: it adds the file to the library and scrapes
+         * its info, so an uploaded movie behaves like one that was there at the last scan */
+        int slot = g_done_wr % UP_DONE_N;
+        snprintf(g_done[slot], sizeof g_done[0], "%s", fpath);
+        g_done_wr++;
+        send_status(fd, "200 OK", "text/plain", "ok");
+    } else send_status(fd, "500 Error", "text/plain", "incomplete");
 }
 
 /* ---------- request dispatch ---------- */
@@ -274,9 +350,12 @@ static void handle_client(int fd) {
 
     /* read until end of headers */
     int total = 0, body_start = -1;
-    while (total < HDRBUF - 1) {
-        int n = recv(fd, hdr + total, HDRBUF - 1 - total, 0);
+    int hidle = 0;
+    while (total < HDRBUF - 1 && !g_stop) {
+        int n = recv_wait(fd, hdr + total, HDRBUF - 1 - total);
+        if (n == -2) { if (g_stop || ++hidle > 20) break; continue; }   /* 500ms waits, ~10s cap */
         if (n <= 0) break;
+        hidle = 0;
         total += n;
         hdr[total] = 0;
         char *end = strstr(hdr, "\r\n\r\n");
@@ -288,7 +367,15 @@ static void handle_client(int fd) {
     sscanf(hdr, "%7s %1023s", method, path);
 
     if (!strcmp(method, "GET")) {
-        if (!strncmp(path, "/rm", 3)) {
+        if (!strncmp(path, "/stat", 5)) {          /* resume probe: current byte size (0 = none) */
+            char fpath[1024];
+            get_query(path, "path", fpath, sizeof(fpath));
+            long long sz = 0;
+            struct stat st;
+            if (fpath[0] && !strncmp(fpath, "sdmc:/", 6) && stat(fpath, &st) == 0) sz = st.st_size;
+            char b[32]; snprintf(b, sizeof b, "%lld", sz);
+            send_status(fd, "200 OK", "text/plain", b);
+        } else if (!strncmp(path, "/rm", 3)) {
             char fpath[1024];
             get_query(path, "path", fpath, sizeof(fpath));
             if (fpath[0] && !strncmp(fpath, "sdmc:/", 6)) remove(fpath);
@@ -325,10 +412,12 @@ static void server_thread(void *arg) {
             svcSleepThread(50000000);   /* 50ms; listen sock is non-blocking */
             continue;
         }
-        /* client inherits the listen sock's O_NONBLOCK -> force it blocking so
-           recv() waits for data during large uploads (else they fail partway) */
+        /* client blocking for clean sends; receives go through select() with a timeout so
+           the loops can poll g_stop -- a B press or HOME must cancel the transfer NOW. */
         fcntl(c, F_SETFL, fcntl(c, F_GETFL, 0) & ~O_NONBLOCK);
+        g_client_fd = c;
         handle_client(c);
+        g_client_fd = -1;
         closesocket(c);
     }
 }
@@ -365,6 +454,8 @@ bool httpd_start(void) {
 
 void httpd_stop(void) {
     g_stop = true;
+    if (g_client_fd >= 0) shutdown(g_client_fd, SHUT_RDWR);   /* unblock an in-flight recv NOW
+                                                               * (owner thread still closes it) */
     if (g_listen_fd >= 0) { closesocket(g_listen_fd); g_listen_fd = -1; }
     if (g_thread) { threadJoin(g_thread, 2000000000ULL); threadFree(g_thread); g_thread = NULL; }
     strcpy(g_url, "wifi off");

@@ -124,6 +124,7 @@ int mp4_mvd_init(int w, int h, const uint8_t *avcc, int avcc_len, int nal_len_si
 
     prime_sps_pps();
     mvd_log("STEP 6: SPS/PPS primed");
+    g_skip_feed = 0;   /* a B-exit mid-drain must not leak "picture pending" into the next file */
     g_ready = 1;
     return 1;
 }

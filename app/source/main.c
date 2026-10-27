@@ -12,6 +12,8 @@
 #include <ctype.h>
 #include <time.h>
 #include <locale.h>
+#include <unistd.h>
+#include <mbedtls/md5.h>
 
 #include "moflex_playback.h"
 #include "mp4_play.h"
@@ -20,10 +22,12 @@
 #include "catalog.h"
 #include "poster.h"
 #include "movieinfo.h"
+#include "trailer.h"
 #include "unzip.h"
 #include "cia_moflex.h"
 #include "ui_gfx.h"
 #include "branding.h"
+#include "store.h"
 
 #define APP_VERSION "v1.0"
 #ifndef BUILD_TAG
@@ -40,6 +44,7 @@
 static u64 s_idle_last, s_idle_prevscan;
 static int s_idle_off, s_idle_swallow, s_idle_hooked;
 static aptHookCookie s_idle_cookie;
+static int dl_lid_closed(void);                      /* defined with the download helpers below */
 static void idle_backlight(int on) {
     if (R_FAILED(gspLcdInit())) return;              /* transient hold -> HOME/suspend safe */
     if (on) GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTH);
@@ -47,14 +52,38 @@ static void idle_backlight(int on) {
     gspLcdExit();
     s_idle_off = !on;
 }
+static void dl_wifi_hold(int on);   /* defined with the download helpers below */
+static int s_dlw_ndm;               /* (tentative decl of the flag defined below) */
+static volatile int s_dlw_active;
+static int s_ndm_resume;            /* wifi hold dropped for a suspend: take it back on return */
 static void idle_apt_hook(APT_HookType t, void *u) {
-    (void)u;   /* HOME / lid sleep: the system restored the backlight behind our back */
-    if (t == APTHOOK_ONRESTORE || t == APTHOOK_ONWAKEUP) { s_idle_off = 0; s_idle_last = osGetTime(); }
+    (void)u;
+    if (t == APTHOOK_ONSUSPEND || t == APTHOOK_ONSLEEP) {
+        /* The exclusive NDM wireless hold (lid-closed downloads) blocks the system's wireless
+         * handoff -- HOME hangs the whole console until it's released. Drop it for the suspend;
+         * the transfer is frozen while we're suspended anyway. */
+        if (s_dlw_ndm) { dl_wifi_hold(0); s_ndm_resume = 1; }
+    }
+    if (t == APTHOOK_ONRESTORE || t == APTHOOK_ONWAKEUP) {
+        s_idle_last = osGetTime();   /* the idle_scan relight invariant handles the screens */
+        if (s_ndm_resume) { s_ndm_resume = 0; if (s_dlw_active) dl_wifi_hold(1); }
+    }
 }
-/* Analog direction bits (circle pad / C-stick) are EXCLUDED from the presence test: a slightly
- * drifting stick sits past the threshold and reports "held" (or flickers edges) every single
- * frame -- the timer would reset forever and the screen would never go dark. Only real
- * button / d-pad / touch EDGES count, both for staying awake and for waking. */
+/* Pending "re-allow sleep": aptSetSleepAllowed(true) runs APT_SleepIfShellClosed against APT's
+ * OWN latched shell view -- calling it the instant the queue drains can sleep the console with
+ * a just-reopened lid (only a lid cycle wakes it). When the lid reads open we DEFER the
+ * re-allow to the idle watchdog, which grants it once the shell has read open twice in a row
+ * (or immediately when it closes -- sleeping then is exactly what the user asked for). */
+static int s_sleep_pending;
+static void sleep_reallow(void) {
+    if (dl_lid_closed()) aptSetSleepAllowed(true);   /* lid closed: sleeping now is correct */
+    else s_sleep_pending = 1;
+}
+/* Analog direction KEY bits (circle pad / C-stick) are EXCLUDED from the presence test: a
+ * slightly drifting stick sits past the threshold and reports "held" (or flickers edges)
+ * every frame -- the timer would reset forever and the screen would never go dark. Stick
+ * presence is instead detected as a large PER-FRAME position delta inside idle_scan: drift
+ * crawls, a deliberate flick jumps, so only major movements count. */
 #define IDLE_ANALOG (KEY_CPAD_UP | KEY_CPAD_DOWN | KEY_CPAD_LEFT | KEY_CPAD_RIGHT | \
                      KEY_CSTICK_UP | KEY_CSTICK_DOWN | KEY_CSTICK_LEFT | KEY_CSTICK_RIGHT)
 static void idle_scan(void) {
@@ -63,11 +92,46 @@ static void idle_scan(void) {
     u64 now = osGetTime();
     if (now - s_idle_prevscan > 2000) s_idle_last = now;   /* back from playback/extract/applet */
     s_idle_prevscan = now;
+    /* Lid watchdog: with sleep denied (background downloads) a lid close/reopen fires NO wake
+     * event -- if anything left the LCDs dark, nothing would ever relight them. A closed->open
+     * transition always forces the backlights on. A ptmu failure counts as "no reading", never
+     * as a transition. Also grants a deferred sleep re-allow (see sleep_reallow above). */
+    static u64 s_shell_t; static int s_shell_closed = -1, s_shell_prev = -1;
+    if (now - s_shell_t >= 500) {
+        s_shell_t = now;
+        u8 sh = 1; int closed = -1;
+        if (R_SUCCEEDED(ptmuInit())) { PTMU_GetShellState(&sh); ptmuExit(); closed = (sh == 0); }
+        if (closed >= 0) {
+            if (s_shell_closed == 1 && closed == 0) { idle_backlight(1); s_idle_last = now; }
+            if (s_sleep_pending && (closed == 1 || (closed == 0 && s_shell_prev == 0))) {
+                aptSetSleepAllowed(true);   /* lid closed, or stably open (APT's view agrees by now) */
+                s_sleep_pending = 0;
+            }
+            s_shell_prev = s_shell_closed; s_shell_closed = closed;
+        }
+    }
+    /* Circle pad / C-stick: only a MAJOR movement counts as presence. Micro drift must not hold
+     * the system awake (why the KEY bits are masked out), but drift is a slow crawl -- a
+     * deliberate flick moves far in ONE frame, so a big per-frame delta is a clean "user is
+     * here" signal (and relights dark screens via the relight invariant below). */
+    {
+        static int s_cpx, s_cpy, s_csx, s_csy;
+        circlePosition cp, cs; hidCircleRead(&cp); hidCstickRead(&cs);
+        int dx = cp.dx - s_cpx, dy = cp.dy - s_cpy, ex = cs.dx - s_csx, ey = cs.dy - s_csy;
+        if (dx * dx + dy * dy >= 48 * 48 || ex * ex + ey * ey >= 48 * 48) s_idle_last = now;
+        s_cpx = cp.dx; s_cpy = cp.dy; s_csx = cs.dx; s_csy = cs.dy;
+    }
     u32 edge = (hidKeysDown() | hidKeysUp()) & ~IDLE_ANALOG;
     if (edge) {
         s_idle_last = now;
-        if (s_idle_off) { idle_backlight(1); s_idle_swallow = 1; }  /* wake press must not act */
+        if (s_idle_off) s_idle_swallow = 1;   /* wake press must not act -- set even when the
+                                               * relight itself is briefly gated on the lid */
     }
+    /* THE relight (single site, with the watchdog transition above): dark screens are only
+     * legitimate while the timer is expired and the lid isn't closed. Any timer reset (edge,
+     * major stick move, watchdog, APT hook, queue event) relights here, and a failed attempt
+     * (transient gsp::Lcd refusal) retries every frame until it lands. */
+    if (s_idle_off && s_shell_closed != 1 && now - s_idle_last < IDLE_OFF_MS) idle_backlight(1);
     if (s_idle_swallow && !((hidKeysHeld() | hidKeysDown()) & ~IDLE_ANALOG))
         s_idle_swallow = 0;                                         /* real keys released -> live */
     if (!s_idle_off && now - s_idle_last >= IDLE_OFF_MS) idle_backlight(0);
@@ -199,10 +263,21 @@ static int s_show_hidden = 0;          /* play-mode toggle (Y): reveal system/hi
 static int is_hidden_dir(const char *n) {
     static const char *sys[] = {
         "3ds", "dcim", "fbi", "gm9", "cheats", "cias", "luma", "nintendo 3ds",
-        "roms", "system volume information", "themes", "moviedata", NULL
+        "roms", "system volume information", "themes", "moviedata", "moflex_player",
+        "_nds", "config", "splashes", "nimbus", "retroarch", NULL
     };
     for (int i = 0; sys[i]; i++) if (!strcasecmp(n, sys[i])) return 1;
     return 0;
+}
+
+/* Folders the library scans (full rescan, startup new-movie walk) never enter: the system ones,
+ * plus the player's own data folder. moflex_player holds caches -- catalogue posters, the store's
+ * covers (three files a title), movie info -- thousands of small files and never a movie (a
+ * download only lives there as an unfinished partial). Walking it was most of a scan's time on
+ * a card with a handful of films. It is hidden like the system folders (Y reveals it), so a
+ * folder the Library will never scan is never offered as a place to put a movie. */
+static int scan_skip_dir(const char *n) {
+    return is_hidden_dir(n);
 }
 
 static void scan(void) {
@@ -280,6 +355,7 @@ static void icon_file(int x, int y, u16 c);
 static void strip_ext(char *d);
 static int  ui_menu(const char *title, const char *subtitle, const char *const *items, int n);
 static int  scrape_one(const char *moviepath);           /* Get Info for one movie (defined later) */
+static int  lib_add_local(const char *path);             /* a file that just appeared on the card */
 static void lib_getinfo_menu(int *idx, int ni, int csel); /* library Get Info: this / all-missing (defined later) */
 
 
@@ -450,6 +526,7 @@ static void upload_screen(void) {
     int ok = httpd_start();
     int redraw = 1, tdown = 0, tx0 = 0, ty0 = 0, wasactive = 0;
     long lastdone = -1;
+    u64 up_t = 0; long up_b = 0; int up_x100 = 0;   /* live receive speed (EMA), like the queue view */
     while (aptMainLoop()) {
         hidScanInput();
         u32 k = hidKeysDown(), ku = hidKeysUp();
@@ -461,7 +538,19 @@ static void upload_screen(void) {
         long done = 0, total = 0; char nm[128] = "";
         int active = ok ? httpd_upload_progress(&done, &total, nm, sizeof nm) : 0;
         if (active) { if (done != lastdone) { lastdone = done; redraw = 1; } wasactive = 1; }
-        else if (wasactive) { wasactive = 0; lastdone = -1; redraw = 1; }   /* just finished */
+        else if (wasactive) { wasactive = 0; lastdone = -1; redraw = 1; up_t = 0; up_x100 = 0; }   /* just finished */
+        /* A file that arrived over Wi-Fi is on the card but not in the library, and nothing told
+         * the library about it. Add it and fetch its info here -- for a SUPER MOFLEX that is a
+         * local trailer read, otherwise a catalog lookup -- so an upload behaves like a file that
+         * was present at the last scan instead of waiting to be noticed. */
+        {
+            char up[PATHLEN + NAMELEN];
+            while (ok && httpd_take_upload(up, sizeof up)) {
+                if (!is_moflex(up)) continue;              /* companions ride along, silently */
+                lib_add_local(up);
+                redraw = 1;
+            }
+        }
         if (redraw) {
             ui_begin(GFX_BOTTOM);
             ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
@@ -483,6 +572,25 @@ static void upload_screen(void) {
                 if (total >= 1048576) snprintf(pl, sizeof pl, "%ld / %ld MB   %d%%", done / 1048576, total / 1048576, pct);
                 else                  snprintf(pl, sizeof pl, "%ld / %ld KB   %d%%", done / 1024, total / 1024, pct);
                 ui_text_center(UI_W / 2, by + bh + 8, 1, UI_INK, pl);
+                u64 now2 = osGetTime();
+                if (up_t == 0) { up_t = now2; up_b = done; }
+                else if (now2 - up_t >= 250) {   /* smoothed live speed, same style as downloads */
+                    double inst = (double)(done - up_b) * 8.0 / 1000.0 / (double)(now2 - up_t);
+                    up_x100 = up_x100 ? (int)(up_x100 * 0.5 + inst * 100.0 * 0.5) : (int)(inst * 100.0);
+                    up_t = now2; up_b = done;
+                }
+                if (up_x100 > 0) {
+                    char spd[48]; snprintf(spd, sizeof spd, "%d.%02d Mbps  (%d KB/s)", up_x100 / 100, up_x100 % 100, up_x100 * 10 / 8);
+                    ui_text_center(UI_W / 2, by + bh + 28, 1, UI_NEON, spd);
+                    if (total > done) {
+                        u32 bps = (u32)up_x100 * 1250u;
+                        u32 es = (u32)((u64)(total - done) / (bps ? bps : 1));
+                        char eta[32];
+                        if (es >= 3600) snprintf(eta, sizeof eta, "ETA %luh %02lum", (unsigned long)(es / 3600), (unsigned long)(es % 3600 / 60));
+                        else            snprintf(eta, sizeof eta, "ETA %lu:%02lu", (unsigned long)(es / 60), (unsigned long)(es % 60));
+                        ui_text_center(UI_W / 2, by + bh + 46, 1, UI_NEONC, eta);
+                    }
+                }
             } else {
                 ui_text_center(UI_W / 2, 62, 1, UI_INK, "Server ON. On the same Wi-Fi, open:");
                 ui_text_center_fit(UI_W / 2, 84, 2, UI_NEONC, httpd_url(), UI_W - 16);
@@ -683,12 +791,28 @@ static bool file_is_zip(const char *path) {
     return n == 4 && h[0] == 'P' && h[1] == 'K' && (h[2] == 3 || h[2] == 5 || h[2] == 7);
 }
 
+/* Would Filesystem hide this folder (or anything inside it) until Y is pressed? Any part of the
+ * path being a system folder or a dot-folder hides it. SAVE TO marks these, so a download isn't
+ * put somewhere it then seems to have vanished from. */
+static int path_hidden(const char *dir) {
+    const char *p = strncmp(dir, "sdmc:/", 6) ? dir : dir + 6;
+    while (*p) {
+        const char *e = strchr(p, '/'); size_t n = e ? (size_t)(e - p) : strlen(p);
+        char part[NAMELEN]; snprintf(part, sizeof part, "%.*s", (int)(n < NAMELEN ? n : NAMELEN - 1), p);
+        if (part[0] == '.' || (n && is_hidden_dir(part))) return 1;
+        if (!e) break;
+        p = e + 1;
+    }
+    return 0;
+}
+
 /* Pick (and optionally create) a destination folder under sdmc:/, starting at cwd.
  * Returns 1 with `out` = chosen dir (trailing '/'), or 0 if cancelled. */
 static int pick_folder(char *out, size_t cap) {
     static char dir[PATHLEN];
     static char list[256][NAMELEN];
     snprintf(dir, sizeof(dir), "%s", cwd);
+    if (path_hidden(dir)) s_show_hidden = 1;   /* starting inside one: don't hide where we are */
     int nd = 0, psel = 0, pscroll = 0, redraw = 1, rescan = 1, hu = 0, hd = 0;
     char backto[NAMELEN] = "";   /* after [..], land on the folder we just left */
     while (aptMainLoop()) {
@@ -698,8 +822,9 @@ static int pick_folder(char *out, size_t cap) {
             if (d) {
                 struct dirent *de;
                 while ((de = readdir(d)) && nd < 256)
-                    if (de->d_type == DT_DIR && strcmp(de->d_name, ".") && strcmp(de->d_name, ".."))
-                        snprintf(list[nd++], NAMELEN, "%s", de->d_name);
+                    if (de->d_type == DT_DIR && strcmp(de->d_name, ".") && strcmp(de->d_name, "..")
+                        && (s_show_hidden || (de->d_name[0] != '.' && !is_hidden_dir(de->d_name))))
+                        snprintf(list[nd++], NAMELEN, "%s", de->d_name);   /* same Y toggle as Filesystem */
                 closedir(d);
             }
             if (backto[0]) {   /* just went up: highlight the folder we exited */
@@ -723,6 +848,7 @@ static int pick_folder(char *out, size_t cap) {
         if (nav_repeat(k, kh, NAV_DOWN, &hd)) { if (psel < total - 1) psel++; redraw = 1; }
         if (nav_repeat(k, kh, NAV_UP,   &hu)) { if (psel > 0) psel--;         redraw = 1; }
         if (k & KEY_B) return 0;
+        if (k & KEY_Y) { s_show_hidden = !s_show_hidden; psel = 0; pscroll = 0; rescan = 1; continue; }
         int newf = (k & KEY_X) ? 1 : 0, act = (k & KEY_A) ? psel : -1;
         touchPosition tp; hidTouchRead(&tp);
         if (k & KEY_TOUCH) { td = 1; tx0 = tp.px; ty0 = tp.py; tsc0 = pscroll; tmv = 0; }
@@ -764,22 +890,32 @@ static int pick_folder(char *out, size_t cap) {
         if (redraw) {
             ui_begin(GFX_BOTTOM);
             ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
-            ui_text_center(UI_W / 2, 12, 2, UI_NEON, "SAVE TO");
+            ui_text(10, 8, 2, UI_NEON, "SAVE TO");
             char pth[64]; int mc = (UI_W - 20) / 8;
             if ((int)strlen(dir) > mc) snprintf(pth, sizeof pth, "...%s", dir + strlen(dir) - (mc - 3));
             else snprintf(pth, sizeof pth, "%s", dir);
             ui_text(10, 34, 1, UI_DIM, pth);
             ui_fill_round(8, 46, UI_W - 16, 1, 0, TH_LINE);
+            ui_text(UI_W - 98, 9, 1, s_show_hidden ? UI_NEONP : UI_DIM, s_show_hidden ? "Y: hide sys" : "Y: show all");
+            /* "hidden" = Filesystem only shows it after Y; the Library never scans it */
+            int hid_here = path_hidden(dir);
             for (int r = 0; r < VIS; r++) { int i = pscroll + r; if (i >= total) break;
                 int by = ry0 + r * (rh + gap), selrow = (i == psel), rw = UI_W - 16;
                 if (selrow) { ui_glow_round(8, by, rw, rh, 7, UI_NEON, 3, 16);
                     ui_vgrad_round(8, by, rw, rh, 7, TH_SEL, TH_SELLO);
                     ui_frame_round(8, by, rw, rh, 7, UI_NEON, 1); }
                 char lb[NAMELEN]; int textx = 18; u16 tc = selrow ? UI_WHITE : UI_INK;
-                if (i == 0) { snprintf(lb, sizeof lb, "Save in this folder"); tc = UI_NEON; }
+                int hid = 0;
+                if (i == 0) { hid = path_hidden(dir);
+                              snprintf(lb, sizeof lb, "%s", hid ? "Save here (hidden)" : "Save in this folder"); tc = UI_NEON; }
                 else if (!is_root && i == 1) snprintf(lb, sizeof lb, ".. (up a folder)");
-                else { snprintf(lb, sizeof lb, "%s", list[i - base]); icon_folder(18, by + (rh - 16) / 2, UI_RGB(240, 205, 110)); textx = 46; }
+                else { const char *fn = list[i - base];
+                       hid = !hid_here && (fn[0] == '.' || is_hidden_dir(fn));
+                       snprintf(lb, sizeof lb, "%.*s", hid ? 24 : NAMELEN - 1, fn);
+                       icon_folder(18, by + (rh - 16) / 2, UI_RGB(240, 205, 110)); textx = 46;
+                       if (hid && !selrow) tc = UI_DIM; }
                 ui_text(textx, by + (rh - 8) / 2, 1, tc, lb);
+                if (hid && i != 0) ui_text(UI_W - 16 - 8 - 48, by + (rh - 8) / 2, 1, UI_NEONP, "hidden");
             }
             if (total > VIS) { int th = VIS * (rh + gap) - gap, ty = ry0, maxs = total - VIS;
                 int hh = th * VIS / total; if (hh < 12) hh = 12; int hy = ty + (th - hh) * pscroll / maxs;
@@ -797,6 +933,36 @@ static int pick_folder(char *out, size_t cap) {
 }
 
 /* greedy word-wrap helper for the top-screen info panel */
+/* Wrap `s`, draw at most `maxlines` lines starting from line `skip`, and return how many lines
+ * the whole string wraps to. The return value is what tells a caller there is more text below
+ * than it has room for -- without it, a long description was simply cut off at the twelfth
+ * line with nothing on screen to say so. */
+static int ui_text_wrap_from(int x, int *y, int scale, u16 col, const char *s,
+                             int maxcw, int maxlines, int skip) {
+    char buf[160];   /* holds up to maxcw codepoints (UTF-8: several bytes each) */
+    int lines = 0, drawn = 0;
+    while (*s) {
+        while (*s == ' ') s++;
+        if (!*s) break;
+        const char *p = s; int cp = 0, lastsp = -1;
+        while (*p && cp < maxcw) {
+            if (*p == ' ') lastsp = (int)(p - s);
+            p += ui_u8_bytes(p, 1);
+            cp++;
+        }
+        int cut = (*p && lastsp > 0) ? lastsp : (int)(p - s);
+        if (lines >= skip && drawn < maxlines) {
+            int n = cut < (int)sizeof(buf) - 1 ? cut : (int)sizeof(buf) - 1;
+            memcpy(buf, s, n); buf[n] = 0;
+            ui_text(x, *y, scale, col, buf);
+            *y += 8 * scale + 2;
+            drawn++;
+        }
+        s += cut;
+        lines++;
+    }
+    return lines;
+}
 static void ui_text_wrap(int x, int *y, int scale, u16 col, const char *s, int maxcw, int maxlines) {
     char buf[160];   /* holds up to maxcw codepoints (UTF-8: several bytes each) */
     int lines = 0;
@@ -901,11 +1067,40 @@ static int cat_is_3d(const CatEntry *e) {
     return 0;
 }
 
+/* first playable episode path of a show folder into out (defined with the show helpers). */
+static int show_first_episode(const CatEntry *e, char *out, int cap);
+/* Resolve a library entry to a file that may carry a SUPER MOFLEX trailer (a show folder ->
+ * its first episode), then probe the trailer. Fills audio/subs display strings + a sub count.
+ * Returns 1 if a trailer was found. */
+static int entry_super(const CatEntry *e, char *audio, int acap, char *subs, int scap, int *nsub) {
+    if (audio && acap) audio[0] = 0;
+    if (subs && scap) subs[0] = 0;
+    if (nsub) *nsub = 0;
+    char probe[PATHLEN + NAMELEN];
+    if (e->is_zip == 2) {                       /* show folder: use the first episode */
+        if (!show_first_episode(e, probe, sizeof probe)) return 0;
+    } else if (e->is_zip == 0) {
+        snprintf(probe, sizeof probe, "%s", e->url);
+    } else return 0;                            /* a .zip season: no trailer */
+    int got = trailer_langs(probe, audio, acap, subs, scap);
+    if (got && subs && nsub) {                  /* count space-separated language codes */
+        int n = subs[0] ? 1 : 0;
+        for (const char *q = subs; *q; q++) if (*q == ' ') n++;
+        *nsub = n;
+    }
+    return got;
+}
+
+/* How far the highlighted entry's description is scrolled, and whether it overflows at all.
+ * Reset whenever the highlight moves -- scrolling belongs to the thing you are looking at. */
+static int g_desc_scroll = 0, g_desc_over = 0, g_desc_total = 0;
+#define DESC_LINES 12
 static void draw_info_top(const CatEntry *e, const u16 *poster) {
     ui_begin(GFX_TOP);
     ui_clear(UI_BG);
     int y = 8;
     ui_text_wrap(10, &y, 2, UI_WHITE, e->name, 24, 2);       /* title (16px, ~24/line) */
+    if (e->super) ui_text(400 - 8 - ui_text_w(1, "SUPER"), 8, 1, UI_NEON, "SUPER");
 
     /* poster box on the left */
     int px0 = 10, py0 = 48;
@@ -933,8 +1128,26 @@ static void draw_info_top(const CatEntry *e, const u16 *poster) {
         ui_text(tx, ty, 1, is3d ? UI_NEONP : UI_DIM,
                 is3d ? "3D  (stereoscopic)" : "2D"); ty += 14;
     }
+    {   /* embedded tracks: cached at scan (local) or from the catalog fields */
+        char line[96];
+        if (e->audio_langs[0]) { snprintf(line, sizeof line, "Audio: %s", e->audio_langs); ui_text_wrap(tx, &ty, 1, UI_NEONC, line, 30, 2); }
+        if (e->sub_langs[0])   { snprintf(line, sizeof line, "Subs: %s", e->sub_langs);     ui_text_wrap(tx, &ty, 1, UI_NEONC, line, 30, 2); }
+    }
     if (e->genres[0]) { ui_text_wrap(tx, &ty, 1, UI_GRAY, e->genres, 30, 3); ty += 4; }
-    if (e->desc[0])   ui_text_wrap(tx, &ty, 1, UI_INK, e->desc, 30, 12);
+    if (e->desc[0]) {
+        int total = ui_text_wrap_from(tx, &ty, 1, UI_INK, e->desc, 30, DESC_LINES, g_desc_scroll);
+        g_desc_over = (total > DESC_LINES); g_desc_total = total;
+        if (g_desc_over) {
+            /* Say that there is more, and which buttons reach it. A New 3DS has ZL/ZR; every
+             * console has L with up and down, so neither is left without a way down the page. */
+            char hint[40];
+            int shown = total - g_desc_scroll; if (shown > DESC_LINES) shown = DESC_LINES;
+            snprintf(hint, sizeof hint, "%s ZL/ZR or L+%s",
+                     g_desc_scroll + shown < total ? "more..." : "end.",
+                     g_desc_scroll > 0 ? "up/down" : "down");
+            ui_text(tx, 228, 1, UI_DIM, hint);
+        }
+    } else { g_desc_over = 0; g_desc_total = 0; }
     ui_present();
 }
 
@@ -977,6 +1190,7 @@ static void browser_show_top(int is_dir, const char *name, const char *fullpath)
  * poster download/decode; a worker thread does it and the UI just polls for the result). ---- */
 static volatile int pw_run = 0, pw_req = -1, pw_done = -2, pw_ok = 0;
 static char      pw_url[256], pw_key[NAMELEN];
+static char      pw_nfo[1024];   /* the entry's metadata, written beside the poster it caches */
 static u16      *pw_buf = NULL;
 static LightLock pw_lock;
 static Thread    pw_thread = NULL;
@@ -984,12 +1198,15 @@ static Thread    pw_thread = NULL;
 static void pw_fn(void *arg) {
     (void)arg;
     while (pw_run) {
-        int id; char url[256], key[NAMELEN];
+        int id; char url[256], key[NAMELEN], nfo[1024];
         LightLock_Lock(&pw_lock);
         id = pw_req; snprintf(url, sizeof url, "%s", pw_url); snprintf(key, sizeof key, "%s", pw_key);
+        snprintf(nfo, sizeof nfo, "%s", pw_nfo);
         LightLock_Unlock(&pw_lock);
         if (id < 0 || id == pw_done) { svcSleepThread(12000000); continue; }   /* nothing new -> idle */
         int ok = url[0] && pw_buf && poster_get(url, key, pw_buf, POSTER_W, POSTER_H);
+        /* the sidecar goes down here, on this thread, so browsing never waits on a card write */
+        if (ok) poster_save_meta(key, nfo);
         LightLock_Lock(&pw_lock);
         if (pw_req == id) { pw_ok = ok; pw_done = id; }   /* publish only if still the wanted selection */
         LightLock_Unlock(&pw_lock);
@@ -1005,11 +1222,24 @@ static void pw_stop(void) {
     if (!pw_thread) return;
     pw_run = 0; threadJoin(pw_thread, 2000000000LL); threadFree(pw_thread); pw_thread = NULL;
 }
-static void pw_request(int id, const char *url, const char *key) {
+static void pw_request(int id, const char *url, const char *key, const CatEntry *e) {
     LightLock_Lock(&pw_lock);
     pw_req = id;
     snprintf(pw_url, sizeof pw_url, "%s", url ? url : "");
     snprintf(pw_key, sizeof pw_key, "%s", key ? key : "");
+    pw_nfo[0] = 0;
+    if (e) {                                  /* same "key: value" shape movieinfo writes */
+        const char *title = e->title[0] ? e->title : e->name;
+        int n = 0;
+        n += snprintf(pw_nfo + n, sizeof pw_nfo - n, "title: %s\n", title);
+        if (e->year)        n += snprintf(pw_nfo + n, sizeof pw_nfo - n, "year: %d\n", e->year);
+        if (e->runtime)     n += snprintf(pw_nfo + n, sizeof pw_nfo - n, "runtime: %d\n", e->runtime);
+        if (e->category[0]) n += snprintf(pw_nfo + n, sizeof pw_nfo - n, "category: %s\n", e->category);
+        if (e->genres[0])   n += snprintf(pw_nfo + n, sizeof pw_nfo - n, "genres: %s\n", e->genres);
+        if (e->is3d >= 0)   n += snprintf(pw_nfo + n, sizeof pw_nfo - n, "3d: %s\n", e->is3d ? "yes" : "no");
+        if (e->desc[0])     n += snprintf(pw_nfo + n, sizeof pw_nfo - n, "desc: %s\n", e->desc);
+        if (n >= (int)sizeof pw_nfo) pw_nfo[sizeof pw_nfo - 1] = 0;
+    }
     LightLock_Unlock(&pw_lock);
 }
 
@@ -1064,6 +1294,10 @@ static void queue_load(void) {
             }
             pp = t ? t + 1 : NULL; fi++;
         }
+        /* A queue written before the name was sanitized still holds the character FAT cannot
+         * store, and would go on failing to save every time it was retried. Clean it on the
+         * way in so an existing queue heals itself rather than needing to be rebuilt. */
+        fat_sanitize(q->fname);
         if (q->url[0] && q->fname[0]) s_qn++;
     }
     fclose(f);
@@ -1227,8 +1461,9 @@ static int dlw_start(void) {   /* main thread: launch the front queue item */
         }
     }
     if (!th) th = threadCreate(dlw_thread, NULL, 32 * 1024, prio - 1, -2, true); /* app core, above UI */
-    if (!th) { aptSetSleepAllowed(true); dl_wifi_hold(0); return 0; }   /* chain-start failed -> normal lid */
+    if (!th) { sleep_reallow(); dl_wifi_hold(0); return 0; }   /* chain-start failed -> normal lid */
     s_dlw_active = 1;
+    s_sleep_pending = 0;         /* a stale deferred re-allow must not fire mid-download */
     aptSetSleepAllowed(false);   /* lid close now only darkens the LCDs; the transfer keeps going */
     dl_wifi_hold(1);             /* ...and NDM must not power the wireless down meanwhile */
     dl_led(0, 0);                /* a fresh queue clears any leftover done/failed light */
@@ -1243,7 +1478,7 @@ static void dlw_stop_wait(void) {   /* abort the in-flight download; partial + q
     if (!s_dlw_finished) s_dlw_zombie = 1;   /* it still owns s_dlw_item until it exits */
     else s_dlw_finished = 0;
     s_dlw_active = 0;
-    aptSetSleepAllowed(true);
+    sleep_reallow();
     dl_wifi_hold(0);
 }
 static void queue_remove_url(const char *url) {   /* the active item may have been reordered */
@@ -1275,6 +1510,12 @@ static int queue_add_front(const CatEntry *e) {   /* 1 = queued, 2 = was already
     QItem *q = &s_q[pos]; memset(q, 0, sizeof *q);
     snprintf(q->name, sizeof q->name, "%s", e->name);
     snprintf(q->fname, sizeof q->fname, "%s", e->fname);
+    /* The SAME sanitize the other queue path does. Without it a catalogue title containing a
+     * character FAT cannot store -- "Thunderbolts*" -- is asked for under that name, the SD
+     * card refuses to create the file, and nothing lands: no file to see in the browser, none
+     * to play, and nothing for fat_rescue to rename either, because rescue can only fix a file
+     * that exists. This is the path A takes from the catalogue, so it is the common one. */
+    fat_sanitize(q->fname);
     snprintf(q->url, sizeof q->url, "%s", e->url);
     snprintf(q->art, sizeof q->art, "%s", e->art);
     snprintf(q->category, sizeof q->category, "%s", e->category);
@@ -1356,10 +1597,16 @@ static int distinct_genres(const CatEntry *cat, int nc, const char *category, ch
 /* neon scrolling picker for a list of short strings. Returns index, -2 (Show All), or -1 (back). */
 static void draw_status(int x, int y, int st);          /* watched badges (defined with the library code) */
 static const signed char *s_pick_status = NULL;         /* optional per-item badge for the NEXT catalog_pick */
+/* Optional per-ROW top screen for the NEXT catalog_pick: the picker itself only owns the bottom
+ * screen, so a list used to leave whatever was already up there -- which is why every episode of
+ * a show showed the SHOW's info. Set this to draw the highlighted item instead. */
+static void (*s_pick_top)(int item) = NULL;
 static int s_pick_init = 0;   /* initial highlight ROW for the NEXT catalog_pick (one-shot):
                                * callers set it when re-showing a list so B-back lands where you were */
 static int catalog_pick(const char *title, const char *subtitle, char items[][64], int n, int show_all, const char *extra) {
     const signed char *pst = s_pick_status; s_pick_status = NULL;   /* consumed by this call only */
+    void (*ptop)(int) = s_pick_top; s_pick_top = NULL;              /* ditto */
+    int ptop_drawn = -1, ptop_settle = 0, ptop_first = 1;
     int has_extra = (extra && extra[0]) ? 1 : 0;
     int total = n + (show_all ? 1 : 0) + has_extra;
     int sel = 0, top = 0, redraw = 1, td = 0, tx0 = 0, ty0 = 0, tsc0 = 0, tmv = 0;
@@ -1400,6 +1647,19 @@ static int catalog_pick(const char *title, const char *subtitle, char items[][64
           if (nr) redraw = 1; }
         if (dlw_poll()) redraw = 1;   /* a background download finished while we were here */
         { static int qt; if (s_dlw_active && ++qt >= 20) { qt = 0; redraw = 1; } }   /* keep the strip live */
+        if (ptop) {                           /* highlighted row changed -> repaint the top screen */
+            int item = sel - has_extra;                 /* the extra row sits above the items */
+            if (item != ptop_drawn) {
+                /* ep_draw_top() READS THE SD CARD (trailer import, poster decode). Painting it on
+                 * every step of a held scroll stalls the list on each episode -- the repeat is
+                 * firing, the I/O is what blocks. Let the highlight settle first, so holding down
+                 * costs one read when you stop rather than one per episode passed. */
+                if (kh & (NAV_UP | NAV_DOWN | KEY_LEFT | KEY_RIGHT)) ptop_settle = 0;
+                else if (ptop_first || ++ptop_settle >= 5) {
+                    ptop(item); ptop_drawn = item; ptop_settle = 0; ptop_first = 0;
+                }
+            }
+        }
         if (redraw) {
             ui_begin(GFX_BOTTOM);
             ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
@@ -1445,17 +1705,31 @@ static int catalog_pick(const char *title, const char *subtitle, char items[][64
 static void lib_add_downloaded(const char *path, const CatEntry *src);   /* defined with the library code */
 static void lib_add_extracted(const char *folder, const CatEntry *src);  /* zip contents -> library (shows too) */
 
-/* live progress while a zip extracts: bar + n/total + current filename */
-static void unzip_prog(int done, int total, const char *name) {
+/* live progress while a zip extracts: bar + n/total + current filename.
+ * Fires between every write chunk, so it also keeps the app ALIVE during extraction:
+ * pumps APT (HOME suspends properly), scans input (idle/backlight/lid logic runs),
+ * and B offers to cancel. Returns 0 to cancel the extraction. */
+static int unzip_prog(int done, int total, const char *name) {
+    if (!aptMainLoop()) return 0;                     /* HOME "close software" -> stop cleanly */
+    hidScanInput();                                   /* = idle_scan: wake/idle/lid watchdog live */
+    if (hidKeysDown() & KEY_B) {
+        if (confirm("Cancel the extraction?\n(The zip file is kept)")) return 0;
+    }
+    static u64 s_uz_draw;                             /* redraw ~7x/s, not every 512KB chunk */
+    u64 now = osGetTime();
+    if (name && now - s_uz_draw < 150) return 1;
+    s_uz_draw = now;
     ui_begin(GFX_BOTTOM); ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
     ui_text_center(UI_W / 2, 84, 2, UI_NEON, "Extracting...");
-    if (name) { char nb[96]; const char *b = strrchr(name, '/'); ui_text_fit(UI_W / 2, 112, 1, UI_DIM, b ? b + 1 : name, UI_W - 16); (void)nb; }
+    if (name) { const char *b = strrchr(name, '/'); ui_text_fit(UI_W / 2, 112, 1, UI_DIM, b ? b + 1 : name, UI_W - 16); }
     int bx = 20, bw = UI_W - 40, by = 138, bh = 16;
     ui_fill_round(bx, by, bw, bh, bh / 2, TH_TRACK);
     if (total > 0) { int fw = (int)((long long)bw * done / total); if (fw > 0) ui_fill_round(bx, by, fw, bh, bh / 2, UI_NEON); }
     char pl[32]; snprintf(pl, sizeof pl, "%d / %d files", done, total);
     ui_text_center(UI_W / 2, by + bh + 10, 1, UI_INK, pl);
+    ui_text_center(UI_W / 2, by + bh + 32, 1, UI_DIM, "B = cancel");
     ui_present(); gfxFlushBuffers(); gfxSwapBuffers();
+    return 1;
 }
 
 /* ---- hierarchical catalog groups: TV shows have seasons, music videos have artists ----
@@ -1526,24 +1800,30 @@ static int catalog_pick_group(const CatEntry *cat, int nc, const char *filt_cat,
     }
     if (ngr <= 1) { filt_group[0] = 0; return 1; }   /* nothing to group -> straight to the list */
     qsort(groups, ngr, 64, strrow_cmp);
+    int nsc = 0;   /* SUPER MOFLEX entries in this category -> a filter row at the top */
+    for (int i = 0; i < nc; i++) if (cat[i].super && !strcasecmp(cat[i].category, filt_cat)) nsc++;
+    int gb = 0;
+    if (nsc) { snprintf(gdisp[0], 64, "* SUPER MOFLEX (%d)", nsc); gb = 1; }
     for (int k = 0; k < ngr; k++) {
-        int n = 0;
+        int n = 0, sup = 0;
         for (int i = 0; i < nc; i++) {
             if (strcasecmp(cat[i].category, filt_cat)) continue;
             char key[64]; cat_group_key(&cat[i], key, sizeof key);
-            if (!strcasecmp(key, groups[k])) n++;
+            if (!strcasecmp(key, groups[k])) { n++; if (cat[i].super) sup = 1; }
         }
-        snprintf(gdisp[k], 64, "%.52s (%d)", groups[k], n);
+        if (sup) snprintf(gdisp[gb + k], 64, "%.46s [S] (%d)", groups[k], n);   /* SUPER MOFLEX show */
+        else     snprintf(gdisp[gb + k], 64, "%.52s (%d)", groups[k], n);
     }
     int is_tv = !strcasecmp(filt_cat, "TV Shows");
     if (!strcasecmp(last_cat, filt_cat) && last_g >= 0 && last_g < ngr)
-        s_pick_init = last_g + 1;   /* B-back from the list lands on the same show/artist */
-    int g = catalog_pick(is_tv ? "SHOWS" : "ARTISTS", filt_cat, gdisp, ngr, 1, NULL);
+        s_pick_init = last_g + 1 + gb;   /* B-back from the list lands on the same show/artist */
+    int g = catalog_pick(is_tv ? "SHOWS" : "ARTISTS", filt_cat, gdisp, ngr + gb, 1, NULL);
     snprintf(last_cat, sizeof last_cat, "%s", filt_cat);
     if (g == -2) { filt_group[0] = 0; last_g = -1; return 1; }   /* Show All */
     if (g < 0) return 0;
-    snprintf(filt_group, cap, "%s", groups[g]);
-    last_g = g;
+    if (gb && g == 0) { snprintf(filt_group, cap, "\x01SUPER"); last_g = -1; return 1; }   /* super filter */
+    snprintf(filt_group, cap, "%s", groups[g - gb]);
+    last_g = g - gb;
     return 1;
 }
 
@@ -1595,7 +1875,7 @@ static void catalog_browse(const Source *src) {
                     int backout = 0;
                     for (;;) {
                         if (!catalog_pick_group(cat, nc, filt_cat, filt_group, sizeof filt_group)) { backout = 1; break; }
-                        if (!strcasecmp(filt_cat, "TV Shows") && filt_group[0]) {
+                        if (!strcasecmp(filt_cat, "TV Shows") && filt_group[0] && strcmp(filt_group, "\x01SUPER")) {
                             if (!catalog_pick_season(cat, nc, filt_group, &filt_season)) continue;   /* back to shows */
                         } else filt_season = 0;
                         break;
@@ -1605,19 +1885,23 @@ static void catalog_browse(const Source *src) {
                 }
                 static char gens[64][32]; int ng = distinct_genres(cat, nc, filt_cat, gens, 64);
                 qsort(gens, ng, 32, strrow_cmp);   /* genres alphabetical */
-                if (ng > 0) {
-                    static char gdisp[64][64];   /* genre rows with counts (within this category) */
+                int nsc = 0; for (int i = 0; i < nc; i++) if (cat[i].super && !strcasecmp(cat[i].category, filt_cat)) nsc++;
+                if (ng > 0 || nsc) {
+                    static char gdisp[66][64]; int gb = 0;
+                    if (nsc) { snprintf(gdisp[0], 64, "SUPER MOFLEX (%d)", nsc); gb = 1; }
                     for (int k = 0; k < ng; k++) {
                         int n = 0;
                         for (int i = 0; i < nc; i++)
                             if (!strcasecmp(cat[i].category, filt_cat) && genre_match(cat[i].genres, gens[k])) n++;
-                        snprintf(gdisp[k], 64, "%.48s (%d)", gens[k], n);
+                        snprintf(gdisp[gb + k], 64, "%.48s (%d)", gens[k], n);
                     }
                     const char *mi[2] = { "View All", "Pick a Genre" };
                     int mm = ui_menu(filt_cat, NULL, mi, 2);
                     if (mm < 0) continue;
-                    if (mm == 1) { int g = catalog_pick("GENRE", filt_cat, gdisp, ng, 0, NULL);
-                                   if (g < 0) continue; snprintf(filt_genre, sizeof filt_genre, "%s", gens[g]); }
+                    if (mm == 1) { int g = catalog_pick("GENRE", filt_cat, gdisp, ng + gb, 0, NULL);
+                                   if (g < 0) continue;
+                                   if (gb && g == 0) snprintf(filt_genre, sizeof filt_genre, "\x01SUPER");
+                                   else snprintf(filt_genre, sizeof filt_genre, "%s", gens[g - gb]); }
                 }
                 s_pick_init = c + 1;   /* B-back re-highlights this category (+1: Show All row) */
             }
@@ -1626,11 +1910,14 @@ cb_have_filter:;
         /* ---- build the filtered + sorted index over cat[] ---- */
 cb_rebuild:;   /* X-search inside the list jumps back here with filt_search set */
         int ni = 0;
+        int super_only = !strcmp(filt_genre, "\x01SUPER");
         for (int i = 0; i < nc; i++) {
             if (filt_cat[0] && strcasecmp(cat[i].category, filt_cat)) continue;
-            if (filt_genre[0] && !genre_match(cat[i].genres, filt_genre)) continue;
-            if (filt_group[0]) { char key[64]; cat_group_key(&cat[i], key, sizeof key);
-                                 if (strcasecmp(key, filt_group)) continue; }
+            if (super_only && !cat[i].super) continue;
+            if (!super_only && filt_genre[0] && !genre_match(cat[i].genres, filt_genre)) continue;
+            if (!strcmp(filt_group, "\x01SUPER")) { if (!cat[i].super) continue; }
+            else if (filt_group[0]) { char key[64]; cat_group_key(&cat[i], key, sizeof key);
+                                      if (strcasecmp(key, filt_group)) continue; }
             if (filt_season > 0 && tv_season_of(&cat[i]) != filt_season) continue;
             if (filt_search[0] && !ci_contains(cat[i].name, filt_search)) continue;   /* search box */
             idx[ni++] = i;
@@ -1650,6 +1937,24 @@ cb_rebuild:;   /* X-search inside the list jumps back here with filt_search set 
         int want_dl = 0;
         if (nav_repeat(k, kh, NAV_DOWN, &hfd)) { if (csel < ni - 1) csel++; redraw = 1; }
         if (nav_repeat(k, kh, NAV_UP, &hfu))   { if (csel > 0) csel--; redraw = 1; }
+        /* Scroll the description on the top screen. ZL/ZR where they exist; L held with up or
+         * down everywhere else, because an Old 3DS has no shoulder triggers and would
+         * otherwise be stuck looking at the first twelve lines forever. L on its own still
+         * jumps letter groups -- it is only a modifier while it is HELD with a direction. */
+        if (g_desc_over) {
+            int sd = 0;
+            if (k & KEY_ZR) sd = 1;
+            if (k & KEY_ZL) sd = -1;
+            if ((kh & KEY_L) && (k & KEY_DOWN)) sd = 1;
+            if ((kh & KEY_L) && (k & KEY_UP))   sd = -1;
+            if (sd) {
+                g_desc_scroll += sd * 4;
+                int last = g_desc_total - DESC_LINES;      /* never past the final line */
+                if (g_desc_scroll > last) g_desc_scroll = last;
+                if (g_desc_scroll < 0)    g_desc_scroll = 0;
+                redraw = 1;
+            }
+        }
         if (k & KEY_RIGHT) { csel += BR_ROWS; if (csel > ni - 1) csel = ni - 1; redraw = 1; }
         if (k & KEY_LEFT)  { csel -= BR_ROWS; if (csel < 0) csel = 0; redraw = 1; }
         if (k & KEY_X) {   /* search WITHIN this view (whatever category/genre is filtered) */
@@ -1712,9 +2017,10 @@ cb_rebuild:;   /* X-search inside the list jumps back here with filt_search set 
         if (dlw_poll()) redraw = 1;   /* finalize finished background downloads */
         { static int qt2; if (s_dlw_active && ++qt2 >= 20) { qt2 = 0; redraw = 1; } }
         if (s_qtoast_t > 0 && --s_qtoast_t == 0) redraw = 1;   /* toast expired -> repaint without it */
-        if (csel != shown) { redraw = 1; phave = 0; settle = 0; requested = 0; }   /* moved -> drop poster */
+        if (csel != shown) { redraw = 1; phave = 0; settle = 0; requested = 0;
+                             g_desc_scroll = 0; }   /* moved -> drop poster, rewind the blurb */
         /* debounced request to the background loader, then poll -- scrolling never blocks on a poster */
-        if (!phave && !requested && cat[idx[csel]].art[0] && ++settle >= 6) { pw_request(idx[csel], cat[idx[csel]].art, cat[idx[csel]].fname); requested = 1; }
+        if (!phave && !requested && cat[idx[csel]].art[0] && ++settle >= 6) { pw_request(idx[csel], cat[idx[csel]].art, cat[idx[csel]].fname, &cat[idx[csel]]); requested = 1; }
         if (!phave && requested && pw_done == idx[csel]) {
             if (pw_ok && poster && pworker) { memcpy(poster, pworker, (size_t)POSTER_W * POSTER_H * 2); phave = 1; }
             requested = 0; redraw = 1;
@@ -1749,6 +2055,7 @@ cb_rebuild:;   /* X-search inside the list jumps back here with filt_search set 
                 else if (selrow) ui_text_clipped(tx - g_mq_off, ty, 1, tc, ce->name, tx, txr);
                 else { char disp[NAMELEN]; snprintf(disp, sizeof disp, "%s", ce->name);
                     int cm = (txr - tx) / 8; if ((int)strlen(disp) > cm) disp[cm] = 0; ui_text(tx, ty, 1, tc, disp); }
+                if (ce->super) ui_text(UI_W - 18 - ui_text_w(1, "S"), ty, 1, UI_NEON, "S");
             }
             if (ni > BR_ROWS) { int th = BR_ROWS * BR_ROWH - 6, ty = BR_LIST_Y, maxs = ni - BR_ROWS;
                 int hh = th * BR_ROWS / ni; if (hh < 12) hh = 12; int hy = ty + (th - hh) * cscroll / maxs;
@@ -1795,7 +2102,7 @@ cb_rebuild:;   /* X-search inside the list jumps back here with filt_search set 
 /* ================= Library: one flat, categorized view of every local movie ================= */
 #define LIB_MAX   3000
 #define LIB_CACHE "sdmc:/moflex_player/library.cache"
-#define LIB_MAGIC 0x4C494238   /* 'LIB8' -- bump to invalidate old caches when CatEntry changes */
+#define LIB_MAGIC 0x4C494242   /* 'LIB9' -- bump to invalidate old caches when CatEntry changes */
 static CatEntry *g_lib = NULL;   /* every playable movie on the SD, with its .nfo metadata */
 static int       g_lib_n = 0;
 
@@ -1812,11 +2119,14 @@ static int has_episode_tag(const char *s) {
         }
     return 0;
 }
-static void strip_3d_tags(char *s) {       /* drop every "(3D)" + collapse the gap it leaves */
+static void strip_3d_tags(char *s) {       /* drop every "(3D)" / "(S)" + collapse the gap */
     char *d = s;
     for (char *p = s; *p; ) {
-        if (p[0] == '(' && p[1] == '3' && (p[2] == 'D' || p[2] == 'd') && p[3] == ')') {
-            p += 4;
+        int skip = 0;
+        if (p[0] == '(' && p[1] == '3' && (p[2] == 'D' || p[2] == 'd') && p[3] == ')') skip = 4;
+        else if (p[0] == '(' && (p[1] == 'S' || p[1] == 's') && p[2] == ')') skip = 3;   /* SUPER marker */
+        if (skip) {
+            p += skip;
             if (d > s && d[-1] == ' ' && (*p == ' ' || *p == 0)) d--;
             continue;
         }
@@ -1919,6 +2229,19 @@ static void lib_add_shows_in_dir(const char *dir, const CatEntry *src) {
 static int epname_cmp(const void *a, const void *b) { return strcasecmp((const char *)a, (const char *)b); }
 #define EP_MAX 100
 static char s_epfile[EP_MAX][PATHLEN + NAMELEN];   /* full episode paths (may span season folders) */
+/* Tolerant collector: EVERY .moflex in the folder, no SxxEyy requirement. Last-resort fallback so
+ * a show whose files are named "Show - 01.moflex" (miniseries without tags) still lists episodes
+ * (name order; the picker labels fall back to the filename when there is no tag). */
+static void ep_collect_dir_any(const char *dirpath, int *n) {
+    DIR *d = opendir(dirpath);
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d)) && *n < EP_MAX) {
+        if (e->d_name[0] == '.' || !is_moflex(e->d_name)) continue;
+        snprintf(s_epfile[*n], sizeof s_epfile[0], "%s/%s", dirpath, e->d_name); (*n)++;
+    }
+    closedir(d);
+}
 static void ep_collect_dir_named(const char *dirpath, const char *showname, int *n) {
     DIR *d = opendir(dirpath);
     if (!d) return;
@@ -1963,6 +2286,7 @@ static int show_collect_eps(const char *showname, const char *url) {
             }
             closedir(pd);
         }
+        if (n == 0) ep_collect_dir_any(url, &n);   /* no SxxEyy tags anywhere -> take every moflex */
     } else {
         /* virtual "<dir>/<Show>" key: the episodes sit flat in the parent, filtered by prefix */
         char pdir[PATHLEN + NAMELEN];
@@ -1972,6 +2296,136 @@ static int show_collect_eps(const char *showname, const char *url) {
     }
     if (n) qsort(s_epfile, n, sizeof s_epfile[0], epname_cmp);   /* SxxEyy sorts into watch order */
     return n;
+}
+static int show_first_episode(const CatEntry *e, char *out, int cap) {
+    if (show_collect_eps(e->name, e->url) <= 0) return 0;
+    snprintf(out, cap, "%s", s_epfile[0]);
+    return 1;
+}
+
+/* The episode AFTER `path` in its own show, for playing a series straight through.
+ * 1 = out holds the next episode's path, 0 = not an episode, or it was the last one.
+ *
+ * Deliberately built on the same collector the episode picker uses, so "next" means exactly
+ * what the picker shows as next -- including episodes that live in a SIBLING season folder,
+ * which is how S01e13 rolls into S02e01. */
+static int next_episode_path(const char *path, char *out, int cap) {
+    const char *sl = strrchr(path, '/');
+    if (!sl || !has_episode_tag(sl + 1)) return 0;          /* a film has no "next" */
+    char dir[PATHLEN + NAMELEN];
+    snprintf(dir, sizeof dir, "%.*s", (int)(sl - path), path);
+    char show[96];
+    ep_show_prefix(sl + 1, show, sizeof show);
+    /* Always a real string: show_collect_eps dereferences showname when it compares sibling
+     * season folders, so NULL there is a crash. Empty is fine -- it just means "no prefix
+     * filter", which is the right behaviour for a file named plainly "S01e01 - Title". */
+    int n = show_collect_eps(show, dir);
+    if (n <= 1) return 0;
+    for (int i = 0; i < n; i++) {
+        if (strcmp(s_epfile[i], path)) continue;
+        if (i + 1 >= n) return 0;                            /* that was the finale */
+        snprintf(out, cap, "%s", s_epfile[i + 1]);
+        return 1;
+    }
+    return 0;
+}
+
+/* Label for the up-next panel: the episode's own filename, minus the show prefix and the
+ * extension, so it reads "S02e07 - Pride" rather than repeating the show name every time. */
+static void next_episode_label(const char *path, char *out, size_t cap) {
+    const char *sl = strrchr(path, '/');
+    const char *fn = sl ? sl + 1 : path;
+    char show[96];
+    ep_show_prefix(fn, show, sizeof show);
+    size_t skip = strlen(show);
+    if (skip && !strncasecmp(fn, show, skip)) {
+        fn += skip;
+        while (*fn == ' ' || *fn == '-') fn++;
+    }
+    snprintf(out, cap, "%s", fn);
+    char *dot = strrchr(out, '.');
+    if (dot && !strcasecmp(dot, ".moflex")) *dot = 0;
+}
+
+/* "UP NEXT" with a countdown: plays the next episode on its own after AUTONEXT_SECS, or
+ * immediately on A. B stops, because B is always back. Returns 1 = play it, 0 = stop.
+ *
+ * A silent auto-advance is the wrong default on a handheld -- it keeps playing at 2am when
+ * nobody is watching. A visible countdown you can stop costs one screen and no guessing. */
+/* Season/episode numbers out of a SxxEyy tag. 1 = parsed. */
+static int ep_numbers(const char *path, int *season, int *ep) {
+    const char *sl = strrchr(path, '/');
+    const char *t = ep_tag_at(sl ? sl + 1 : path);
+    if (!t) return 0;
+    *season = atoi(t + 1);
+    const char *q = t + 1; while (isdigit((unsigned char)*q)) q++;
+    *ep = atoi(q + 1);
+    return 1;
+}
+
+/* Asked by the playback engines when a movie reaches its end: is this an episode with another
+ * to follow? Only then do they hand control back (MOFLEX_EOF) instead of parking on the last
+ * frame -- so films keep the stop-in-place behaviour exactly as before. */
+static int autonext_has_next(const char *path) {
+    char nxt[PATHLEN + NAMELEN];
+    return next_episode_path(path, nxt, sizeof nxt);
+}
+
+#define AUTONEXT_SECS 5
+static int next_episode_prompt(const char *curpath, const char *nextpath) {
+    char label[NAMELEN];
+    next_episode_label(nextpath, label, sizeof label);
+    /* "Next" is the next episode PRESENT on the card, so a missing file is stepped over --
+     * you cannot play what is not there. Stepping over it silently is what would confuse, so
+     * name the gap and let the countdown be stopped. */
+    char gap[64]; gap[0] = 0;
+    { int cs, ce, ns, ne;
+      if (ep_numbers(curpath, &cs, &ce) && ep_numbers(nextpath, &ns, &ne) &&
+          ns == cs && ne > ce + 1) {
+          if (ne == ce + 2) snprintf(gap, sizeof gap, "S%02de%02d is not on the card", cs, ce + 1);
+          else              snprintf(gap, sizeof gap, "S%02de%02d-e%02d are not on the card",
+                                     cs, ce + 1, ne - 1);
+      } }
+    int bw = 116, bh = 36, by = 158, x0 = 30, x1 = UI_W - 30 - bw;
+    int sel = 0, tdown = 0, tx0 = 0, ty0 = 0;
+    u64 t0 = osGetTime();
+    int lastsec = -1;
+    while (aptMainLoop()) {
+        hidScanInput();
+        u32 k = hidKeysDown(), ku = hidKeysUp();
+        if (k & KEY_LEFT || k & KEY_RIGHT) sel = !sel;
+        if (k & KEY_A) return sel == 0;
+        if (k & KEY_B) return 0;
+        touchPosition tp; hidTouchRead(&tp);
+        if (k & KEY_TOUCH) { tdown = 1; tx0 = tp.px; ty0 = tp.py; }
+        else if ((ku & KEY_TOUCH) && tdown) { tdown = 0;
+            if (ty0 >= by && ty0 < by + bh) {
+                if (tx0 >= x0 && tx0 < x0 + bw) return 1;
+                if (tx0 >= x1 && tx0 < x1 + bw) return 0;
+            }
+        }
+        int left = AUTONEXT_SECS - (int)((osGetTime() - t0) / 1000);
+        if (left <= 0) return 1;
+        if (left != lastsec) {                       /* redraw once a second, not every frame */
+            lastsec = left;
+            ui_begin(GFX_BOTTOM);
+            ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
+            ui_text_center(UI_W / 2, 48, 2, UI_NEON, "UP NEXT");
+            ui_text_fit(UI_W / 2, 88, 1, UI_INK, label, UI_W - 16);
+            if (gap[0]) ui_text_fit(UI_W / 2, 104, 1, UI_RED, gap, UI_W - 16);
+            char cd[48];
+            snprintf(cd, sizeof cd, "Playing in %d...", left);
+            ui_text_center(UI_W / 2, gap[0] ? 120 : 112, 1, UI_DIM, cd);
+            int tw = (UI_W - 60) * left / AUTONEXT_SECS;      /* draining countdown bar */
+            ui_fill_round(30, 130, UI_W - 60, 6, 3, UI_BG2);
+            if (tw > 0) ui_fill_round(30, 130, tw, 6, 3, UI_NEON);
+            ui_button(x0, by, bw, bh, "PLAY", sel == 0, UI_NEON);
+            ui_button(x1, by, bw, bh, "STOP", sel == 1, UI_RED);
+            ui_present();
+        }
+        gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
+    }
+    return 0;
 }
 
 /* One episode's watch status: 2 watched, 1 in progress, 0 new. */
@@ -1990,6 +2444,30 @@ static int show_status(const char *showname, const char *url) {
     return (w == n) ? 2 : touched ? 1 : 0;
 }
 
+/* Top screen for the highlighted EPISODE. A SUPER MOFLEX episode carries its own title, synopsis
+ * and air date in its trailer, so show those rather than repeating the series blurb for all
+ * thirteen episodes -- importing on first sight, which is a local read of the file we are already
+ * pointing at. Falls back to the show's own info when an episode has nothing of its own. */
+static CatEntry s_ep_show;          /* the series entry, for the fallback */
+static int s_ep_have_show;
+static void ep_draw_top(int i) {
+    if (i < 0 || i >= EP_MAX || !s_epfile[i][0]) {
+        if (s_ep_have_show) draw_info_top(&s_ep_show, NULL);
+        return;
+    }
+    const char *path = s_epfile[i];
+    if (!movieinfo_have(path)) trailer_import_movieinfo(path);   /* silent, local, once */
+    CatEntry meta;
+    if (movieinfo_load(path, &meta)) {
+        static u16 art[POSTER_W * POSTER_H];
+        int have = movieinfo_poster(path, art, POSTER_W, POSTER_H);
+        if (!have && s_ep_have_show) have = movieinfo_poster(s_ep_show.url, art, POSTER_W, POSTER_H);
+        draw_info_top(&meta, have ? art : NULL);
+    } else if (s_ep_have_show) {
+        draw_info_top(&s_ep_show, NULL);                          /* nothing of its own: the series */
+    }
+}
+
 static int show_pick_episode(const char *showname, const char *url, char *out, size_t cap) {
     static char eps[EP_MAX][64];
     static signed char epst[EP_MAX];
@@ -2004,6 +2482,10 @@ static int show_pick_episode(const char *showname, const char *url, char *out, s
         epst[i] = (signed char)ep_status(s_epfile[i]);
     }
     s_pick_status = epst;   /* same watched badges as the library list */
+    s_ep_have_show = 0;
+    for (int i = 0; i < g_lib_n; i++)                             /* the series entry, for fallback */
+        if (!strcmp(g_lib[i].url, url)) { s_ep_show = g_lib[i]; s_ep_have_show = 1; break; }
+    s_pick_top = ep_draw_top;
     int c = catalog_pick("EPISODES", showname, eps, n, 0, NULL);
     if (c < 0) return 0;
     snprintf(out, cap, "%s", s_epfile[c]);
@@ -2011,12 +2493,103 @@ static int show_pick_episode(const char *showname, const char *url, char *out, s
 }
 
 static int s_scan_stop;   /* lid closed mid-scan -> abort cleanly (checked ~2x/s) */
+static int s_scan_btn = 0;   /* set while the library scan's own screen is up (B may stop it) */
 static int scan_should_stop(void) {
     static u64 last;
     u64 now = osGetTime();
     if (now - last >= 500) { last = now; if (dl_lid_closed()) s_scan_stop = 1; }
+    if (s_scan_btn) { hidScanInput(); if (hidKeysDown() & KEY_B) s_scan_stop = 1; }   /* B = stop, cleanly */
     return s_scan_stop;
 }
+/* ---- scan crash recovery ------------------------------------------------------------------
+ * A file the scan cannot survive (a corrupt CIA or trailer that crashes a parser) used to take
+ * the app down on EVERY launch, and the only way out was skipping the scan and hunting for the
+ * file by hand. This catches it with two SD operations per scan rather than one per file: a
+ * marker written when a scan starts and removed when it ends. A marker still there at the next
+ * scan means that scan died -- so the next one runs in RECOVERY, naming each file in the marker
+ * just before opening it. Recovery dies on the same file (the walk order is stable), and the scan
+ * after that reads the name, adds the file to the skip list and says so. A skipped file stays in
+ * the library under its filename, so it can be deleted from the file manager, but no scan opens
+ * it again -- unless it is REPLACED: entries carry the file's size, so a re-download of the same
+ * name is a different file and gets opened normally. The per-file writes only ever happen in
+ * that one recovery pass. */
+#define SCAN_MARK "sdmc:/moflex_player/.scan_running"
+#define SCAN_SKIP "sdmc:/moflex_player/scan_skip.txt"
+#define SKIP_MAX  32
+static char s_skip[SKIP_MAX][PATHLEN + NAMELEN];
+static long long s_skip_sz[SKIP_MAX];                  /* the size it had when it crashed */
+static int  s_skip_n = 0, s_skip_loaded = 0, s_scan_recovery = 0;
+static long long file_size(const char *path) { struct stat st; return stat(path, &st) ? -1 : (long long)st.st_size; }
+#define SKIP_VER "sdmc:/moflex_player/scan_skip.v2"
+static void skip_load(void) {
+    s_skip_n = 0; s_skip_loaded = 1;
+    /* Before v2 the marker kept naming a file after it had been read safely, so whatever stopped a
+     * recovery scan later (closing the app, a slow folder) was pinned on the last file opened --
+     * usually an innocent CIA. Those entries can't be trusted: drop them once. */
+    FILE *v = fopen(SKIP_VER, "rb");
+    if (v) fclose(v);
+    else { remove(SCAN_SKIP); v = fopen(SKIP_VER, "wb"); if (v) fclose(v); }
+    FILE *f = fopen(SCAN_SKIP, "rb");
+    if (!f) return;
+    char line[PATHLEN + NAMELEN + 24];
+    while (s_skip_n < SKIP_MAX && fgets(line, sizeof line, f)) {      /* "<size> <path>" */
+        char *nl = strpbrk(line, "\r\n"); if (nl) *nl = 0;
+        char *sp = strchr(line, ' ');
+        if (!sp || !sp[1]) continue;
+        s_skip_sz[s_skip_n] = atoll(line);
+        snprintf(s_skip[s_skip_n], sizeof s_skip[0], "%s", sp + 1);
+        s_skip_n++;
+    }
+    fclose(f);
+}
+static int scan_skipped(const char *path) {
+    if (!s_skip_loaded) skip_load();
+    for (int i = 0; i < s_skip_n; i++)
+        if (!strcmp(s_skip[i], path)) return file_size(path) == s_skip_sz[i];   /* replaced -> try it */
+    return 0;
+}
+/* recovery only: name the file about to be opened, so a crash inside it can be pinned on it */
+static void scan_guard(const char *path) {
+    if (!s_scan_recovery) return;
+    FILE *f = fopen(SCAN_MARK, "wb");
+    if (f) { fprintf(f, "R\n%s\n", path); fclose(f); }
+}
+/* ...and clear it again once the file has been read: a scan that dies AFTER this (closed from
+ * HOME, powered off in a slow folder) is no file's fault, and must not blame the last one opened */
+static void scan_guard_done(void) {
+    if (!s_scan_recovery) return;
+    FILE *f = fopen(SCAN_MARK, "wb");
+    if (f) { fputs("R\n", f); fclose(f); }
+}
+static void scan_begin(void) {
+    mkdir("sdmc:/moflex_player", 0777);
+    s_scan_recovery = 0;
+    FILE *f = fopen(SCAN_MARK, "rb");
+    if (f) {                                             /* the last scan never finished */
+        char kind[8] = "", path[PATHLEN + NAMELEN] = "";
+        if (fgets(kind, sizeof kind, f) && fgets(path, sizeof path, f)) {
+            char *nl = strpbrk(path, "\r\n"); if (nl) *nl = 0;
+        }
+        fclose(f);
+        if (kind[0] == 'R' && path[0] && !scan_skipped(path)) {   /* recovery died IN this file */
+            long long sz = file_size(path);
+            FILE *s = fopen(SCAN_SKIP, "ab");
+            if (s) { fprintf(s, "%lld %s\n", sz, path); fclose(s); }
+            if (s_skip_n < SKIP_MAX) { s_skip_sz[s_skip_n] = sz; snprintf(s_skip[s_skip_n++], sizeof s_skip[0], "%s", path); }
+            if (!cia_is_cia(path)) {   /* a CIA is skipped silently: most are games, never listed */
+                const char *b = strrchr(path, '/'); b = b ? b + 1 : path;
+                char body[400];
+                snprintf(body, sizeof body, "This file crashed the library scan,\nso it will be skipped from now on:\n\n%.120s\n\n"
+                         "It may be corrupt. Delete it or\ndownload it again.", b);
+                msg_screen("FILE SKIPPED", body);
+            }
+        } else s_scan_recovery = 1;                      /* died somewhere unknown: find where */
+    }
+    f = fopen(SCAN_MARK, "wb");
+    if (f) { fputs(s_scan_recovery ? "R\n" : "N\n", f); fclose(f); }
+}
+static void scan_end(void) { remove(SCAN_MARK); s_scan_recovery = 0; }
+
 static void lib_scan_dir(const char *dir, int depth) {
     if (g_lib_n >= LIB_MAX || depth > 8) return;
     DIR *d = opendir(dir);
@@ -2024,24 +2597,57 @@ static void lib_scan_dir(const char *dir, int depth) {
     int shows_done = 0;   /* episode grouping runs once per directory */
     struct dirent *e;
     while ((e = readdir(d)) && g_lib_n < LIB_MAX && !scan_should_stop()) {
+        static u64 last_draw;   /* live progress on a clock, not per movie found: a big folder with
+                                 * no movies in it used to leave the screen still, and looked frozen */
+        u64 now = osGetTime();
+        if (now - last_draw >= 250) {
+            last_draw = now;
+            ui_begin(GFX_BOTTOM); ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
+            ui_text_center(UI_W / 2, 96, 2, UI_NEON, "Scanning...");
+            char m[32]; snprintf(m, sizeof m, "%d found", g_lib_n);
+            ui_text_center(UI_W / 2, 128, 1, UI_DIM, m);
+            char pth[64]; int mc = (UI_W - 20) / 8;
+            if ((int)strlen(dir) > mc) snprintf(pth, sizeof pth, "...%s", dir + strlen(dir) - (mc - 3));
+            else snprintf(pth, sizeof pth, "%s", dir);
+            ui_text_center(UI_W / 2, 148, 1, UI_DIM, pth);
+            ui_text_center(UI_W / 2, 200, 1, UI_DIM, "B: stop (keeps your old library)"); ui_present();
+            gfxFlushBuffers(); gfxSwapBuffers();
+        }
         if (e->d_name[0] == '.') continue;
         char full[PATHLEN + NAMELEN];
         snprintf(full, sizeof full, "%s%s", dir, e->d_name);
+        /* The listing already says file or folder (d_type). A stat() per entry -- each one a
+         * search of its folder on FAT -- was the slow part, and only a movie needs one (its date). */
+        int isdir;
+        if (e->d_type != DT_UNKNOWN) isdir = (e->d_type == DT_DIR);
+        else { struct stat sd; if (stat(full, &sd)) continue; isdir = S_ISDIR(sd.st_mode); }
+        if (!isdir && !is_moflex(e->d_name)) continue;       /* not a video: nothing to look up */
         struct stat st;
-        if (stat(full, &st)) continue;
-        if (S_ISDIR(st.st_mode)) {
-            if (is_hidden_dir(e->d_name)) continue;          /* skip 3DS / Nintendo / luma / etc. */
+        memset(&st, 0, sizeof st);
+        if (!isdir && stat(full, &st)) continue;
+        if (isdir) {
+            if (scan_skip_dir(e->d_name)) continue;          /* 3DS / Nintendo / luma / our caches */
             char sub[PATHLEN];
             snprintf(sub, sizeof sub, "%s/", full);
             lib_scan_dir(sub, depth + 1);
         } else if (is_moflex(e->d_name)) {
-            if (has_episode_tag(e->d_name) && depth > 0) {   /* TV episode: grouped into SHOW entries */
+            if (has_episode_tag(e->d_name)) {   /* TV episode -> grouped into a SHOW entry (even a
+                                                * single loose episode at SD root gets its own show) */
                 if (!shows_done) { lib_add_shows_in_dir(dir, NULL); shows_done = 1; }
                 continue;
             }
-            if (cia_is_cia(e->d_name) && !cia_has_moflex(full)) continue;   /* skip non-movie CIAs */
             CatEntry *c = &g_lib[g_lib_n];
-            movieinfo_load(full, c);                          /* name/genres/category/year/is3d from .nfo, if any */
+            if (scan_skipped(full)) {                        /* crashed a scan before: list it by
+                                                               * name only, never open it */
+                if (cia_is_cia(e->d_name)) continue;          /* ...unless a CIA: can't tell a game from a movie */
+                memset(c, 0, sizeof *c); c->is3d = -1;
+            } else {
+                scan_guard(full);
+                int game = cia_is_cia(e->d_name) && !cia_has_moflex(full);
+                if (!game) movieinfo_load(full, c);           /* name/genres/category/year/is3d from .nfo, if any */
+                scan_guard_done();
+                if (game) continue;                           /* skip non-movie CIAs */
+            }
             snprintf(c->url, sizeof c->url, "%s", full);      /* the path we play + the poster key */
             snprintf(c->fname, sizeof c->fname, "%s", e->d_name);
             if (!c->name[0]) { snprintf(c->name, sizeof c->name, "%s", e->d_name); strip_ext(c->name); }
@@ -2051,13 +2657,6 @@ static void lib_scan_dir(const char *dir, int depth) {
             time_t mt = st.st_mtime; struct tm *tmv = localtime(&mt);
             if (tmv) strftime(c->date, sizeof c->date, "%Y-%m-%d", tmv);   /* file date -> "sort by date added" */
             g_lib_n++;
-            if ((g_lib_n & 7) == 0) {                          /* live progress */
-                ui_begin(GFX_BOTTOM); ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
-                ui_text_center(UI_W / 2, 96, 2, UI_NEON, "Scanning...");
-                char m[32]; snprintf(m, sizeof m, "%d found", g_lib_n);
-                ui_text_center(UI_W / 2, 128, 1, UI_DIM, m); ui_present();
-                gfxFlushBuffers(); gfxSwapBuffers();
-            }
         }
     }
     closedir(d);
@@ -2135,6 +2734,7 @@ static void lib_note_renamed(const char *oldpath, const char *newpath) {
             return;
         }
 }
+static void lib_refresh_entry(int i);   /* defined below */
 static void lib_rescan(void) {
     if (!g_lib) g_lib = (CatEntry *)malloc(sizeof(CatEntry) * LIB_MAX);
     if (!g_lib) return;
@@ -2147,10 +2747,42 @@ static void lib_rescan(void) {
     ui_text_center(UI_W / 2, 96, 2, UI_NEON, "Scanning...");
     ui_text_center(UI_W / 2, 128, 1, UI_DIM, "searching the SD card for movies"); ui_present();
     gfxFlushBuffers(); gfxSwapBuffers();
+    scan_begin();                                 /* crash recovery: see scan_guard() */
+    s_scan_btn = 1;
     lib_scan_dir("sdmc:/", 0);
+    s_scan_btn = 0;
     if (s_scan_stop) { g_lib_n = 0; lib_load_cache_only(); }   /* aborted -> keep the OLD library,
                                                                 * never save a truncated cache */
-    else lib_save_cache();
+    else {
+        for (int i = 0; i < g_lib_n; i++) {
+            if (scan_skipped(g_lib[i].url)) continue;   /* crashed a scan before: never open it */
+            scan_guard(g_lib[i].url);                   /* (a show: the folder stands for its episode) */
+            /* SUPER MOFLEX: import EVERYTHING from the file ONCE at scan (info, poster, tracks),
+             * exactly like a website scrape -- afterward the library is self-sufficient and
+             * nothing ever opens the moflex again for metadata. */
+            g_lib[i].super = entry_super(&g_lib[i], g_lib[i].audio_langs, sizeof g_lib[i].audio_langs,
+                                         g_lib[i].sub_langs, sizeof g_lib[i].sub_langs, NULL) ? 1 : 0;
+            if (g_lib[i].super && !movieinfo_have(g_lib[i].url)) {
+                char rep[PATHLEN + NAMELEN];
+                if (g_lib[i].is_zip == 2) {
+                    if (show_first_episode(&g_lib[i], rep, sizeof rep))
+                        trailer_import_movieinfo_key(rep, g_lib[i].url, 1);   /* series info + poster */
+                } else trailer_import_movieinfo(g_lib[i].url);
+                /* pull the freshly-saved info into the entry, but keep super + langs (import cleared them) */
+                int sup = g_lib[i].super;
+                char au[48], sb[64];
+                snprintf(au, sizeof au, "%s", g_lib[i].audio_langs);
+                snprintf(sb, sizeof sb, "%s", g_lib[i].sub_langs);
+                lib_refresh_entry(i);
+                g_lib[i].super = sup;
+                snprintf(g_lib[i].audio_langs, sizeof g_lib[i].audio_langs, "%s", au);
+                snprintf(g_lib[i].sub_langs, sizeof g_lib[i].sub_langs, "%s", sb);
+            }
+            scan_guard_done();   /* done with this file */
+        }
+        lib_save_cache();
+    }
+    scan_end();                  /* finished or aborted on purpose: either way it did not crash */
     if (dl_was) dlw_start();     /* resume the queue (progress was kept) */
 }
 
@@ -2162,9 +2794,24 @@ static void lib_refresh_entry(int i) {
     char oldname[CAT_NAMELEN]; snprintf(oldname, sizeof oldname, "%s", ce->name);
     char path[CAT_URLLEN]; snprintf(path, sizeof path, "%s", ce->url);
     char date[12];         snprintf(date, sizeof date, "%s", ce->date);
+    /* movieinfo_load overwrites the WHOLE entry, which drops the SUPER flag and the embedded
+     * track languages -- they come from the file's trailer, not from any .nfo. The scan used to
+     * save and restore them around this call and Get Info did not, so scraping a SUPER MOFLEX
+     * silently lost its (S) until the next full rescan. Preserve them here so every caller is
+     * covered, and re-probe when the entry has not been checked yet. */
+    int  sup = ce->super;
+    char au[sizeof ce->audio_langs], sb[sizeof ce->sub_langs];
+    snprintf(au, sizeof au, "%s", ce->audio_langs);
+    snprintf(sb, sizeof sb, "%s", ce->sub_langs);
     movieinfo_load(path, ce);
     snprintf(ce->url, sizeof ce->url, "%s", path);
     snprintf(ce->date, sizeof ce->date, "%s", date);
+    ce->super = sup;
+    snprintf(ce->audio_langs, sizeof ce->audio_langs, "%s", au);
+    snprintf(ce->sub_langs, sizeof ce->sub_langs, "%s", sb);
+    if (!ce->super)                                  /* never probed (or a brand-new entry) */
+        ce->super = entry_super(ce, ce->audio_langs, sizeof ce->audio_langs,
+                                ce->sub_langs, sizeof ce->sub_langs, NULL) ? 1 : 0;
     if (!ce->category[0]) snprintf(ce->category, sizeof ce->category, "Uncategorized");
     lib_episode_name(ce);
     if (was_show) {
@@ -2252,7 +2899,7 @@ __attribute__((unused)) static void lib_detect_dir(const char *dir, int depth) {
         if (e->d_type != DT_UNKNOWN) isdir = (e->d_type == DT_DIR);
         else { struct stat st; if (stat(full, &st)) continue; isdir = S_ISDIR(st.st_mode); }
         if (isdir) {
-            if (is_hidden_dir(e->d_name)) continue;
+            if (scan_skip_dir(e->d_name)) continue;
             char sub[PATHLEN];
             snprintf(sub, sizeof sub, "%s/", full);
             lib_detect_dir(sub, depth + 1);
@@ -2280,6 +2927,7 @@ __attribute__((unused)) static void lib_detect_dir(const char *dir, int depth) {
                 continue;
             }
             if (dt_covered(full)) continue;                                /* cheap hash check first */
+            if (scan_skipped(full)) continue;                              /* crashed a scan: never open */
             if (cia_is_cia(e->d_name) && !cia_has_moflex(full)) continue;  /* open only NEW CIAs */
             if (s_newlist && s_new_n < NEWLIST_MAX) snprintf(s_newlist[s_new_n], sizeof s_newlist[0], "%s", full);
             s_new_n++;
@@ -2362,6 +3010,46 @@ static void lib_add_downloaded(const char *path, const CatEntry *src) {
     time_t now = time(NULL); struct tm *tmv = localtime(&now);
     if (tmv) strftime(c->date, sizeof c->date, "%Y-%m-%d", tmv);
     lib_save_cache();
+}
+
+/* A file that appeared on the card by itself (a Wi-Fi upload): add it to the library and fill in
+ * what we can WITHOUT the user having to find it and press Get Info. A SUPER MOFLEX carries its
+ * own info, so that costs one local read; anything else falls back to the catalog scrape that
+ * Get Info would have run. Returns the library index, or -1. */
+static int lib_add_local(const char *path) {
+    if (!is_moflex(path)) return -1;
+    if (g_lib_n == 0) { lib_load_cache_only(); if (g_lib_n == 0) return -1; }  /* no library yet ->
+                                                                               * the first scan gets it */
+    if (!g_lib) return -1;
+    int at = -1;
+    for (int i = 0; i < g_lib_n; i++) if (!strcmp(g_lib[i].url, path)) { at = i; break; }
+    if (at < 0) {
+        if (g_lib_n >= LIB_MAX) return -1;
+        at = g_lib_n++;
+        CatEntry *c = &g_lib[at];
+        memset(c, 0, sizeof *c);
+        snprintf(c->url, sizeof c->url, "%s", path);
+        const char *bn = strrchr(path, '/'); bn = bn ? bn + 1 : path;
+        snprintf(c->fname, sizeof c->fname, "%s", bn);
+        snprintf(c->name, sizeof c->name, "%s", bn); strip_ext(c->name);
+        c->is3d = -1;                                     /* unknown: guessed from the name */
+        time_t now = time(NULL); struct tm *tmv = localtime(&now);
+        if (tmv) strftime(c->date, sizeof c->date, "%Y-%m-%d", tmv);
+    }
+    CatEntry *e = &g_lib[at];
+    char au[48], sb[64];
+    if (entry_super(e, au, sizeof au, sb, sizeof sb, NULL)) {   /* self-describing: no network */
+        e->super = 1;
+        snprintf(e->audio_langs, sizeof e->audio_langs, "%s", au);
+        snprintf(e->sub_langs, sizeof e->sub_langs, "%s", sb);
+        if (trailer_import_movieinfo(e->url)) lib_refresh_entry(at);
+    } else if (!movieinfo_have(e->url)) {
+        if (scrape_one(e->url) > 0) lib_refresh_entry(at);      /* the same lookup Get Info does */
+    } else lib_refresh_entry(at);
+    if (!e->category[0]) snprintf(e->category, sizeof e->category, "Uncategorized");
+    lib_episode_name(e);
+    lib_save_cache();
+    return at;
 }
 
 /* After a zip extracts: put its contents in the library. Episode-tagged folders become ONE show
@@ -2463,9 +3151,11 @@ static int library_list(const char *filt_cat, const char *filt_genre, u16 *poste
 ll_rebuild:;   /* X-search inside the list jumps back here with s_lib_search set */
     memset(s_vs, 0xFF, sizeof s_vs);
     int *idx = lib_idxbuf, ni = 0;
+    int super_only = !strcmp(filt_genre, "\x01SUPER");
     for (int i = 0; i < g_lib_n; i++) {
         if (filt_cat[0] && strcasecmp(lib_disp_cat(&g_lib[i]), filt_cat)) continue;
-        if (filt_genre[0] && !genre_match(g_lib[i].genres, filt_genre)) continue;
+        if (super_only) { if (!g_lib[i].super) continue; }
+        else if (filt_genre[0] && !genre_match(g_lib[i].genres, filt_genre)) continue;
         if (s_lib_search[0] && !ci_contains(g_lib[i].name, s_lib_search)) continue;   /* search box */
         idx[ni++] = i;
     }
@@ -2495,6 +3185,24 @@ ll_rebuild:;   /* X-search inside the list jumps back here with s_lib_search set
         int play = 0, info = 0;
         if (nav_repeat(k, kh, NAV_DOWN, &hfd)) { if (csel < ni - 1) csel++; redraw = 1; }
         if (nav_repeat(k, kh, NAV_UP, &hfu))   { if (csel > 0) csel--; redraw = 1; }
+        /* Scroll the description on the top screen. ZL/ZR where they exist; L held with up or
+         * down everywhere else, because an Old 3DS has no shoulder triggers and would
+         * otherwise be stuck looking at the first twelve lines forever. L on its own still
+         * jumps letter groups -- it is only a modifier while it is HELD with a direction. */
+        if (g_desc_over) {
+            int sd = 0;
+            if (k & KEY_ZR) sd = 1;
+            if (k & KEY_ZL) sd = -1;
+            if ((kh & KEY_L) && (k & KEY_DOWN)) sd = 1;
+            if ((kh & KEY_L) && (k & KEY_UP))   sd = -1;
+            if (sd) {
+                g_desc_scroll += sd * 4;
+                int last = g_desc_total - DESC_LINES;      /* never past the final line */
+                if (g_desc_scroll > last) g_desc_scroll = last;
+                if (g_desc_scroll < 0)    g_desc_scroll = 0;
+                redraw = 1;
+            }
+        }
         if (k & KEY_RIGHT) { csel += BR_ROWS; if (csel > ni - 1) csel = ni - 1; redraw = 1; }
         if (k & KEY_LEFT)  { csel -= BR_ROWS; if (csel < 0) csel = 0; redraw = 1; }
         if (k & KEY_R) { char cc = firstc(g_lib[idx[csel]].name); int i = csel;
@@ -2549,7 +3257,8 @@ ll_rebuild:;   /* X-search inside the list jumps back here with s_lib_search set
             } else { snprintf(out, cap, "%s", pe->url); result = LL_PLAY; break; }
         }
         if (info) { lib_getinfo_menu(idx, ni, csel); shown = -1; redraw = 1; }   /* This / All-missing */
-        if (csel != shown) { redraw = 1; phave = 0; settle = 0; }   /* moved -> reload local poster */
+        if (csel != shown) { redraw = 1; phave = 0; settle = 0;
+                             g_desc_scroll = 0; }   /* moved -> reload poster, rewind the blurb */
         /* Don't hit the SD for a poster while scrolling: a no-artwork ("Uncategorized") item
          * costs 3 failed FAT lookups (.p565/.jpg/.png) that would stall a held scroll. Load
          * only once the list has settled and no nav key is held / no drag is in progress. */
@@ -2570,7 +3279,8 @@ ll_rebuild:;   /* X-search inside the list jumps back here with s_lib_search set
             ui_text(10, 8, 2, UI_NEON, "LIBRARY");
             char hdr[24]; snprintf(hdr, sizeof hdr, "%d / %d", csel + 1, ni);
             ui_text(UI_W - (int)strlen(hdr) * 8 - 10, 12, 1, UI_NEONP, hdr);
-            char sh[80]; snprintf(sh, sizeof sh, "%s%s%s", filt_cat[0] ? filt_cat : "All", filt_genre[0] ? " / " : "", filt_genre);
+            const char *fg = !strcmp(filt_genre, "\x01SUPER") ? "SUPER MOFLEX" : filt_genre;
+        char sh[80]; snprintf(sh, sizeof sh, "%s%s%s", filt_cat[0] ? filt_cat : "All", fg[0] ? " / " : "", fg);
             ui_text_left_fit(10, 30, 1, UI_NEONC, sh, UI_W - 20);
             ui_fill_round(8, 42, UI_W - 16, 1, 0, TH_LINE);
             for (int r = 0; r < BR_ROWS; r++) { int i = cscroll + r; if (i >= ni) break;
@@ -2582,6 +3292,7 @@ ll_rebuild:;   /* X-search inside the list jumps back here with s_lib_search set
                 icon_movie(18, ry + 3, UI_NEONC);
                 { int st = vid_status(idx[i]); if (st >= 0) draw_status(9, ry + (rh - 9) / 2, st); }   /* first in the row */
                 int tx = 46, txr = UI_W - 16, ty = ry + (rh - 8) / 2;
+                if (ce->super) txr -= 14;                       /* reserve room for the S marker */
                 char yr[8] = "";
                 if (ce->year > 0) { snprintf(yr, sizeof yr, "%d", ce->year); txr -= 40; }   /* reserve room for the year */
                 int tw = ui_text_w(1, ce->name);
@@ -2591,6 +3302,10 @@ ll_rebuild:;   /* X-search inside the list jumps back here with s_lib_search set
                 else { char disp[NAMELEN]; snprintf(disp, sizeof disp, "%s", ce->name);
                     int cm = (txr - tx) / 8; if ((int)strlen(disp) > cm) disp[cm] = 0; ui_text(tx, ty, 1, tc, disp); }
                 if (yr[0]) ui_text(UI_W - 16 - ui_text_w(1, yr), ty, 1, selrow ? UI_NEONC : UI_GRAY, yr);
+                if (ce->super) {   /* SUPER MOFLEX marker: fixed slot left of the year column */
+                    int sx = UI_W - 16 - (yr[0] ? 40 : 0) - 12;
+                    ui_text(sx, ty, 1, UI_NEON, "S");
+                }
             }
             if (ni > BR_ROWS) { int th = BR_ROWS * BR_ROWH - 6, ty = BR_LIST_Y, maxs = ni - BR_ROWS;
                 int hh = th * BR_ROWS / ni; if (hh < 12) hh = 12; int hy = ty + (th - hh) * cscroll / maxs;
@@ -2626,7 +3341,7 @@ static int library_view(char *out, size_t cap) {
     while (aptMainLoop() && !chose) {
         static char cats[24][32]; int ncat = lib_distinct_categories(cats, 24);
         qsort(cats, ncat, 32, strrow_cmp);
-        static char cdisp[24][64];   /* display rows with per-category counts (selection uses cats[]) */
+        static char cdisp[24][64];
         for (int k = 0; k < ncat; k++) {
             int n = 0;
             for (int i = 0; i < g_lib_n; i++) if (!strcasecmp(lib_disp_cat(&g_lib[i]), cats[k])) n++;
@@ -2672,18 +3387,23 @@ static int library_view(char *out, size_t cap) {
                         int r = library_list(fc, "", poster, &sortmode, out, cap);
                         if (r == LL_PLAY) chose = 1; else if (r == LL_RESCAN) rescan = 1;
                     } else {                                   /* Pick a Genre */
-                        static char gdisp[64][64];   /* genre rows with counts (within this category) */
+                        static char gdisp[66][64]; int gb = 0;   /* SUPER MOFLEX = top genre */
+                        int nsc = 0;
+                        for (int i = 0; i < g_lib_n; i++)
+                            if (g_lib[i].super && !strcasecmp(lib_disp_cat(&g_lib[i]), fc)) nsc++;
+                        if (nsc) { snprintf(gdisp[0], 64, "SUPER MOFLEX (%d)", nsc); gb = 1; }
                         for (int k = 0; k < ng; k++) {
                             int n = 0;
                             for (int i = 0; i < g_lib_n; i++)
                                 if (!strcasecmp(lib_disp_cat(&g_lib[i]), fc) && genre_match(g_lib[i].genres, gens[k])) n++;
-                            snprintf(gdisp[k], 64, "%.48s (%d)", gens[k], n);
+                            snprintf(gdisp[gb + k], 64, "%.48s (%d)", gens[k], n);
                         }
                         int gen_back = 0;
                         while (!gen_back && !chose && !rescan && aptMainLoop()) {
-                            int g = catalog_pick("GENRE", fc, gdisp, ng, 0, NULL);
+                            int g = catalog_pick("GENRE", fc, gdisp, ng + gb, 0, NULL);
                             if (g < 0) { gen_back = 1; break; }         /* back -> View All / Pick a Genre */
-                            int r = library_list(fc, gens[g], poster, &sortmode, out, cap);
+                            int r = (gb && g == 0) ? library_list(fc, "\x01SUPER", poster, &sortmode, out, cap)
+                                                   : library_list(fc, gens[g - gb], poster, &sortmode, out, cap);
                             if (r == LL_PLAY) chose = 1; else if (r == LL_RESCAN) rescan = 1;
                             s_pick_init = g;   /* back from the list -> re-show the GENRE picker HERE */
                         }
@@ -2726,10 +3446,11 @@ static void download_url_direct(void) {
     snprintf(g_dl_name, sizeof(g_dl_name), "%s", fname);
     g_last_prog = 0;
     if (!download_resume_check(url)) return;   /* B on the prompt -> back */
+    s_sleep_pending = 0;
     aptSetSleepAllowed(false);                 /* direct downloads survive a closed lid too */
     dl_wifi_hold(1);
     bool ok = download_to_file(url, dest, dl_progress, NULL);
-    aptSetSleepAllowed(true);
+    sleep_reallow();
     dl_wifi_hold(0);
     if (!ok) { download_cancel_msg(url); return; }   /* progress saved; offers DELETE FILE, B keeps it */
     size_t fl = strlen(fname);
@@ -2743,10 +3464,11 @@ static void download_url_direct(void) {
         gfxFlushBuffers(); gfxSwapBuffers();
         int tot = 0;
         int nf = unzip_to_dir_cb(dest, folder, &tot, unzip_prog);
-        if (nf > 0) remove(dest);
+        if (nf > 0 && nf == tot) remove(dest);   /* partial extraction must keep the source zip */
         char m[96];
         if (nf > 0 && nf == tot) snprintf(m, sizeof m, "Extracted %d file%s.", nf, nf == 1 ? "" : "s");
         else if (nf > 0)         snprintf(m, sizeof m, "Extracted %d of %d files.", nf, tot);
+        else if (nf < 0)         snprintf(m, sizeof m, "Extraction canceled.\nThe zip file was kept.");
         else                     snprintf(m, sizeof m, tot == 0 ? "Could not open the zip." : "Extract FAILED.");
         if (nf > 0) lib_add_extracted(folder, NULL);
         msg_screen("DOWNLOAD", m);
@@ -2888,8 +3610,12 @@ static int s_scrape_sub = 0;   /* what the last scrape_one did about subtitles (
 static int dlw_poll(void) {
     if (!s_dlw_active || !s_dlw_finished) return 0;
     s_dlw_active = 0; s_dlw_finished = 0;
+    /* An item just finished: fresh timer -> the idle_scan relight invariant lights the screens
+     * on the next pumped frame (first extraction chunk / next menu frame), so completion and
+     * extraction never run invisibly on idle-dark LCDs. */
+    s_idle_last = osGetTime();
     if (!s_dlw_ok) {   /* cancelled or failed: keep the item + partial data for resume */
-        aptSetSleepAllowed(true);            /* lid closed -> the console can nap now */
+        sleep_reallow();                     /* lid closed -> naps; lid open -> deferred (race-safe) */
         dl_wifi_hold(0);
         if (!s_dlw_stop) dl_led(1, 0);       /* real failure: red light so a closed lid still tells you */
         if (s_dlw_stop) qtoast("Download paused");
@@ -2918,7 +3644,14 @@ static int dlw_poll(void) {
         snprintf(folder, sizeof folder, "%.*s", (int)(fl - 4), dest);
         int tot = 0;
         int nf = unzip_to_dir_cb(dest, folder, &tot, unzip_prog);   /* brief modal extract screen */
-        if (nf > 0) { remove(dest); lib_add_extracted(folder, &e); }
+        if (nf > 0 && nf < tot) {   /* partial (e.g. SD filled): keep the zip so a retry can finish */
+            lib_add_extracted(folder, &e);
+            char pm[96]; snprintf(pm, sizeof pm, "Extracted %d of %d files.\nThe zip was kept -- use MANAGE ->\nEXTRACT ZIP to retry.", nf, tot);
+            msg_screen("DOWNLOAD", pm);
+        }
+        else if (nf > 0) { remove(dest); lib_add_extracted(folder, &e); }
+        else if (nf < 0)   /* user canceled mid-extract: zip intact, finish any time from MANAGE */
+            msg_screen("DOWNLOAD", "Extraction canceled.\nThe zip was kept -- use MANAGE ->\nEXTRACT ZIP to finish later.");
         else {   /* a silent failure here stranded zips with no explanation -- say it, keep the zip */
             char em[96];
             snprintf(em, sizeof em, "Downloaded, but extracting failed.\nThe zip was kept -- use MANAGE ->\nEXTRACT ZIP to retry.");
@@ -2940,7 +3673,9 @@ static int dlw_poll(void) {
         dl_wifi_hold(0);
         dl_led(0, 1);                     /* green: all done (keeps blinking through sleep) */
         if (dl_lid_closed() && s_dlw_after == 1) dl_power_off();
-        else aptSetSleepAllowed(true);    /* lid closed -> drifts into sleep; open -> user is here */
+        else sleep_reallow();             /* lid closed -> drifts into sleep; open -> deferred re-allow
+                                             * (granting it at this exact instant raced a reopening lid
+                                             * and could sleep the console with the lid open) */
     }
     return 1;
 }
@@ -3056,7 +3791,13 @@ static void add_movies_menu(void) {
 static void local_stem(const char *path, char *o, size_t cap) {   /* basename without extension */
     const char *b = strrchr(path, '/'); b = b ? b + 1 : path;
     snprintf(o, cap, "%s", b);
-    char *d = strrchr(o, '.'); if (d && d != o) *d = 0;
+    char *d = strrchr(o, '.');
+    /* strip KNOWN media extensions only: cutting at any last '.' truncated dotted show/folder
+     * names ("The Super Mario Bros. Super Show!" -> "The Super Mario Bros") so Get Info could
+     * never match them against the catalog */
+    if (d && d != o && (!strcasecmp(d, ".moflex") || !strcasecmp(d, ".mp4") || !strcasecmp(d, ".cia") ||
+                        !strcasecmp(d, ".zip") || !strcasecmp(d, ".m4v") || !strcasecmp(d, ".mov")))
+        *d = 0;
 }
 static int four_digits(const char *p) {
     return isdigit((unsigned char)p[0]) && isdigit((unsigned char)p[1]) &&
@@ -3125,9 +3866,71 @@ static int scr_match(const char *localstem, const CatEntry *e) {
     if (e->year > 0) snprintf(ts, sizeof ts, "%s%d", tt, e->year);   /* title[] has no year -> use the year field */
     else             snprintf(ts, sizeof ts, "%s%s", tt, ty);
     if (!strcmp(ls, es) || !strcmp(ls, fs) || !strcmp(ls, ts)) return 1;   /* title+year match (movies & TV) */
-    /* no year in the filename -> match title only (remakes may pick the wrong year; add a year to be exact) */
-    if (!ly[0] && strlen(lt) >= 4 && (!strcmp(lt, et) || !strcmp(lt, ft) || !strcmp(lt, tt))) return 1;
+    /* no year in the filename -> title-only match (2). A remake shares the title, so scr_find()
+     * decides between same-titled entries of different years instead of taking the first. */
+    if (!ly[0] && strlen(lt) >= 4 && (!strcmp(lt, et) || !strcmp(lt, ft) || !strcmp(lt, tt))) return 2;
+    /* TV folders carry qualifiers the catalog title lacks ("Uzumaki - Season 1"): cut the name at a
+     * word-boundary "Season" and retry everything with the shorter stem. Titles that BEGIN with
+     * "Season" ("Season of the Witch") are untouched -- the cut must leave a real prefix. */
+    for (const char *p = localstem + 1; *p; p++)
+        if (!isalnum((unsigned char)p[-1]) && !strncasecmp(p, "season", 6) && !isalpha((unsigned char)p[6])) {
+            size_t L = (size_t)(p - localstem);
+            while (L > 0 && (localstem[L - 1] == ' ' || localstem[L - 1] == '-')) L--;
+            if (L >= 4) {
+                char cut[256]; snprintf(cut, sizeof cut, "%.*s", (int)L, localstem);
+                return scr_match(cut, e);   /* depth 1: the prefix holds no further "Season" */
+            }
+            break;
+        }
     return 0;
+}
+/* A catalog entry's year: the year field, else whatever its name carries. 0 = unknown. */
+static int cat_year(const CatEntry *e) {
+    if (e->year > 0) return e->year;
+    char t[256], y[5]; parse_title_year(e->name, t, sizeof t, y);
+    return y[0] ? atoi(y) : 0;
+}
+/* Length of a local moflex in whole minutes (0 = unknown: a folder, an mp4, unreadable). */
+static int file_minutes(const char *path) {
+    static MfxDemux m;
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    int64_t us = 0;
+    if (mfx_open_auto(&m, f, path) == 0) { us = m.duration_us; mfx_close(&m); }
+    fclose(f);
+    return us > 0 ? (int)((us + 30000000) / 60000000) : 0;
+}
+/* Pick the catalog entry for a local movie, or -1. A title+year match wins outright. A yearless
+ * file that matches same-titled entries of DIFFERENT years ("The Lion King" 1994 and 2019) is a
+ * remake collision: the file's own length picks the film (runtime within 10%), and if that cannot
+ * single one out it stays unmatched -- no info beats the wrong film's poster and description. */
+static int scr_find(const char *moviepath, const char *lstem, const char *hint, const CatEntry *cat, int nc) {
+    int first = -1, year0 = 0, mixed = 0;
+    for (int i = 0; i < nc; i++) {
+        int r = scr_match(lstem, &cat[i]);
+        if (!r && hint && hint[0]) r = scr_match(hint, &cat[i]);   /* hint only when the file says nothing:
+                                                                     * it is the CACHED name, maybe the wrong film's */
+        if (r == 1) return i;
+        if (r != 2) continue;
+        if (first < 0) first = i;
+        int y = cat_year(&cat[i]);
+        if (y) { if (!year0) year0 = y; else if (y != year0) mixed = 1; }
+    }
+    if (first < 0 || !mixed) return first;              /* none, or one film listed more than once */
+    int mins = file_minutes(moviepath);
+    if (mins <= 0) return -1;
+    int pick = -1, pick_year = 0;
+    for (int i = first; i < nc; i++) {
+        int r = scr_match(lstem, &cat[i]);
+        if (!r && hint && hint[0]) r = scr_match(hint, &cat[i]);
+        if (r != 2 || cat[i].runtime <= 0) continue;
+        int tol = cat[i].runtime / 10; if (tol < 3) tol = 3;
+        if (abs(mins - cat[i].runtime) > tol) continue;
+        int y = cat_year(&cat[i]);
+        if (pick < 0) { pick = i; pick_year = y; }
+        else if (y != pick_year) return -1;                /* two films of that length too: don't guess */
+    }
+    return pick;
 }
 /* Fetch a catalog entry's poster into pb, with one retry for transient network failures.
  * Returns 1 if a poster was decoded, 0 if there's no art or the download kept failing. */
@@ -3138,38 +3941,47 @@ static int fetch_poster(const CatEntry *e, u16 *pb) {
 }
 
 /* Try to find + save catalog metadata for ONE movie (forces a refresh; used by X:Get info).
- * Returns 0 = no match, 1 = saved with poster, 2 = saved but the poster wouldn't download. */
-static int scrape_one(const char *moviepath) {
+ * Returns 1 = saved with poster, 2 = saved but the poster wouldn't download, 0 = no catalog
+ * matched, -1 = every catalog download failed, -2 = out of memory. The distinct failure codes
+ * exist because all three used to read "No catalog had this title" -- undiagnosable. */
+static int scrape_one_stem(const char *moviepath, const char *name_hint) {
     s_scrape_sub = 0;
+    /* SUPER MOFLEX: the file may carry its own library info + poster -- no network needed */
+    if (trailer_import_movieinfo(moviepath)) return 3;   /* imported from the file's own trailer */
     load_sources();
     char lstem[192]; local_stem(moviepath, lstem, sizeof lstem);
-    int cap = 4096; CatEntry *cat = (CatEntry *)malloc(sizeof(CatEntry) * cap);
+    int cap = 2048; CatEntry *cat = (CatEntry *)malloc(sizeof(CatEntry) * cap);
     u16 *pb = (u16 *)malloc((size_t)POSTER_W * POSTER_H * sizeof(u16));
-    if (!cat) { free(pb); return 0; }
-    int found = 0;
+    if (!cat) { free(pb); return -2; }
+    int found = 0, fetched = 0;
     for (int s = 0; s < nsources && !found; s++) {
         printf("\x1b[2J\x1b[H=== GET INFO ===\n\nChecking %.28s ...\n", sources[s].name);
         gfxFlushBuffers(); gfxSwapBuffers();
         char *json = NULL; size_t len = 0;
         if (!download_to_mem(sources[s].url, &json, &len, 32 * 1024 * 1024)) continue;
+        fetched = 1;
         int nc = catalog_parse(json, sources[s].kind, sources[s].dl_base, sources[s].art_base, cat, cap);
         free(json);
-        for (int i = 0; i < nc; i++) if (scr_match(lstem, &cat[i])) {
+        int i = scr_find(moviepath, lstem, name_hint, cat, nc);
+        if (i >= 0) {
             int poster_ok = fetch_poster(&cat[i], pb);
             movieinfo_save(moviepath, &cat[i], poster_ok ? pb : NULL, POSTER_W, POSTER_H);
             s_scrape_sub = fetch_sub(moviepath, cat[i].sub);   /* subs without redownloading */
             found = poster_ok ? 1 : 2;
-            break;
         }
     }
     free(pb); free(cat);
-    return found;
+    return found ? found : (fetched ? 0 : -1);
 }
+/* A show recorded on a nested season folder has a path stem like "Season 1" -- useless for
+ * matching -- while its display NAME carries the real show title. Library Get Info passes the
+ * name as a second candidate; plain path-based callers use the stem alone. */
+static int scrape_one(const char *moviepath) { return scrape_one_stem(moviepath, NULL); }
 /* Batch: fill in every movie in the current folder that is MISSING metadata (skips ones that
  * already have art + description). Each catalog is fetched only once. */
 static void scrape_folder(void) {
     load_sources();
-    int cap = 4096; CatEntry *cat = (CatEntry *)malloc(sizeof(CatEntry) * cap);
+    int cap = 2048; CatEntry *cat = (CatEntry *)malloc(sizeof(CatEntry) * cap);
     u16 *pb = (u16 *)malloc((size_t)POSTER_W * POSTER_H * sizeof(u16));
     static char done[MAXE];
     int todo = 0;
@@ -3207,11 +4019,12 @@ static void scrape_folder(void) {
             gfxFlushBuffers(); gfxSwapBuffers();
             char full[PATHLEN + NAMELEN]; snprintf(full, sizeof full, "%s%s", cwd, entries[i].name);
             char lstem[192]; local_stem(full, lstem, sizeof lstem);
-            for (int c = 0; c < nc; c++) if (scr_match(lstem, &cat[c])) {
+            int c = scr_find(full, lstem, NULL, cat, nc);
+            if (c >= 0) {
                 int poster_ok = fetch_poster(&cat[c], pb);
                 movieinfo_save(full, &cat[c], poster_ok ? pb : NULL, POSTER_W, POSTER_H);
                 fetch_sub(full, cat[c].sub);
-                done[i] = 1; got++; break;   /* matched (priority-first); a missing poster is
+                done[i] = 1; got++;          /* matched (priority-first); a missing poster is
                                               * refetched next run since movieinfo_have needs one */
             }
         }
@@ -3225,27 +4038,59 @@ static void scrape_folder(void) {
 
 /* Library GET INFO: refresh just this movie, in place. */
 static void lib_scrape_one(int i) {
-    char path[CAT_URLLEN]; snprintf(path, sizeof path, "%s", g_lib[i].url);
-    int r = scrape_one(path);
-    if (r) { lib_refresh_entry(i); lib_save_cache(); }
+    CatEntry *e = &g_lib[i];
+    /* SUPER MOFLEX (file OR a show whose episodes carry trailers): import locally, no network */
+    char au[48], sb[64]; int nsub = 0;
+    if (entry_super(e, au, sizeof au, sb, sizeof sb, &nsub)) {
+        char rep[PATHLEN + NAMELEN];
+        if (e->is_zip == 2) { if (!show_first_episode(e, rep, sizeof rep)) rep[0] = 0; }
+        else snprintf(rep, sizeof rep, "%s", e->url);
+        int ok = e->is_zip == 2 ? trailer_import_movieinfo_key(rep, e->url, 1)
+                                 : trailer_import_movieinfo(e->url);
+        if (ok) lib_refresh_entry(i);
+        /* we just probed the trailer: keep what it told us on the entry, so the (S) badge and
+         * the Audio/Subs lines survive a Get Info without waiting for the next full rescan */
+        e->super = 1;
+        snprintf(e->audio_langs, sizeof e->audio_langs, "%s", au);
+        snprintf(e->sub_langs, sizeof e->sub_langs, "%s", sb);
+        lib_save_cache();
+        char m[200];
+        snprintf(m, sizeof m, "SUPER MOFLEX detected.\nInfo + artwork loaded from the file.\nAudio: %s\nSubtitles: %d language%s",
+                 au[0] ? au : "-", nsub, nsub == 1 ? "" : "s");
+        msg_screen("SUPER MOFLEX", m);
+        return;
+    }
+    char path[CAT_URLLEN]; snprintf(path, sizeof path, "%s", e->url);
+    int r = scrape_one_stem(path, e->name);
+    if (r > 0) { lib_refresh_entry(i); lib_save_cache(); }
     char m[160];
     snprintf(m, sizeof m, "%s%s",
              r == 1 ? "Info + artwork saved."
            : r == 2 ? "Info saved, but the poster\ndidn't download. Try again for the art."
+           : r == -1 ? "Could not download the catalog.\nCheck the connection and try again."
+           : r == -2 ? "Out of memory.\nRestart the app and try again."
                     : "No catalog had this title.",
-             !r ? "" : s_scrape_sub == 1 ? "\nSubtitles downloaded."
+             r <= 0 ? "" : s_scrape_sub == 1 ? "\nSubtitles downloaded."
                      : s_scrape_sub == 2 ? "\nSubtitles already present." : "\nNo subtitles in the catalog.");
     msg_screen("GET INFO", m);
 }
 
 /* Library GET INFO (batch): fill in every movie in the current list that's MISSING info. */
 static void lib_scrape_missing(int *idx, int ni) {
+    if (osGetWifiStrength() == 0) {   /* nothing here can work offline; do not spend the timeouts */
+        msg_screen("GET INFO", "No wireless connection.\nConnect to wifi and try again.");
+        return;
+    }
     load_sources();
-    int cap = 4096; CatEntry *cat = (CatEntry *)malloc(sizeof(CatEntry) * cap);
+    int cap = 2048; CatEntry *cat = (CatEntry *)malloc(sizeof(CatEntry) * cap);
     u16 *pb = (u16 *)malloc((size_t)POSTER_W * POSTER_H * sizeof(u16));
     static char done[LIB_MAX];
     int todo = 0;
-    for (int i = 0; i < ni; i++) { done[i] = movieinfo_have(g_lib[idx[i]].url) ? 1 : 0; if (!done[i]) todo++; }
+    for (int i = 0; i < ni; i++) {
+        done[i] = movieinfo_have(g_lib[idx[i]].url) ? 1 : 0;
+        if (!done[i] && trailer_import_movieinfo(g_lib[idx[i]].url)) { done[i] = 1; lib_refresh_entry(idx[i]); }
+        if (!done[i]) todo++;
+    }
     if (!cat || todo == 0) {
         msg_screen("GET INFO", todo == 0 ? "Every movie here already has info." : "Out of memory.");
         free(pb); free(cat); return;
@@ -3270,12 +4115,13 @@ static void lib_scrape_missing(int *idx, int ni) {
                    sources[s].name, got, todo, scanned, g_lib[idx[i]].name);
             gfxFlushBuffers(); gfxSwapBuffers();
             char lstem[192]; local_stem(g_lib[idx[i]].url, lstem, sizeof lstem);
-            for (int c = 0; c < nc; c++) if (scr_match(lstem, &cat[c])) {
+            int c = scr_find(g_lib[idx[i]].url, lstem, NULL, cat, nc);
+            if (c >= 0) {
                 int poster_ok = fetch_poster(&cat[c], pb);
                 movieinfo_save(g_lib[idx[i]].url, &cat[c], poster_ok ? pb : NULL, POSTER_W, POSTER_H);
                 fetch_sub(g_lib[idx[i]].url, cat[c].sub);
                 lib_refresh_entry(idx[i]);
-                done[i] = 1; got++; break;
+                done[i] = 1; got++;
             }
         }
     }
@@ -3297,12 +4143,30 @@ static void lib_rescan_interactive(void) {
     if (added > 0) snprintf(found, sizeof found, "%d new video%s added.", added, added == 1 ? "" : "s");
     else           snprintf(found, sizeof found, "No new videos found.");
     int *idx = (int *)malloc(sizeof(int) * (g_lib_n ? g_lib_n : 1)); int ni = 0;
-    if (idx) for (int j = 0; j < g_lib_n; j++) if (!movieinfo_have(g_lib[j].url)) idx[ni++] = j;
+    if (idx) for (int j = 0; j < g_lib_n; j++) if (!movieinfo_have(g_lib[j].url)) {
+        if (g_lib[j].is_zip == 2) {   /* SHOW folder: series info from any episode's trailer */
+            if (show_collect_eps(g_lib[j].name, g_lib[j].url) > 0 &&
+                trailer_import_movieinfo_key(s_epfile[0], g_lib[j].url, 1)) { lib_refresh_entry(j); continue; }
+        } else if (trailer_import_movieinfo(g_lib[j].url)) { lib_refresh_entry(j); continue; }
+        idx[ni++] = j;
+    }
     if (ni > 0) {
-        char body[128];
-        snprintf(body, sizeof body, "%s\n%d video%s missing art & info.\nDownload art & info?",
-                 found, ni, ni == 1 ? "" : "s");
-        if (prompt2("LIBRARY", body, "DOWNLOAD", "SKIP") == 0) lib_scrape_missing(idx, ni);
+        char body[192];
+        if (osGetWifiStrength() == 0) {
+            /* Offering a download with no wireless is offering something that cannot work: the
+             * catalogue fetch burns its 20s connect timeout per source and then reports
+             * "matched 0", which reads like a failure of the app rather than an absence of
+             * network. Say what is actually wrong and let them get on with it. */
+            snprintf(body, sizeof body, "%s\n%d video%s missing art & info,\n"
+                     "but there is no wireless connection.\n"
+                     "Connect to wifi and use\nRescan Library to fetch it.",
+                     found, ni, ni == 1 ? "" : "s");
+            msg_screen("LIBRARY", body);
+        } else {
+            snprintf(body, sizeof body, "%s\n%d video%s missing art & info.\nDownload art & info?",
+                     found, ni, ni == 1 ? "" : "s");
+            if (prompt2("LIBRARY", body, "DOWNLOAD", "SKIP") == 0) lib_scrape_missing(idx, ni);
+        }
     } else msg_screen("LIBRARY", found);
     free(idx);
 }
@@ -3310,8 +4174,27 @@ static void lib_rescan_interactive(void) {
 /* ---- startup: detect movies added outside the app (browser download, PC copy, upload) and offer
  * a rescan; after rescanning, offer art + info download for the new arrivals. ---- */
 static int startup_detect_poll(void);
-#define LATEST_URL "https://github.com/brainphreak/clownsec-moflex-player/releases/download/v1.0/latest.txt"
+/* Channel-aware update check: ONE ELF serves all three CIA identities, so the channel comes from
+ * our own TitleID at runtime (UniqueID 0xf8a2c stable / 0xf8a2d beta / 0xf8a2e mp4). Each build
+ * compares against ITS OWN release's latest.txt -- the beta used to check the production number
+ * and never noticed newer beta builds. (3DSX/HBL has no matching UniqueID -> stable URL.) */
+#define LATEST_URL_STABLE "https://github.com/brainphreak/clownsec-moflex-player/releases/download/v1.0/latest.txt"
+#define LATEST_URL_BETA   "https://github.com/brainphreak/clownsec-moflex-player/releases/download/v1.1.0-beta/latest.txt"
+#define LATEST_URL_MP4    "https://github.com/brainphreak/clownsec-moflex-player/releases/download/mp4-beta/latest.txt"
+static const char *latest_url(void) {
+#ifdef UPDATE_TEST_URL
+    return UPDATE_TEST_URL;
+#endif
+    u64 tid = 0;
+    APT_GetProgramID(&tid);
+    u32 uid = (u32)((tid >> 8) & 0xFFFFF);
+    if (uid == 0xf8a2d) return LATEST_URL_BETA;
+    if (uid == 0xf8a2e) return LATEST_URL_MP4;
+    return LATEST_URL_STABLE;
+}
 static char s_upd[24] = ""; static int s_upd_shown = 0;
+static char s_upd_md5[33] = "";   /* latest.txt line 2 (optional): MD5 of the channel's .cia */
+static int s_upd_quit = 0;        /* an update installed: home_gui returns so main() exits */
 static volatile int s_dtw_exit = 1;   /* worker thread fully finished (fetch included) */
 /* Parse a leading "MAJOR.MINOR" out of s WITHOUT scanf (no newlib locale involvement). */
 static void ver_parse(const char *s, int *a, int *b) {
@@ -3327,7 +4210,7 @@ static void update_check(void) {   /* worker thread; printf-free so it can't hit
         if (try) for (int w = 0; w < 50 && !s_dt_abort; w++) svcSleepThread(100 * 1000 * 1000LL);   /* 5s, abortable */
         if (osGetWifiStrength() == 0) continue;   /* offline or still associating -> retry, never block */
         char *buf = NULL; size_t len = 0;
-        if (!download_to_mem(LATEST_URL, &buf, &len, 256) || !buf) continue;   /* busy -> retry */
+        if (!download_to_mem(latest_url(), &buf, &len, 256) || !buf) continue;   /* busy -> retry */
         buf[len < 255 ? len : 255] = 0;
         int ld = 0, ln = 0, cd = 0, cn = 0;
         ver_parse(buf, &ld, &ln);
@@ -3338,6 +4221,19 @@ static void update_check(void) {   /* worker thread; printf-free so it can't hit
                 if ((*pp >= '0' && *pp <= '9') || *pp == '.') s_upd[j++] = *pp; else break;
             }
             s_upd[j] = 0;
+            /* line 2, when published: the CIA's MD5. Builds before the self-updater read only the
+             * leading number, so the extra line never confused them. */
+            const char *nl = strchr(buf, '\n');
+            if (nl) {
+                int k = 0;
+                for (const char *pp = nl + 1; *pp && k < 32; pp++) {
+                    char c = *pp;
+                    if (c >= 'A' && c <= 'F') c = (char)(c - 'A' + 'a');
+                    if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) s_upd_md5[k++] = c;
+                    else if (k) break;
+                }
+                s_upd_md5[k == 32 ? 32 : 0] = 0;
+            }
         }
         free(buf);
         return;
@@ -3362,7 +4258,13 @@ static void startup_new_movie_check(void) {
         if (g_lib_n == 0) { msg_screen("LIBRARY", "No videos found on the SD card.\nDownload or add some first."); return; }
         int *idx = (int *)malloc(sizeof(int) * g_lib_n); int ni = 0;   /* offer art+info for all missing */
         if (idx) {
-            for (int j = 0; j < g_lib_n; j++) if (!movieinfo_have(g_lib[j].url)) idx[ni++] = j;
+            for (int j = 0; j < g_lib_n; j++) if (!movieinfo_have(g_lib[j].url)) {
+                if (g_lib[j].is_zip == 2) {
+                    if (show_collect_eps(g_lib[j].name, g_lib[j].url) > 0 &&
+                        trailer_import_movieinfo_key(s_epfile[0], g_lib[j].url, 1)) { lib_refresh_entry(j); continue; }
+                } else if (trailer_import_movieinfo(g_lib[j].url)) { lib_refresh_entry(j); continue; }
+                idx[ni++] = j;
+            }
             if (ni > 0) {
                 if (prompt2("GET INFO", "Download art & info?", "DOWNLOAD", "SKIP") == 0) lib_scrape_missing(idx, ni);
             }
@@ -3382,13 +4284,155 @@ static void startup_new_movie_check(void) {
     }
 }
 
+/* ---- self-update: fetch this channel's CIA, check it, install it over ourselves, restart ----
+ * The asset sits beside latest.txt in the same release, named per channel. A .3dsx run from the
+ * Homebrew Launcher cannot install a CIA (and has no title to relaunch), so it overwrites its own
+ * .3dsx instead -- the path HBL launched it from is argv[0]. */
+#define UPD_CIA_TMP  "sdmc:/moflex_player/update.cia"
+#define UPD_3DSX_TMP "sdmc:/moflex_player/update.3dsx"
+extern int __system_argc;
+extern char **__system_argv;
+static void upd_asset_url(char *out, size_t n, const char *ext) {
+    const char *lu = latest_url(), *sl = strrchr(lu, '/');
+    int base = sl ? (int)(sl - lu) + 1 : 0;
+    u64 tid = 0; APT_GetProgramID(&tid);
+    u32 uid = (u32)((tid >> 8) & 0xFFFFF);
+    const char *nm = uid == 0xf8a2d ? "clownsec_player_beta" : uid == 0xf8a2e ? "clownsec_player_mp4" : "clownsec_player";
+    snprintf(out, n, "%.*s%s%s", base, lu, nm, ext);
+}
+static void upd_screen(const char *title, const char *line, int pct) {
+    ui_begin(GFX_BOTTOM);
+    ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
+    ui_text_center(UI_W / 2, 12, 2, UI_NEON, title);
+    ui_glow_round(28, 40, UI_W - 56, 2, 1, UI_NEON, 3, 30);
+    ui_fill_round(28, 40, UI_W - 56, 2, 1, UI_NEON);
+    ui_text_center(UI_W / 2, 68, 1, UI_NEONC, line);
+    if (pct >= 0) {
+        int bx = 20, bw = UI_W - 40, by = 104, bh = 16;
+        ui_fill_round(bx, by, bw, bh, bh / 2, TH_TRACK);
+        int fw = bw * pct / 100; if (fw > 0) ui_fill_round(bx, by, fw, bh, bh / 2, UI_NEON);
+        char pl[16]; snprintf(pl, sizeof pl, "%d%%", pct);
+        ui_text_center(UI_W / 2, by + bh + 8, 1, UI_INK, pl);
+    }
+    ui_text_center(UI_W / 2, 180, 1, UI_DIM, "Do not turn off the system.");
+    ui_present();
+    gfxFlushBuffers(); gfxSwapBuffers();
+}
+/* 1 when the file's MD5 matches the 32-hex `want`, or when no MD5 was published (AM still checks
+ * every content hash in the CIA against its TMD, so a damaged CIA fails the install either way). */
+static int upd_md5_ok(const char *path, const char *want) {
+    if (!want[0]) return 1;
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    unsigned char *buf = (unsigned char *)malloc(64 * 1024), dg[16];
+    if (!buf) { fclose(f); return 0; }
+    mbedtls_md5_context c; mbedtls_md5_init(&c); mbedtls_md5_starts_ret(&c);
+    size_t n;
+    while ((n = fread(buf, 1, 64 * 1024, f)) > 0) mbedtls_md5_update_ret(&c, buf, n);
+    mbedtls_md5_finish_ret(&c, dg); mbedtls_md5_free(&c);
+    free(buf); fclose(f);
+    char hex[33];
+    for (int i = 0; i < 16; i++) snprintf(hex + i * 2, 3, "%02x", dg[i]);
+    return strcmp(hex, want) == 0;
+}
+static int upd_cia_install(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    const size_t CH = 128 * 1024;
+    u8 *buf = (u8 *)malloc(CH);
+    if (!buf || sz <= 0 || R_FAILED(amInit())) { free(buf); fclose(f); return 0; }
+    Handle h; int ok = 0;
+    if (R_SUCCEEDED(AM_StartCiaInstall(MEDIATYPE_SD, &h))) {
+        u64 off = 0; ok = 1; u64 last = 0;
+        size_t n;
+        while ((n = fread(buf, 1, CH, f)) > 0) {
+            u32 wr = 0;
+            if (R_FAILED(FSFILE_Write(h, &wr, off, buf, (u32)n, 0)) || wr != n) { ok = 0; break; }
+            off += n;
+            u64 now = osGetTime();
+            if (now - last >= 100) { last = now; upd_screen("INSTALLING", "Clownsec Player", (int)(off * 100 / (u64)sz)); }
+        }
+        if (ok && (long)off != sz) ok = 0;
+        if (ok) ok = R_SUCCEEDED(AM_FinishCiaInstall(h));
+        else AM_CancelCIAInstall(h);
+    }
+    amExit(); free(buf); fclose(f);
+    return ok;
+}
+/* Returns 1 when the new build is on the card and the app should exit (it relaunches itself). */
+static int self_update(void) {
+    int hbl = envIsHomebrew();
+    const char *self = (hbl && __system_argc > 0 && __system_argv && __system_argv[0] &&
+                        !strncmp(__system_argv[0], "sdmc:/", 6)) ? __system_argv[0] : NULL;
+    if (hbl && !self) {
+        msg_screen("UPDATE", "Can't find this .3dsx on the SD card.\nRedownload it via the QR / FBI.");
+        return 0;
+    }
+    {   /* a power cut mid-install leaves no working player: insist on charge */
+        u8 lvl = 5, chg = 1;
+        if (R_SUCCEEDED(ptmuInit())) { PTMU_GetBatteryLevel(&lvl); PTMU_GetBatteryChargeState(&chg); ptmuExit(); }
+        if (lvl < 2 && !chg) { msg_screen("UPDATE", "Battery is low.\nPlug in the charger and try again."); return 0; }
+    }
+    char url[256];
+    upd_asset_url(url, sizeof url, hbl ? ".3dsx" : ".cia");
+    const char *tmp = hbl ? UPD_3DSX_TMP : UPD_CIA_TMP;
+    mkdir("sdmc:/moflex_player", 0777);
+    remove(tmp);
+    download_discard_partial(url);   /* same URL every release: never resume an older build's bytes */
+    snprintf(g_dl_name, sizeof g_dl_name, "Clownsec Player %s", s_upd);
+    g_last_prog = 0;
+    s_sleep_pending = 0;
+    aptSetSleepAllowed(false);
+    dl_wifi_hold(1);
+    bool got = download_to_file(url, tmp, dl_progress, NULL);
+    dl_wifi_hold(0);
+    if (!got) {
+        sleep_reallow();
+        download_discard_partial(url);
+        long http = download_last_http();
+        char m[96];
+        if (http == 404) snprintf(m, sizeof m, "The update file isn't published yet.\nTry again later.");
+        else snprintf(m, sizeof m, "The download stopped.\nNothing was changed.");
+        msg_screen("UPDATE", m);
+        return 0;
+    }
+    upd_screen("CHECKING", "Clownsec Player", -1);
+    if (!upd_md5_ok(tmp, s_upd_md5)) {
+        sleep_reallow(); remove(tmp);
+        msg_screen("UPDATE", "The download was damaged.\nNothing was changed. Try again.");
+        return 0;
+    }
+    int ok;
+    if (hbl) {   /* swap the .3dsx in place; the old one stays until the new one is whole */
+        char bak[PATHLEN + NAMELEN];
+        snprintf(bak, sizeof bak, "%s.old", self);
+        remove(bak);
+        ok = rename(self, bak) == 0;
+        if (ok && rename(tmp, self) != 0) { rename(bak, self); ok = 0; }
+        if (ok) remove(bak);
+    } else {
+        upd_screen("INSTALLING", "Clownsec Player", 0);
+        ok = upd_cia_install(tmp);
+    }
+    remove(tmp);
+    sleep_reallow();
+    if (!ok) { msg_screen("UPDATE", "The install failed.\nThe current version is unchanged."); return 0; }
+    char m[96];
+    if (hbl) snprintf(m, sizeof m, "Updated to %s.\nStart it again from the\nHomebrew Launcher.", s_upd);
+    else { snprintf(m, sizeof m, "Updated to %s.\nThe player will now restart.", s_upd); aptSetChainloaderToSelf(); }
+    msg_screen_btn("UPDATE INSTALLED", m, "OKAY");
+    return 1;
+}
+
 /* Home screen polls this once per frame; runs the prompts when the background walk lands. */
 static int startup_detect_poll(void) {
     if (s_upd[0] && !s_upd_shown) {   /* newer build published */
         s_upd_shown = 1;
         char um[96];
-        snprintf(um, sizeof um, "A newer build is available:\n%s (you have %s).\nRedownload via the QR / FBI.", s_upd, BUILD_TAG);
-        msg_screen_btn("UPDATE AVAILABLE", um, "OKAY");   /* once per session; the tag stays after */
+        snprintf(um, sizeof um, "A newer build is available:\n%s (you have %s).\nInstall it now?", s_upd, BUILD_TAG);
+        if (prompt2("UPDATE AVAILABLE", um, "UPDATE", "LATER") == 0 && self_update())   /* once per session */
+            s_upd_quit = 1;
         return 1;
     }
     if (s_dt_consumed || !s_dt_done) return 0;
@@ -3528,10 +4572,13 @@ static void getinfo_menu(void) {
         int r = scrape_one(full);
         char m[160];
         snprintf(m, sizeof m, "%s%s",
-                 r == 1 ? "Info + artwork saved."
+                 r == 3 ? "Loaded from the SUPER MOFLEX file.\nInfo + artwork are self-contained."
+               : r == 1 ? "Info + artwork saved."
                : r == 2 ? "Info saved, but the poster\ndidn't download. Try again for the art."
+               : r == -1 ? "Could not download the catalog.\nCheck the connection and try again."
+               : r == -2 ? "Out of memory.\nRestart the app and try again."
                         : "No catalog had this title.",
-                 !r ? "" : s_scrape_sub == 1 ? "\nSubtitles downloaded."
+                 r <= 0 ? "" : (r == 3) ? "" : s_scrape_sub == 1 ? "\nSubtitles downloaded."
                          : s_scrape_sub == 2 ? "\nSubtitles already present." : "\nNo subtitles in the catalog.");
         msg_screen("DOWNLOAD INFO", m);
     } else if (a == 1) {
@@ -3582,6 +4629,7 @@ static void manage_menu(void) {
         char m[96];
         if (nf > 0 && nf == tot) snprintf(m, sizeof m, "Extracted %d file%s.", nf, nf == 1 ? "" : "s");
         else if (nf > 0)         snprintf(m, sizeof m, "Extracted %d of %d files.", nf, tot);
+        else if (nf < 0)         snprintf(m, sizeof m, "Extraction canceled.\nThe zip file was kept.");
         else                     snprintf(m, sizeof m, tot == 0 ? "Could not open the zip." : "Extract FAILED.");
         if (nf > 0) {
             lib_add_extracted(folder, NULL);
@@ -3658,6 +4706,259 @@ static int pick_moflex(const char *ciapath, const CiaMoflex *list, int n) {
     return -1;
 }
 
+/* ---------- play in Nintendo's 3D Movie Player (Old 3DS) ----------
+ * The Old 3DS struggles with our decoder, but the stock 3D Movie Player plays moflex in hardware --
+ * it only looks in the ROOT of the SD card, though, and has no folders. So with this setting on,
+ * picking a movie moves THAT ONE FILE to sdmc:/ (a FAT rename: instant, no copy), notes where it
+ * came from, and jumps to the Movie Player. The next start of this app moves it home again BEFORE
+ * the library loads, so the library never sees it missing. The state file is written and flushed
+ * BEFORE the move: a power cut between the two leaves a note for a file that never left, which the
+ * restore treats as already home. Title IDs as in 3ds-moflex-launcher. */
+#define EXTPLAY_CFG   "sdmc:/moflex_player/extplayer.cfg"
+#define EXTPLAY_STATE "sdmc:/moflex_player/extplay_state.txt"
+/* -1 = ask at every play (the default), 0 = always ours, 1 = always the 3D Movie Player */
+/* Per KIND of movie, -1 = ask at play time, 0 = always ours, 1 = always the 3D Movie Player.
+ * 3D is what stutters on an Old 3DS, so it asks by default; 2D plays fine here and goes straight
+ * to our player unless someone opts in (say, for an unusually heavy 2D encode). */
+static int g_extplay3d = -1, g_extplay2d = 0;
+static int g_extplay_ok = 0;                  /* Old 3DS only: a New 3DS plays everything fine */
+static void extplay_load(void) {
+    bool isnew = false; APT_CheckNew3DS(&isnew);
+    g_extplay_ok = !isnew;
+    FILE *f = fopen(EXTPLAY_CFG, "rb");
+    int v3 = -1, v2 = 0;
+    if (f) {
+        /* "3d 2d"; a file from build 61008.18 holds one value, which was asked about 3D files */
+        if (fscanf(f, "%d", &v3) != 1 || v3 < -1 || v3 > 1) v3 = -1;
+        if (fscanf(f, "%d", &v2) != 1 || v2 < -1 || v2 > 1) v2 = 0;
+        fclose(f);
+    }
+    /* the file survives an SD card moving to a New 3DS; the mode does not (read through
+     * g_extplay_ok everywhere, so the saved choice is still there if the card moves back) */
+    g_extplay3d = v3; g_extplay2d = v2;
+}
+static void extplay_save(void) {
+    mkdir("sdmc:/moflex_player", 0777);
+    FILE *f = fopen(EXTPLAY_CFG, "wb");
+    if (f) { fprintf(f, "%d %d\n", g_extplay3d, g_extplay2d); fclose(f); }
+}
+/* 3D or not, cheapest answer first: the file's .nfo flag (a super moflex's, imported), the
+ * library entry's flag, then "3D" in the filename. A name WITHOUT "3D" proves nothing --
+ * Nintendo's own files (Dinosaur Office) have neither an .nfo nor "3D" in the name -- so only
+ * then is the video itself read: the same left/right interleave test playback uses
+ * (mfx_detect_stereo), ~2 s of packets, once, at play time. */
+static int movie_is_3d(const char *path) {
+    static CatEntry c;
+    memset(&c, 0, sizeof c);
+    movieinfo_load(path, &c);
+    if (c.is3d >= 0) return c.is3d;
+    if (g_lib)
+        for (int i = 0; i < g_lib_n; i++)
+            if (!strcmp(g_lib[i].url, path) && g_lib[i].is3d >= 0) return g_lib[i].is3d;
+    memset(&c, 0, sizeof c);
+    const char *b = strrchr(path, '/'); b = b ? b + 1 : path;
+    snprintf(c.fname, sizeof c.fname, "%s", b);
+    if (cat_is_3d(&c)) return 1;
+    static MfxDemux m;
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    int st = 0;
+    if (mfx_open_auto(&m, f, path) == 0) { st = mfx_detect_stereo(&m); mfx_close(&m); }
+    fclose(f);
+    return st;
+}
+static const char *extplay_mode_name(int v) {
+    return v < 0 ? "ASK" : v ? "NINTENDO PLAYER" : "CLOWNSEC PLAYER";
+}
+/* X on home: one row per kind of movie, each opening the three choices */
+static void extplay_choose(void) {
+    if (!g_extplay_ok) return;
+    for (;;) {
+        char r3[40], r2[40];
+        snprintf(r3, sizeof r3, "3D MOVIES: %s", extplay_mode_name(g_extplay3d));
+        snprintf(r2, sizeof r2, "2D MOVIES: %s", extplay_mode_name(g_extplay2d));
+        const char *rows[3] = { r3, r2, "DONE" };
+        int k = ui_menu("PLAY MOVIES WITH", "Nintendo Player: no subs or 2nd audio", rows, 3);
+        if (k != 0 && k != 1) return;
+        const char *it[4] = { "ASK EVERY TIME", "ALWAYS CLOWNSEC PLAYER", "ALWAYS NINTENDO PLAYER", "CANCEL" };
+        int c = ui_menu(k == 0 ? "3D MOVIES" : "2D MOVIES", "Nintendo Player: no subs or 2nd audio", it, 4);
+        if (c >= 0 && c <= 2) {
+            if (k == 0) g_extplay3d = c - 1; else g_extplay2d = c - 1;
+            extplay_save();
+        }
+    }
+}
+/* Which player for this movie, Old 3DS: 1 = 3D Movie Player, 0 = ours, -1 = backed out.
+ * Asked at the moment it matters -- pressing play -- unless an ALWAYS answer was saved. */
+static int extplay_pick(int is3d) {
+    if (!g_extplay_ok) return 0;
+    int *mode = is3d ? &g_extplay3d : &g_extplay2d;
+    if (*mode == 0 || *mode == 1) return *mode;
+    int c = prompt2("OLD 3DS",
+                    is3d ? "3D movies may stutter in the\nClownsec Player on an Old 3DS. The\nNintendo Player plays smoothly, but\nhas no subtitles or 2nd audio track."
+                         : "The Nintendo Player plays smoothly,\nbut has no subtitles or 2nd\naudio track.",
+                    "NINTENDO", "CLOWNSEC");
+    if (c < 0) return -1;
+    int use = (c == 0);
+    int a = prompt2(use ? "NINTENDO PLAYER" : "CLOWNSEC PLAYER",
+                    is3d ? "Always play 3D movies this way?\n\nChange it later with X\non the home screen."
+                         : "Always play 2D movies this way?\n\nChange it later with X\non the home screen.",
+                    "ALWAYS", "JUST ONCE");
+    if (a == 0) { *mode = use; extplay_save(); }
+    return use;
+}
+static int extplay_find(u64 *tid, FS_MediaType *mt) {
+    static const u64 ids[] = {
+        0x0004000000036A00ULL,   /* CIA-installed */
+        0x0004001000021A00ULL,   /* USA (preinstalled) */
+        0x0004001000021B01ULL,   /* EUR */
+        0x0004001000020F00ULL,   /* JPN */
+    };
+    static const FS_MediaType mts[] = { MEDIATYPE_SD, MEDIATYPE_NAND };
+    if (R_FAILED(amInit())) return 0;
+    int found = 0;
+    for (int m = 0; m < 2 && !found; m++)
+        for (int i = 0; i < 4 && !found; i++) {
+            AM_TitleEntry te; u64 id = ids[i];
+            if (R_SUCCEEDED(AM_GetTitleInfo(mts[m], 1, &id, &te))) { *tid = id; *mt = mts[m]; found = 1; }
+        }
+    amExit();
+    return found;
+}
+/* Startup: put back a movie the last session lent to the Movie Player. Never overwrites: if a
+ * file of that name has appeared at home meanwhile, the returning one gets a " (2)" name. */
+static void extplay_restore(void) {
+    FILE *f = fopen(EXTPLAY_STATE, "rb");
+    if (!f) return;
+    char home[PATHLEN + NAMELEN] = "", root[PATHLEN + NAMELEN] = "";
+    if (fgets(home, sizeof home, f)) { char *nl = strchr(home, '\n'); if (nl) *nl = 0; }
+    if (fgets(root, sizeof root, f)) { char *nl = strchr(root, '\n'); if (nl) *nl = 0; }
+    fclose(f);
+    struct stat st;
+    int in_root = root[0] && stat(root, &st) == 0;
+    int at_home = home[0] && stat(home, &st) == 0;
+    if (in_root && !at_home) {
+        if (rename(root, home) != 0) {
+            msg_screen("NINTENDO PLAYER", "Could not move the movie back\nfrom the SD card root.\nIt is still in sdmc:/");
+            return;                                   /* keep the note: try again next start */
+        }
+    } else if (in_root && at_home) {
+        char alt[PATHLEN + NAMELEN];
+        size_t L = strlen(home);
+        const char *dot = (L > 7) ? home + L - 7 : home + L;   /* ".moflex" */
+        snprintf(alt, sizeof alt, "%.*s (2)%s", (int)(dot - home), home, dot);
+        if (stat(alt, &st) == 0 || rename(root, alt) != 0) {
+            msg_screen("NINTENDO PLAYER", "A movie in the SD card root has the\nsame name as one in your library.\nLeft it in sdmc:/ -- nothing\nwas overwritten.");
+        } else {
+            msg_screen("NINTENDO PLAYER", "A file with the same name appeared\nin the movie's folder, so it came\nback with \" (2)\" added to its name.");
+        }
+    } else if (!in_root && !at_home) {
+        msg_screen("NINTENDO PLAYER", "The movie lent to the Nintendo Player\nis no longer on the SD card\n(deleted or moved outside the app).");
+    }
+    remove(EXTPLAY_STATE);
+}
+/* Every .moflex in the SD root shows up in the Movie Player's list, not just the one being lent.
+ * At STARTUP on an Old 3DS -- after the lent movie is home, BEFORE the library is built or
+ * loaded for the session -- offer to file root movies into sdmc:/moflex_movies/ (with their
+ * poster/subtitle companions). Doing it later, after a first scan had indexed them in the root,
+ * left the library pointing at the old place. A cache from an earlier session is loaded first so
+ * known entries follow the move. Never overwrites: a clash stays in the root. */
+#define TIDY_DIR "sdmc:/moflex_movies"
+static void extplay_tidy_root(void) {
+    if (!g_extplay_ok || (g_extplay3d == 0 && g_extplay2d == 0)) return;   /* never lends: root is harmless */
+    static char names[256][NAMELEN];
+    int n = 0;
+    DIR *d = opendir("sdmc:/");
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d)) && n < 256) {
+        size_t L = strlen(e->d_name);
+        if (L <= 7 || strcasecmp(e->d_name + L - 7, ".moflex")) continue;
+        snprintf(names[n++], NAMELEN, "%s", e->d_name);
+    }
+    closedir(d);
+    if (n == 0) return;
+    char m[200];
+    snprintf(m, sizeof m, "%d movie%s in the SD card root.\nThe Nintendo Player lists all of\nthem every time. Move %s to\nsdmc:/moflex_movies/ ?",
+             n, n == 1 ? " is" : "s are", n == 1 ? "it" : "them");
+    if (prompt2("SD CARD ROOT", m, "MOVE", "LEAVE") != 0) return;
+    lib_load_cache();                                 /* so known entries follow (0 = none yet: fine) */
+    mkdir(TIDY_DIR, 0777);
+    static const char *const comp[] = { ".jpg", ".srt", ".ass", ".ssa" };
+    int moved = 0, kept = 0;
+    for (int i = 0; i < n; i++) {
+        char from[PATHLEN + NAMELEN], to[PATHLEN + NAMELEN];
+        struct stat st;
+        snprintf(from, sizeof from, "sdmc:/%s", names[i]);
+        snprintf(to, sizeof to, TIDY_DIR "/%s", names[i]);
+        if (stat(to, &st) == 0 || rename(from, to) != 0) { kept++; continue; }
+        lib_note_renamed(from, to);
+        moved++;
+        size_t L = strlen(names[i]) - 7;                 /* companions: same name, other extension */
+        for (int c = 0; c < 4; c++) {
+            char cf[PATHLEN + NAMELEN], ct[PATHLEN + NAMELEN];
+            snprintf(cf, sizeof cf, "sdmc:/%.*s%s", (int)L, names[i], comp[c]);
+            snprintf(ct, sizeof ct, TIDY_DIR "/%.*s%s", (int)L, names[i], comp[c]);
+            if (stat(cf, &st) == 0 && stat(ct, &st) != 0) rename(cf, ct);
+        }
+    }
+    if (kept) {
+        snprintf(m, sizeof m, "Moved %d movie%s. %d could not be\nmoved (same name already in\nmoflex_movies) and stayed put.",
+                 moved, moved == 1 ? "" : "s", kept);
+        msg_screen("SD CARD ROOT", m);
+    }
+}
+
+/* Lend path to the Movie Player. Returns 1 when the jump is under way (the app must now exit),
+ * 0 when it did not happen (a message was shown; the file is where it was). */
+static int extplay_launch(const char *path) {
+    u64 tid = 0; FS_MediaType mt = MEDIATYPE_SD;
+    if (!extplay_find(&tid, &mt)) {
+        msg_screen("NINTENDO PLAYER", "The Nintendo Player (3D Movie\nPlayer) is not installed. Playing\nin the Clownsec Player instead.");
+        return 0;
+    }
+    const char *b = strrchr(path, '/'); b = b ? b + 1 : path;
+    char root[PATHLEN + NAMELEN];
+    snprintf(root, sizeof root, "sdmc:/%s", b);
+    int moved = 0;
+    if (strcasecmp(root, path) != 0) {               /* already in the root: nothing to move */
+        struct stat st;
+        if (stat(root, &st) == 0) {
+            msg_screen("NINTENDO PLAYER", "A file with this name is already\nin the SD card root. Move or delete\nit first. Playing in the\nClownsec Player instead.");
+            return 0;
+        }
+        mkdir("sdmc:/moflex_player", 0777);
+        FILE *f = fopen(EXTPLAY_STATE, "wb");
+        if (!f) { msg_screen("NINTENDO PLAYER", "Could not save the restore note.\nPlaying in the\nClownsec Player instead."); return 0; }
+        fprintf(f, "%s\n%s\n", path, root);
+        fflush(f); fsync(fileno(f)); fclose(f);
+        if (rename(path, root) != 0) {
+            remove(EXTPLAY_STATE);
+            msg_screen("NINTENDO PLAYER", "Could not move the movie to the\nSD card root. Playing in the\nClownsec Player instead.");
+            return 0;
+        }
+        moved = 1;
+    }
+    /* NOT APT_PrepareToDoApplicationJump + APT_DoApplicationJump from here: with current libctru
+     * the app's own shutdown then closes to the HOME menu and the jump never lands (seen on an
+     * Old 3DS: we exited, the Movie Player did not start). The chainloader hands the jump to
+     * aptExit(), which performs it as the LAST step of a normal exit. extplay_find() already
+     * confirmed the title is installed. */
+    (void)moved;
+    aptSetChainloader(tid, (u8)mt);
+    /* The exit (stopping the SD walk, the update fetch, networking) and the Movie Player's own
+     * boot take a while on an Old 3DS; without this the screen sat frozen on the last prompt.
+     * Nothing draws after this, so it stays up until the Movie Player takes over. */
+    ui_begin(GFX_BOTTOM);
+    ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
+    ui_text_center(UI_W / 2, 70, 2, UI_NEON, "OPENING");
+    ui_text_center(UI_W / 2, 100, 1, UI_NEONC, "Nintendo Player");
+    ui_text_center(UI_W / 2, 140, 1, UI_INK, "This may take a moment...");
+    ui_present();
+    gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
+    return 1;
+}
+
 static MoflexResult play_movie(const char *path) {
     /* filenames with FAT-illegal characters list fine but can never be OPENED -- offer to fix */
     { const char *b0 = strrchr(path, '/'); b0 = b0 ? b0 + 1 : path;
@@ -3672,13 +4973,34 @@ static MoflexResult play_movie(const char *path) {
           lib_note_renamed(path, fixed);   /* keep the library entry pointed at the new name */
           path = fixed;
       } }
+    {   /* a library / recently-played entry still pointing where the file USED to be */
+        struct stat st0;
+        if (stat(path, &st0) != 0) {
+            msg_screen("FILE NOT FOUND", "This video is not where it was. It may\nhave been moved, renamed or deleted.\n\n"
+                       "If you moved it: Library > Rescan\nLibrary, or open it from Filesystem.");
+            branding_show();
+            return MOFLEX_QUIT_BACK;
+        } }
     cia_clear_selection();
     const char *title_src = path; char titlebuf[NAMELEN];
     if (cia_is_cia(path)) {
         CiaMoflex list[64];
         int nc = cia_list_moflex(path, list, 64);
         if (nc == 0) {
-            msg_screen("NOT A MOVIE", "This CIA has no playable video inside\n(it's an app, or the content is encrypted).");
+            int why = cia_last_error();
+            if (why == CIA_ERR_OPEN)
+                msg_screen("FILE NOT FOUND", "This CIA could not be opened. It may\nhave been moved, renamed or deleted.\n\n"
+                           "If you moved it: Library > Rescan\nLibrary, or open it from Filesystem.");
+            else if (why == CIA_ERR_SHORT)
+                msg_screen("INCOMPLETE FILE", "This CIA is shorter than it should be:\nthe download or copy did not finish.\n\n"
+                           "Copy or download it again.");
+            else if (why == CIA_ERR_ENCRYPTED)
+                msg_screen("ENCRYPTED CIA", "This CIA's content is encrypted, so\nthe video inside cannot be read.\n\n"
+                           "Only unencrypted movie CIAs play.");
+            else if (why == CIA_ERR_NOT_CIA)
+                msg_screen("NOT A CIA", "This file is named .cia but is not a\nCIA (or it is damaged).\n\nDownload it again.");
+            else
+                msg_screen("NOT A MOVIE", "This CIA has no video inside --\nit is an app or a game, not a movie.");
             branding_show();
             return MOFLEX_QUIT_BACK;
         }
@@ -3710,6 +5032,19 @@ static MoflexResult play_movie(const char *path) {
         }
         dlw_stop_wait();
         s_dlw_resume_ask = 1;   /* offer to resume once we are back on the home screen */
+    }
+    /* Movie Player mode: plain .moflex only (it cannot open a CIA or an MP4). It keeps its own
+     * resume point, so ours is not asked about. */
+    if (g_extplay_ok && !cia_is_cia(path)) {
+        size_t L = strlen(path);
+        if (L > 7 && !strcasecmp(path + L - 7, ".moflex")) {
+            int use = extplay_pick(movie_is_3d(path));
+            if (use < 0) { cia_clear_selection(); branding_show(); return MOFLEX_QUIT_BACK; }
+            if (use && extplay_launch(path)) {
+                cia_clear_selection();
+                return MOFLEX_QUIT_EXIT;              /* jumping: unwind and exit cleanly */
+            }
+        }
     }
     { long long rp = moflex_resume_get(path);   /* pre-played -> resume, start fresh, or back out */
       if (rp > 3000000) {
@@ -3770,7 +5105,8 @@ static void browser_draw_gfx(int mode) {
     ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
     ui_text(10, 8, 2, UI_NEON, manage ? "MANAGE" : "FILESYSTEM");
     if (manage && move_pending) ui_text(UI_W - 96, 9, 1, UI_NEONC, "MOVE ready");
-    else if (!manage && s_show_hidden) ui_text(UI_W - 74, 9, 1, UI_NEONP, "SYS on");
+    else if (!manage) ui_text(UI_W - 98, 9, 1, s_show_hidden ? UI_NEONP : UI_DIM,
+                              s_show_hidden ? "Y: hide sys" : "Y: show all");
     /* current path (tail-trimmed to fit) */
     char pth[64]; int mc = (UI_W - 20) / 8;
     if ((int)strlen(cwd) > mc) snprintf(pth, sizeof pth, "...%s", cwd + strlen(cwd) - (mc - 3));
@@ -4132,7 +5468,7 @@ static void home_draw(int bsel, long long rpos) {
         ui_fill_round(THSW_X + 24, THSW_Y + 5, 6, 6, 2, a3);
         ui_text(THSW_X + 36, THSW_Y + 4, 1, UI_DIM, "Y");
     }
-    ui_text_center(UI_W / 2, 32, 1, UI_NEONP, "3DS VIDEO PLAYER");
+    ui_text_center(UI_W / 2, 32, 1, UI_NEONP, g_extplay_ok ? "3DS VIDEO PLAYER  (X: PLAYER)" : "3DS VIDEO PLAYER");
     ui_glow_round(28, 46, UI_W - 56, 2, 1, UI_NEON, 3, 34);
     ui_fill_round(28, 46, UI_W - 56, 2, 1, UI_NEON);
 
@@ -4184,6 +5520,7 @@ static int home_gui(void) {
     long long rpos = g_now_playing_path[0] ? moflex_resume_get(g_now_playing_path) : 0;
     while (aptMainLoop()) {
         if (startup_detect_poll()) redraw = 1;
+        if (s_upd_quit) return -1;   /* new build installed: exit so it can relaunch */
         if (dlw_poll()) redraw = 1;   /* finalize background downloads while on home */
         if (s_dlw_resume_ask) {
             s_dlw_resume_ask = 0;
@@ -4194,6 +5531,7 @@ static int home_gui(void) {
         u32 k = hidKeysDown();
         if (k & KEY_START) return -1;
         if (k & KEY_Y) { themes_screen(); redraw = 1; }
+        if ((k & KEY_X) && g_extplay_ok) { extplay_choose(); redraw = 1; }
         if (k & KEY_RIGHT) { bsel = (bsel + 1) % 3; redraw = 1; }
         if (k & KEY_LEFT)  { bsel = (bsel + 2) % 3; redraw = 1; }
         if (k & KEY_A) return g_btns[bsel].choice;
@@ -4256,20 +5594,20 @@ static int open_pick(void) {
         hidScanInput();
         u32 k = hidKeysDown();
         if (k & KEY_B) return -1;
-        if (k & (KEY_DOWN | KEY_RIGHT)) { if (sel < 2) sel++; redraw = 1; }
+        if (k & (KEY_DOWN | KEY_RIGHT)) { if (sel < 3) sel++; redraw = 1; }
         if (k & (KEY_UP | KEY_LEFT))    { if (sel > 0) sel--; redraw = 1; }
         if (k & KEY_A) return sel;
+        /* four rows now: WALK THE AISLE joined LIBRARY / FILESYSTEM / RECENTLY PLAYED */
         if (k & KEY_TOUCH) { touchPosition tp; hidTouchRead(&tp);
-            if (tp.py >= 52 && tp.py < 100)  return 0;
-            if (tp.py >= 112 && tp.py < 160) return 1;
-            if (tp.py >= 172 && tp.py < 220) return 2; }
+            for (int i = 0; i < 4; i++) if (tp.py >= 44 + i * 47 && tp.py < 44 + i * 47 + 40) return i; }
         if (redraw) {
             ui_begin(GFX_BOTTOM);
             ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
-            ui_text_center(UI_W / 2, 16, 2, UI_NEON, "OPEN VIDEO");
-            ui_button(34,  52, UI_W - 68, 48, "LIBRARY",         sel == 0, UI_NEON);
-            ui_button(34, 112, UI_W - 68, 48, "FILESYSTEM",      sel == 1, UI_NEONP);
-            ui_button(34, 172, UI_W - 68, 48, "RECENTLY PLAYED", sel == 2, UI_NEONC);
+            ui_text_center(UI_W / 2, 14, 2, UI_NEON, "OPEN VIDEO");
+            ui_button(34,  44, UI_W - 68, 40, "LIBRARY",         sel == 0, UI_NEON);
+            ui_button(34,  91, UI_W - 68, 40, "FILESYSTEM",      sel == 1, UI_NEONP);
+            ui_button(34, 138, UI_W - 68, 40, "RECENTLY PLAYED", sel == 2, UI_NEONC);
+            ui_button(34, 185, UI_W - 68, 40, "WALK THE AISLE",  sel == 3, UI_NEON);
             ui_present(); redraw = 0;
         }
         gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
@@ -4279,8 +5617,51 @@ static int open_pick(void) {
 
 /* OPEN VIDEO: pick a source, then a movie. Returns 0 = home, 1 = exit app, 2 = play out[]. */
 /* where the last picked movie came from, so BACK in the player returns to the right place */
-enum { PLAY_FROM_BROWSER = 0, PLAY_FROM_HOME = 1, PLAY_FROM_LIBRARY = 2, PLAY_FROM_RECENT = 3 };
+enum { PLAY_FROM_BROWSER = 0, PLAY_FROM_HOME = 1, PLAY_FROM_LIBRARY = 2, PLAY_FROM_RECENT = 3,
+       PLAY_FROM_STORE = 4 };
 static int s_pick_origin = PLAY_FROM_BROWSER;
+
+/* WALK THE AISLE: a case's key is its moviedata key -- the movie's filename without extension --
+ * so find the library entry with that name. out may be NULL: the store also asks only "is it
+ * here?" to keep deleted movies' leftover moviedata off the shelves. */
+static int store_resolve(const char *key, char *out, size_t cap) {
+    if (!key || !key[0] || lib_load_cache() <= 0) return 0;
+    size_t K = strlen(key);
+    for (int i = 0; i < g_lib_n; i++) {
+        const char *f = g_lib[i].fname;
+        /* the key is the name with its extension off -- or the whole name, for a show folder,
+         * whose name may well contain a dot of its own ("Dr. Who") */
+        if (strncmp(f, key, K)) continue;
+        const char *rest = f + K;
+        if (!(rest[0] == 0 || (rest[0] == '.' && strlen(rest) <= 7 && !strchr(rest + 1, '.')))) continue;
+        if (!out || !cap) return 1;
+        struct stat st;
+        if (stat(g_lib[i].url, &st) == 0 && S_ISDIR(st.st_mode))   /* a show: its first episode */
+            return show_first_episode(&g_lib[i], out, (int)cap);
+        snprintf(out, cap, "%s", g_lib[i].url);
+        return 1;
+    }
+    return 0;
+}
+/* 1 = picked a movie (out set), 0 = walked out, -1 = app closing */
+static int store_pick(char *out, size_t cap) {
+    /* The store stocks only movies that are in the library AND have info. Coming here before
+     * ever opening LIBRARY meant no library list at all, so every case was filtered out and the
+     * shelves stood empty: scan first, exactly as LIBRARY does on its first visit. */
+    if (lib_load() <= 0) { msg_screen("WALK THE AISLE", "No movies found on the SD card."); return 0; }
+    int have = 0;
+    for (int i = 0; i < g_lib_n && !have; i++) have = movieinfo_have(g_lib[i].url);
+    if (!have) {
+        msg_screen("WALK THE AISLE", "Your movies have no info yet, so the\nshelves would be empty.\n\n"
+                                     "Open LIBRARY and use GET INFO,\nthen come back.");
+        return 0;
+    }
+    int r = store_run(store_resolve, out, cap);
+    consoleInit(GFX_BOTTOM, NULL);            /* the store drew the bottom as a console */
+    gfxSetDoubleBuffering(GFX_BOTTOM, false);
+    branding_show();
+    return r;
+}
 
 static int open_video(char *out, size_t cap) {
     for (;;) {
@@ -4288,6 +5669,9 @@ static int open_video(char *out, size_t cap) {
         if (pick < 0) return 0;                                 /* back -> home */
         if (pick == 0) { if (library_view(out, cap)) { s_pick_origin = PLAY_FROM_LIBRARY; return 2; } }
         else if (pick == 2) { if (recent_pick(out, cap)) { s_pick_origin = PLAY_FROM_RECENT; return 2; } }
+        else if (pick == 3) { int r = store_pick(out, cap);
+                              if (r < 0) return 1;
+                              if (r == 1) { s_pick_origin = PLAY_FROM_STORE; return 2; } }
         else { int r = browser(MODE_PLAY, out, cap);            /* Filesystem */
                if (r == 1) return 1;
                if (r == 2) { s_pick_origin = PLAY_FROM_BROWSER; return 2; } }   /* r==0 backed out -> chooser */
@@ -4318,6 +5702,18 @@ static int play_and_handle(const char *path, int origin) {
     MoflexResult r = play_movie(path);
     for (;;) {
         char np[PATHLEN + NAMELEN];
+        /* Played to the end and it is part of a series -> offer the next episode. Only on a
+         * natural EOF: pressing B is a decision to stop, and answering it with "here's more"
+         * would be ignoring the user. */
+        if (r == MOFLEX_EOF) {
+            char nxt[PATHLEN + NAMELEN];
+            if (g_now_playing_path[0] &&
+                next_episode_path(g_now_playing_path, nxt, sizeof nxt) &&
+                next_episode_prompt(g_now_playing_path, nxt)) {
+                r = play_movie(nxt);
+                continue;
+            }
+        }
         if (r == MOFLEX_QUIT_OPEN) {
             int b = open_video(np, sizeof np);
             if (b == 1) return 1;
@@ -4326,6 +5722,15 @@ static int play_and_handle(const char *path, int origin) {
         }
         if (r == MOFLEX_QUIT_BACK) {
             if (origin == PLAY_FROM_HOME) return 0;              /* back IS the home screen */
+            if (origin == PLAY_FROM_STORE) {
+                /* to OPEN VIDEO, not straight back into the aisle: walking back in is one tap from
+                 * there, and Library / Filesystem / Recent are too, for someone who is done browsing
+                 * the shelves (re-entering the aisle also means waiting for it to load) */
+                int b2 = open_video(np, sizeof np);
+                if (b2 == 1) return 1;
+                if (b2 == 2) { origin = s_pick_origin; r = play_movie(np); continue; }
+                return 0;
+            }
             if (origin == PLAY_FROM_RECENT) {                    /* back to the recents list */
                 if (recent_pick(np, sizeof np)) { r = play_movie(np); continue; }
                 return 0;                                        /* backed out of recents -> home */
@@ -4356,8 +5761,10 @@ int main(void) {
      * wctomb pointer is NULL until locale is touched -- so formatting a filename with a non-ASCII
      * byte on that thread called through NULL (prefetch abort, PC=0). This makes it valid. */
     setlocale(LC_ALL, "C");
+    moflex_set_autonext(autonext_has_next);   /* series roll on to the next episode at EOF */
     osSetSpeedupEnable(true);   /* unlock New 3DS 804MHz clock (no-op on old 3DS) */
     gfxInitDefault();
+    romfsInit();                /* files shipped inside the app (the store's song) */
     ndspInit();
     theme_load();               /* restore the saved theme before anything draws */
 
@@ -4371,6 +5778,9 @@ int main(void) {
     gfxSetDoubleBuffering(GFX_BOTTOM, false);
     branding_show();                                  /* 3D CLOWNSEC logo on top */
 
+    extplay_load();
+    extplay_restore();           /* FIRST: bring back a movie lent to the 3D Movie Player (any model) */
+    extplay_tidy_root();         /* Old 3DS: root movies -> moflex_movies, BEFORE the library loads */
     startup_new_movie_check();   /* movies added outside the app -> offer rescan (+ art/info) */
     lastplay_restore();          /* home boots with the last-played movie ready on PLAY */
     if (queue_count() > 0) {
@@ -4404,6 +5814,7 @@ int main(void) {
     downloader_exit();
     socExit();
     ndspExit();
+    romfsExit();
     gfxExit();
     return 0;
 }

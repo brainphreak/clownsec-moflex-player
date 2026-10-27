@@ -10,6 +10,11 @@ typedef struct { char name[128]; int64_t off, size; } CiaMoflex;
 /* List every unencrypted .moflex inside a CIA's RomFS. Returns the count (0 = none / encrypted). */
 int cia_list_moflex(const char *path, CiaMoflex *out, int max);
 
+/* Why the last cia_list_moflex() found nothing -- so the player can say what is actually wrong
+ * instead of one catch-all "app or encrypted" for a file that was only moved. */
+enum { CIA_OK = 0, CIA_ERR_OPEN, CIA_ERR_NOT_CIA, CIA_ERR_SHORT, CIA_ERR_ENCRYPTED, CIA_ERR_NO_VIDEO };
+int cia_last_error(void);
+
 /* Locate the first embedded .moflex. Returns 1 + byte offset/size, else 0. */
 int cia_find_moflex(const char *path, int64_t *out_off, int64_t *out_size);
 
