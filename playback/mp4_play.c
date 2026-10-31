@@ -463,6 +463,7 @@ MoflexResult mp4_play(const char *path) {
       size_t L = strlen(title); if (L > 4 && !strcasecmp(title + L - 4, ".mp4")) title[L - 4] = 0; }
 
     moflex_subs_autoload(path);   /* load a matching .srt (sidecar or moviedata/) if one exists */
+    moflex_defaults_apply_subs(NULL);   /* the viewer's subtitle default (no language tags here) */
 
     double dur_s = mp4_duration_s(&m);
     int64_t dur_us = (int64_t)(dur_s * 1e6);

@@ -1109,6 +1109,97 @@ static int g_atrk_streams[4]; static int g_atrk_n = 0;   /* audio stream indices
 static char g_atrk_lbl[4][4];                            /* button labels: "ENG"/"JPN"/"A1".. */
 static int g_atrk_sel = 0;                               /* chosen track ordinal (0 = first) */
 static volatile int g_atrk_apply = 0;                    /* menu changed the track: player re-locks */
+
+/* ---- playback defaults (sdmc:/moflex_player/defaults.cfg) ----
+ * A video with no .sub of its own used to start from fixed values (size 1, 10 px, first audio
+ * track, built-in subtitles off), so a viewer who watches everything in Japanese with size-3
+ * subtitles re-set all of it on every new episode. These are what such a video starts from
+ * instead; anything changed in the player's menus still saves per video and wins next time. */
+#define DEF_FILE "sdmc:/moflex_player/defaults.cfg"
+static const char *const LANG_CODE[] = { "", "ENG", "JPN", "SPA", "FRE", "GER", "ITA", "POR",
+                                         "RUS", "KOR", "CHI", "DUT", "SWE", "POL", "ARA", "HIN" };
+static const char *const LANG_NAME[] = { "First track", "English", "Japanese", "Spanish", "French",
+                                         "German", "Italian", "Portuguese", "Russian", "Korean",
+                                         "Chinese", "Dutch", "Swedish", "Polish", "Arabic", "Hindi" };
+#define LANG_N ((int)(sizeof LANG_CODE / sizeof LANG_CODE[0]))
+static MoflexDefaults g_def;
+static int g_def_loaded = 0;
+static int g_cfg_fresh = 0;    /* this video has no .sub: the defaults are in charge of it */
+
+/* ISO 639-2 has two codes for some languages (fre/fra, ger/deu ...); files carry either */
+static int lang_match(const char *tag, int li) {
+    if (!tag || !tag[0] || li <= 0 || li >= LANG_N) return 0;
+    if (!strcasecmp(tag, LANG_CODE[li])) return 1;
+    static const char *const ALT[][2] = { { "FRE", "FRA" }, { "GER", "DEU" }, { "CHI", "ZHO" },
+                                          { "DUT", "NLD" }, { "ENG", "EN" }, { "JPN", "JA" } };
+    for (size_t i = 0; i < sizeof ALT / sizeof ALT[0]; i++)
+        if (!strcasecmp(LANG_CODE[li], ALT[i][0]) && !strcasecmp(tag, ALT[i][1])) return 1;
+    return 0;
+}
+void moflex_defaults_reset(MoflexDefaults *d) {
+    d->alang = 0; d->subs = MOFLEX_DEF_SUBS_AS_FOUND; d->slang = 0;
+    d->size = 1; d->pos = SUB_POS_DEF; d->font = 0; d->depth = 0;
+}
+static void def_load(void) {
+    if (g_def_loaded) return;
+    g_def_loaded = 1;
+    moflex_defaults_reset(&g_def);
+    FILE *f = fopen(DEF_FILE, "rb"); if (!f) return;
+    int v = 0, a, s, sl, sz, p, fn, dp;
+    if (fscanf(f, "%d %d %d %d %d %d %d %d", &v, &a, &s, &sl, &sz, &p, &fn, &dp) == 8 && v == 1) {
+        if (a >= 0 && a < LANG_N) g_def.alang = a;
+        if (s >= 0 && s < MOFLEX_DEF_SUBS_N) g_def.subs = s;
+        if (sl >= 0 && sl < LANG_N) g_def.slang = sl;
+        if (sz >= 1 && sz <= SUB_SIZE_MAX) g_def.size = sz;
+        if (p >= 0 && p <= SUB_POS_MAX) g_def.pos = p;
+        g_def.font = !!fn;
+        if (dp >= -16 && dp <= 16) g_def.depth = dp;
+    }
+    fclose(f);
+}
+void moflex_defaults_get(MoflexDefaults *d) { def_load(); *d = g_def; }
+void moflex_defaults_set(const MoflexDefaults *d) {
+    g_def = *d; g_def_loaded = 1;
+    mkdir("sdmc:/moflex_player", 0777);
+    FILE *f = fopen(DEF_FILE, "wb"); if (!f) return;
+    fprintf(f, "1 %d %d %d %d %d %d %d\n", g_def.alang, g_def.subs, g_def.slang,
+            g_def.size, g_def.pos, g_def.font, g_def.depth);
+    fclose(f);
+}
+int  moflex_lang_count(void) { return LANG_N; }
+const char *moflex_lang_code(int i) { return i > 0 && i < LANG_N ? LANG_CODE[i] : ""; }
+const char *moflex_lang_name(int i) { return i >= 0 && i < LANG_N ? LANG_NAME[i] : "?"; }
+int  moflex_sub_size_max(void) { return SUB_SIZE_MAX; }
+int  moflex_sub_pos_max(void) { return SUB_POS_MAX; }
+
+/* fresh video: the preferred built-in subtitle language, before the track is stashed */
+static void def_pick_subtrack(void) {
+    if (!g_cfg_fresh) return;
+    g_trsub_sel = 0;
+    for (int k = 0; k < g_tra.sub_n; k++)
+        if (lang_match(g_tra.sub_lang[k], g_def.slang)) { g_trsub_sel = k; break; }
+}
+/* fresh video: the preferred audio language, once the track labels are known */
+static void def_pick_audio(void) {
+    if (!g_cfg_fresh || g_def.alang <= 0) return;
+    for (int t = 0; t < g_atrk_n && t < 4; t++)
+        if (lang_match(g_atrk_lbl[t], g_def.alang)) { g_atrk_sel = t; return; }
+}
+/* fresh video: subtitles on/off, once both the subtitles and the audio language are settled */
+static void def_apply_subs(const char *alang) {
+    if (!g_cfg_fresh || g_nsubs == 0) return;
+    switch (g_def.subs) {
+        case MOFLEX_DEF_SUBS_ON:  g_sub_on = 1; break;
+        case MOFLEX_DEF_SUBS_OFF: g_sub_on = 0; break;
+        case MOFLEX_DEF_SUBS_FOREIGN:
+            /* an untagged track ("A1", "A2") tells us nothing: leave it as found */
+            if (alang && alang[0] && !(alang[0] == 'A' && alang[1] >= '0' && alang[1] <= '9'))
+                g_sub_on = !lang_match(alang, g_def.slang > 0 ? g_def.slang : 1);
+            break;
+    }
+}
+void moflex_defaults_apply_subs(const char *alang) { def_apply_subs(alang); }
+
 static void subcfg_save(const char *movie) {
     mkdir("sdmc:/moflex_player", 0777); mkdir("sdmc:/moflex_player/resume", 0777);
     char p[256]; subcfg_path(movie, p, sizeof p);
@@ -1134,7 +1225,13 @@ static void subcfg_load(const char *movie) {
     g_zoom = ZOOM_MIN; g_conv = 0; g_ghost = 0;
     char p[256]; subcfg_path(movie, p, sizeof p);
     FILE *f = fopen(p, "rb");
-    if (!f) { int e = subenc_load(movie); if (e >= 0) g_sub_enc = e; return; }   /* pre-.sub: encoding only */
+    g_cfg_fresh = !f;
+    if (!f) {   /* nothing saved for this video: start from the viewer's defaults */
+        def_load();
+        g_sub_size = g_def.size; g_sub_pos = g_def.pos; g_sub_font = g_def.font; g_sub_depth = g_def.depth;
+        int e = subenc_load(movie); if (e >= 0) g_sub_enc = e;   /* pre-.sub: encoding only */
+        return;
+    }
     int ver = 0, on = 0, top = 0, size = 1, depth = 0, enc = 0; long long off = 0;
     if (fscanf(f, "%d %d %d %d %d %lld %d", &ver, &on, &top, &size, &depth, &off, &enc) == 7 && ver == 1) {
         int asel = 0, fnt = 0, pos = -1;
@@ -1173,13 +1270,24 @@ static void subcfg_load(const char *movie) {
     }
     fclose(f);
 }
+/* Settings screen "copy from a video": that video's saved appearance as defaults. Called from
+ * the home screen, never during playback, so borrowing the playback globals is safe -- the next
+ * film reloads them all through subcfg_load anyway. */
+int moflex_defaults_from_movie(const char *path, MoflexDefaults *d) {
+    subcfg_load(path);
+    if (g_cfg_fresh) return 0;
+    d->subs  = g_sub_on ? MOFLEX_DEF_SUBS_ON : MOFLEX_DEF_SUBS_OFF;
+    d->size  = g_sub_size; d->pos = g_sub_pos; d->font = g_sub_font; d->depth = g_sub_depth;
+    return 1;
+}
 
 /* auto-load a matching track at playback start: "<movie>.srt" beside the file, else moviedata/;
  * then the same two places for .ass and .ssa. SRT first: where both exist it is the one someone
  * went to the trouble of making for this player. */
 static void subs_autoload(const char *moviepath) {
     g_nsubs = 0; g_sub_on = 0; g_sub_off = 0; g_sub_file[0] = 0;   /* offset is per-movie */
-    subcfg_load(moviepath);   /* this movie's saved settings (else keep last-used) */
+    subcfg_load(moviepath);   /* this movie's saved settings (else the viewer's defaults) */
+    def_pick_subtrack();      /* fresh video: the preferred built-in subtitle language */
     if (g_sub_file[0]) {      /* the exact track they were watching with -- keeps their on/off choice */
         char want[512]; snprintf(want, sizeof want, "%s", g_sub_file);   /* subs_load() rewrites g_sub_file */
         /* The embedded stash is a CACHE at a FIXED path. Rebuilding a movie rewrites the
@@ -4140,6 +4248,8 @@ static MoflexResult moflex_play_ring(const char *path) {
         snprintf(g_atrk_lbl[g_atrk_n], 4, "%s", g_tra.lang_alt[0] ? g_tra.lang_alt : "A2");
         g_atrk_streams[g_atrk_n++] = -1;    /* -1 = the trailer source (Audio Track N) */
     }
+    def_pick_audio();     /* no saved track: the viewer's preferred language, when the file has it */
+    def_apply_subs(g_atrk_n > 0 && g_atrk_sel < 4 ? g_atrk_lbl[g_atrk_sel] : g_tra.lang_main);
     if (g_atrk_n > 1) {   /* dual audio: honor this movie's saved track (subcfg, loaded above) */
         if (g_atrk_sel < 0 || g_atrk_sel >= g_atrk_n) g_atrk_sel = 0;
         if (g_atrk_streams[g_atrk_sel] >= 0) {
@@ -4946,6 +5056,7 @@ static MoflexResult moflex_play_classic(const char *path) {
         if (g_trsub_sel < 0 || g_trsub_sel >= g_tra.sub_n) g_trsub_sel = 0;
         if (trsub_stash(path, g_trsub_sel)) subs_load(EMB_SRT);
     }
+    def_apply_subs(g_tra.lang_main);   /* single-audio path: the file's main language */
 
     /* audio */
     #undef NWB
@@ -5318,6 +5429,7 @@ static MoflexResult moflex_play_soft(const char *path) {
         else if (L > 4 && !strcasecmp(title + L - 4, ".zip")) title[L - 4] = 0;
         else if (L > 4 && !strcasecmp(title + L - 4, ".cia")) title[L - 4] = 0; }
     subs_autoload(path);
+    def_apply_subs(NULL);   /* no trailer probe on this path: ON/OFF apply, FOREIGN can't tell */
 
     gfxSetScreenFormat(GFX_TOP, GSP_BGR8_OES);   /* 24-bit software blit (no banding) */
     gfxSetDoubleBuffering(GFX_TOP, true);        /* both eyes to the back buffer -> appear together on swap */
@@ -5603,3 +5715,98 @@ void moflex_subs_autoload(const char *moviepath) { subs_autoload(moviepath); }
 void moflex_sub_menu(const char *moviepath, int is3d) { sub_menu(moviepath, is3d); }
 void moflex_sub_overlay(int is3d, long long us) { sub_overlay(is3d, (int64_t)us); }
 int  moflex_subs_on(void) { return g_sub_on; }
+
+/* ---- PLAYBACK DEFAULTS preview ----
+ * Position, size and 3D depth are guesswork as numbers, so the defaults screen runs inside this
+ * and the top screen shows a caption through the RING renderer itself: the same face choice,
+ * scale ladder, wrap budget and per-eye shift a film gets. The app's bottom-screen UI is drawn
+ * as usual and shown as a texture, exactly like the in-player menus. */
+static void preview_scene(void) {
+    /* a dusk street: bright enough near the caption line to judge the outline against */
+    C2D_DrawRectangle(0, 0, 0, SCR_W, 150, C2D_Color32(18, 26, 64, 255), C2D_Color32(18, 26, 64, 255),
+                      C2D_Color32(170, 90, 110, 255), C2D_Color32(170, 90, 110, 255));
+    C2D_DrawCircleSolid(318, 52, 0, 20, C2D_Color32(250, 240, 200, 255));
+    static const short B[][3] = { { 0, 70, 96 }, { 62, 56, 70 }, { 112, 80, 110 }, { 186, 60, 82 },
+                                  { 240, 72, 124 }, { 306, 50, 64 }, { 350, 50, 104 } };
+    for (size_t i = 0; i < sizeof B / sizeof B[0]; i++)
+        C2D_DrawRectSolid(B[i][0], 150 - B[i][2], 0, B[i][1], B[i][2], C2D_Color32(28, 22, 40, 255));
+    C2D_DrawRectangle(0, 150, 0, SCR_W, SCR_H - 150, C2D_Color32(120, 110, 120, 255), C2D_Color32(120, 110, 120, 255),
+                      C2D_Color32(220, 210, 200, 255), C2D_Color32(220, 210, 200, 255));
+}
+static void preview_black(void) {   /* fresh framebuffers hold garbage */
+    for (int fb = 0; fb < 2; fb++) {
+        u16 fw = 0, fh = 0; u8 *p;
+        p = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, &fw, &fh);  if (p) memset(p, 0, (size_t)fw * fh * 3);
+        p = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, &fw, &fh); if (p) memset(p, 0, (size_t)fw * fh * 3);
+        gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
+    }
+}
+int moflex_defaults_preview(const MoflexDefaults *d,
+                            int (*frame)(void *ctx, unsigned kd, unsigned kh, unsigned ku,
+                                         int tx, int ty, int *drew), void *ctx) {
+    int sv_size = g_sub_size, sv_pos = g_sub_pos, sv_font = g_sub_font, sv_depth = g_sub_depth;
+    int sv_tpos = g_sub_tpos, sv_link = g_sub_link;
+    gfxExit(); gfxInitDefault();          /* the same clean hand-over moflex_play_ring does */
+    preview_black();
+    gfxSet3D(true);
+    int ok3d = C3D_Init(C3D_DEFAULT_CMDBUF_SIZE), ok2d = ok3d && C2D_Init(SUB_C2D_OBJECTS);
+    C3D_RenderTarget *topL = NULL, *topR = NULL, *bot = NULL;
+    if (ok2d) {
+        C2D_Prepare();
+        topL = C2D_CreateScreenTarget(GFX_TOP, GFX_LEFT);
+        topR = C2D_CreateScreenTarget(GFX_TOP, GFX_RIGHT);
+        bot  = C2D_CreateScreenTarget(GFX_BOTTOM, GFX_LEFT);
+    }
+    if (!ok2d || !topL || !topR || !bot || !ui_tex_init()) {
+        if (ok2d) { gpu_park_program(); C2D_Fini(); }
+        if (ok3d) { if (!ok2d) gpu_park_program(); C3D_Fini(); }
+        gfxSet3D(false); gfxExit(); gfxInitDefault(); preview_black();
+        return -2;
+    }
+    C2D_TextBuf sbuf = C2D_TextBufNew(512), lbuf = C2D_TextBufNew(96);
+    RingSub rs; ring_sub_init(&rs, sbuf, &g_stx[0], 0);
+    C2D_Text lbl, lbl3d;
+    C2D_TextParse(&lbl, lbuf, "PREVIEW"); C2D_TextOptimize(&lbl);
+    C2D_TextParse(&lbl3d, lbuf, "PREVIEW  -  raise the 3D slider to see depth"); C2D_TextOptimize(&lbl3d);
+    SubBlock blk; memset(&blk, 0, sizeof blk);
+    snprintf(blk.t, sizeof blk.t, "%s", "This is how your subtitles will look while a video plays.");
+    u32 black = C2D_Color32(0, 0, 0, 255), white = C2D_Color32(255, 255, 255, 255);
+    int code = 0, closing = 1, upload = 1;
+    while (aptMainLoop()) {
+        hidScanInput();
+        u32 kd = hidKeysDown(), kh = hidKeysHeld(), ku = hidKeysUp();
+        touchPosition tp; hidTouchRead(&tp);
+        int drew = 0;
+        ui_capture(1);                    /* the app's ui_present() becomes a no-op: we texture it */
+        code = frame(ctx, kd, kh, ku, tp.px, tp.py, &drew);
+        if (code) { closing = 0; ui_capture(0); break; }   /* ui_present() must draw again */
+        g_sub_size = d->size; g_sub_pos = d->pos; g_sub_font = d->font; g_sub_depth = d->depth;
+        g_sub_tpos = SUB_TPOS_DEF; g_sub_link = 1;
+        int stereo = osGet3DSliderState() > R3_MONO_AT;
+        int sdep = stereo ? g_sub_depth : 0;
+        ring_sub_prep(&rs, &blk, sdep < 0 ? -sdep : sdep);
+        if (drew || upload) { ui_tex_upload(); upload = 0; }
+        C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
+        for (int eye = 0; eye < 2; eye++) {
+            C3D_RenderTarget *t = eye ? topR : topL;
+            C2D_TargetClear(t, black); C2D_SceneBegin(t);
+            preview_scene();
+            C2D_DrawText(!stereo && d->depth ? &lbl3d : &lbl, C2D_WithColor, 8, 6, 0, 0.5f, 0.5f,
+                         C2D_Color32(255, 255, 255, 200));
+            ring_sub_draw(&rs, eye ? sdep : -sdep, white, black);
+        }
+        ui_tex_blit(bot);
+        C3D_FrameEnd(0);
+    }
+    ui_capture(0);                        /* whatever ended the loop, hand back a drawing UI */
+    C2D_TextBufDelete(sbuf); C2D_TextBufDelete(lbuf);
+    subtex_free(); ui_tex_free();
+    gspWaitForVBlank(); gspWaitForVBlank();
+    gpu_park_program(); C2D_Fini(); C3D_Fini();
+    gfxSet3D(false);
+    g_sub_size = sv_size; g_sub_pos = sv_pos; g_sub_font = sv_font; g_sub_depth = sv_depth;
+    g_sub_tpos = sv_tpos; g_sub_link = sv_link;
+    if (closing) return -1;               /* app closing: a gfx re-init now hangs the close */
+    gfxExit(); gfxInitDefault(); preview_black();
+    return code;
+}

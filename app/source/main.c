@@ -4801,8 +4801,8 @@ static int extplay_pick(int is3d) {
     if (c < 0) return -1;
     int use = (c == 0);
     int a = prompt2(use ? "NINTENDO PLAYER" : "CLOWNSEC PLAYER",
-                    is3d ? "Always play 3D movies this way?\n\nChange it later with X\non the home screen."
-                         : "Always play 2D movies this way?\n\nChange it later with X\non the home screen.",
+                    is3d ? "Always play 3D movies this way?\n\nChange it later in Settings\n(X on the home screen)."
+                         : "Always play 2D movies this way?\n\nChange it later in Settings\n(X on the home screen).",
                     "ALWAYS", "JUST ONCE");
     if (a == 0) { *mode = use; extplay_save(); }
     return use;
@@ -5444,6 +5444,215 @@ static void themes_screen(void) {
     theme_save();
 }
 
+/* ---------- PLAYBACK DEFAULTS (X on home -> SETTINGS) ----------
+ * What a video with no settings of its own starts with: audio language, subtitles on/off and
+ * their look. A scrolling list of fixed-height rows -- however many rows there are, each keeps a
+ * readable height and nothing is squeezed off the bottom. Saved on the way out. */
+#define DEFS_ROWS 9
+#define DEFS_VIS  6
+#define DEFS_Y0   46
+#define DEFS_RH   23
+static const char *defs_subs_name(int m) {
+    static const char *const N[MOFLEX_DEF_SUBS_N] = { "As found", "Always on", "Off", "Foreign audio" };
+    return m >= 0 && m < MOFLEX_DEF_SUBS_N ? N[m] : "?";
+}
+static void defs_value(const MoflexDefaults *d, int r, char *v, size_t cap) {
+    switch (r) {
+        case 0: snprintf(v, cap, "%s", moflex_lang_name(d->alang)); break;
+        case 1: snprintf(v, cap, "%s", defs_subs_name(d->subs)); break;
+        case 2: snprintf(v, cap, "%s", moflex_lang_name(d->slang)); break;
+        case 3: snprintf(v, cap, "%d / %d", d->size, moflex_sub_size_max()); break;
+        case 4: snprintf(v, cap, "%d px up", d->pos); break;
+        case 5: snprintf(v, cap, "%s", d->font ? "Pixel" : "System"); break;
+        case 6: snprintf(v, cap, "%+d", d->depth); break;
+        default: v[0] = 0; break;
+    }
+}
+static const char *const DEFS_LABEL[DEFS_ROWS] = {
+    "Audio", "Subtitles", "Sub language", "Size", "Position", "Font", "3D depth",
+    "COPY FROM LAST VIDEO", "RESET TO ORIGINAL" };
+/* two help lines for the selected row (each fits the 320px screen at scale 1) */
+static void defs_help(const MoflexDefaults *d, int r, const char **h1, const char **h2) {
+    static const char *const SUBS1[MOFLEX_DEF_SUBS_N] = {
+        "A downloaded .srt shows; built-in", "Subtitles start on whenever the",
+        "Subtitles start off. Turn them on", "On when the audio isn't in your" };
+    static const char *const SUBS2[MOFLEX_DEF_SUBS_N] = {
+        "subtitles wait until you turn them on.", "video has any.",
+        "from the player's CC menu.", "sub language (English if First)." };
+    switch (r) {
+        case 0: *h1 = "Played when the video has it,";    *h2 = "otherwise its first audio track."; break;
+        case 1: *h1 = SUBS1[d->subs]; *h2 = SUBS2[d->subs]; break;
+        case 2: *h1 = "Built-in track picked when a video"; *h2 = "has subtitles in several languages."; break;
+        case 6: *h1 = "3D videos only. - pulls subtitles"; *h2 = "toward you, + pushes them back."; break;
+        case 7: *h1 = "Use the subtitle look you set";     *h2 = "on the last video you played."; break;
+        case 8: *h1 = "Back to the player's original";     *h2 = "settings."; break;
+        default: *h1 = "Videos you've already adjusted";  *h2 = "keep their own settings."; break;
+    }
+}
+/* step row r by dir (+1/-1); step > 1 only for position (held d-pad ramps up) */
+static void defs_step(MoflexDefaults *d, int r, int dir, int step) {
+    int nl = moflex_lang_count();
+    switch (r) {
+        case 0: d->alang = (d->alang + nl + dir) % nl; break;
+        case 1: d->subs = (d->subs + MOFLEX_DEF_SUBS_N + dir) % MOFLEX_DEF_SUBS_N; break;
+        case 2: d->slang = (d->slang + nl + dir) % nl; break;
+        case 3: d->size += dir; if (d->size < 1) d->size = 1;
+                if (d->size > moflex_sub_size_max()) d->size = moflex_sub_size_max(); break;
+        case 4: d->pos += dir * step; if (d->pos < 0) d->pos = 0;
+                if (d->pos > moflex_sub_pos_max()) d->pos = moflex_sub_pos_max(); break;
+        case 5: d->font = !d->font; break;
+        case 6: d->depth += dir; if (d->depth < -16) d->depth = -16; if (d->depth > 16) d->depth = 16; break;
+    }
+}
+/* the two action rows; returns 1 when the values changed */
+static int defs_action(MoflexDefaults *d, int r) {
+    if (r == 7) {
+        char last[PATHLEN + NAMELEN] = "";
+        if (g_now_playing_path[0]) snprintf(last, sizeof last, "%s", g_now_playing_path);
+        else { FILE *f = fopen(RECENT_FILE, "rb");
+               if (f) { if (fgets(last, sizeof last, f)) { char *nl = strchr(last, '\n'); if (nl) *nl = 0; }
+                        fclose(f); } }
+        if (!last[0]) { msg_screen("COPY FROM LAST VIDEO", "Nothing played yet."); return 0; }
+        if (!moflex_defaults_from_movie(last, d)) {
+            msg_screen("COPY FROM LAST VIDEO", "The last video has no subtitle\nsettings of its own yet.\nAdjust them in the player first.");
+            return 0;
+        }
+        msg_screen("COPY FROM LAST VIDEO", "Copied: subtitles on/off, size,\nposition, font and 3D depth.");
+        return 1;
+    }
+    if (r == 8) {
+        if (prompt2("RESET DEFAULTS", "Put every default back to the\nplayer's original settings?", "RESET", "CANCEL") != 0) return 0;
+        moflex_defaults_reset(d);
+        return 1;
+    }
+    return 0;
+}
+/* screen state, kept across preview sessions (an action row leaves the preview for its dialog) */
+typedef struct {
+    MoflexDefaults d;
+    int sel, top, redraw, hfu, hfd, hlr, tdown, tx0, ty0, ttop0, tmoved, act;
+} DefsUI;
+static void defs_draw(const DefsUI *u) {
+    ui_begin(GFX_BOTTOM);
+    ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
+    ui_text_center(UI_W / 2, 8, 2, UI_NEON, "PLAYBACK DEFAULTS");
+    ui_text_center(UI_W / 2, 28, 1, UI_NEONP, "For videos you haven't adjusted");
+    ui_fill_round(28, 40, UI_W - 56, 2, 1, UI_NEON);
+    for (int r = 0; r < DEFS_VIS && u->top + r < DEFS_ROWS; r++) {
+        int i = u->top + r, by = DEFS_Y0 + r * DEFS_RH, bh = DEFS_RH - 3, rw = UI_W - 24;
+        if (i >= 7) { ui_button(12, by, rw, bh, DEFS_LABEL[i], i == u->sel, UI_NEONP); continue; }
+        if (i == u->sel) {
+            ui_glow_round(12, by, rw, bh, 6, UI_NEON, 3, 16);
+            ui_vgrad_round(12, by, rw, bh, 6, TH_SEL, TH_SELLO);
+            ui_frame_round(12, by, rw, bh, 6, UI_NEON, 1);
+        } else ui_frame_round(12, by, rw, bh, 6, TH_LINE, 1);
+        ui_text(22, by + (bh - 8) / 2, 1, i == u->sel ? UI_WHITE : UI_INK, DEFS_LABEL[i]);
+        char v[32]; defs_value(&u->d, i, v, sizeof v);
+        char vv[40]; snprintf(vv, sizeof vv, i == u->sel ? "< %s >" : "%s", v);
+        ui_text(12 + rw - 10 - ui_text_w(1, vv), by + (bh - 8) / 2, 1, UI_NEONC, vv);
+    }
+    {   /* scrollbar: the list is longer than the screen */
+        int th = DEFS_VIS * DEFS_RH - 3, hh = th * DEFS_VIS / DEFS_ROWS;
+        int hy = DEFS_Y0 + (th - hh) * u->top / (DEFS_ROWS - DEFS_VIS);
+        ui_fill_round(UI_W - 6, DEFS_Y0, 3, th, 1, TH_TRACK);
+        ui_fill_round(UI_W - 6, hy, 3, hh, 1, UI_NEON);
+    }
+    const char *h1, *h2; defs_help(&u->d, u->sel, &h1, &h2);
+    ui_text_center(UI_W / 2, 190, 1, UI_INK, h1);
+    ui_text_center(UI_W / 2, 202, 1, UI_INK, h2);
+    ui_text_center(UI_W / 2, 224, 1, UI_DIM, "d-pad: choose & change    B: done");
+    ui_present();
+}
+/* one frame of input (+ a repaint when something changed). 1 = done, 2 = run action u->act */
+static int defs_frame(void *ctx, unsigned k, unsigned kh, unsigned ku, int tx, int ty, int *drew) {
+    DefsUI *u = (DefsUI *)ctx;
+    if (k & (KEY_B | KEY_START)) return 1;
+    if (nav_repeat(k, kh, NAV_DOWN, &u->hfd)) { u->sel = (u->sel + 1) % DEFS_ROWS; u->redraw = 1; }
+    if (nav_repeat(k, kh, NAV_UP, &u->hfu))   { u->sel = (u->sel + DEFS_ROWS - 1) % DEFS_ROWS; u->redraw = 1; }
+    /* left/right change the value; held, position walks faster the longer it is held */
+    int lr = (kh & (KEY_RIGHT | KEY_CPAD_RIGHT)) ? 1 : (kh & (KEY_LEFT | KEY_CPAD_LEFT)) ? -1 : 0;
+    if (!lr) u->hlr = 0;
+    else if (u->sel < 7) {
+        int fire = 0, step = 1;
+        if (k & (KEY_LEFT | KEY_RIGHT | KEY_CPAD_LEFT | KEY_CPAD_RIGHT)) { fire = 1; u->hlr = 0; }
+        else if (++u->hlr > 16 && (u->sel == 3 || u->sel == 4 || u->sel == 6) && u->hlr % 3 == 0) {
+            fire = 1; if (u->sel == 4) step = u->hlr > 60 ? 10 : u->hlr > 30 ? 5 : 1; }
+        if (fire) { defs_step(&u->d, u->sel, lr, step); u->redraw = 1; }
+    }
+    if (k & KEY_A) {
+        if (u->sel >= 7) { u->act = u->sel; return 2; }
+        defs_step(&u->d, u->sel, 1, 1); u->redraw = 1;
+    }
+    if (k & KEY_TOUCH) { u->tdown = 1; u->tx0 = tx; u->ty0 = ty; u->ttop0 = u->top; u->tmoved = 0; }
+    else if ((kh & KEY_TOUCH) && u->tdown) {   /* drag the list */
+        int dy = ty - u->ty0;
+        if (dy > 6 || dy < -6) u->tmoved = 1;
+        if (u->tmoved) { int ns = u->ttop0 - dy / DEFS_RH;
+            if (ns < 0) ns = 0; if (ns > DEFS_ROWS - DEFS_VIS) ns = DEFS_ROWS - DEFS_VIS;
+            if (ns != u->top) { u->top = ns; u->redraw = 1; } }
+    }
+    else if ((ku & KEY_TOUCH) && u->tdown) {
+        u->tdown = 0;
+        int r = (u->ty0 - DEFS_Y0) / DEFS_RH;
+        if (!u->tmoved && u->ty0 >= DEFS_Y0 && r < DEFS_VIS && u->top + r < DEFS_ROWS) {
+            int i = u->top + r;
+            if (i >= 7) { u->sel = i; u->act = i; return 2; }
+            if (i != u->sel) u->sel = i;   /* first tap on a setting selects it */
+            else defs_step(&u->d, i, u->tx0 < UI_W / 2 ? -1 : 1, 1);   /* left half -, right half + */
+            u->redraw = 1;
+        }
+    }
+    if (u->sel < u->top) { u->top = u->sel; u->redraw = 1; }
+    if (u->sel >= u->top + DEFS_VIS) { u->top = u->sel - DEFS_VIS + 1; u->redraw = 1; }
+    if (u->redraw) { defs_draw(u); u->redraw = 0; *drew = 1; }
+    return 0;
+}
+/* the software screens after the preview had the GPU: same restore as after playing a movie */
+static void defs_screens_restore(void) {
+    consoleInit(GFX_BOTTOM, NULL);
+    gfxSetDoubleBuffering(GFX_BOTTOM, false);
+    branding_show();
+}
+static void playback_defaults_screen(void) {
+    DefsUI u; memset(&u, 0, sizeof u);
+    moflex_defaults_get(&u.d);
+    MoflexDefaults orig = u.d;
+    for (;;) {
+        u.redraw = 1; u.tdown = 0;
+        int c = moflex_defaults_preview(&u.d, defs_frame, &u);
+        if (c == -1) return;              /* the app is closing */
+        if (c == -2) {                    /* no GPU for the preview: the same screen without it */
+            defs_screens_restore();
+            while (aptMainLoop()) {
+                hidScanInput();
+                touchPosition tp; hidTouchRead(&tp);
+                int drew = 0;
+                c = defs_frame(&u, hidKeysDown(), hidKeysHeld(), hidKeysUp(), tp.px, tp.py, &drew);
+                if (c) break;
+                gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
+            }
+            if (!c) return;
+        }
+        defs_screens_restore();
+        if (c == 2) { defs_action(&u.d, u.act); continue; }
+        break;
+    }
+    if (memcmp(&u.d, &orig, sizeof u.d)) moflex_defaults_set(&u.d);
+}
+/* X on home: everything that is a setting rather than a video */
+static void settings_menu(void) {
+    for (;;) {
+        char r1[40]; const char *rows[3]; int act[3], n = 0;
+        rows[n] = "PLAYBACK DEFAULTS"; act[n++] = 0;
+        if (g_extplay_ok) { snprintf(r1, sizeof r1, "OLD 3DS: PLAY MOVIES WITH..."); rows[n] = r1; act[n++] = 1; }
+        rows[n] = "DONE"; act[n++] = -1;
+        int c = ui_menu("SETTINGS", g_extplay_ok ? "Audio, subtitles and players" : "Audio and subtitles", rows, n);
+        if (c < 0 || act[c] < 0) return;
+        if (act[c] == 0) playback_defaults_screen();
+        else extplay_choose();
+    }
+}
+
 static void home_draw(int bsel, long long rpos) {
     ui_begin(GFX_BOTTOM);
     ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);   /* dark gradient backdrop */
@@ -5468,7 +5677,7 @@ static void home_draw(int bsel, long long rpos) {
         ui_fill_round(THSW_X + 24, THSW_Y + 5, 6, 6, 2, a3);
         ui_text(THSW_X + 36, THSW_Y + 4, 1, UI_DIM, "Y");
     }
-    ui_text_center(UI_W / 2, 32, 1, UI_NEONP, g_extplay_ok ? "3DS VIDEO PLAYER  (X: PLAYER)" : "3DS VIDEO PLAYER");
+    ui_text_center(UI_W / 2, 32, 1, UI_NEONP, "3DS VIDEO PLAYER  (X: SETTINGS)");
     ui_glow_round(28, 46, UI_W - 56, 2, 1, UI_NEON, 3, 34);
     ui_fill_round(28, 46, UI_W - 56, 2, 1, UI_NEON);
 
@@ -5531,7 +5740,7 @@ static int home_gui(void) {
         u32 k = hidKeysDown();
         if (k & KEY_START) return -1;
         if (k & KEY_Y) { themes_screen(); redraw = 1; }
-        if ((k & KEY_X) && g_extplay_ok) { extplay_choose(); redraw = 1; }
+        if (k & KEY_X) { settings_menu(); redraw = 1; }
         if (k & KEY_RIGHT) { bsel = (bsel + 1) % 3; redraw = 1; }
         if (k & KEY_LEFT)  { bsel = (bsel + 2) % 3; redraw = 1; }
         if (k & KEY_A) return g_btns[bsel].choice;
