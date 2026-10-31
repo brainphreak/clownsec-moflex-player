@@ -46,10 +46,15 @@ static int            g_skip_feed = 0;   /* a picture surfaced during ProcessVid
 static MVDSTD_Config  g_config;
 static uint8_t       *g_pkt = NULL;       /* Annex-B packet for a frame */
 static size_t         g_pkt_cap = 0;
-#define MVD_SLOTS 5   /* rotating decoded-frame buffers: B-frame reordering presents frames
+#define MVD_SLOTS_MAX 5   /* rotating decoded-frame buffers: B-frame reordering presents frames
                        * OUT of decode order, so a decoded frame must survive until its display
                        * time while later frames keep decoding (queue depth 4 + 1 in flight) */
-static u16           *g_outs[MVD_SLOTS];
+static u16           *g_outs[MVD_SLOTS_MAX];
+/* Slots allocated (always MVD_SLOTS_MAX now; kept as a variable for mp4_mvd_slots). */
+static int            MVD_SLOTS = MVD_SLOTS_MAX;
+static u32            g_max_sample = 0;   /* largest video sample, sizes the Annex-B packet */
+void mp4_mvd_hint_max_sample(u32 bytes) { g_max_sample = bytes; }
+int  mp4_mvd_slots(void) { return MVD_SLOTS; }
 static int            g_slot = 0;
 #define g_out (g_outs[g_slot])
 static int            g_w = 0, g_h = 0, g_nal_len = 4;   /* DISPLAY dims (from the stsd box) */
@@ -106,18 +111,27 @@ int mp4_mvd_init(int w, int h, const uint8_t *avcc, int avcc_len, int nal_len_si
     remove("sdmc:/mvd_log.txt");   /* fresh log per attempt */
     mvd_log("STEP 1: init w=%d h=%d coded=%dx%d nal_len=%d avcc=%d", w, h, g_cw, g_ch, g_nal_len, avcc_len);
     mvd_log("STEP 2: linearSpaceFree=%lu", (unsigned long)linearSpaceFree());
-    g_pkt_cap = 2 * 1024 * 1024;
+    /* The Annex-B packet only ever holds one sample (+3 bytes per NAL, minus its 4-byte length):
+     * size it from the file's largest sample instead of a flat 2 MB, which 1080p cannot spare. */
+    g_pkt_cap = g_max_sample ? (size_t)g_max_sample + g_max_sample / 8 + 4096 : 2 * 1024 * 1024;
+    /* ONE attempt. A retry after a failed mvdstdInit (the old 4-slot fallback, for 1080p) is not
+     * something the mvd sysmodule tolerates, and 1080p itself crashed it -- the caller refuses
+     * frames above 720p before getting here. */
+    MVD_SLOTS = MVD_SLOTS_MAX;
     g_pkt = (uint8_t *)linearAlloc(g_pkt_cap);
-    int allock = 1;
+    int allock = (g_pkt != NULL);
     for (int i = 0; i < MVD_SLOTS; i++) { g_outs[i] = (u16 *)linearAlloc((size_t)g_cw * g_ch * sizeof(u16)); if (!g_outs[i]) allock = 0; }
     g_slot = 0;
-    mvd_log("STEP 3: pkt=%p out0=%p", g_pkt, g_outs[0]);
-    if (!g_pkt || !allock) { mp4_mvd_exit(); return 0; }
-
+    mvd_log("STEP 3: pkt=%p out0=%p free=%lu", g_pkt, g_outs[0], (unsigned long)linearSpaceFree());
+    if (!allock) { mp4_mvd_exit(); return -1; }   /* out of linear memory */
+    /* mvdstdInit takes its work buffer from the same linear heap: too little left is a memory
+     * problem too, not an unsupported stream -- and it is not even attempted */
+    if (linearSpaceFree() < (u32)MVD_DEFAULT_WORKBUF_SIZE + (256u << 10)) { mp4_mvd_exit(); return -1; }
     Result ir = mvdstdInit(MVDMODE_VIDEOPROCESSING, MVD_INPUT_H264, MVD_OUTPUT_BGR565,
                            MVD_DEFAULT_WORKBUF_SIZE, NULL);
     mvd_log("STEP 4: mvdstdInit result=%08lX linearFreeAfter=%lu", (unsigned long)ir, (unsigned long)linearSpaceFree());
-    if (R_FAILED(ir)) { mp4_mvd_exit(); return 0; }
+    int short_mem = 0;
+    if (R_FAILED(ir)) { mp4_mvd_exit(); return short_mem ? -1 : 0; }
     mvdstdGenerateDefaultConfig(&g_config, (u32)g_cw, (u32)g_ch, (u32)g_cw, (u32)g_ch, NULL, NULL, NULL);
     g_config.output_type = MVD_OUTPUT_BGR565;
     mvd_log("STEP 5: config generated");
@@ -143,7 +157,7 @@ void mp4_mvd_reset(void) {
 void mp4_mvd_exit(void) {
     if (g_ready) mvdstdExit();
     if (g_pkt) { linearFree(g_pkt); g_pkt = NULL; }
-    for (int i = 0; i < MVD_SLOTS; i++) if (g_outs[i]) { linearFree(g_outs[i]); g_outs[i] = NULL; }
+    for (int i = 0; i < MVD_SLOTS_MAX; i++) if (g_outs[i]) { linearFree(g_outs[i]); g_outs[i] = NULL; }
     g_ready = 0;
 }
 
@@ -192,6 +206,12 @@ void mp4_mvd_present(int slot, int sbs) {
     if (sbs) { int hw = g_w / 2; blit_eye(GFX_LEFT, 0, hw); blit_eye(GFX_RIGHT, hw, hw); }
     else     { blit_eye(GFX_LEFT, 0, g_w); }
     g_slot = save;
+}
+
+const u16 *mp4_mvd_frame(int slot, int *w, int *h, int *stride) {
+    if (slot < 0 || slot >= MVD_SLOTS || !g_outs[slot]) return NULL;
+    *w = g_w; *h = g_h; *stride = g_cw;
+    return g_outs[slot];
 }
 
 /* ---- reference-player decode state machine (modeled on Video_player_for_3DS) ----
