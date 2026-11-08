@@ -693,8 +693,12 @@ colors, so even light backgrounds stay coherent. Custom colors are saved to
 
 ## Credits & license
 
+CLOWNSEC VIDEO is licensed under the **GNU Lesser General Public License v2.1 or later**
+(LGPL-2.1-or-later) — see [LICENSE](LICENSE). Bundled third-party code keeps its own license:
+
 - The MobiClip/moflex decode path is derived from **FFmpeg** (LGPL) — see `ffmpeg_support/`
   and `decoder/`.
+- **Helix AAC decoder** (RealNetworks RPSL/RCSL) — see `thirdparty/helixaac/`.
 - Bundled: [cJSON](https://github.com/DaveGamble/cJSON) (MIT),
   [kuba--/zip](https://github.com/kuba--/zip) (Unlicense),
   [stb_image](https://github.com/nothings/stb) (public domain),
