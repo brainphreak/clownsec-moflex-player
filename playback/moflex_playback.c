@@ -137,6 +137,10 @@ static void pq_load(void) {
  * the film is streaming from, and a 720p MP4 has too little decode headroom to absorb it. The
  * moflex engines never set g_kit_defer, so they save exactly as before. */
 static int g_kit_defer = 0, g_kit_pq_pending = 0, g_kit_sub_pending = 0;
+/* player_kit (streams): subtitles the server burns into the picture can be switched although no
+ * subtitle text is loaded, so the CC menu's on/off row must work without g_nsubs. Never set by
+ * the moflex engines. */
+static int g_kit_subs_any = 0;
 static void pq_save(void) {
     if (g_kit_defer) { g_kit_pq_pending = 1; return; }
     mkdir("sdmc:/moflex_player", 0777);
@@ -2812,7 +2816,7 @@ static int submenu_input(u32 kd, u32 kh, touchPosition tp, int is3d, const char 
            else { g_sub_rep++; if (g_sub_rep > 10 && g_sub_rep % 3 == 0) rep = held; } }
     if (t_row >= 0 && !val_row) press = 1;             /* toggle/cycle/encoding/load: activate */
     switch (a) {
-        case 0: if (press) { if (g_nsubs > 0) g_sub_on = !g_sub_on; } break;
+        case 0: if (press) { if (g_nsubs > 0 || g_kit_subs_any) g_sub_on = !g_sub_on; } break;
         case 2: {   /* a step, not a cycle: left/right (or the row's halves) nudge one level */
             int d = rep ? rep : press;
             if (d > 0) { if (g_sub_size < SUB_SIZE_MAX) g_sub_size++; }
@@ -5952,7 +5956,9 @@ void kit_fmt_save(const char *movie, int fmt) {
     FILE *f = fopen(p, "wb"); if (!f) return;
     fprintf(f, "%d\n", fmt); fclose(f);
 }
+void kit_set_subs_any(int on) { g_kit_subs_any = on; }
 void kit_film_end(void) {
+    g_kit_subs_any = 0;
     g_kit_defer = 0;                      /* (the caller flushed before this) */
     g_kit_fmt_row = 0;                    /* the moflex VIDEO menu never shows the Format row */
     if (g_screen_off) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; }
@@ -6122,3 +6128,23 @@ void kit_draw(KitGpu *g, C2D_Image L, C2D_Image R, int is3d, const char *title,
     else { g_panel_sw(g->bot, title, disp_us, dur_us, playing); g_kit_tex_menu = 0; }
     C3D_FrameEnd(0);
 }
+
+/* A stream's subtitles arrive as a file the source fetched (Plex: an external .srt/.ass). */
+int moflex_subs_load_file(const char *path) {
+    int n = subs_load(path);
+    if (n > 0) g_sub_on = 1;
+    return n;
+}
+int moflex_fmt_load_key(const char *key) { return kit_fmt_load(key); }
+int moflex_subs_wanted(const char *key, const char *audio_lang) {
+    subcfg_load(key);                     /* before playback: the globals are reloaded at open anyway */
+    if (!g_cfg_fresh) return g_sub_on;
+    def_load();
+    switch (g_def.subs) {
+        case MOFLEX_DEF_SUBS_ON: return 1;
+        case MOFLEX_DEF_SUBS_FOREIGN:
+            return (audio_lang && audio_lang[0]) ? !lang_match(audio_lang, g_def.slang > 0 ? g_def.slang : 1) : 0;
+        default: return 0;
+    }
+}
+void moflex_subs_set(int on) { g_sub_on = !!on; }

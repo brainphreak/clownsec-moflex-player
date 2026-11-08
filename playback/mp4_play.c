@@ -877,3 +877,429 @@ MoflexResult mp4_play(const char *path) {
     mp4_close(&m);
     return result;
 }
+
+/* =========================== NETWORK STREAM (Plex) ===========================
+ * The same engine as an MP4 file -- MVD decode, reorder queue, audio-master clock, textures,
+ * the moflex screens through player_kit -- fed from a live MPEG-TS stream instead of a file:
+ * HttpStream (curl worker -> ring) -> TsDemux -> two FIFOs of access units. A seek is a new
+ * stream from the server at the target; its timestamps restart near zero, so every time below
+ * is base_us (where this stream starts in the film) + the unit's own timestamp. */
+#include "ts_demux.h"
+
+typedef struct { int64_t pts, dts; int key; uint8_t *data; size_t len; } SAu;
+typedef struct { SAu *v; int cap, h, n; size_t bytes; } SFifo;
+static int sf_push(SFifo *f, const TsAU *a) {
+    if (f->n == f->cap) {
+        int nc = f->cap ? f->cap * 2 : 256; SAu *g = (SAu *)malloc((size_t)nc * sizeof(SAu));
+        if (!g) return 0;
+        for (int i = 0; i < f->n; i++) g[i] = f->v[(f->h + i) % f->cap];
+        free(f->v); f->v = g; f->cap = nc; f->h = 0;
+    }
+    uint8_t *d = (uint8_t *)malloc(a->len ? a->len : 1);
+    if (!d) return 0;
+    memcpy(d, a->data, a->len);
+    SAu *e = &f->v[(f->h + f->n) % f->cap];
+    e->pts = a->pts_us; e->dts = a->dts_us; e->key = a->key; e->data = d; e->len = a->len;
+    f->n++; f->bytes += a->len;
+    return 1;
+}
+static SAu *sf_front(SFifo *f) { return f->n ? &f->v[f->h] : NULL; }
+/* how much film the queued units cover (their timestamp span) */
+static int64_t sf_span(const SFifo *f) {
+    if (f->n < 2) return 0;
+    int64_t a = f->v[f->h].pts, b = f->v[(f->h + f->n - 1) % f->cap].pts;
+    return b > a ? b - a : 0;
+}
+static void sf_drop(SFifo *f) {
+    if (!f->n) return;
+    SAu *e = &f->v[f->h]; f->bytes -= e->len; free(e->data);
+    f->h = (f->h + 1) % f->cap; f->n--;
+}
+static void sf_clear(SFifo *f) { while (f->n) sf_drop(f); }
+static void sf_free(SFifo *f) { sf_clear(f); free(f->v); memset(f, 0, sizeof *f); }
+
+static SFifo  g_sv, g_sa;            /* video / audio units waiting */
+static int    g_sa_base_set = 0;     /* the audio clock's base taken from the first fed frame */
+static int64_t g_s_base = 0;         /* where the current stream starts in the film */
+
+/* pull what the network has delivered into the FIFOs (bounded: the ring holds the rest, and a
+ * full ring holds the server back) */
+static void stream_fill(HttpStream *hs, TsDemux *td) {
+    static uint8_t tmp[32 * 1024];
+    for (int guard = 0; guard < 16 && g_sv.bytes + g_sa.bytes < (3u << 20) / 2; guard++) {
+        size_t n = hs ? hs_read(hs, tmp, sizeof tmp) : 0;
+        if (!n) { if (hs && hs_done(hs)) ts_flush(td); }
+        else ts_push(td, tmp, n);
+        TsAU a;
+        while (ts_pop(td, &a)) sf_push(a.kind == TS_AU_VIDEO ? &g_sv : &g_sa, &a);
+        if (!n) break;
+    }
+}
+/* the file path's pump_audio, fed from the audio FIFO */
+static void pump_stream_audio(void) {
+    if (!g_have_audio) return;
+    for (int i = 0; i < NWB; i++) {
+        ndspWaveBuf *wb = &g_wb[i];
+        if (wb->status != NDSP_WBUF_FREE && wb->status != NDSP_WBUF_DONE) continue;
+        if (wb->status == NDSP_WBUF_DONE) { g_a_played += g_slot_ns[i]; g_slot_ns[i] = 0; }
+        SAu *a = sf_front(&g_sa);
+        if (!a) continue;
+        if (!g_sa_base_set) { g_a_base_us = g_s_base + a->pts; g_sa_base_set = 1; }
+        int sp = mp4_aac_decode(&g_aac, a->data, (int)a->len, g_abuf[i]);
+        sf_drop(&g_sa);
+        if (sp <= 0) continue;
+        kit_audio_gain(g_abuf[i], sp * g_aac.channels);
+        DSP_FlushDataCache(g_abuf[i], sp * g_aac.channels * 2);
+        memset(wb, 0, sizeof *wb);
+        wb->data_vaddr = g_abuf[i]; wb->nsamples = sp; g_slot_ns[i] = sp;
+        ndspChnWaveBufAdd(0, wb);
+        g_a_started = 1;
+    }
+}
+static void stream_audio_reset(void) {
+    if (!g_have_audio) return;
+    ndspChnWaveBufClear(0);
+    for (int i = 0; i < NWB; i++) { g_wb[i].status = NDSP_WBUF_DONE; g_slot_ns[i] = 0; }
+    g_a_played = 0; g_a_started = 0; g_sa_base_set = 0;
+}
+
+MoflexResult stream_play(const StreamSrc *src) {
+    bool isnew = false; APT_CheckNew3DS(&isnew);
+    if (!isnew) { mp4_msg("Streaming needs a New 3DS (hardware H.264)."); return MOFLEX_QUIT_BACK; }
+    int fmt = src->fmt;
+    { int saved = kit_fmt_load(src->key); if (saved >= 0) fmt = saved; }
+    int is3d = (fmt != 0);
+    const char *title = src->title ? src->title : "Stream";
+    int64_t dur_us = src->dur_us;
+
+    KitGpu gpu;
+    if (!kit_gpu_begin(&gpu, is3d)) { mp4_msg("Could not start the graphics for playback."); return MOFLEX_QUIT_BACK; }
+    if (!tex_alloc(2)) { kit_gpu_end(&gpu, 0); mp4_msg("Not enough memory for the video textures."); return MOFLEX_QUIT_BACK; }
+    C2D_Image img[2][2];
+    for (int st = 0; st < 2; st++) for (int e = 0; e < 2; e++)
+        img[st][e] = (C2D_Image){ &g_tex[st][e < g_tex_n ? e : 0], &g_texsub };
+    moflex_subs_autoload(src->key);       /* per-item settings (zoom etc.) */
+    if (src->subfile && src->subfile[0]) moflex_subs_load_file(src->subfile);   /* the server's text track */
+    if (src->burnable || (src->subfile && src->subfile[0])) moflex_subs_set(src->subs_on);
+    kit_set_subs_any(src->burnable);      /* the CC menu's on/off works for burned-in subtitles too */
+    int last_subs = moflex_subs_on();     /* burnable: Y / CC on-off re-requests the stream */
+    kit_film_begin(is3d);
+    kit_fmt_set(fmt);
+    kit_saves_baseline();
+    aptHook(&g_mp4_apt_cookie, mp4_apt_hook, NULL);
+    for (int f = 0; f < 2; f++) kit_draw(&gpu, img[0][0], img[0][1], is3d, title, src->start_us, dur_us, 1);
+
+    MoflexResult result = MOFLEX_QUIT_BACK;
+    memset(&g_sv, 0, sizeof g_sv); memset(&g_sa, 0, sizeof g_sa);
+    TsDemux *td = ts_new();
+    g_s_base = src->start_us > 0 ? src->start_us : 0;
+    HttpStream *hs = td ? src->open(src->ctx, g_s_base, fmt) : NULL;
+    int mvd_up = 0;
+    g_have_audio = 0;
+    memset(g_wb, 0, sizeof g_wb); memset(g_abuf, 0, sizeof g_abuf); memset(g_slot_ns, 0, sizeof g_slot_ns);
+    char why[200] = "";
+
+    /* ---- connect + learn the stream: SPS/PPS (size, decoder config) and the audio format ---- */
+    if (!hs) snprintf(why, sizeof why, "%s", src->error ? src->error(src->ctx) : "Could not open the stream.");
+    u64 t_open = osGetTime();
+    while (hs && aptMainLoop()) {
+        stream_fill(hs, td);
+        const uint8_t *avcc; int al; int w = 0, h = 0; uint8_t asc[2]; int ar, ac;
+        int vid = ts_video_avcc(td, &avcc, &al) && ts_video_dims(td, &w, &h);
+        int aud = ts_audio_config(td, asc, &ar, &ac);
+        if (vid && (aud || g_sv.n > 48)) {
+            if ((long)((w + 15) & ~15) * ((h + 15) & ~15) > 1280L * 720L) {
+                snprintf(why, sizeof why, "The stream is %dx%d -- too large for the 3DS.", w, h); break; }
+            mp4_mvd_hint_max_sample(256 * 1024);
+            int mi = mp4_mvd_init(w, h, avcc, al, 4);
+            if (mi <= 0) { snprintf(why, sizeof why, mi < 0 ? "Not enough video memory for the stream."
+                                                            : "The video decoder refused the stream."); break; }
+            mvd_up = 1;
+            if (aud && mp4_aac_open(&g_aac, asc, 2, ar, ac)) {
+                int ok = 1;
+                for (int i = 0; i < NWB && ok; i++) {
+                    g_abuf[i] = (int16_t *)linearAlloc(AAC_MAXSAMP * g_aac.channels * 2);
+                    if (!g_abuf[i]) ok = 0; else g_wb[i].status = NDSP_WBUF_DONE;
+                }
+                if (ok) {
+                    ndspChnReset(0);
+                    ndspChnSetInterp(0, NDSP_INTERP_POLYPHASE);
+                    ndspChnSetRate(0, (float)g_aac.rate);
+                    ndspChnSetFormat(0, g_aac.channels == 2 ? NDSP_FORMAT_STEREO_PCM16 : NDSP_FORMAT_MONO_PCM16);
+                    float mix[12]; memset(mix, 0, sizeof mix); mix[0] = mix[1] = 1.0f; ndspChnSetMix(0, mix);
+                    g_have_audio = 1;
+                } else {
+                    for (int i = 0; i < NWB; i++) if (g_abuf[i]) { linearFree(g_abuf[i]); g_abuf[i] = NULL; }
+                    mp4_aac_close(&g_aac);
+                }
+            }
+            break;
+        }
+        if (hs_done(hs) && !hs_buffered(hs)) {
+            long hc = hs_http(hs);
+            snprintf(why, sizeof why, hc >= 400 ? "The server refused the stream (HTTP %ld)." : "The stream ended before any video arrived.", hc);
+            break;
+        }
+        if (osGetTime() - t_open > 30000) { snprintf(why, sizeof why, "The server sent no video for 30 seconds."); break; }
+        hidScanInput();
+        if (hidKeysDown() & KEY_B) { why[0] = 0; result = MOFLEX_QUIT_BACK; goto teardown_early; }
+        gspWaitForVBlank();
+    }
+    if (!mvd_up) {
+        if (!aptMainLoop()) result = MOFLEX_QUIT_EXIT;
+        goto teardown_early;
+    }
+
+    g_playing = 1;
+    g_pq_n = 0; g_ftn = 0; g_ft_full = 0; g_ft_dry = 0; g_ft_push = 0; g_ft_pop = 0;
+    g_present_log = 12; g_lb_count = 0; g_pq_key = -1;
+    {
+    int64_t cur_us = g_s_base;
+    int shown = -1, shown_slot = -1;
+    #define SHOW_SLOT(sl) do { int ns_ = shown < 0 ? 0 : 1 - shown; frame_to_tex((sl), fmt, ns_); \
+                               shown = ns_; shown_slot = (sl); } while (0)
+    int gate = 1, gate_fed = 0, need_key = 1;
+    /* STREAM BUFFERING. A cold start (the server seeking into a big 1080p HEVC film to transcode
+     * it) can deliver video slower than real time for a few seconds while the small audio keeps
+     * coming -- the sound ran on over a frozen picture. So: start only with ~2 s of video in hand,
+     * and if the video runs dry mid-film, PAUSE the sound until ~1.5 s has built up again. */
+    int rebuf = 0;
+    #define PREBUF_US  2000000
+    #define REBUF_US   1500000
+    #define GATE_ARM() do { gate = 1; gate_fed = 0; if (g_have_audio) ndspChnSetPaused(0, true); clk_pause(); } while (0)
+    GATE_ARM();
+    int quit = 0, was_paused = 0, vol_dirty = 0, shold = 0;
+    int scrubbing = 0, vol_drag = 0; int64_t scrub_us = 0;
+    int want_seek = 0; int64_t seek_to = 0;
+    int dirty = 1, dirty2 = 0, last_sec = -1, drops = 0;
+    u64 behind_since = 0, last_report = osGetTime();
+
+    while (!quit && aptMainLoop()) {
+        hidScanInput();
+        u32 kh = hidKeysHeld(), kd = tap_filter(hidKeysDown(), kh);
+        touchPosition tp; hidTouchRead(&tp);
+        if (kit_take_redraw()) { gfxSet3D(is3d); dirty = 1; }
+        {   int nf;                       /* Format row: 2D <-> 3D needs a differently sized stream */
+            if (kit_fmt_take_change(&nf)) {
+                int was3d = is3d;
+                fmt = nf; is3d = (fmt != 0);
+                gfxSet3D(is3d); kit_set_view3d(is3d);
+                kit_fmt_save(src->key, fmt);
+                if (was3d != is3d) { seek_to = cur_us; want_seek = 1; }   /* re-request at the new size */
+                else if (shown_slot >= 0 && !g_playing) SHOW_SLOT(shown_slot);
+                dirty = 1;
+            } }
+        kit_input(&kd, &kh, &dirty);
+        if (kit_menu_open()) {
+            kit_menu_input(kd, kh, tp, is3d, src->key);
+            if (kd || (kh & (KEY_TOUCH | KEY_LEFT | KEY_RIGHT | KEY_UP | KEY_DOWN))) dirty = 1;
+        } else {
+            if (kd & KEY_B) { result = MOFLEX_QUIT_BACK; break; }
+            int toggle = (kd & KEY_A) ? 1 : 0;
+            if (kd & KEY_UP)     { kit_vol_step(1);  vol_dirty = 1; dirty = 1; }
+            if (kd & KEY_DOWN)   { kit_vol_step(-1); vol_dirty = 1; dirty = 1; }
+            if (kd & KEY_Y)      { kit_toggle_subs(); dirty = 1; }
+            if (kd & KEY_SELECT) { kit_open_subs_menu(); dirty = 1; }
+            if (kd & KEY_X)      { kit_toggle_dark(); dirty = 1; }
+            {   int sdir = (kh & KEY_RIGHT) ? 1 : ((kh & KEY_LEFT) ? -1 : 0);
+                if (sdir == 0) shold = 0;
+                else { int fire = (kd & (KEY_RIGHT | KEY_LEFT)) ? 1 : 0;
+                       if (!fire) { shold++; if (shold > 8 && (shold % 3 == 0)) fire = 1; }
+                       if (fire) { seek_to = (want_seek ? seek_to : cur_us) + (int64_t)sdir * SEEK_STEP_US;
+                                   want_seek = 1; dirty = 1; } } }
+            if (kd & KEY_TOUCH) {
+                switch (kit_touch(tp.px, tp.py, is3d)) {
+                    case KIT_T_SCRUB:   scrubbing = 1; break;
+                    case KIT_T_VOL:     vol_drag = 1; break;
+                    case KIT_T_PLAY:    toggle = 1; break;
+                    case KIT_T_RW:      seek_to = cur_us - SEEK_STEP_US; want_seek = 1; break;
+                    case KIT_T_FF:      seek_to = cur_us + SEEK_STEP_US; want_seek = 1; break;
+                    case KIT_T_OPEN:    result = MOFLEX_QUIT_OPEN;   quit = 1; break;
+                    case KIT_T_MANAGE:  result = MOFLEX_QUIT_MANAGE; quit = 1; break;
+                    case KIT_T_ADD:     result = MOFLEX_QUIT_ADD;    quit = 1; break;
+                    default: break;
+                }
+                dirty = 1;
+            }
+            if (toggle) { g_playing = !g_playing; dirty = 1; }
+            if (scrubbing) {
+                if (kh & KEY_TOUCH) { scrub_us = kit_scrub_us(tp.px, dur_us); dirty = 1; }
+                else { seek_to = scrub_us; want_seek = 1; scrubbing = 0; }
+            }
+            if (vol_drag) {
+                if (kh & KEY_TOUCH) { if (kit_vol_drag(tp.py)) vol_dirty = 1; dirty = 1; }
+                else vol_drag = 0;
+            }
+        }
+        if (quit) break;
+
+        /* Burned-in subtitles are part of the picture, so the player's switch (Y, or the CC menu's
+         * on/off) can only take effect by asking the server for the stream again, with or
+         * without them, from here -- the same short restart as switching 2D/3D. */
+        if (src->burnable && moflex_subs_on() != last_subs) {
+            last_subs = moflex_subs_on();
+            src->set_burn(src->ctx, last_subs);
+            if (!want_seek) { seek_to = cur_us; want_seek = 1; }
+            dirty = 1;
+        }
+
+        /* ---- seek = a new stream from the server at the target ---- */
+        if (want_seek && !scrubbing && !(kh & (KEY_LEFT | KEY_RIGHT))) {
+            if (seek_to < 0) seek_to = 0;
+            if (dur_us > 0 && seek_to > dur_us - 1000000) seek_to = dur_us - 1000000;
+            src->close(src->ctx, hs); hs = NULL;
+            ts_reset(td); sf_clear(&g_sv); sf_clear(&g_sa);
+            mp4_mvd_reset(); g_pq_n = 0; g_ftn = 0;
+            stream_audio_reset();
+            g_s_base = seek_to; cur_us = seek_to; need_key = 1;
+            hs = src->open(src->ctx, seek_to, fmt);
+            if (!hs) { snprintf(why, sizeof why, "%s", src->error ? src->error(src->ctx) : "The stream could not restart."); break; }
+            g_playing = 1; want_seek = 0; behind_since = 0; rebuf = 0;
+            GATE_ARM();
+            dirty = 1;
+        }
+
+        stream_fill(hs, td);
+        int newframe = 0;
+        if (!g_playing) {
+            if (!was_paused) {
+                if (g_have_audio) ndspChnSetPaused(0, true);
+                clk_pause();
+                if (vol_dirty) { kit_vol_save(); vol_dirty = 0; }
+                kit_flush_saves(src->key);
+                if (src->report) src->report(src->ctx, "paused", cur_us);
+                was_paused = 1; dirty = 1;
+            }
+            if (shown_slot >= 0) {
+                int b, c, sa; kit_pq(&b, &c, &sa);
+                if ((((b + 64) << 16) | ((c + 64) << 8) | (sa + 128)) != g_pq_key) { SHOW_SLOT(shown_slot); dirty = 1; }
+            }
+        } else {
+            if (was_paused) { if (!gate && !rebuf) { if (g_have_audio) ndspChnSetPaused(0, false); clk_resume(); }
+                              was_paused = 0; dirty = 1; }
+            pump_stream_audio();
+
+            /* ---- end: the server finished and everything it sent has been shown ---- */
+            if (hs && hs_done(hs) && !hs_buffered(hs) && !g_sv.n && g_pq_n == 0 && !mp4_mvd_pending()) {
+                if (hs_done(hs) < 0 && (dur_us <= 0 || cur_us < dur_us - 10000000))
+                    snprintf(why, sizeof why, "The stream from the server stopped.");
+                else result = MOFLEX_EOF;
+                break;
+            }
+
+            int fed_pass = 0;
+            while (g_pq_n < g_pq_depth && (g_sv.n || mp4_mvd_pending())) {
+                if (fed_pass >= 8) break;
+                int consumed = 0, r = 0;
+                if (!mp4_mvd_pending() && g_sv.n) {
+                    SAu *v = sf_front(&g_sv);
+                    if (need_key && !v->key) { sf_drop(&g_sv); continue; }   /* decoder starts on an IDR */
+                    need_key = 0;
+                    if (g_ftn < FT_MAX) { g_ft[g_ftn++] = g_s_base + v->pts; g_ft_push++; }
+                    else g_ft_full++;
+                    r = mp4_mvd_pump(v->data, (int)v->len, &consumed);
+                    sf_drop(&g_sv);
+                } else {
+                    r = mp4_mvd_pump(NULL, 0, &consumed);
+                    if (!r && !g_sv.n) break;
+                }
+                pump_stream_audio();
+                if (consumed) { fed_pass++; if (gate) gate_fed++; }
+                if (r) gate_fed = 0;
+                if (r && g_ftn > 0) { g_pq[g_pq_n].cts = ft_pop_min(); g_ft_pop++; g_pq[g_pq_n].slot = r - 1; g_pq_n++; }
+                else if (r) g_ft_dry++;
+                else if (!consumed) break;
+            }
+            if (gate && gate_fed > 240) { snprintf(why, sizeof why, "The video decoder produced no picture."); break; }
+
+            int ended = hs && hs_done(hs);
+            if (!gate && !rebuf && !g_sv.n && g_pq_n == 0 && !mp4_mvd_pending() && hs && !ended) {
+                rebuf = 1;                        /* video ran dry: hold the sound with the picture */
+                if (g_have_audio) ndspChnSetPaused(0, true);
+                clk_pause();
+            }
+            if (rebuf && (sf_span(&g_sv) >= REBUF_US || ended)) {
+                rebuf = 0;
+                if (g_have_audio) ndspChnSetPaused(0, false);
+                clk_resume();
+                behind_since = 0;
+            }
+            if (g_pq_n > 0 && gate && (ended || sf_span(&g_sv) >= PREBUF_US) &&
+                (!g_have_audio || g_sa.n > 8 || ended)) {
+                /* first picture after open/seek -- and enough sound queued to start with it */
+                int mi = 0;
+                for (int i = 1; i < g_pq_n; i++) if (g_pq[i].cts < g_pq[mi].cts) mi = i;
+                cur_us = g_pq[mi].cts;
+                SHOW_SLOT(g_pq[mi].slot); newframe = 1;
+                g_pq[mi] = g_pq[--g_pq_n];
+                gate = 0;
+                if (g_have_audio) ndspChnSetPaused(0, false);
+                else clk_set(cur_us, 1);
+            } else if (g_pq_n > 0 && !gate) {
+                int64_t now = media_now_us();
+                int pick = -1; int64_t pick_cts = 0;
+                while (g_pq_n > 0) {
+                    int mi = 0;
+                    for (int i = 1; i < g_pq_n; i++) if (g_pq[i].cts < g_pq[mi].cts) mi = i;
+                    if (g_pq[mi].cts > now) break;
+                    if (pick >= 0) drops++;
+                    pick = g_pq[mi].slot; pick_cts = g_pq[mi].cts;
+                    g_pq[mi] = g_pq[--g_pq_n];
+                }
+                if (pick >= 0) {
+                    cur_us = pick_cts;
+                    if (now - cur_us > 750000) {
+                        u64 tnow = osGetTime();
+                        if (!behind_since) behind_since = tnow;
+                        else if (tnow - behind_since > 3000 && !want_seek) { seek_to = now; want_seek = 1; behind_since = 0; }
+                    } else behind_since = 0;
+                    SHOW_SLOT(pick);
+                    newframe = 1;
+                }
+            }
+            if (src->report && osGetTime() - last_report > 30000) {
+                last_report = osGetTime(); src->report(src->ctx, "playing", cur_us);
+            }
+        }
+
+        int64_t disp_us = scrubbing ? scrub_us : (want_seek ? seek_to : cur_us);
+        int sec = (int)(disp_us / 1000000);
+        if (sec != last_sec) { last_sec = sec; dirty = 1; }
+        if (newframe || dirty || dirty2) {
+            int st = shown < 0 ? 0 : shown;
+            kit_draw(&gpu, img[st][0], img[st][1], is3d, title, disp_us, dur_us, g_playing);
+            dirty2 = dirty && !newframe; dirty = 0;
+        } else gspWaitForVBlank();
+    }
+    if (!aptMainLoop() && result == MOFLEX_QUIT_BACK) result = MOFLEX_QUIT_EXIT;
+    #undef SHOW_SLOT
+    #undef GATE_ARM
+    #undef PREBUF_US
+    #undef REBUF_US
+    if (vol_dirty) kit_vol_save();
+    kit_flush_saves(src->key);
+    if (src->report) src->report(src->ctx, "stopped", result == MOFLEX_EOF ? dur_us : cur_us);
+    /* a local resume point too, under the stream's key: the home screen's RESUME reads it */
+    if (result == MOFLEX_EOF || (dur_us > 0 && cur_us >= dur_us - 10000000)) moflex_resume_clear(src->key);
+    else if (cur_us > 3000000) moflex_resume_save(src->key, cur_us);
+    (void)drops;
+    }
+
+teardown_early:
+    if (hs) src->close(src->ctx, hs);
+    aptUnhook(&g_mp4_apt_cookie);
+    kit_film_end();
+    if (g_have_audio) {
+        ndspChnWaveBufClear(0); ndspChnReset(0);
+        for (int i = 0; i < NWB; i++) if (g_abuf[i]) { linearFree(g_abuf[i]); g_abuf[i] = NULL; }
+        mp4_aac_close(&g_aac);
+        g_have_audio = 0;
+    }
+    if (mvd_up) mp4_mvd_exit();
+    sf_free(&g_sv); sf_free(&g_sa);
+    ts_free(td);
+    tex_free();
+    kit_gpu_end(&gpu, result == MOFLEX_QUIT_EXIT);
+    if (why[0]) mp4_msg(why);
+    return result;
+}

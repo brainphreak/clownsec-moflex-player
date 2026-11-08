@@ -70,6 +70,12 @@ const char *moflex_lang_name(int i);                       /* "English", "Japane
 int  moflex_sub_size_max(void);
 int  moflex_sub_pos_max(void);
 void moflex_defaults_apply_subs(const char *alang);        /* MP4 path: after autoload */
+int  moflex_subs_load_file(const char *path);              /* load + show a subtitle file (streams) */
+int  moflex_fmt_load_key(const char *key);                 /* a video's saved 3D Format choice, -1 = none */
+/* Would the player show subtitles for this video at start? Its own saved on/off if it has one,
+ * else the Playback Defaults (As found = off: nothing is "found" until a track is drawn). */
+int  moflex_subs_wanted(const char *key, const char *audio_lang);
+void moflex_subs_set(int on);                              /* the player's subtitle switch */
 /* Run the defaults screen with a live caption on the top screen, drawn by the player's own
  * renderer. frame() handles one frame of input and draws the bottom screen with ui_* as usual
  * (setting *drew when it repainted); a nonzero return ends the preview and is returned. Returns

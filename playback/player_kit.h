@@ -63,6 +63,7 @@ void kit_menu_input(u32 kd, u32 kh, touchPosition tp, int is3d, const char *path
 void kit_open_subs_menu(void);        /* SELECT */
 void kit_toggle_subs(void);           /* Y */
 void kit_toggle_dark(void);           /* X */
+void kit_set_subs_any(int on);        /* subtitles exist though none are loaded (burned in by the server) */
 
 /* A touch-DOWN on the panel. Menu buttons and the moon are handled inside; transport actions
  * come back for the caller. */

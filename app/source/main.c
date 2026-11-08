@@ -28,6 +28,7 @@
 #include "ui_gfx.h"
 #include "branding.h"
 #include "store.h"
+#include "plex.h"
 
 #define APP_VERSION "v1.0"
 #ifndef BUILD_TAG
@@ -207,12 +208,22 @@ static void lastplay_save(const char *path) {   /* remember across app restarts 
     FILE *f = fopen(LASTPLAY_FILE, "wb");
     if (f) { fprintf(f, "%s\n", path); fclose(f); }
 }
+#define PLEXLAST_FILE "sdmc:/moflex_player/plex_last.txt"   /* "plex:<key>" in lastplay -> its title, 3D */
 static void lastplay_restore(void) {   /* home screen boots with the last movie loaded on PLAY */
     FILE *f = fopen(LASTPLAY_FILE, "rb");
     if (!f) return;
     char pth[PATHLEN + NAMELEN] = "";
     if (fgets(pth, sizeof pth, f)) { char *nl = strchr(pth, '\n'); if (nl) *nl = 0; }
     fclose(f);
+    if (!strncmp(pth, "plex:", 5)) {               /* the last thing played was a Plex stream */
+        FILE *g = fopen(PLEXLAST_FILE, "rb");
+        char ln[2][160] = { "", "" };
+        if (g) { for (int i = 0; i < 2 && fgets(ln[i], sizeof ln[i], g); i++) { char *nl = strpbrk(ln[i], "\r\n"); if (nl) *nl = 0; } fclose(g); }
+        if (!ln[1][0]) return;
+        snprintf(g_now_playing_path, sizeof g_now_playing_path, "%s", pth);
+        snprintf(g_now_playing, sizeof g_now_playing, "%s", ln[1]);
+        return;
+    }
     struct stat st;
     if (!pth[0] || stat(pth, &st)) return;         /* file gone -> nothing to restore */
     snprintf(g_now_playing_path, sizeof g_now_playing_path, "%s", pth);
@@ -379,6 +390,8 @@ static void ui_text_left_fit(int x, int y, int scale, u16 c, const char *s, int 
 static void ui_text_center_fit(int cx, int y, int maxscale, u16 c, const char *s, int maxw) {
     int sc = maxscale;
     while (sc > 1 && ui_text_w(sc, s) > maxw) sc--;
+    y += (maxscale - sc) * 4;                 /* a smaller line stays centred on the same row */
+    if (sc == 1 && ui_text_w(1, s) > maxw) { ui_text_fit(cx, y, 1, c, s, maxw); return; }   /* still too long: ".." */
     ui_text_center(cx, y, sc, c, s);
 }
 /* neon message popup with a Back button (replaces the old console result screens) */
@@ -394,7 +407,7 @@ static void msg_screen_btn(const char *title, const char *body, const char *btn)
         if (redraw) {
             ui_begin(GFX_BOTTOM);
             ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
-            ui_text_center(UI_W / 2, 14, 2, UI_NEON, title);
+            ui_text_center_fit(UI_W / 2, 14, 2, UI_NEON, title, UI_W - 16);   /* long names (Plex libraries) shrink to fit */
             ui_glow_round(28, 42, UI_W - 56, 2, 1, UI_NEON, 3, 30);
             ui_fill_round(28, 42, UI_W - 56, 2, 1, UI_NEON);
             int ly = 74; const char *p = body; char line[80];
@@ -408,6 +421,16 @@ static void msg_screen_btn(const char *title, const char *body, const char *btn)
     }
 }
 static void msg_screen(const char *title, const char *body) { msg_screen_btn(title, body, "Back"); }
+/* the same screen with no button and no wait: "working on it" while a request runs */
+static void msg_screen_nowait(const char *title, const char *body) {
+    ui_begin(GFX_BOTTOM);
+    ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
+    ui_text_center_fit(UI_W / 2, 14, 2, UI_NEON, title, UI_W - 16);   /* long names (Plex libraries) shrink to fit */
+    ui_fill_round(28, 42, UI_W - 56, 2, 1, UI_NEON);
+    ui_text_fit(UI_W / 2, 110, 1, UI_INK, body, UI_W - 16);
+    ui_present();
+    gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
+}
 
 static int confirm(const char *prompt) {
     int redraw = 1, tdown = 0, tx0 = 0, ty0 = 0;
@@ -465,7 +488,7 @@ static int prompt2(const char *title, const char *body, const char *lbl0, const 
         if (redraw) {
             ui_begin(GFX_BOTTOM);
             ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
-            ui_text_center(UI_W / 2, 48, 2, UI_NEON, title);
+            ui_text_center_fit(UI_W / 2, 48, 2, UI_NEON, title, UI_W - 16);   /* long names (Plex libraries) shrink to fit */
             int ly = 88; const char *p = body; char line[64];
             while (*p) {
                 int j = 0; while (*p && *p != '\n' && j < 63) line[j++] = *p++;
@@ -1665,7 +1688,7 @@ static int catalog_pick(const char *title, const char *subtitle, char items[][64
             ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
             if (s_dlw_active && s_dlw_total)   /* thin download-progress strip along the top edge */
                 ui_fill_round(0, 0, (int)((u64)UI_W * s_dlw_done / s_dlw_total), 3, 0, UI_NEONP);
-            ui_text_center(UI_W / 2, 12, 2, UI_NEON, title);
+            ui_text_center_fit(UI_W / 2, 12, 2, UI_NEON, title, UI_W - 16);   /* long names (Plex libraries) shrink to fit */
             if (subtitle && subtitle[0]) ui_text_fit(UI_W / 2, 34, 1, UI_NEONP, subtitle, UI_W - 16);
             ui_glow_round(28, 48, UI_W - 56, 2, 1, UI_NEON, 3, 30); ui_fill_round(28, 48, UI_W - 56, 2, 1, UI_NEON);
             for (int r = 0; r < VIS; r++) { int i = top + r; if (i >= total) break;
@@ -3560,7 +3583,7 @@ static int ui_menu(const char *title, const char *subtitle, const char *const *i
         if (redraw) {
             ui_begin(GFX_BOTTOM);
             ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
-            ui_text_center(UI_W / 2, 14, 2, UI_NEON, title);
+            ui_text_center_fit(UI_W / 2, 14, 2, UI_NEON, title, UI_W - 16);   /* long names (Plex libraries) shrink to fit */
             ui_glow_round(28, 40, UI_W - 56, 2, 1, UI_NEON, 3, 34);
             ui_fill_round(28, 40, UI_W - 56, 2, 1, UI_NEON);
             if (subtitle && subtitle[0]) ui_text_fit(UI_W / 2, 50, 1, UI_NEONC, subtitle, UI_W - 16);
@@ -4303,7 +4326,7 @@ static void upd_asset_url(char *out, size_t n, const char *ext) {
 static void upd_screen(const char *title, const char *line, int pct) {
     ui_begin(GFX_BOTTOM);
     ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
-    ui_text_center(UI_W / 2, 12, 2, UI_NEON, title);
+    ui_text_center_fit(UI_W / 2, 12, 2, UI_NEON, title, UI_W - 16);   /* long names (Plex libraries) shrink to fit */
     ui_glow_round(28, 40, UI_W - 56, 2, 1, UI_NEON, 3, 30);
     ui_fill_round(28, 40, UI_W - 56, 2, 1, UI_NEON);
     ui_text_center(UI_W / 2, 68, 1, UI_NEONC, line);
@@ -5639,16 +5662,381 @@ static void playback_defaults_screen(void) {
     }
     if (memcmp(&u.d, &orig, sizeof u.d)) moflex_defaults_set(&u.d);
 }
+/* ---------- PLEX (local network) ----------
+ * Settings (address + optional token), then library -> show -> season -> episode lists from the
+ * server, then playback through stream_play: Plex transcodes to H.264 + AAC at the top screen's
+ * size and the MP4 engine plays it with the usual panel and menus. New 3DS only. */
+/* Link with a code at plex.tv/link (no token typing), then pick the account's server on this
+ * network. 1 = linked and a server chosen. */
+static int plex_link(PlexCfg *c) {
+    msg_screen_nowait("LINK WITH PLEX", "Contacting plex.tv...");
+    long long id = 0; char code[16];
+    if (!plex_pin_start(c, &id, code)) {
+        char m[160]; snprintf(m, sizeof m, "Could not reach plex.tv.\n%s", plex_error());
+        msg_screen("LINK WITH PLEX", m); return 0;
+    }
+    char token[64] = ""; int got = 0;
+    u64 next = 0, t0 = osGetTime();
+    int redraw = 1;
+    while (aptMainLoop()) {
+        hidScanInput();
+        if (hidKeysDown() & KEY_B) return 0;
+        if (redraw) {
+            ui_begin(GFX_BOTTOM);
+            ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
+            ui_text_center(UI_W / 2, 14, 2, UI_NEON, "LINK WITH PLEX");
+            ui_fill_round(28, 42, UI_W - 56, 2, 1, UI_NEON);
+            ui_text_center(UI_W / 2, 58, 1, UI_INK, "On your phone or computer, go to");
+            ui_text_center(UI_W / 2, 76, 2, UI_NEONC, "plex.tv/link");
+            ui_text_center(UI_W / 2, 100, 1, UI_INK, "and enter this code:");
+            ui_text_center(UI_W / 2, 122, 5, UI_WHITE, code);
+            ui_text_center(UI_W / 2, 186, 1, UI_DIM, "Waiting for the code to be entered...");
+            ui_text_center(UI_W / 2, 224, 1, UI_DIM, "B: cancel");
+            ui_present(); redraw = 0;
+        }
+        u64 now = osGetTime();
+        if (now >= next) {
+            next = now + 2000;
+            int r = plex_pin_poll(c, id, token, sizeof token);
+            if (r > 0) { got = 1; break; }
+            if (r < 0 || now - t0 > 15 * 60 * 1000) { msg_screen("LINK WITH PLEX", "The code expired.\nTry again."); return 0; }
+        }
+        gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
+    }
+    if (!got) return 0;
+    snprintf(c->account, sizeof c->account, "%s", token);   /* the account link, kept apart */
+    if (!c->url[0] || !c->token[0]) snprintf(c->token, sizeof c->token, "%s", token);
+    plex_cfg_save(c);
+    return 1;
+}
+
+/* Pick one of the linked account's servers on this network (own first, then friends' shared
+ * ones). Switching never needs a new link: plex.tv gives each server's own access token. */
+static int plex_choose_server(PlexCfg *c) {
+    if (!c->account[0] && !c->token[0]) { msg_screen("CHOOSE SERVER", "Link your Plex account first."); return 0; }
+    msg_screen_nowait("CHOOSE SERVER", "Asking plex.tv for your servers...");
+    PlexServer sv[8]; int n = plex_servers(c, sv, 8);
+    if (n < 0) { char m[160]; snprintf(m, sizeof m, "Could not reach plex.tv.\n%s", plex_error()); msg_screen("CHOOSE SERVER", m); return 0; }
+    if (n == 0) { msg_screen("CHOOSE SERVER", "No Plex server answered on this\nnetwork. Use ENTER ADDRESS instead."); return 0; }
+    char lbl[8][80]; const char *rows[9];
+    for (int i = 0; i < n; i++) {
+        snprintf(lbl[i], sizeof lbl[i], "%s%s", sv[i].name, sv[i].owned ? "" : " (SHARED)");
+        rows[i] = lbl[i];
+    }
+    rows[n] = "CANCEL";
+    int pick = ui_menu("CHOOSE SERVER", "Plex servers on this network", rows, n + 1);
+    if (pick < 0 || pick >= n) return 0;
+    snprintf(c->url, sizeof c->url, "%s", sv[pick].url);
+    snprintf(c->token, sizeof c->token, "%s", sv[pick].token);
+    snprintf(c->name, sizeof c->name, "%s", sv[pick].name);
+    plex_cfg_save(c);
+    return 1;
+}
+static void plex_test(PlexCfg *c) {
+    if (!c->url[0]) { msg_screen("PLEX SERVER", "Choose a server first."); return; }
+    msg_screen_nowait("PLEX SERVER", "Connecting...");
+    PlexItem *it = NULL; int n = plex_list(c, "/library/sections", &it);
+    free(it);
+    char m[200];
+    if (n >= 0) snprintf(m, sizeof m, "Connected to %s.\n%d librar%s found.", c->name[0] ? c->name : "the server",
+                         n, n == 1 ? "y" : "ies");
+    else snprintf(m, sizeof m, "Could not connect.\n%s", plex_error());
+    msg_screen("PLEX SERVER", m);
+}
+
+static void plex_setup(void) {
+    PlexCfg c; plex_cfg_load(&c);
+    if (!c.account[0] && c.token[0]) {        /* a link from before the account was kept apart */
+        msg_screen_nowait("PLEX SERVER", "Checking your Plex link...");
+        if (plex_token_is_account(&c, c.token)) {
+            snprintf(c.account, sizeof c.account, "%s", c.token);
+            plex_cfg_save(&c);
+        }
+    }
+    for (;;) {
+        char r0[64], r1[96], r2[48];
+        const char *u = c.url; if (!strncmp(u, "http://", 7)) u += 7;
+        snprintf(r0, sizeof r0, "ACCOUNT: %s", c.account[0] ? "LINKED" : "NOT LINKED");
+        snprintf(r1, sizeof r1, "SERVER: %s", !c.url[0] ? "(none)" : c.name[0] ? c.name : u);
+        snprintf(r2, sizeof r2, "TOKEN: %s", c.token[0] ? "SET" : "NONE");
+        const char *rows[5] = { r0, r1, r2, "TEST CONNECTION", "DONE" };
+        int k = ui_menu("PLEX SERVER", "Your Plex account and server", rows, 5);
+        if (k < 0 || k == 4) return;
+        if (k == 0) {                                          /* ACCOUNT */
+            int any = c.account[0] || c.token[0] || c.url[0];   /* anything to forget */
+            const char *it[3] = { c.account[0] ? "LINK AGAIN (NEW CODE)" : "LINK WITH PLEX.TV (CODE)",
+                                  "SIGN OUT (FORGET ALL)", "CANCEL" };
+            int a = ui_menu("PLEX ACCOUNT", c.account[0] ? "This 3DS is linked to Plex" : "Link with a code at plex.tv/link",
+                            it, any ? 3 : 1);
+            if (a == 0) { if (plex_link(&c) && plex_choose_server(&c)) plex_test(&c); }
+            else if (a == 1 && any) {
+                if (prompt2("SIGN OUT", "Forget the Plex account, server\nand token on this 3DS?", "SIGN OUT", "KEEP") == 0) {
+                    c.url[0] = 0; c.token[0] = 0; c.account[0] = 0; c.name[0] = 0;
+                    plex_cfg_save(&c);
+                }
+            }
+        } else if (k == 1) {                                   /* SERVER */
+            const char *it[3] = { "CHOOSE FROM MY ACCOUNT", "ENTER ADDRESS", "CANCEL" };
+            int a = ui_menu("PLEX SERVER", r1, it, 3);
+            if (a == 0) { if (plex_choose_server(&c)) plex_test(&c); }
+            else if (a == 1) {
+                SwkbdState s; char buf[128];
+                swkbdInit(&s, SWKBD_TYPE_NORMAL, 2, -1);
+                swkbdSetHintText(&s, "Server address, e.g. 192.168.1.20:32400");
+                swkbdSetInitialText(&s, u);
+                if (swkbdInputText(&s, buf, sizeof buf) != SWKBD_BUTTON_RIGHT || !buf[0]) continue;
+                char *b = buf; while (*b == ' ') b++;
+                if (!strncmp(b, "http://", 7)) b += 7;
+                if (strchr(b, ':')) snprintf(c.url, sizeof c.url, "http://%s", b);   /* port given */
+                else snprintf(c.url, sizeof c.url, "http://%s:32400", b);
+                c.name[0] = 0;
+                if (c.account[0] && !c.token[0]) snprintf(c.token, sizeof c.token, "%s", c.account);
+                plex_cfg_save(&c); plex_cfg_load(&c);
+                plex_test(&c);
+            }
+        } else if (k == 2) {                                   /* TOKEN (manual setups) */
+            SwkbdState s; char buf[64];
+            swkbdInit(&s, SWKBD_TYPE_NORMAL, 2, -1);
+            swkbdSetHintText(&s, "Plex token (leave empty for none)");
+            swkbdSetInitialText(&s, c.token);
+            if (swkbdInputText(&s, buf, sizeof buf) != SWKBD_BUTTON_RIGHT) continue;
+            char *b = buf; while (*b == ' ') b++;
+            snprintf(c.token, sizeof c.token, "%s", b);
+            plex_cfg_save(&c);
+        } else if (k == 3) plex_test(&c);
+    }
+}
+
+typedef struct { PlexCfg c; PlexItem it; char session[24]; int burn; } PlexPlay;
+static void plex_src_set_burn(void *ctx, int on) { ((PlexPlay *)ctx)->burn = on; }
+static HttpStream *plex_src_open(void *ctx, long long at_us, int fmt) {
+    PlexPlay *p = (PlexPlay *)ctx;
+    /* burned-in subtitles would straddle both eyes of a side-by-side frame */
+    return plex_stream_open(&p->c, p->it.rating, at_us, fmt != 0, p->burn && fmt == 0, p->session);
+}
+static void plex_src_close(void *ctx, HttpStream *s) {
+    PlexPlay *p = (PlexPlay *)ctx;
+    hs_close(s);
+    plex_stream_stop(&p->c, p->session); p->session[0] = 0;
+}
+/* timeline reports go out on their own thread: a request mid-playback must not stall a frame */
+typedef struct { PlexCfg c; char rating[16]; char state[12]; long long pos, dur; } PlexRep;
+static void plex_rep_thread(void *a) {
+    PlexRep *r = (PlexRep *)a;
+    plex_timeline(&r->c, r->rating, r->state, r->pos, r->dur);
+    free(r);
+}
+static void plex_src_report(void *ctx, const char *state, long long pos_us) {
+    PlexPlay *p = (PlexPlay *)ctx;
+    PlexRep *r = (PlexRep *)malloc(sizeof *r); if (!r) return;
+    r->c = p->c; snprintf(r->rating, sizeof r->rating, "%s", p->it.rating);
+    snprintf(r->state, sizeof r->state, "%s", state);
+    r->pos = pos_us / 1000; r->dur = p->it.duration_ms;
+    if (!strcmp(state, "stopped")) { plex_rep_thread(r); return; }   /* last word: wait for it */
+    s32 prio = 0x30; svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
+    if (!threadCreate(plex_rep_thread, r, 16 * 1024, 0x3F, -2, true)) free(r);
+    (void)prio;
+}
+static const char *plex_src_error(void *ctx) { (void)ctx; return plex_error(); }
+
+/* 3D layout of a Plex item: the edition says it ("3D Half SBS" / "3D Full SBS"); untagged, a
+ * double-wide frame is full SBS and anything else in a "3D" library is half SBS. */
+static int plex_fmt(const PlexItem *it, int lib3d) {
+    if (ci_contains(it->edition, "full sbs") || ci_contains(it->edition, "fsbs")) return 1;
+    if (ci_contains(it->edition, "half sbs") || ci_contains(it->edition, "hsbs") ||
+        ci_contains(it->edition, "half-sbs")) return 2;
+    if (ci_contains(it->edition, "sbs") || ci_contains(it->edition, "3d") || lib3d) {
+        if (it->width && it->height && it->width * 10 > it->height * 27) return 1;
+        return 2;
+    }
+    return 0;
+}
+/* returns the player's result (MOFLEX_QUIT_EXIT = the app is closing). from_us >= 0: start there
+ * without asking (RESUME on the home card); < 0: offer Plex's resume point. */
+static MoflexResult plex_play(const PlexCfg *c, const PlexItem *it, int lib3d, long long from_us) {
+    static PlexPlay p;
+    p.c = *c; p.it = *it; p.session[0] = 0; p.burn = 0;
+    long long start = from_us > 0 ? from_us : 0;
+    if (from_us < 0 && it->offset_ms > 10000 && (it->duration_ms <= 0 || it->offset_ms < it->duration_ms - 30000)) {
+        long t = (long)(it->offset_ms / 1000);
+        char m[80]; snprintf(m, sizeof m, "Resume from %ld:%02ld:%02ld?", t / 3600, (t / 60) % 60, t % 60);
+        int a = prompt2(it->title, m, "RESUME", "START OVER");
+        if (a < 0) return MOFLEX_QUIT_BACK;
+        if (a == 0) start = it->offset_ms * 1000;
+    }
+    char key[40]; snprintf(key, sizeof key, "plex:%s", it->rating);
+    char title[128];
+    if (!strcmp(it->type, "episode") && it->index)
+        snprintf(title, sizeof title, "S%02dE%02d %s", it->parent_index, it->index, it->title);
+    else snprintf(title, sizeof title, "%s", it->title);
+    /* ---- subtitles: which track (Playback Defaults), and how (drawn by us / burned by Plex) ---- */
+    int fmt = plex_fmt(it, lib3d);
+    static char subfile[96]; subfile[0] = 0;
+    PlexSub subs[16]; long long part = 0, orig_sel = 0, burn_id = 0; char alang[8] = "";
+    int ns = plex_item_streams(c, it->rating, subs, 16, &part, alang, sizeof alang);
+    {   int saved = moflex_fmt_load_key(key); if (saved >= 0) fmt = saved; }   /* the Format row's choice */
+    int burnable = 0, subs_on = moflex_subs_wanted(key, alang);   /* the PLAYER's switch decides */
+    if (ns > 0) {
+        MoflexDefaults d; moflex_defaults_get(&d);
+        int pick = -1, sel = -1;
+        for (int i = 0; i < ns; i++) if (subs[i].selected) { sel = i; orig_sel = subs[i].id; }
+        /* the track to use whenever subtitles are on: Plex's own selection, else the preferred
+         * language (not a forced-only track), else the first */
+        const char *want = d.slang > 0 ? moflex_lang_code(d.slang) : "ENG";
+        pick = sel;
+        for (int i = 0; i < ns && pick < 0; i++) if (!subs[i].forced && !strcasecmp(subs[i].lang, want)) pick = i;
+        if (pick < 0) pick = 0;
+        if (pick >= 0) {
+            const PlexSub *s = &subs[pick];
+            int text = !strcmp(s->codec, "srt") || !strcmp(s->codec, "ass") || !strcmp(s->codec, "ssa") ||
+                       !strcmp(s->codec, "subrip");
+            if (s->key[0] && text) {              /* an external text file: drawn by the player */
+                snprintf(subfile, sizeof subfile, "sdmc:/moflex_player/.plexsub.%s", strcmp(s->codec, "srt") ? s->codec : "srt");
+                if (!plex_download(c, s->key, subfile)) subfile[0] = 0;
+            } else if (fmt == 0) {                /* embedded: Plex burns the selected track in */
+                if (s->id == orig_sel || plex_select_sub(c, part, s->id)) {
+                    burnable = 1; burn_id = s->id; p.burn = subs_on;
+                }
+            }
+        }
+    }
+
+    /* the home card now offers THIS item (survives restarts like a local file) */
+    snprintf(g_now_playing_path, sizeof g_now_playing_path, "%s", key);
+    snprintf(g_now_playing, sizeof g_now_playing, "%s", title);
+    lastplay_save(key);
+    {   FILE *g = fopen(PLEXLAST_FILE, "wb");
+        if (g) { fprintf(g, "%d\n%s\n", lib3d, title); fclose(g); } }
+    StreamSrc s = { &p, title, key, it->duration_ms * 1000, start, plex_fmt(it, lib3d),
+                    plex_src_open, plex_src_close, plex_src_report, plex_src_error, subfile,
+                    burnable, subs_on, plex_src_set_burn };
+    MoflexResult r = stream_play(&s);
+    if (burn_id && burn_id != orig_sel) plex_select_sub(c, part, orig_sel);   /* leave Plex's choice as it was */
+    consoleInit(GFX_BOTTOM, NULL);
+    gfxSetDoubleBuffering(GFX_BOTTOM, false);
+    branding_show();
+    return r;
+}
+static int plex_playable(const PlexItem *it) {
+    return !strcmp(it->type, "movie") || !strcmp(it->type, "episode") || !strcmp(it->type, "clip") ||
+           !strcmp(it->type, "video");
+}
+/* Top screen for the highlighted Plex row: the local library's info view -- poster (the server
+ * resizes it; cached on the card like catalog art), title, year, genres, rating, runtime, summary. */
+static const PlexItem *s_plex_items = NULL; static int s_plex_n = 0;
+static PlexCfg s_plex_cfg;
+static void plex_draw_top(int i) {
+    if (!s_plex_items || i < 0 || i >= s_plex_n) return;
+    const PlexItem *e = &s_plex_items[i];
+    CatEntry m; memset(&m, 0, sizeof m);
+    if (!strcmp(e->type, "episode") && e->index)
+        snprintf(m.name, sizeof m.name, "S%02dE%02d %s", e->parent_index, e->index, e->title);
+    else if (e->year) snprintf(m.name, sizeof m.name, "%s (%d)", e->title, e->year);
+    else snprintf(m.name, sizeof m.name, "%s", e->title);
+    snprintf(m.title, sizeof m.title, "%s", e->title);
+    if (e->crating[0] && e->genres[0]) snprintf(m.genres, sizeof m.genres, "%s  %s", e->crating, e->genres);
+    else snprintf(m.genres, sizeof m.genres, "%s", e->crating[0] ? e->crating : e->genres);
+    snprintf(m.desc, sizeof m.desc, "%s", e->summary);
+    if (!m.desc[0] && e->edition[0]) snprintf(m.desc, sizeof m.desc, "Edition: %s", e->edition);
+    snprintf(m.category, sizeof m.category, "Plex");
+    m.year = e->year;
+    m.runtime = (int)(e->duration_ms / 60000);
+    m.is3d = (ci_contains(e->edition, "3d") || ci_contains(e->edition, "sbs")) ? 1 : 0;
+    static u16 art[POSTER_W * POSTER_H];
+    int have = 0;
+    if (e->poster[0] && strncmp(e->poster, "/:/resources", 12)) {   /* skip Plex's stock section icons */
+        char url[640]; plex_art_url(&s_plex_cfg, e->poster, POSTER_W, POSTER_H, url, sizeof url);
+        char key[200]; snprintf(key, sizeof key, "plex%s", e->poster);   /* the thumb path is versioned */
+        have = poster_get(url, key, art, POSTER_W, POSTER_H);
+    }
+    draw_info_top(&m, have ? art : NULL);
+}
+
+/* RESUME on the home card for a Plex item: fetch it fresh, start at the saved point. 1 = exit app */
+static int plex_resume_home(void) {
+    PlexCfg c;
+    if (!plex_cfg_load(&c)) { msg_screen("PLEX", "No Plex server is set up."); return 0; }
+    const char *rk = g_now_playing_path + 5;
+    int lib3d = 0;
+    {   FILE *g = fopen(PLEXLAST_FILE, "rb"); char ln[16] = "";
+        if (g) { if (fgets(ln, sizeof ln, g)) lib3d = atoi(ln); fclose(g); } }
+    msg_screen_nowait("PLEX", "Connecting...");
+    char path[64]; snprintf(path, sizeof path, "/library/metadata/%s", rk);
+    PlexItem *it = NULL; int n = plex_list(&c, path, &it);
+    if (n <= 0) { free(it); char m[160]; snprintf(m, sizeof m, "Could not reach the Plex server.\n%s", plex_error()); msg_screen("PLEX", m); return 0; }
+    PlexItem pick = it[0]; free(it);
+    long long at = moflex_resume_get(g_now_playing_path);          /* where it stopped on THIS 3DS */
+    if (at <= 0 && pick.offset_ms > 10000) at = pick.offset_ms * 1000;   /* else Plex's own point */
+    return plex_play(&c, &pick, lib3d, at > 0 ? at : 0) == MOFLEX_QUIT_EXIT;
+}
+
+/* 1 = the app is closing */
+static int plex_browse(void) {
+    PlexCfg c;
+    if (!plex_cfg_load(&c)) {
+        if (prompt2("PLEX", "No Plex server is set up yet.\n\nSET UP links this 3DS to your Plex\naccount with a short code.",
+                    "SET UP", "BACK") != 0) return 0;
+        plex_setup();
+        if (!plex_cfg_load(&c)) return 0;
+    }
+    int lib3d = 0;                            /* inside a library named "...3D..." */
+    static char path[8][192], ttl[8][96];
+    int depth = 0, presel[8] = { 0 };
+    snprintf(path[0], sizeof path[0], "/library/sections");
+    snprintf(ttl[0], sizeof ttl[0], "%s", c.name[0] ? c.name : "PLEX");   /* which server this is */
+    for (;;) {
+        msg_screen_nowait(ttl[depth], "Loading...");
+        PlexItem *it = NULL;
+        int n = plex_list(&c, path[depth], &it);
+        if (n < 0) { msg_screen("PLEX", plex_error()); if (depth == 0) return 0; depth--; continue; }
+        if (n == 0) { free(it); msg_screen(ttl[depth], "Nothing here."); if (depth == 0) return 0; depth--; continue; }
+        char (*names)[64] = (char (*)[64])malloc((size_t)n * 64);
+        if (!names) { free(it); return 0; }
+        for (int i = 0; i < n; i++) {
+            const PlexItem *e = &it[i];
+            const char *mark = (plex_playable(e) && e->viewed) ? "* " : "";
+            if (!strcmp(e->type, "episode"))
+                snprintf(names[i], 64, "%s%d. %s", mark, e->index, e->title);
+            else if (e->year && (!strcmp(e->type, "movie") || !strcmp(e->type, "show")))
+                snprintf(names[i], 64, "%s%s (%d)%s%s%s", mark, e->title, e->year,
+                         e->edition[0] ? " [" : "", e->edition, e->edition[0] ? "]" : "");
+            else snprintf(names[i], 64, "%s%s%s%s%s", mark, e->title,
+                          e->edition[0] ? " [" : "", e->edition, e->edition[0] ? "]" : "");
+        }
+        s_pick_init = presel[depth];
+        s_plex_items = it; s_plex_n = n; s_plex_cfg = c;
+        s_pick_top = plex_draw_top;           /* poster + info for the highlighted row */
+        gfxSet3D(false);                      /* the info view is 2D: the 3D logo must not stay in the right eye */
+        int sel = catalog_pick(ttl[depth], NULL, names, n, 0, NULL);
+        s_plex_items = NULL; s_plex_n = 0;
+        branding_show();                      /* the logo back while the next list loads */
+        free(names);
+        if (sel < 0 || sel >= n) { free(it); if (depth == 0) return 0; depth--; if (depth == 0) lib3d = 0; continue; }
+        presel[depth] = sel;
+        PlexItem pick = it[sel]; free(it);
+        if (plex_playable(&pick)) {
+            if (plex_play(&c, &pick, lib3d, -1) == MOFLEX_QUIT_EXIT) return 1;
+        } else if (depth < 7 && pick.key[0]) {
+            if (depth == 0) lib3d = ci_contains(pick.title, "3d");
+            depth++; presel[depth] = 0;
+            snprintf(path[depth], sizeof path[depth], "%s", pick.key);
+            snprintf(ttl[depth], sizeof ttl[depth], "%s", pick.title);
+        }
+    }
+}
+
 /* X on home: everything that is a setting rather than a video */
 static void settings_menu(void) {
     for (;;) {
-        char r1[40]; const char *rows[3]; int act[3], n = 0;
+        char r1[40]; const char *rows[4]; int act[4], n = 0;
         rows[n] = "PLAYBACK DEFAULTS"; act[n++] = 0;
+        rows[n] = "PLEX SERVER"; act[n++] = 2;
         if (g_extplay_ok) { snprintf(r1, sizeof r1, "OLD 3DS: PLAY MOVIES WITH..."); rows[n] = r1; act[n++] = 1; }
         rows[n] = "DONE"; act[n++] = -1;
         int c = ui_menu("SETTINGS", g_extplay_ok ? "Audio, subtitles and players" : "Audio and subtitles", rows, n);
         if (c < 0 || act[c] < 0) return;
         if (act[c] == 0) playback_defaults_screen();
+        else if (act[c] == 2) plex_setup();
         else extplay_choose();
     }
 }
@@ -5803,20 +6191,21 @@ static int open_pick(void) {
         hidScanInput();
         u32 k = hidKeysDown();
         if (k & KEY_B) return -1;
-        if (k & (KEY_DOWN | KEY_RIGHT)) { if (sel < 3) sel++; redraw = 1; }
+        if (k & (KEY_DOWN | KEY_RIGHT)) { if (sel < 4) sel++; redraw = 1; }
         if (k & (KEY_UP | KEY_LEFT))    { if (sel > 0) sel--; redraw = 1; }
         if (k & KEY_A) return sel;
-        /* four rows now: WALK THE AISLE joined LIBRARY / FILESYSTEM / RECENTLY PLAYED */
+        /* five rows: PLEX joined LIBRARY / FILESYSTEM / RECENTLY PLAYED / WALK THE AISLE */
         if (k & KEY_TOUCH) { touchPosition tp; hidTouchRead(&tp);
-            for (int i = 0; i < 4; i++) if (tp.py >= 44 + i * 47 && tp.py < 44 + i * 47 + 40) return i; }
+            for (int i = 0; i < 5; i++) if (tp.py >= 40 + i * 39 && tp.py < 40 + i * 39 + 34) return i; }
         if (redraw) {
             ui_begin(GFX_BOTTOM);
             ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
-            ui_text_center(UI_W / 2, 14, 2, UI_NEON, "OPEN VIDEO");
-            ui_button(34,  44, UI_W - 68, 40, "LIBRARY",         sel == 0, UI_NEON);
-            ui_button(34,  91, UI_W - 68, 40, "FILESYSTEM",      sel == 1, UI_NEONP);
-            ui_button(34, 138, UI_W - 68, 40, "RECENTLY PLAYED", sel == 2, UI_NEONC);
-            ui_button(34, 185, UI_W - 68, 40, "WALK THE AISLE",  sel == 3, UI_NEON);
+            ui_text_center(UI_W / 2, 12, 2, UI_NEON, "OPEN VIDEO");
+            ui_button(34,  40, UI_W - 68, 34, "LIBRARY",         sel == 0, UI_NEON);
+            ui_button(34,  79, UI_W - 68, 34, "FILESYSTEM",      sel == 1, UI_NEONP);
+            ui_button(34, 118, UI_W - 68, 34, "RECENTLY PLAYED", sel == 2, UI_NEONC);
+            ui_button(34, 157, UI_W - 68, 34, "WALK THE AISLE",  sel == 3, UI_NEON);
+            ui_button(34, 196, UI_W - 68, 34, "PLEX",            sel == 4, UI_NEONP);
             ui_present(); redraw = 0;
         }
         gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
@@ -5878,6 +6267,14 @@ static int open_video(char *out, size_t cap) {
         if (pick < 0) return 0;                                 /* back -> home */
         if (pick == 0) { if (library_view(out, cap)) { s_pick_origin = PLAY_FROM_LIBRARY; return 2; } }
         else if (pick == 2) { if (recent_pick(out, cap)) { s_pick_origin = PLAY_FROM_RECENT; return 2; } }
+        else if (pick == 4) {
+            /* Plex streams H.264, which only the New 3DS decodes in hardware: say so up front
+             * instead of letting an Old 3DS link, browse and only hit the wall at PLAY */
+            bool isnew = false; APT_CheckNew3DS(&isnew);
+            if (!isnew) msg_screen("PLEX", "Plex streaming needs a New 3DS\n(hardware H.264 video).\n\n"
+                                           "This Old 3DS can still play\nmoflex files from LIBRARY.");
+            else if (plex_browse()) return 1;
+        }
         else if (pick == 3) { int r = store_pick(out, cap);
                               if (r < 0) return 1;
                               if (r == 1) { s_pick_origin = PLAY_FROM_STORE; return 2; } }
@@ -6012,7 +6409,8 @@ int main(void) {
         else if (choice == 1) { add_movies_menu(); }
         else if (choice == 2) { if (browser(MODE_MANAGE, NULL, 0) == 1) running = 0; }
         else if (choice == 3) {                  /* PLAY: resume the loaded movie; B goes back HERE */
-            if (g_now_playing_path[0] && play_and_handle(g_now_playing_path, PLAY_FROM_HOME)) running = 0;
+            if (!strncmp(g_now_playing_path, "plex:", 5)) { if (plex_resume_home()) running = 0; }   /* a Plex stream */
+            else if (g_now_playing_path[0] && play_and_handle(g_now_playing_path, PLAY_FROM_HOME)) running = 0;
         }
     }
     s_dt_abort = 1;   /* stop the background SD walk before teardown */
