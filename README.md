@@ -14,6 +14,11 @@ decoder: any resolution up to 1920x1088 (aspect-fit to the screen), side-by-side
 auto-detected, B-frames handled, with the same subtitles, resume, seeking, and library
 features as moflex.
 
+**NEW — Plex streaming (BETA).** On a **New 3DS** the player can now browse your own
+**Plex Media Server** and stream from it over your home network — movies and shows, with
+posters, info, resume and seeking, and side-by-side 3D played in real 3D. It's in beta: please
+report anything that misbehaves. See [Plex streaming (beta)](#plex-streaming-beta).
+
 It also plays **SUPER MOFLEX** files — a `.moflex` that carries a second audio language,
 several subtitle tracks, and its own poster and info — switching languages and subtitles in
 place. See [SUPER MOFLEX](#super-moflex-languages-subtitles-and-info-inside-the-file).
@@ -133,6 +138,9 @@ This is the short tour — the complete list of everything the player does lives
 - **Old 3DS: Nintendo Player hand-off** — play any `.moflex` in the console's own 3D Movie
   Player for smooth 3D, per 2D/3D or asked each time. See
   [Old 3DS: play in the Nintendo Player](#old-3ds-play-in-the-nintendo-player).
+- **Plex streaming (BETA, New 3DS)** — browse your Plex server's libraries and stream movies
+  and episodes, with resume, seeking, subtitles and SBS 3D. See
+  [Plex streaming (beta)](#plex-streaming-beta).
 - **Updates itself** — offers new builds and installs them in place. See [Updating](#updating).
 - **Catalog browser** — browse the Clownsec / Zackk archives from `catalog.json`, with a
   top-screen info panel (poster art, year, runtime, genres, file size, description, and a
@@ -285,6 +293,34 @@ which simply ignores them:
 
 They are built from an encode plus the original video with the
 [SUPER MOFLEX Builder](https://github.com/brainphreak/3ds-super-moflex).
+
+## Plex streaming (beta)
+
+> **Beta.** Plex support is new. It works on our test setups, but expect rough edges — please
+> report problems (what you played, your Plex server version, and what happened).
+
+**Needs a New 3DS** (or New 2DS XL): Plex streams H.264 video, which only the New 3DS can decode
+in hardware. On an Old 3DS the PLEX button just explains this.
+
+**Setup** — open **SETTINGS → PLEX SERVER** (X on the home screen):
+
+1. **Link your Plex account:** the 3DS shows a code — enter it at **plex.tv/link**. (Or skip
+   linking if your server lists your home network under *"List of IP addresses and networks
+   that are allowed without auth"*.)
+2. **Choose the server** from the Plex servers found on your network.
+
+**Watching** — **OPEN VIDEO → PLEX**, then browse your libraries, shows and seasons with
+posters, descriptions, genres and watched counts, and pick something to play:
+
+- Plex converts the video on your server to fit the 3DS screen and streams it — so your server
+  does the heavy lifting, and any format Plex can play works.
+- **Resume** from where you (or Plex on another device) left off; **seeking** works as usual.
+- **Side-by-side 3D** (`3D Half SBS` / `3D Full SBS` editions, or a 3D library) plays in real 3D.
+- **Subtitles** are either drawn by the player or burned in by Plex — choose in
+  **SETTINGS → PLAYBACK DEFAULTS**.
+
+**Limits for now:** home network only (the 3DS and the server on the same Wi-Fi — no remote
+streaming), and video is sized for the top screen (400x240).
 
 ## Background downloads (close the lid and walk away)
 

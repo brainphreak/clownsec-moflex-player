@@ -20,6 +20,17 @@
 * Old 3DS: hand any .moflex to Nintendo's 3D Movie Player for smooth 3D (ask, or always, per 2D/3D)
 * Long MP4 films (2 h+) load and play
 
+## Plex streaming (BETA, New 3DS)
+
+* Link with a code at plex.tv/link (or use a server that allows your network without auth)
+* Finds Plex servers on your home network
+* Browse libraries, shows and seasons with posters, info, genres and watched counts
+* Streams movies and episodes, transcoded by the server for the 3DS screen
+* Resume from Plex's own resume point; seeking
+* Side-by-side 3D editions play in real 3D
+* Subtitles drawn by the player or burned in by Plex (Playback Defaults)
+* Old 3DS: the PLEX button explains that streaming needs a New 3DS
+
 ## Subtitles
 
 * SubRip (`.srt`) and styled ASS/SSA (`.ass`/`.ssa`) subtitles, external or embedded
