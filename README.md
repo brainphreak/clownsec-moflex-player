@@ -302,22 +302,97 @@ They are built from an encode plus the original video with the
 **Needs a New 3DS** (or New 2DS XL): Plex streams H.264 video, which only the New 3DS can decode
 in hardware. On an Old 3DS the PLEX button just explains this.
 
-**Setup** — open **SETTINGS → PLEX SERVER** (X on the home screen):
+**What you need**
 
-1. **Link your Plex account:** the 3DS shows a code — enter it at **plex.tv/link**. (Or skip
-   linking if your server lists your home network under *"List of IP addresses and networks
-   that are allowed without auth"*.)
-2. **Choose the server** from the Plex servers found on your network.
+- A New 3DS / New 2DS XL on the **same Wi-Fi network** as your Plex Media Server.
+- A Plex Media Server that's allowed to **transcode** (the default). Plex Pass is not required —
+  the 3DS asks for small 400x240 video, which is easy work for the server.
+- Internet access on the 3DS for the recommended setup (linking talks to plex.tv once; the video
+  itself always comes straight from your server on the home network).
 
-**Watching** — **OPEN VIDEO → PLEX**, then browse your libraries, shows and seasons with
-posters, descriptions, genres and watched counts, and pick something to play:
+All Plex settings are under **SETTINGS → PLEX SERVER** (press **X** on the home screen). The
+screen shows **ACCOUNT** (linked or not), **SERVER** (which one is in use), **TOKEN** (set or
+none), **TEST CONNECTION** and **DONE**.
+
+### Setup option 1 — link with plex.tv (recommended)
+
+No typing of addresses or tokens, and it works with servers friends have shared with you.
+
+1. **SETTINGS → PLEX SERVER → ACCOUNT → LINK WITH PLEX.TV (CODE).**
+2. The 3DS shows a **4-character code**. On your phone or computer, sign in to Plex, go to
+   **[plex.tv/link](https://plex.tv/link)** and enter it. The 3DS notices within a few seconds
+   (the code is good for 15 minutes; **B** cancels).
+3. **Choose your server.** The 3DS lists the Plex servers on your account that it can reach on
+   this network — your own first, then shared ones marked **(SHARED)**. Pick one.
+4. It runs **TEST CONNECTION** for you: *"Connected to *name*. N libraries found."* means you're
+   done.
+
+To switch servers later: **SERVER → CHOOSE FROM MY ACCOUNT**. No need to link again, because each
+server gets its own access token from plex.tv automatically.
+
+### Setup option 2 — manual (enter the server's address yourself)
+
+Use this if the 3DS can't reach plex.tv, or if **CHOOSE SERVER** says *"No Plex server answered on
+this network"*.
+
+1. **Find your server's local IP address**, e.g. in Plex Web → **Settings → (your server) →
+   Remote Access** (shown as the *private* address), or in your router's list of devices.
+2. **SETTINGS → PLEX SERVER → SERVER → ENTER ADDRESS** and type it, e.g. `192.168.1.20`. The
+   port defaults to **32400** — add `:port` only if you changed it (`192.168.1.20:32401`).
+   `http://` is optional. The 3DS tests the connection as soon as you confirm.
+3. **Authentication.** The server needs to know the 3DS is allowed in. Pick **one** of:
+   - **Linked account (easiest):** if you also linked with plex.tv (option 1, step 1–2), the
+     manual address automatically uses your account. Nothing else to do.
+   - **A Plex token:** **TOKEN** → type your `X-Plex-Token`. To find it: in Plex Web open any
+     movie → **⋯ → Get Info → View XML**; the address of the page that opens ends in
+     `X-Plex-Token=xxxxxxxxxxxxxxxxxxxx` — that string is the token. (Plex's own guide: *"Finding
+     an authentication token / X-Plex-Token"*.) Treat it like a password.
+   - **No token at all:** in Plex Web → **Settings → (your server) → Network** (click *Show
+     Advanced*) add your home network to **"List of IP addresses and networks that are allowed
+     without auth"** — e.g. `192.168.1.0/255.255.255.0` — then save. Leave **TOKEN** as **NONE**.
+     Anyone on your Wi-Fi can then reach the server without signing in, so only do this on a
+     network you trust.
+4. **TEST CONNECTION** to confirm.
+
+### Plex server settings that matter
+
+- **Secure connections** (Settings → *server* → Network): leave it on **Preferred** (the
+  default). The 3DS talks to the server over plain HTTP on your home network; **Required** will
+  block it.
+- **Transcoder**: must be enabled (it is unless you turned it off). The server converts
+  everything to H.264 for the 3DS.
+- **Remote access** is **not** used — the 3DS only connects over the home network, so you don't
+  need to set it up for this.
+
+### Signing out
+
+**ACCOUNT → SIGN OUT (FORGET ALL)** removes the account link, server and token from the 3DS. (The
+3DS also appears in plex.tv → **Account → Authorized Devices**, where you can remove it.)
+
+### Watching
+
+**OPEN VIDEO → PLEX**, then browse your libraries, shows and seasons with posters,
+descriptions, genres and watched counts, and pick something to play:
 
 - Plex converts the video on your server to fit the 3DS screen and streams it — so your server
   does the heavy lifting, and any format Plex can play works.
 - **Resume** from where you (or Plex on another device) left off; **seeking** works as usual.
+  Your progress is reported back to Plex, so it shows on your other devices too.
 - **Side-by-side 3D** (`3D Half SBS` / `3D Full SBS` editions, or a 3D library) plays in real 3D.
 - **Subtitles** are either drawn by the player or burned in by Plex — choose in
   **SETTINGS → PLAYBACK DEFAULTS**.
+
+### Troubleshooting
+
+| Message | What to do |
+|---|---|
+| *Plex streaming needs a New 3DS* | Plex can't play on an Old 3DS / 2DS — the hardware H.264 decoder is New-3DS only. |
+| *Could not reach plex.tv* | The 3DS has no internet. Check Wi-Fi, or use the manual setup (option 2). |
+| *The code expired. Try again.* | The code wasn't entered within 15 minutes — link again for a fresh one. |
+| *No Plex server answered on this network* | The server is off, on another network, or not advertising a local address. Use **ENTER ADDRESS**. |
+| *Could not connect* (TEST CONNECTION) | Wrong IP/port, server off, or a firewall on the server PC blocking port 32400. Check that Plex Web works from another device using the same address. |
+| *Plex refused access: check the token* | The token is wrong or was revoked — link again, or enter a fresh token. Also check **Secure connections** isn't set to *Required*. |
+| *No Plex server is set up* | Open **SETTINGS → PLEX SERVER** and do option 1 or 2 first. |
 
 **Limits for now:** home network only (the 3DS and the server on the same Wi-Fi — no remote
 streaming), and video is sized for the top screen (400x240).
