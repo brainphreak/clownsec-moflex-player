@@ -133,7 +133,16 @@ static void pq_load(void) {
     }
     fclose(f);
 }
+/* player_kit (MP4) defers the menus' SD writes to pause/exit: a write mid-playback stalls the card
+ * the film is streaming from, and a 720p MP4 has too little decode headroom to absorb it. The
+ * moflex engines never set g_kit_defer, so they save exactly as before. */
+static int g_kit_defer = 0, g_kit_pq_pending = 0, g_kit_sub_pending = 0;
+/* player_kit (streams): subtitles the server burns into the picture can be switched although no
+ * subtitle text is loaded, so the CC menu's on/off row must work without g_nsubs. Never set by
+ * the moflex engines. */
+static int g_kit_subs_any = 0;
 static void pq_save(void) {
+    if (g_kit_defer) { g_kit_pq_pending = 1; return; }
     mkdir("sdmc:/moflex_player", 0777);
     FILE *f = fopen(PQ_FILE, "wb"); if (!f) return;
     fprintf(f, "%d %d %d %d\n", g_pq_bright, g_pq_con, g_pq_sat, g_autolvl);
@@ -1109,7 +1118,99 @@ static int g_atrk_streams[4]; static int g_atrk_n = 0;   /* audio stream indices
 static char g_atrk_lbl[4][4];                            /* button labels: "ENG"/"JPN"/"A1".. */
 static int g_atrk_sel = 0;                               /* chosen track ordinal (0 = first) */
 static volatile int g_atrk_apply = 0;                    /* menu changed the track: player re-locks */
+
+/* ---- playback defaults (sdmc:/moflex_player/defaults.cfg) ----
+ * A video with no .sub of its own used to start from fixed values (size 1, 10 px, first audio
+ * track, built-in subtitles off), so a viewer who watches everything in Japanese with size-3
+ * subtitles re-set all of it on every new episode. These are what such a video starts from
+ * instead; anything changed in the player's menus still saves per video and wins next time. */
+#define DEF_FILE "sdmc:/moflex_player/defaults.cfg"
+static const char *const LANG_CODE[] = { "", "ENG", "JPN", "SPA", "FRE", "GER", "ITA", "POR",
+                                         "RUS", "KOR", "CHI", "DUT", "SWE", "POL", "ARA", "HIN" };
+static const char *const LANG_NAME[] = { "First track", "English", "Japanese", "Spanish", "French",
+                                         "German", "Italian", "Portuguese", "Russian", "Korean",
+                                         "Chinese", "Dutch", "Swedish", "Polish", "Arabic", "Hindi" };
+#define LANG_N ((int)(sizeof LANG_CODE / sizeof LANG_CODE[0]))
+static MoflexDefaults g_def;
+static int g_def_loaded = 0;
+static int g_cfg_fresh = 0;    /* this video has no .sub: the defaults are in charge of it */
+
+/* ISO 639-2 has two codes for some languages (fre/fra, ger/deu ...); files carry either */
+static int lang_match(const char *tag, int li) {
+    if (!tag || !tag[0] || li <= 0 || li >= LANG_N) return 0;
+    if (!strcasecmp(tag, LANG_CODE[li])) return 1;
+    static const char *const ALT[][2] = { { "FRE", "FRA" }, { "GER", "DEU" }, { "CHI", "ZHO" },
+                                          { "DUT", "NLD" }, { "ENG", "EN" }, { "JPN", "JA" } };
+    for (size_t i = 0; i < sizeof ALT / sizeof ALT[0]; i++)
+        if (!strcasecmp(LANG_CODE[li], ALT[i][0]) && !strcasecmp(tag, ALT[i][1])) return 1;
+    return 0;
+}
+void moflex_defaults_reset(MoflexDefaults *d) {
+    d->alang = 0; d->subs = MOFLEX_DEF_SUBS_AS_FOUND; d->slang = 0;
+    d->size = 1; d->pos = SUB_POS_DEF; d->font = 0; d->depth = 0;
+}
+static void def_load(void) {
+    if (g_def_loaded) return;
+    g_def_loaded = 1;
+    moflex_defaults_reset(&g_def);
+    FILE *f = fopen(DEF_FILE, "rb"); if (!f) return;
+    int v = 0, a, s, sl, sz, p, fn, dp;
+    if (fscanf(f, "%d %d %d %d %d %d %d %d", &v, &a, &s, &sl, &sz, &p, &fn, &dp) == 8 && v == 1) {
+        if (a >= 0 && a < LANG_N) g_def.alang = a;
+        if (s >= 0 && s < MOFLEX_DEF_SUBS_N) g_def.subs = s;
+        if (sl >= 0 && sl < LANG_N) g_def.slang = sl;
+        if (sz >= 1 && sz <= SUB_SIZE_MAX) g_def.size = sz;
+        if (p >= 0 && p <= SUB_POS_MAX) g_def.pos = p;
+        g_def.font = !!fn;
+        if (dp >= -16 && dp <= 16) g_def.depth = dp;
+    }
+    fclose(f);
+}
+void moflex_defaults_get(MoflexDefaults *d) { def_load(); *d = g_def; }
+void moflex_defaults_set(const MoflexDefaults *d) {
+    g_def = *d; g_def_loaded = 1;
+    mkdir("sdmc:/moflex_player", 0777);
+    FILE *f = fopen(DEF_FILE, "wb"); if (!f) return;
+    fprintf(f, "1 %d %d %d %d %d %d %d\n", g_def.alang, g_def.subs, g_def.slang,
+            g_def.size, g_def.pos, g_def.font, g_def.depth);
+    fclose(f);
+}
+int  moflex_lang_count(void) { return LANG_N; }
+const char *moflex_lang_code(int i) { return i > 0 && i < LANG_N ? LANG_CODE[i] : ""; }
+const char *moflex_lang_name(int i) { return i >= 0 && i < LANG_N ? LANG_NAME[i] : "?"; }
+int  moflex_sub_size_max(void) { return SUB_SIZE_MAX; }
+int  moflex_sub_pos_max(void) { return SUB_POS_MAX; }
+
+/* fresh video: the preferred built-in subtitle language, before the track is stashed */
+static void def_pick_subtrack(void) {
+    if (!g_cfg_fresh) return;
+    g_trsub_sel = 0;
+    for (int k = 0; k < g_tra.sub_n; k++)
+        if (lang_match(g_tra.sub_lang[k], g_def.slang)) { g_trsub_sel = k; break; }
+}
+/* fresh video: the preferred audio language, once the track labels are known */
+static void def_pick_audio(void) {
+    if (!g_cfg_fresh || g_def.alang <= 0) return;
+    for (int t = 0; t < g_atrk_n && t < 4; t++)
+        if (lang_match(g_atrk_lbl[t], g_def.alang)) { g_atrk_sel = t; return; }
+}
+/* fresh video: subtitles on/off, once both the subtitles and the audio language are settled */
+static void def_apply_subs(const char *alang) {
+    if (!g_cfg_fresh || g_nsubs == 0) return;
+    switch (g_def.subs) {
+        case MOFLEX_DEF_SUBS_ON:  g_sub_on = 1; break;
+        case MOFLEX_DEF_SUBS_OFF: g_sub_on = 0; break;
+        case MOFLEX_DEF_SUBS_FOREIGN:
+            /* an untagged track ("A1", "A2") tells us nothing: leave it as found */
+            if (alang && alang[0] && !(alang[0] == 'A' && alang[1] >= '0' && alang[1] <= '9'))
+                g_sub_on = !lang_match(alang, g_def.slang > 0 ? g_def.slang : 1);
+            break;
+    }
+}
+void moflex_defaults_apply_subs(const char *alang) { def_apply_subs(alang); }
+
 static void subcfg_save(const char *movie) {
+    if (g_kit_defer) { g_kit_sub_pending = 1; return; }   /* written by kit_flush_saves */
     mkdir("sdmc:/moflex_player", 0777); mkdir("sdmc:/moflex_player/resume", 0777);
     char p[256]; subcfg_path(movie, p, sizeof p);
     FILE *f = fopen(p, "wb"); if (!f) return;
@@ -1134,7 +1235,13 @@ static void subcfg_load(const char *movie) {
     g_zoom = ZOOM_MIN; g_conv = 0; g_ghost = 0;
     char p[256]; subcfg_path(movie, p, sizeof p);
     FILE *f = fopen(p, "rb");
-    if (!f) { int e = subenc_load(movie); if (e >= 0) g_sub_enc = e; return; }   /* pre-.sub: encoding only */
+    g_cfg_fresh = !f;
+    if (!f) {   /* nothing saved for this video: start from the viewer's defaults */
+        def_load();
+        g_sub_size = g_def.size; g_sub_pos = g_def.pos; g_sub_font = g_def.font; g_sub_depth = g_def.depth;
+        int e = subenc_load(movie); if (e >= 0) g_sub_enc = e;   /* pre-.sub: encoding only */
+        return;
+    }
     int ver = 0, on = 0, top = 0, size = 1, depth = 0, enc = 0; long long off = 0;
     if (fscanf(f, "%d %d %d %d %d %lld %d", &ver, &on, &top, &size, &depth, &off, &enc) == 7 && ver == 1) {
         int asel = 0, fnt = 0, pos = -1;
@@ -1173,13 +1280,24 @@ static void subcfg_load(const char *movie) {
     }
     fclose(f);
 }
+/* Settings screen "copy from a video": that video's saved appearance as defaults. Called from
+ * the home screen, never during playback, so borrowing the playback globals is safe -- the next
+ * film reloads them all through subcfg_load anyway. */
+int moflex_defaults_from_movie(const char *path, MoflexDefaults *d) {
+    subcfg_load(path);
+    if (g_cfg_fresh) return 0;
+    d->subs  = g_sub_on ? MOFLEX_DEF_SUBS_ON : MOFLEX_DEF_SUBS_OFF;
+    d->size  = g_sub_size; d->pos = g_sub_pos; d->font = g_sub_font; d->depth = g_sub_depth;
+    return 1;
+}
 
 /* auto-load a matching track at playback start: "<movie>.srt" beside the file, else moviedata/;
  * then the same two places for .ass and .ssa. SRT first: where both exist it is the one someone
  * went to the trouble of making for this player. */
 static void subs_autoload(const char *moviepath) {
     g_nsubs = 0; g_sub_on = 0; g_sub_off = 0; g_sub_file[0] = 0;   /* offset is per-movie */
-    subcfg_load(moviepath);   /* this movie's saved settings (else keep last-used) */
+    subcfg_load(moviepath);   /* this movie's saved settings (else the viewer's defaults) */
+    def_pick_subtrack();      /* fresh video: the preferred built-in subtitle language */
     if (g_sub_file[0]) {      /* the exact track they were watching with -- keeps their on/off choice */
         char want[512]; snprintf(want, sizeof want, "%s", g_sub_file);   /* subs_load() rewrites g_sub_file */
         /* The embedded stash is a CACHE at a FIXED path. Rebuilding a movie rewrites the
@@ -2355,13 +2473,19 @@ static int g_view_is3d = 1;
  * to VIEW and lives here as a trailing row on that console. Kept OUT of the index remap below
  * by giving it its own action code, so the existing rows keep their numbers. */
 #define VIEW_BASE (g_view_is3d ? VIEW_ROWS_3D : VIEW_ROWS_2D)
-#define VIEW_ROWS (VIEW_BASE + (g_hq_avail ? 1 : 0))
+#define VIEW_ROWS (VIEW_BASE + (g_hq_avail ? 1 : 0) + g_kit_fmt_row)
 #define VIEW_ACT_HQ 99
+/* MP4 only (player_kit): a trailing "3D format" row -- 2D / SBS / Half SBS -- for files whose
+ * frame shape cannot say which they are. The moflex engines never set g_kit_fmt_row, so for them
+ * the menu is exactly what it was. */
+#define VIEW_ACT_FMT 98
+static int g_kit_fmt_row = 0, g_kit_fmt = 0, g_kit_fmt_changed = 0;
 static int g_view_sel = 0, g_view_rep = 0;
 static int g_hq_req = 0;      /* set when the HQ row is toggled; the panel turns it into a replay */
 /* display row -> action code (the 2D list skips convergence + ghost) */
 static int view_act(int row) {
     if (g_hq_avail && row == VIEW_BASE) return VIEW_ACT_HQ;
+    if (g_kit_fmt_row && row == VIEW_BASE + (g_hq_avail ? 1 : 0)) return VIEW_ACT_FMT;
     if (!g_view_is3d && row >= 2) row += 2;
     return row;
 }
@@ -2369,6 +2493,11 @@ static void view_label(int row, char *r, int cap) {
     int i = view_act(row);
     if (i == VIEW_ACT_HQ) {
         snprintf(r, cap, "HQ colour:  %s   (A toggles)", g_hq ? "24-bit" : "16-bit");
+        return;
+    }
+    if (i == VIEW_ACT_FMT) {
+        static const char *const F[3] = { "2D", "3D SBS", "3D Half SBS" };
+        snprintf(r, cap, "Format:  %s   (A changes)", F[g_kit_fmt >= 0 && g_kit_fmt <= 2 ? g_kit_fmt : 0]);
         return;
     }
     switch (i) {
@@ -2428,6 +2557,12 @@ static int view_input(u32 kd, u32 kh, touchPosition tp) {
     else { rep = (kd & (KEY_LEFT | KEY_RIGHT | KEY_TOUCH)) ? held : 0;
            if (rep) g_view_rep = 0;
            else { g_view_rep++; if (g_view_rep > 8 && g_view_rep % 2 == 0) rep = held; } }
+    if (i == VIEW_ACT_FMT) {   /* A / tap / right: next format; left: previous */
+        int d = (kd & KEY_LEFT) ? -1 : (press || (kd & KEY_RIGHT) ||
+                (t_row >= 0 && t_row == g_view_sel && (kd & KEY_TOUCH))) ? 1 : 0;
+        if (d) { g_kit_fmt = (g_kit_fmt + 3 + d) % 3; g_kit_fmt_changed = 1; }
+        return 0;
+    }
     if (i == VIEW_ACT_HQ) {
         if (press || (t_row >= 0 && t_row == g_view_sel && (kd & KEY_TOUCH))) {
             g_hq_req = 1;                                 /* panel re-opens the film in the new depth */
@@ -2681,7 +2816,7 @@ static int submenu_input(u32 kd, u32 kh, touchPosition tp, int is3d, const char 
            else { g_sub_rep++; if (g_sub_rep > 10 && g_sub_rep % 3 == 0) rep = held; } }
     if (t_row >= 0 && !val_row) press = 1;             /* toggle/cycle/encoding/load: activate */
     switch (a) {
-        case 0: if (press) { if (g_nsubs > 0) g_sub_on = !g_sub_on; } break;
+        case 0: if (press) { if (g_nsubs > 0 || g_kit_subs_any) g_sub_on = !g_sub_on; } break;
         case 2: {   /* a step, not a cycle: left/right (or the row's halves) nudge one level */
             int d = rep ? rep : press;
             if (d > 0) { if (g_sub_size < SUB_SIZE_MAX) g_sub_size++; }
@@ -4140,6 +4275,8 @@ static MoflexResult moflex_play_ring(const char *path) {
         snprintf(g_atrk_lbl[g_atrk_n], 4, "%s", g_tra.lang_alt[0] ? g_tra.lang_alt : "A2");
         g_atrk_streams[g_atrk_n++] = -1;    /* -1 = the trailer source (Audio Track N) */
     }
+    def_pick_audio();     /* no saved track: the viewer's preferred language, when the file has it */
+    def_apply_subs(g_atrk_n > 0 && g_atrk_sel < 4 ? g_atrk_lbl[g_atrk_sel] : g_tra.lang_main);
     if (g_atrk_n > 1) {   /* dual audio: honor this movie's saved track (subcfg, loaded above) */
         if (g_atrk_sel < 0 || g_atrk_sel >= g_atrk_n) g_atrk_sel = 0;
         if (g_atrk_streams[g_atrk_sel] >= 0) {
@@ -4946,6 +5083,7 @@ static MoflexResult moflex_play_classic(const char *path) {
         if (g_trsub_sel < 0 || g_trsub_sel >= g_tra.sub_n) g_trsub_sel = 0;
         if (trsub_stash(path, g_trsub_sel)) subs_load(EMB_SRT);
     }
+    def_apply_subs(g_tra.lang_main);   /* single-audio path: the file's main language */
 
     /* audio */
     #undef NWB
@@ -5318,6 +5456,7 @@ static MoflexResult moflex_play_soft(const char *path) {
         else if (L > 4 && !strcasecmp(title + L - 4, ".zip")) title[L - 4] = 0;
         else if (L > 4 && !strcasecmp(title + L - 4, ".cia")) title[L - 4] = 0; }
     subs_autoload(path);
+    def_apply_subs(NULL);   /* no trailer probe on this path: ON/OFF apply, FOREIGN can't tell */
 
     gfxSetScreenFormat(GFX_TOP, GSP_BGR8_OES);   /* 24-bit software blit (no banding) */
     gfxSetDoubleBuffering(GFX_TOP, true);        /* both eyes to the back buffer -> appear together on swap */
@@ -5603,3 +5742,409 @@ void moflex_subs_autoload(const char *moviepath) { subs_autoload(moviepath); }
 void moflex_sub_menu(const char *moviepath, int is3d) { sub_menu(moviepath, is3d); }
 void moflex_sub_overlay(int is3d, long long us) { sub_overlay(is3d, (int64_t)us); }
 int  moflex_subs_on(void) { return g_sub_on; }
+
+/* ---- PLAYBACK DEFAULTS preview ----
+ * Position, size and 3D depth are guesswork as numbers, so the defaults screen runs inside this
+ * and the top screen shows a caption through the RING renderer itself: the same face choice,
+ * scale ladder, wrap budget and per-eye shift a film gets. The app's bottom-screen UI is drawn
+ * as usual and shown as a texture, exactly like the in-player menus. */
+static void preview_scene(void) {
+    /* a dusk street: bright enough near the caption line to judge the outline against */
+    C2D_DrawRectangle(0, 0, 0, SCR_W, 150, C2D_Color32(18, 26, 64, 255), C2D_Color32(18, 26, 64, 255),
+                      C2D_Color32(170, 90, 110, 255), C2D_Color32(170, 90, 110, 255));
+    C2D_DrawCircleSolid(318, 52, 0, 20, C2D_Color32(250, 240, 200, 255));
+    static const short B[][3] = { { 0, 70, 96 }, { 62, 56, 70 }, { 112, 80, 110 }, { 186, 60, 82 },
+                                  { 240, 72, 124 }, { 306, 50, 64 }, { 350, 50, 104 } };
+    for (size_t i = 0; i < sizeof B / sizeof B[0]; i++)
+        C2D_DrawRectSolid(B[i][0], 150 - B[i][2], 0, B[i][1], B[i][2], C2D_Color32(28, 22, 40, 255));
+    C2D_DrawRectangle(0, 150, 0, SCR_W, SCR_H - 150, C2D_Color32(120, 110, 120, 255), C2D_Color32(120, 110, 120, 255),
+                      C2D_Color32(220, 210, 200, 255), C2D_Color32(220, 210, 200, 255));
+}
+static void preview_black(void) {   /* fresh framebuffers hold garbage */
+    for (int fb = 0; fb < 2; fb++) {
+        u16 fw = 0, fh = 0; u8 *p;
+        p = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, &fw, &fh);  if (p) memset(p, 0, (size_t)fw * fh * 3);
+        p = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, &fw, &fh); if (p) memset(p, 0, (size_t)fw * fh * 3);
+        gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
+    }
+}
+int moflex_defaults_preview(const MoflexDefaults *d,
+                            int (*frame)(void *ctx, unsigned kd, unsigned kh, unsigned ku,
+                                         int tx, int ty, int *drew), void *ctx) {
+    int sv_size = g_sub_size, sv_pos = g_sub_pos, sv_font = g_sub_font, sv_depth = g_sub_depth;
+    int sv_tpos = g_sub_tpos, sv_link = g_sub_link;
+    gfxExit(); gfxInitDefault();          /* the same clean hand-over moflex_play_ring does */
+    preview_black();
+    gfxSet3D(true);
+    int ok3d = C3D_Init(C3D_DEFAULT_CMDBUF_SIZE), ok2d = ok3d && C2D_Init(SUB_C2D_OBJECTS);
+    C3D_RenderTarget *topL = NULL, *topR = NULL, *bot = NULL;
+    if (ok2d) {
+        C2D_Prepare();
+        topL = C2D_CreateScreenTarget(GFX_TOP, GFX_LEFT);
+        topR = C2D_CreateScreenTarget(GFX_TOP, GFX_RIGHT);
+        bot  = C2D_CreateScreenTarget(GFX_BOTTOM, GFX_LEFT);
+    }
+    if (!ok2d || !topL || !topR || !bot || !ui_tex_init()) {
+        if (ok2d) { gpu_park_program(); C2D_Fini(); }
+        if (ok3d) { if (!ok2d) gpu_park_program(); C3D_Fini(); }
+        gfxSet3D(false); gfxExit(); gfxInitDefault(); preview_black();
+        return -2;
+    }
+    C2D_TextBuf sbuf = C2D_TextBufNew(512), lbuf = C2D_TextBufNew(96);
+    RingSub rs; ring_sub_init(&rs, sbuf, &g_stx[0], 0);
+    C2D_Text lbl, lbl3d;
+    C2D_TextParse(&lbl, lbuf, "PREVIEW"); C2D_TextOptimize(&lbl);
+    C2D_TextParse(&lbl3d, lbuf, "PREVIEW  -  raise the 3D slider to see depth"); C2D_TextOptimize(&lbl3d);
+    SubBlock blk; memset(&blk, 0, sizeof blk);
+    snprintf(blk.t, sizeof blk.t, "%s", "This is how your subtitles will look while a video plays.");
+    u32 black = C2D_Color32(0, 0, 0, 255), white = C2D_Color32(255, 255, 255, 255);
+    int code = 0, closing = 1, upload = 1;
+    while (aptMainLoop()) {
+        hidScanInput();
+        u32 kd = hidKeysDown(), kh = hidKeysHeld(), ku = hidKeysUp();
+        touchPosition tp; hidTouchRead(&tp);
+        int drew = 0;
+        ui_capture(1);                    /* the app's ui_present() becomes a no-op: we texture it */
+        code = frame(ctx, kd, kh, ku, tp.px, tp.py, &drew);
+        if (code) { closing = 0; ui_capture(0); break; }   /* ui_present() must draw again */
+        g_sub_size = d->size; g_sub_pos = d->pos; g_sub_font = d->font; g_sub_depth = d->depth;
+        g_sub_tpos = SUB_TPOS_DEF; g_sub_link = 1;
+        int stereo = osGet3DSliderState() > R3_MONO_AT;
+        int sdep = stereo ? g_sub_depth : 0;
+        ring_sub_prep(&rs, &blk, sdep < 0 ? -sdep : sdep);
+        if (drew || upload) { ui_tex_upload(); upload = 0; }
+        C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
+        for (int eye = 0; eye < 2; eye++) {
+            C3D_RenderTarget *t = eye ? topR : topL;
+            C2D_TargetClear(t, black); C2D_SceneBegin(t);
+            preview_scene();
+            C2D_DrawText(!stereo && d->depth ? &lbl3d : &lbl, C2D_WithColor, 8, 6, 0, 0.5f, 0.5f,
+                         C2D_Color32(255, 255, 255, 200));
+            ring_sub_draw(&rs, eye ? sdep : -sdep, white, black);
+        }
+        ui_tex_blit(bot);
+        C3D_FrameEnd(0);
+    }
+    ui_capture(0);                        /* whatever ended the loop, hand back a drawing UI */
+    C2D_TextBufDelete(sbuf); C2D_TextBufDelete(lbuf);
+    subtex_free(); ui_tex_free();
+    gspWaitForVBlank(); gspWaitForVBlank();
+    gpu_park_program(); C2D_Fini(); C3D_Fini();
+    gfxSet3D(false);
+    g_sub_size = sv_size; g_sub_pos = sv_pos; g_sub_font = sv_font; g_sub_depth = sv_depth;
+    g_sub_tpos = sv_tpos; g_sub_link = sv_link;
+    if (closing) return -1;               /* app closing: a gfx re-init now hangs the close */
+    gfxExit(); gfxInitDefault(); preview_black();
+    return code;
+}
+
+/* ==================== PLAYER KIT (see player_kit.h) ====================
+ * The ring engine's controls and presentation as calls, for the MP4 player. Each function is the
+ * ring loop's own code for that job (same rectangles, same rules, same draw sequence); the ring
+ * loop itself is untouched and does not call any of this. */
+#include "player_kit.h"
+static C2D_TextBuf g_kit_sbuf = NULL, g_kit_sbufT = NULL;
+static RingSub g_kit_rsb, g_kit_rst;
+static int g_kit_redraw = 0;
+/* An open menu is re-rendered + re-uploaded only when it may have changed (input, or it was just
+ * opened); otherwise its last texture is blitted. The ring repaints it every frame, which is
+ * affordable next to a 400x240 software decode but not next to a 720p MVD decode that has little
+ * slack: the menu's per-frame upload alone was enough to push the picture out of sync. */
+static int g_kit_menu_dirty = 1, g_kit_tex_menu = 0;
+
+int kit_gpu_begin(KitGpu *g, int is3d) {
+    memset(g, 0, sizeof *g);
+    gfxExit(); gfxInitDefault();          /* clean state for citro2d, exactly as moflex_play_ring */
+    preview_black();
+    gfxSet3D(is3d);
+    if (!C3D_Init(C3D_DEFAULT_CMDBUF_SIZE)) { gfxSet3D(false); return 0; }
+    if (!C2D_Init(SUB_C2D_OBJECTS)) { gpu_park_program(); C3D_Fini(); gfxSet3D(false); return 0; }
+    C2D_Prepare();
+    g->topL = C2D_CreateScreenTarget(GFX_TOP, GFX_LEFT);
+    g->topR = C2D_CreateScreenTarget(GFX_TOP, GFX_RIGHT);
+    g->bot  = C2D_CreateScreenTarget(GFX_BOTTOM, GFX_LEFT);
+    if (!g->topL || !g->topR || !g->bot || !ui_tex_init()) {
+        gpu_park_program(); C2D_Fini(); C3D_Fini(); gfxSet3D(false);
+        gfxExit(); gfxInitDefault(); preview_black();
+        return 0;
+    }
+    g_kit_sbuf = C2D_TextBufNew(512); g_kit_sbufT = C2D_TextBufNew(512);
+    ring_sub_init(&g_kit_rsb, g_kit_sbuf, &g_stx[0], 0);
+    ring_sub_init(&g_kit_rst, g_kit_sbufT, &g_stx[1], 1);
+    return 1;
+}
+void kit_gpu_end(KitGpu *g, int closing) {
+    ui_capture(0);
+    if (g_kit_sbuf) { C2D_TextBufDelete(g_kit_sbuf); g_kit_sbuf = NULL; }
+    if (g_kit_sbufT) { C2D_TextBufDelete(g_kit_sbufT); g_kit_sbufT = NULL; }
+    subtex_free(); ui_tex_free();
+    gspWaitForVBlank(); gspWaitForVBlank();
+    gpu_park_program(); C2D_Fini(); C3D_Fini();
+    gfxSet3D(false);
+    (void)g;
+    if (closing) return;                  /* app closing: a gfx re-init now hangs the close */
+    gfxExit(); gfxInitDefault(); preview_black();
+}
+
+void kit_film_begin(int is3d) {
+    ptmuInit(); g_mcu_ok = R_SUCCEEDED(mcuHwcInit()); g_batt_pct = -1; g_batt_next = 0;
+    g_lcd_ok = R_SUCCEEDED(gspLcdInit()); g_screen_off = 0;
+    pq_load(); vol_load();
+    g_submenu = 0; g_sub_sel = 0;
+    g_touch_locked = 0; g_lock_toast = 0; g_backlight_on = 1;
+    g_panel_cheap = 0; g_panel_force = 1;
+    g_view_is3d = is3d;
+    g_atrk_n = 1; g_atrk_sel = 0; g_atrk_apply = 0;   /* one track: SOUND shows auto level only */
+    lb_reset(); al_reset();
+    g_kit_redraw = 0;
+    g_kit_fmt_row = 1; g_kit_fmt_changed = 0;
+    g_kit_defer = 1; g_kit_pq_pending = 0; g_kit_sub_pending = 0;
+}
+/* What subcfg_save / pq_save would write, as one string: a menu opened and closed without a
+ * change matches the last write and touches nothing. */
+static char g_kit_sub_last[640], g_kit_pq_last[64];
+static void kit_sub_state(char *o, size_t cap) {
+    snprintf(o, cap, "%d %d %d %lld %d %d %d %d %d %d %d %d %d %s", g_sub_on, g_sub_size, g_sub_depth,
+             (long long)g_sub_off, g_sub_enc, g_atrk_sel, g_sub_font, g_sub_pos, g_zoom, g_conv,
+             g_ghost, g_sub_tpos, g_sub_link, g_sub_file);
+}
+static void kit_pq_state(char *o, size_t cap) {
+    snprintf(o, cap, "%d %d %d %d", g_pq_bright, g_pq_con, g_pq_sat, g_autolvl);
+}
+/* Write what the menus CHANGED (per-video subtitle/view settings, picture/level settings). Called
+ * when playback pauses or ends -- never while the film streams. */
+void kit_flush_saves(const char *path) {
+    int was = g_kit_defer;                /* restore, never force on: after kit_film_end it is off */
+    g_kit_defer = 0;
+    char cur[640];
+    if (g_kit_sub_pending) {
+        g_kit_sub_pending = 0; kit_sub_state(cur, sizeof cur);
+        if (strcmp(cur, g_kit_sub_last)) { subcfg_save(path); snprintf(g_kit_sub_last, sizeof g_kit_sub_last, "%s", cur); }
+    }
+    if (g_kit_pq_pending) {
+        g_kit_pq_pending = 0; kit_pq_state(cur, sizeof cur);
+        if (strcmp(cur, g_kit_pq_last)) { pq_save(); snprintf(g_kit_pq_last, sizeof g_kit_pq_last, "%s", cur); }
+    }
+    g_kit_defer = was;
+}
+/* the baseline: what is on the card for this film right now (call after its settings load) */
+void kit_saves_baseline(void) {
+    kit_sub_state(g_kit_sub_last, sizeof g_kit_sub_last);
+    kit_pq_state(g_kit_pq_last, sizeof g_kit_pq_last);
+}
+/* 3D format (MP4): the VIDEO menu's Format row */
+void kit_fmt_set(int fmt) { g_kit_fmt = fmt; g_kit_fmt_changed = 0; }
+int  kit_fmt_take_change(int *fmt) {
+    if (!g_kit_fmt_changed) return 0;
+    g_kit_fmt_changed = 0; *fmt = g_kit_fmt; return 1;
+}
+void kit_set_view3d(int is3d) { g_view_is3d = is3d; g_kit_menu_dirty = 1; }
+static void kit_fmt_path(const char *movie, char *out, size_t cap) {
+    resume_path(movie, out, cap);                                   /* .../<key>.pos */
+    size_t L = strlen(out);
+    if (L >= 4) snprintf(out + L - 4, cap - (L - 4), ".fmt");
+}
+int kit_fmt_load(const char *movie) {
+    char p[256]; kit_fmt_path(movie, p, sizeof p);
+    FILE *f = fopen(p, "rb"); if (!f) return -1;
+    int v = -1; if (fscanf(f, "%d", &v) != 1 || v < 0 || v > 2) v = -1;
+    fclose(f); return v;
+}
+void kit_fmt_save(const char *movie, int fmt) {
+    mkdir("sdmc:/moflex_player", 0777); mkdir("sdmc:/moflex_player/resume", 0777);
+    char p[256]; kit_fmt_path(movie, p, sizeof p);
+    FILE *f = fopen(p, "wb"); if (!f) return;
+    fprintf(f, "%d\n", fmt); fclose(f);
+}
+void kit_set_subs_any(int on) { g_kit_subs_any = on; }
+void kit_film_end(void) {
+    g_kit_subs_any = 0;
+    g_kit_defer = 0;                      /* (the caller flushed before this) */
+    g_kit_fmt_row = 0;                    /* the moflex VIDEO menu never shows the Format row */
+    if (g_screen_off) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; }
+    if (g_lcd_ok) { gspLcdExit(); g_lcd_ok = 0; }
+    if (g_mcu_ok) { mcuHwcExit(); g_mcu_ok = 0; }
+    ptmuExit();
+    g_backlight_on = 1;
+}
+void kit_suspend(void) {   /* the gsp::Lcd half of mp_ring_apt_hook */
+    if (g_screen_off) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; } g_backlight_on = 1;
+    if (g_lcd_ok) gspLcdExit();
+    gfxSet3D(false);
+}
+void kit_restore(void) {
+    if (g_lcd_ok) gspLcdInit();
+    g_backlight_on = 1;
+    g_kit_redraw = 1;
+}
+int kit_take_redraw(void) { int r = g_kit_redraw; g_kit_redraw = 0; return r; }
+
+void kit_input(u32 *pkd, u32 *pkh, int *dirty) {
+    u32 kd = *pkd, kh = *pkh;
+    {   /* lid watchdog (ring): force the backlights on at closed->open */
+        static u64 s_lid_t; static int s_lid_closed = -1;
+        u64 lnow = osGetTime();
+        if (lnow - s_lid_t >= 500) {
+            s_lid_t = lnow;
+            u8 shell = 1;
+            if (R_SUCCEEDED(ptmuInit())) { PTMU_GetShellState(&shell); ptmuExit(); }
+            if (s_lid_closed == 1 && shell != 0) {
+                if (g_lcd_ok) GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTH);
+                else if (R_SUCCEEDED(gspLcdInit())) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTH); gspLcdExit(); }
+                g_screen_off = 0; g_backlight_on = 1; *dirty = 1;
+            }
+            s_lid_closed = (shell == 0) ? 1 : 0;
+        }
+    }
+    if ((kh & KEY_L) && (kh & KEY_R) && (kd & (KEY_L | KEY_R))) {   /* L+R: full lock */
+        g_touch_locked = !g_touch_locked; g_lock_toast = 0; *dirty = 1; kd = 0; kh = 0;
+    }
+    if (g_touch_locked) {
+        if (kd) { g_lock_toast = 90; *dirty = 1; }
+        kd = 0; kh = 0;
+    }
+    if (g_screen_off) {   /* any button wakes it (not L/R: the lock combo); a touch wakes it too */
+        if (kd & ~(KEY_TOUCH | KEY_L | KEY_R)) { g_screen_off = 0; *dirty = 1; kd = 0; }
+        else if (kd & KEY_TOUCH) { g_screen_off = 0; *dirty = 1; }
+        kd &= ~KEY_TOUCH; kh &= ~KEY_TOUCH;
+    }
+    if (g_lock_toast > 0) { g_lock_toast--; *dirty = 1; }
+    if (g_lcd_ok) {
+        int on = (!g_screen_off) || (g_lock_toast > 0);
+        if (on != g_backlight_on) { if (on) GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM);
+                                    else GSPLCD_PowerOffBacklight(GSPLCD_SCREEN_BOTTOM); g_backlight_on = on; }
+    }
+    *pkd = kd; *pkh = kh;
+}
+
+int  kit_menu_open(void) { return g_submenu != 0; }
+void kit_menu_input(u32 kd, u32 kh, touchPosition tp, int is3d, const char *path) {
+    if (kd || (kh & (KEY_TOUCH | KEY_LEFT | KEY_RIGHT | KEY_UP | KEY_DOWN))) g_kit_menu_dirty = 1;
+    submenu_input(kd, kh, tp, is3d, path);
+    g_hq_req = 0;                         /* HQ is an Old-3DS ring row; never shown here */
+}
+void kit_open_subs_menu(void) { g_submenu = 1; g_sub_sel = 0; g_kit_menu_dirty = 1; }
+void kit_toggle_subs(void) { g_sub_on = !g_sub_on; }
+void kit_toggle_dark(void) { if (g_lcd_ok) g_screen_off = !g_screen_off; }
+
+KitTouch kit_touch(int px, int py, int is3d) {
+    if (py >= BAR_Y - 8 && py <= BAR_Y + BAR_H + 8 && px >= BAR_X && px <= BAR_X + BAR_W) return KIT_T_SCRUB;
+    if (px >= VOL_X - 14 && px <= VOL_X + 26 && py >= VOL_Y - 8 && py <= VOL_Y + VOL_H + 8) return KIT_T_VOL;
+    if (py >= PLAY_CY - 20 && py <= PLAY_CY + 20 && px >= PLAY_CX - 20 && px <= PLAY_CX + 20) return KIT_T_PLAY;
+    if (py >= PLAY_CY - 20 && py <= PLAY_CY + 20 && px >= RW_CX - 18 && px <= RW_CX + 18) return KIT_T_RW;
+    if (py >= PLAY_CY - 20 && py <= PLAY_CY + 20 && px >= FF_CX - 18 && px <= FF_CX + 18) return KIT_T_FF;
+    if (px >= AUD_X && px < AUD_X + AUD_W && py >= AUD_Y && py < AUD_Y + AUD_H) {
+        g_submenu = 4; g_snd_sel = 0; g_kit_menu_dirty = 1; return KIT_T_HANDLED; }
+    if (px >= CC_X && px < CC_X + CC_W && py >= CC_Y && py < CC_Y + CC_H) {
+        g_submenu = 1; g_sub_sel = 0; g_kit_menu_dirty = 1; return KIT_T_HANDLED; }
+    if (px >= ZM_X && px < ZM_X + ZM_W && py >= ZM_Y && py < ZM_Y + ZM_H) {
+        g_submenu = 3; g_view_sel = 0; g_view_is3d = is3d; g_kit_menu_dirty = 1; return KIT_T_HANDLED; }
+    if (g_lcd_ok && px >= DIM_X && px < DIM_X + DIM_W && py >= DIM_Y && py < DIM_Y + DIM_H) {
+        g_screen_off = 1; return KIT_T_HANDLED; }
+    if (py >= BTN_Y && py < BTN_Y + BTN_H) {
+        if (px >= BKB_X && px < BKB_X + BKB_W) return KIT_T_OPEN;
+        if (px >= OPB_X && px < OPB_X + OPB_W) return KIT_T_MANAGE;
+        if (px >= EXB_X && px < EXB_X + EXB_W) return KIT_T_ADD;
+    }
+    return KIT_T_NONE;
+}
+int64_t kit_scrub_us(int px, int64_t dur_us) {
+    if (px < BAR_X) px = BAR_X; if (px > BAR_X + BAR_W) px = BAR_X + BAR_W;
+    return (int64_t)((double)(px - BAR_X) / BAR_W * (dur_us > 0 ? dur_us : 0));
+}
+int kit_vol_drag(int py) {
+    float f = 1.0f - (float)(py - VOL_Y) / VOL_H; if (f < 0) f = 0; if (f > 1) f = 1;
+    int st = (int)(f * 4.0f / 0.25f + 0.5f); float nv = st * 0.25f;
+    if (nv < 0.25f) nv = 0.25f; if (nv > 4.0f) nv = 4.0f;
+    if (nv == g_vol) return 0;
+    g_vol = nv; return 1;
+}
+void kit_vol_step(int dir) {
+    if (dir > 0) { int s = (int)(g_vol / 0.25f + 0.0001f); g_vol = (s + 1) * 0.25f; if (g_vol > 4.0f) g_vol = 4.0f; }
+    else         { int s = (int)(g_vol / 0.25f + 0.9999f); g_vol = (s - 1) * 0.25f; if (g_vol < 0.25f) g_vol = 0.25f; }
+}
+void kit_vol_save(void) { vol_save(); }
+
+void kit_audio_gain(int16_t *s, int ns) {   /* r3_audio_feed_raw's gain stage */
+    float g = g_vol;
+    if (g_autolvl > 0 && g_autolvl <= 2) g *= al_update(s, ns);
+    if (g == 1.0f) return;
+    for (int i = 0; i < ns; i++) {
+        int t = (int)(s[i] * g);
+        t = al_soft(t);
+        s[i] = (int16_t)(t > 32767 ? 32767 : (t < -32768 ? -32768 : t));
+    }
+}
+void kit_pq(int *bright, int *con, int *sat) { *bright = g_pq_bright; *con = g_pq_con; *sat = g_pq_sat; }
+void kit_lb_merge(int t, int b, int l, int r) {   /* lb_sample's merge, measured by the caller */
+    if (t < g_lb_top)   g_lb_top = t;
+    if (b < g_lb_bot)   g_lb_bot = b;
+    if (l < g_lb_left)  g_lb_left = l;
+    if (r < g_lb_right) g_lb_right = r;
+    g_lb_w = SCR_W; g_lb_h = SCR_H; g_lb_have = 1;
+}
+
+void kit_draw(KitGpu *g, C2D_Image L, C2D_Image R, int is3d, const char *title,
+              int64_t disp_us, int64_t dur_us, int playing) {
+    u32 black = C2D_Color32(0, 0, 0, 255), subcol = C2D_Color32(255, 255, 255, 255), subout = black;
+    static SubBlock vb, vt; subs_view(disp_us, &vb, &vt);   /* empty when off / no cue now */
+    {   /* the ring's subtitle prep: wrap leaves room for the per-eye shift */
+        float lz, lox, loy; r3_frame(&lz, &lox, &loy);
+        int ldep = r3_stereo(is3d) ? (int)((float)g_sub_depth * lz + (g_sub_depth < 0 ? -0.5f : 0.5f)) : 0;
+        if (ldep < 0) ldep = -ldep;
+        ring_sub_prep(&g_kit_rsb, &vb, ldep);
+        ring_sub_prep(&g_kit_rst, &vt, ldep);
+    }
+    float zm, zox, zoy; r3_frame(&zm, &zox, &zoy);
+    int stereo = r3_stereo(is3d);
+    int cv = stereo ? g_conv : 0;
+    int cmask = (zm <= 1.001f) ? (cv < 0 ? -cv : cv) : 0;
+    float mix = r3_mix(stereo);
+    C2D_ImageTint mixt; C2D_AlphaImageTint(&mixt, mix);
+    int sdep = (int)((float)g_sub_depth * zm + (g_sub_depth < 0 ? -0.5f : 0.5f));
+    C2D_Image imR = stereo ? R : L;
+    C3D_FrameBegin(0);
+    C2D_TargetClear(g->topL, black); C2D_SceneBegin(g->topL);
+    C2D_DrawImageAt(L, zox - cv, zoy, 0, NULL, zm, zm);
+    if (mix > 0.0f) C2D_DrawImageAt(imR, zox + cv, zoy, 0, &mixt, zm, zm);
+    if (stereo && g_ghost) r3_ghost(L, zox - cv, imR, zox + cv, zoy, zm);
+    r3_mask_edges(cmask, black);
+    ring_sub_draw(&g_kit_rst, stereo ? -sdep : 0, subcol, subout);
+    ring_sub_draw(&g_kit_rsb, stereo ? -sdep : 0, subcol, subout);
+    C2D_TargetClear(g->topR, black); C2D_SceneBegin(g->topR);
+    C2D_DrawImageAt(imR, zox + cv, zoy, 0, NULL, zm, zm);
+    if (mix > 0.0f) C2D_DrawImageAt(L, zox - cv, zoy, 0, &mixt, zm, zm);
+    if (stereo && g_ghost) r3_ghost(imR, zox + cv, L, zox - cv, zoy, zm);
+    r3_mask_edges(cmask, black);
+    ring_sub_draw(&g_kit_rst, stereo ? sdep : 0, subcol, subout);
+    ring_sub_draw(&g_kit_rsb, stereo ? sdep : 0, subcol, subout);
+    if (g_screen_off) { g_dark_sw(g->bot); g_panel_force = 1; g_kit_tex_menu = 0; }
+    else if (g_submenu) {
+        if (g_kit_menu_dirty || !g_kit_tex_menu || g_lock_toast > 0) {
+            g_submenu_sw(g->bot, is3d); g_kit_menu_dirty = 0; g_kit_tex_menu = 1;
+        } else ui_tex_blit(g->bot);       /* unchanged menu: reuse its texture */
+        g_panel_force = 1;
+    }
+    else { g_panel_sw(g->bot, title, disp_us, dur_us, playing); g_kit_tex_menu = 0; }
+    C3D_FrameEnd(0);
+}
+
+/* A stream's subtitles arrive as a file the source fetched (Plex: an external .srt/.ass). */
+int moflex_subs_load_file(const char *path) {
+    int n = subs_load(path);
+    if (n > 0) g_sub_on = 1;
+    return n;
+}
+int moflex_fmt_load_key(const char *key) { return kit_fmt_load(key); }
+int moflex_subs_wanted(const char *key, const char *audio_lang) {
+    subcfg_load(key);                     /* before playback: the globals are reloaded at open anyway */
+    if (!g_cfg_fresh) return g_sub_on;
+    def_load();
+    switch (g_def.subs) {
+        case MOFLEX_DEF_SUBS_ON: return 1;
+        case MOFLEX_DEF_SUBS_FOREIGN:
+            return (audio_lang && audio_lang[0]) ? !lang_match(audio_lang, g_def.slang > 0 ? g_def.slang : 1) : 0;
+        default: return 0;
+    }
+}
+void moflex_subs_set(int on) { g_sub_on = !!on; }

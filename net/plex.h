@@ -1,0 +1,91 @@
+/* Plex Media Server as a media source (local network, plain HTTP).
+ *
+ * Browsing is Plex's JSON API; playback asks the universal transcoder for one continuous MPEG-TS
+ * stream of H.264 + AAC sized for the top screen (verified against PMS 1.43: protocol=http,
+ * a fresh session per start, offset= for seeks with timestamps restarting near zero).
+ * The token is optional: with none, the server must list this network under "allowed without
+ * auth"; with one, every request carries it as X-Plex-Token. Settings live on the SD card only. */
+#ifndef PLEX_H
+#define PLEX_H
+
+#include <stdint.h>
+#include "httpstream.h"
+
+typedef struct {
+    char url[128];      /* the server in use: "http://10.0.0.31:32400" (no trailing slash) */
+    char token[64];     /* that server's access token; "" = none (server allows this network) */
+    char client[40];    /* this console's X-Plex-Client-Identifier, made once */
+    char account[64];   /* the plex.tv account token from linking; "" = not linked */
+    char name[64];      /* the server's name, for the screens */
+} PlexCfg;
+
+typedef struct {
+    char   key[192];    /* what to list next ("/library/sections/1/all", ".../children") */
+    char   rating[16];  /* ratingKey: the item itself */
+    char   type[12];    /* "movie" "show" "season" "episode" "section" ... */
+    char   title[96];
+    char   edition[48];  /* Plex "edition" ("3D Half SBS", "3D Full SBS" ...), "" = none */
+    char   thumb[160];
+    char   poster[160];  /* the portrait art to show: the item's own, or the season/show's for an episode */
+    char   summary[400];
+    char   genres[80];   /* "Action, Sci-Fi" */
+    char   crating[12];  /* content rating: "PG-13", "TV-MA" */
+    int    width, height; /* the source video, from its first media version */
+    int    index, parent_index, year;
+    int    leaf_count, viewed_leaf;   /* shows/seasons: episodes, watched */
+    int    viewed;
+    long long duration_ms, offset_ms; /* offset = Plex's resume point */
+} PlexItem;
+
+int  plex_cfg_load(PlexCfg *c);          /* 1 = a server is configured */
+
+/* Linking without typing a token (what Plex's TV apps do): plex_pin_start gets a short code for
+ * the viewer to enter at plex.tv/link; plex_pin_poll returns 1 with the token once they have.
+ * Poll every couple of seconds; -1 = expired or failed. */
+int  plex_pin_start(const PlexCfg *c, long long *id, char code[16]);
+int  plex_pin_poll(const PlexCfg *c, long long id, char *token, int cap);
+/* Is this token a plex.tv ACCOUNT token? (A link made before the account was stored apart left
+ * it only as the server token.) 1 = yes, 0 = no / can't tell. */
+int  plex_token_is_account(const PlexCfg *c, const char *token);
+/* The linked account's servers that answer on this network (plain HTTP), owned ones first;
+ * each with its own access token (a friend's shared server has one of its own). */
+typedef struct { char name[64]; char url[128]; char token[64]; int owned; } PlexServer;
+int  plex_servers(const PlexCfg *c, PlexServer *out, int max);
+void plex_cfg_save(const PlexCfg *c);
+
+/* GET path (e.g. "/library/sections") and return its entries. *items is malloc'd (free it).
+ * Returns the count, or -1 (plex_error() says why). */
+int  plex_list(const PlexCfg *c, const char *path, PlexItem **items);
+const char *plex_error(void);
+/* URL of the server's resized JPEG for a thumb path (fits w x h), for the poster cache. */
+void plex_art_url(const PlexCfg *c, const char *thumb, int w, int h, char *out, int cap);
+
+/* Start a transcoded stream of a movie/episode at offset_us. session (>= 24 bytes) receives
+ * the session id to stop later. is3d: ask for a frame that keeps both eyes side by side (up to
+ * 800x480 -- Plex keeps the layout: half SBS 1080p -> 800x450, full SBS -> 796x224); 0 = 400x240. */
+HttpStream *plex_stream_open(const PlexCfg *c, const char *rating_key, int64_t offset_us,
+                             int is3d, int burn_subs, char *session);
+
+/* ---- subtitles ----
+ * External text files download as-is and are drawn by the player (size/position/3D depth). An
+ * EMBEDDED track can only be burned into the video by Plex (its other route is HLS/DASH-only),
+ * and only once it is the part's selected subtitle -- so: select, stream with burn, restore. */
+typedef struct {
+    long long id;
+    char codec[12];      /* "srt" "ass" "pgs" "vobsub" ... */
+    char lang[8];        /* "eng" */
+    char title[48];
+    char key[96];        /* external file: "/library/streams/<id>"; "" = embedded */
+    int  forced, selected;
+} PlexSub;
+/* The item's subtitle tracks, its part id, and its selected audio language. Returns the count, -1. */
+int  plex_item_streams(const PlexCfg *c, const char *rating_key, PlexSub *subs, int max,
+                       long long *part_id, char *audio_lang, int alcap);
+int  plex_select_sub(const PlexCfg *c, long long part_id, long long sub_id);   /* 0 = none */
+int  plex_download(const PlexCfg *c, const char *path, const char *dest);     /* 1 = saved */
+void plex_stream_stop(const PlexCfg *c, const char *session);
+/* Tell Plex where playback is (state: "playing" "paused" "stopped") -- resume + watched sync. */
+void plex_timeline(const PlexCfg *c, const char *rating_key, const char *state,
+                   long long pos_ms, long long dur_ms);
+
+#endif

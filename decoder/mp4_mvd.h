@@ -8,9 +8,15 @@
 #include <stdint.h>
 
 /* Initialize MVD for a w x h H.264 stream and prime it with the SPS/PPS from the MP4 avcC box.
- * nal_len_size is the AVCC length-prefix width (usually 4). Returns 1 on success. */
+ * nal_len_size is the AVCC length-prefix width (usually 4). Returns 1 on success, -1 when the
+ * linear heap cannot hold the decoder + frame buffers, 0 when the hardware refused the stream. */
 int  mp4_mvd_init(int w, int h, const uint8_t *avcc, int avcc_len, int nal_len_size);
 void mp4_mvd_exit(void);
+/* Before init: the largest video sample in the file (sizes the packet buffer to fit, not 2 MB). */
+void mp4_mvd_hint_max_sample(u32 bytes);
+/* After init: decoded-frame slots allocated. The caller can hold at most slots-1 pictures queued
+ * while the next one decodes. */
+int  mp4_mvd_slots(void);
 
 /* One decode-pump step (reference-player state machine). If pictures are pending inside the
  * decoder, drains one (sample ignored); otherwise feeds `sample` (*consumed set to 1).
@@ -29,5 +35,9 @@ void mp4_mvd_reset(void);
  * Otherwise the whole frame goes to GFX_LEFT. Each eye is aspect-fit (nearest-scaled + centered,
  * letterboxed) into the 400x240 top screen. */
 void mp4_mvd_present(int slot, int sbs);
+
+/* The decoded frame in `slot` itself: BGR565 (GPU_RGB565 bit layout), w x h DISPLAY pixels, rows
+ * `stride` pixels apart (the coded width). For callers that present it themselves. */
+const u16 *mp4_mvd_frame(int slot, int *w, int *h, int *stride);
 
 #endif
