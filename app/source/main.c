@@ -4204,16 +4204,25 @@ static int startup_detect_poll(void);
 #define LATEST_URL_STABLE "https://github.com/brainphreak/clownsec-moflex-player/releases/download/v1.0/latest.txt"
 #define LATEST_URL_BETA   "https://github.com/brainphreak/clownsec-moflex-player/releases/download/v1.1.0-beta/latest.txt"
 #define LATEST_URL_MP4    "https://github.com/brainphreak/clownsec-moflex-player/releases/download/mp4-beta/latest.txt"
-static const char *latest_url(void) {
+/* The same files are mirrored on clownsec.com in GitHub's layout (<release tag>/latest.txt with the
+ * channel's .cia/.3dsx beside it): when GitHub's release downloads fail (they 504'd for hours on
+ * 2026-11-08 and every player silently saw "no update"), the check and the download fall back. */
+#define LATEST_URL_STABLE_M "https://www.clownsec.com/player/v1.0/latest.txt"
+#define LATEST_URL_BETA_M   "https://www.clownsec.com/player/v1.1.0-beta/latest.txt"
+#define LATEST_URL_MP4_M    "https://www.clownsec.com/player/mp4-beta/latest.txt"
+#define UPD_SOURCES 2                 /* 0 = GitHub, 1 = clownsec.com mirror */
+static int s_upd_src = 0;             /* the source whose latest.txt answered: download from it first */
+static const char *latest_url_n(int src) {
 #ifdef UPDATE_TEST_URL
+    (void)src;
     return UPDATE_TEST_URL;
 #endif
     u64 tid = 0;
     APT_GetProgramID(&tid);
     u32 uid = (u32)((tid >> 8) & 0xFFFFF);
-    if (uid == 0xf8a2d) return LATEST_URL_BETA;
-    if (uid == 0xf8a2e) return LATEST_URL_MP4;
-    return LATEST_URL_STABLE;
+    if (uid == 0xf8a2d) return src ? LATEST_URL_BETA_M : LATEST_URL_BETA;
+    if (uid == 0xf8a2e) return src ? LATEST_URL_MP4_M : LATEST_URL_MP4;
+    return src ? LATEST_URL_STABLE_M : LATEST_URL_STABLE;
 }
 static char s_upd[24] = ""; static int s_upd_shown = 0;
 static char s_upd_md5[33] = "";   /* latest.txt line 2 (optional): MD5 of the channel's .cia */
@@ -4233,10 +4242,20 @@ static void update_check(void) {   /* worker thread; printf-free so it can't hit
         if (try) for (int w = 0; w < 50 && !s_dt_abort; w++) svcSleepThread(100 * 1000 * 1000LL);   /* 5s, abortable */
         if (osGetWifiStrength() == 0) continue;   /* offline or still associating -> retry, never block */
         char *buf = NULL; size_t len = 0;
-        if (!download_to_mem(latest_url(), &buf, &len, 256) || !buf) continue;   /* busy -> retry */
-        buf[len < 255 ? len : 255] = 0;
-        int ld = 0, ln = 0, cd = 0, cn = 0;
-        ver_parse(buf, &ld, &ln);
+        int ld = 0, ln = 0, cd = 0, cn = 0, src;
+        /* A server error still "downloads": GitHub's 504 is a 92-byte HTML page that parses as
+         * version 0. Only a body that starts with a real "MAJOR.MINOR" counts as an answer;
+         * anything else tries the mirror, then the next round. */
+        for (src = 0; src < UPD_SOURCES && !s_dt_abort; src++) {
+            if (download_to_mem(latest_url_n(src), &buf, &len, 256) && buf) {
+                buf[len < 255 ? len : 255] = 0;
+                ver_parse(buf, &ld, &ln);
+                if (buf[0] >= '0' && buf[0] <= '9' && ld > 0) break;
+            }
+            free(buf); buf = NULL;
+        }
+        if (!buf) continue;                       /* no source answered -> retry */
+        s_upd_src = src;
         ver_parse(BUILD_TAG, &cd, &cn);
         if (ld > cd || (ld == cd && ln > cn)) {   /* copy "MAJOR.MINOR" verbatim, no snprintf */
             int j = 0;
@@ -4315,8 +4334,8 @@ static void startup_new_movie_check(void) {
 #define UPD_3DSX_TMP "sdmc:/moflex_player/update.3dsx"
 extern int __system_argc;
 extern char **__system_argv;
-static void upd_asset_url(char *out, size_t n, const char *ext) {
-    const char *lu = latest_url(), *sl = strrchr(lu, '/');
+static void upd_asset_url(char *out, size_t n, const char *ext, int src) {
+    const char *lu = latest_url_n(src), *sl = strrchr(lu, '/');
     int base = sl ? (int)(sl - lu) + 1 : 0;
     u64 tid = 0; APT_GetProgramID(&tid);
     u32 uid = (u32)((tid >> 8) & 0xFFFFF);
@@ -4398,32 +4417,40 @@ static int self_update(void) {
         if (lvl < 2 && !chg) { msg_screen("UPDATE", "Battery is low.\nPlug in the charger and try again."); return 0; }
     }
     char url[256];
-    upd_asset_url(url, sizeof url, hbl ? ".3dsx" : ".cia");
     const char *tmp = hbl ? UPD_3DSX_TMP : UPD_CIA_TMP;
     mkdir("sdmc:/moflex_player", 0777);
-    remove(tmp);
-    download_discard_partial(url);   /* same URL every release: never resume an older build's bytes */
     snprintf(g_dl_name, sizeof g_dl_name, "Clownsec Player %s", s_upd);
-    g_last_prog = 0;
     s_sleep_pending = 0;
     aptSetSleepAllowed(false);
     dl_wifi_hold(1);
-    bool got = download_to_file(url, tmp, dl_progress, NULL);
+    /* the source that answered the check first, then the other one: a CIA that fails on GitHub
+     * (or arrives damaged) gets a second chance from the mirror. Both serve the same file, so the
+     * one MD5 from latest.txt checks either. */
+    bool got = false; int md5_bad = 0;
+    long http = 0;
+    for (int k = 0; k < UPD_SOURCES && !got; k++) {
+        int src = (s_upd_src + k) % UPD_SOURCES;
+        upd_asset_url(url, sizeof url, hbl ? ".3dsx" : ".cia", src);
+        remove(tmp);
+        download_discard_partial(url);   /* same URL every release: never resume an older build's bytes */
+        g_last_prog = 0;
+        got = download_to_file(url, tmp, dl_progress, NULL);
+        if (!got) { http = download_last_http(); download_discard_partial(url); continue; }
+        upd_screen("CHECKING", "Clownsec Player", -1);
+        if (!upd_md5_ok(tmp, s_upd_md5)) { got = false; md5_bad = 1; remove(tmp); }
+    }
     dl_wifi_hold(0);
+    if (!got && md5_bad) {
+        sleep_reallow();
+        msg_screen("UPDATE", "The download was damaged.\nNothing was changed. Try again.");
+        return 0;
+    }
     if (!got) {
         sleep_reallow();
-        download_discard_partial(url);
-        long http = download_last_http();
         char m[96];
         if (http == 404) snprintf(m, sizeof m, "The update file isn't published yet.\nTry again later.");
         else snprintf(m, sizeof m, "The download stopped.\nNothing was changed.");
         msg_screen("UPDATE", m);
-        return 0;
-    }
-    upd_screen("CHECKING", "Clownsec Player", -1);
-    if (!upd_md5_ok(tmp, s_upd_md5)) {
-        sleep_reallow(); remove(tmp);
-        msg_screen("UPDATE", "The download was damaged.\nNothing was changed. Try again.");
         return 0;
     }
     int ok;

@@ -6,6 +6,13 @@ it, checks its MD5, installs it over itself and relaunches. Every release has to
 
 ## Rules
 
+0. **Every release goes to GitHub AND the clownsec.com mirror** (since 61108.2):
+   `https://www.clownsec.com/player/<release tag>/` holds the same `latest.txt`, `.cia` and
+   `.3dsx` (server dir `/var/www/html/clownsec/player/<tag>/`). The player checks GitHub first and
+   falls back to the mirror when GitHub fails or returns an error page (GitHub's release downloads
+   504'd for hours on 2026-11-08); the CIA download falls back the same way. A stale mirror means
+   users stuck on the old build whenever GitHub is down, so update both, same order.
+
 1. **`latest.txt` is two lines:** the build tag, then the MD5 of the exact `.cia` being uploaded.
    ```
    61024.4
@@ -44,7 +51,11 @@ make clean BUILD_TAG=$BUILD_TAG && ./build_cia.sh
 strings clownsec_player.3dsx | grep -c clownsec.com/test        # must be 0
 printf '%s\n%s\n' "$BUILD_TAG" "$(md5 -q clownsec_player.cia)" > latest.txt
 cp latest.txt ../latest.txt
+# GitHub + the clownsec.com mirror (the updater falls back to it): binaries first on BOTH,
+# latest.txt last on BOTH
+rsync clownsec_player.cia clownsec_player.3dsx brainphreak:/var/www/html/clownsec/player/v1.0/
 gh release upload v1.0 clownsec_player.cia clownsec_player.3dsx --clobber
+rsync latest.txt brainphreak:/var/www/html/clownsec/player/v1.0/
 gh release upload v1.0 latest.txt --clobber                      # last
 curl -sL https://github.com/brainphreak/clownsec-moflex-player/releases/download/v1.0/clownsec_player.cia | md5
 ```
