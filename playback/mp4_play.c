@@ -1001,6 +1001,11 @@ MoflexResult stream_play(const StreamSrc *src) {
     memset(&g_sv, 0, sizeof g_sv); memset(&g_sa, 0, sizeof g_sa);
     TsDemux *td = ts_new();
     g_s_base = src->start_us > 0 ? src->start_us : 0;
+    /* a fresh clock for THIS video. Only a seek used to reset it, so the next stream ran on the
+     * previous one's position: a never-played movie showed (and reported to Plex, and saved as
+     * its resume point) the time the last movie stopped at. */
+    g_a_played = 0; g_a_started = 0; g_sa_base_set = 0; g_a_base_us = g_s_base;
+    clk_set(g_s_base, 0);
     HttpStream *hs = td ? src->open(src->ctx, g_s_base, fmt) : NULL;
     int mvd_up = 0;
     g_have_audio = 0;
