@@ -37,6 +37,7 @@ typedef struct {
     int    leaf_count, viewed_leaf;   /* shows/seasons: episodes, watched */
     int    viewed;
     long long duration_ms, offset_ms; /* offset = Plex's resume point */
+    long long stamp;    /* a library (section): when its contents last changed -- the SD cache's key */
 } PlexItem;
 
 int  plex_cfg_load(PlexCfg *c);          /* 1 = a server is configured */
@@ -72,6 +73,11 @@ void plex_cfg_save(const PlexCfg *c);
  * Returns the count, or -1 (plex_error() says why). */
 int  plex_list(const PlexCfg *c, const char *path, PlexItem **items);
 const char *plex_error(void);
+/* SD-card copy of a big listing (a whole library), so it opens at once next time. Valid only
+ * while the library's stamp (PlexItem.stamp from /library/sections) is unchanged and the copy is
+ * under 3 days old. load: count, or -1 = no valid copy. */
+int  plex_cache_load(const PlexCfg *c, const char *path, long long stamp, PlexItem **items);
+void plex_cache_save(const PlexCfg *c, const char *path, long long stamp, const PlexItem *items, int n);
 /* URL of the server's resized JPEG for a thumb path (fits w x h), for the poster cache. */
 void plex_art_url(const PlexCfg *c, const char *thumb, int w, int h, char *out, int cap);
 

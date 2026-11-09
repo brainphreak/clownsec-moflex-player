@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 
 #define PLEX_CFG "sdmc:/moflex_player/plex.cfg"
 static char g_err[96] = "";
@@ -196,6 +197,7 @@ static int plex_parse_page(cJSON *mc, int sections, PlexItem **pv, int *pn, int 
             it->leaf_count = (int)jnum(e, "leafCount"); it->viewed_leaf = (int)jnum(e, "viewedLeafCount");
             it->viewed = jnum(e, "viewCount") > 0;
             it->duration_ms = jnum(e, "duration"); it->offset_ms = jnum(e, "viewOffset");
+            it->stamp = jnum(e, "contentChangedAt"); if (!it->stamp) it->stamp = jnum(e, "updatedAt");
             if (it->title[0]) n++;
         }
     }
@@ -249,6 +251,47 @@ int plex_list(const PlexCfg *c, const char *path, PlexItem **items) {
     if (!v) return -1;
     *items = v;
     return n;
+}
+
+/* ---- SD cache of big listings ---- */
+#define PLEX_CACHE_DIR "sdmc:/moflex_player/plexcache"
+#define PLEX_CACHE_MAGIC 0x31435850u              /* "PXC1" */
+#define PLEX_CACHE_MAX_AGE (3 * 24 * 3600)
+typedef struct { uint32_t magic, item_size; int32_t n, pad; int64_t stamp, saved; } PlexCacheHdr;
+static void plex_cache_name(const PlexCfg *c, const char *path, char *out, size_t cap) {
+    /* one file per server + listing: the server's id when known (survives an address change) */
+    uint32_t h = 2166136261u;
+    for (const char *s = c->machine[0] ? c->machine : c->url; *s; s++) { h ^= (uint8_t)*s; h *= 16777619u; }
+    h ^= '|'; h *= 16777619u;
+    for (const char *s = path; *s; s++) { h ^= (uint8_t)*s; h *= 16777619u; }
+    snprintf(out, cap, PLEX_CACHE_DIR "/%08lx.bin", (unsigned long)h);
+}
+int plex_cache_load(const PlexCfg *c, const char *path, long long stamp, PlexItem **items) {
+    *items = NULL;
+    if (stamp <= 0) return -1;
+    char fn[96]; plex_cache_name(c, path, fn, sizeof fn);
+    FILE *f = fopen(fn, "rb"); if (!f) return -1;
+    PlexCacheHdr hd; long long now = (long long)time(NULL);
+    int ok = fread(&hd, sizeof hd, 1, f) == 1 && hd.magic == PLEX_CACHE_MAGIC &&
+             hd.item_size == sizeof(PlexItem) && hd.n > 0 && hd.n < 100000 && hd.stamp == stamp &&
+             now - hd.saved < PLEX_CACHE_MAX_AGE && now >= hd.saved;
+    PlexItem *v = ok ? (PlexItem *)malloc((size_t)hd.n * sizeof(PlexItem)) : NULL;
+    if (v && fread(v, sizeof(PlexItem), (size_t)hd.n, f) != (size_t)hd.n) { free(v); v = NULL; }
+    fclose(f);
+    if (!v) return -1;
+    *items = v;
+    return hd.n;
+}
+void plex_cache_save(const PlexCfg *c, const char *path, long long stamp, const PlexItem *items, int n) {
+    if (stamp <= 0 || n <= 0) return;
+    mkdir("sdmc:/moflex_player", 0777); mkdir(PLEX_CACHE_DIR, 0777);
+    char fn[96], tmp[100]; plex_cache_name(c, path, fn, sizeof fn); snprintf(tmp, sizeof tmp, "%s.tmp", fn);
+    FILE *f = fopen(tmp, "wb"); if (!f) return;
+    PlexCacheHdr hd = { PLEX_CACHE_MAGIC, sizeof(PlexItem), n, 0, stamp, (int64_t)time(NULL) };
+    int ok = fwrite(&hd, sizeof hd, 1, f) == 1 && fwrite(items, sizeof(PlexItem), (size_t)n, f) == (size_t)n;
+    ok = (fclose(f) == 0) && ok;
+    remove(fn);
+    if (!ok || rename(tmp, fn) != 0) remove(tmp);   /* never leave a half-written copy */
 }
 
 static void urlenc(const char *s, char *o, size_t cap) {

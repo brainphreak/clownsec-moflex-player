@@ -6032,16 +6032,29 @@ static int plex_browse(void) {
     int lib3d = 0;                            /* inside a library named "...3D..." */
     static char path[8][192], ttl[8][96];
     int depth = 0, presel[8] = { 0 };
+    /* each level's list is kept while you're below it, so going back never downloads it again;
+     * a whole library (stamp > 0) is also kept on the SD card for next time */
+    PlexItem *lst[8] = { 0 }; int lstn[8] = { 0 }; long long stamp[8] = { 0 };
+    #define PLEX_BROWSE_DONE(rv) do { for (int d_ = 0; d_ < 8; d_++) free(lst[d_]); return (rv); } while (0)
+    #define PLEX_UP() do { free(lst[depth]); lst[depth] = NULL; if (depth == 0) PLEX_BROWSE_DONE(0); depth--; } while (0)
     snprintf(path[0], sizeof path[0], "/library/sections");
     snprintf(ttl[0], sizeof ttl[0], "%s", c.name[0] ? c.name : "PLEX");   /* which server this is */
     for (;;) {
-        msg_screen_nowait(ttl[depth], "Loading...");
-        PlexItem *it = NULL;
-        int n = plex_list_here(&c, path[depth], &it, ttl[depth]);
-        if (n < 0) { msg_screen("PLEX", plex_error()); if (depth == 0) return 0; depth--; continue; }
-        if (n == 0) { free(it); msg_screen(ttl[depth], "Nothing here."); if (depth == 0) return 0; depth--; continue; }
+        if (!lst[depth]) {
+            msg_screen_nowait(ttl[depth], "Loading...");
+            PlexItem *got = NULL;
+            int k = plex_cache_load(&c, path[depth], stamp[depth], &got);
+            if (k < 0) {
+                k = plex_list_here(&c, path[depth], &got, ttl[depth]);
+                if (k > 0) plex_cache_save(&c, path[depth], stamp[depth], got, k);
+            }
+            if (k < 0) { msg_screen("PLEX", plex_error()); PLEX_UP(); continue; }
+            if (k == 0) { free(got); msg_screen(ttl[depth], "Nothing here."); PLEX_UP(); continue; }
+            lst[depth] = got; lstn[depth] = k;
+        }
+        PlexItem *it = lst[depth]; int n = lstn[depth];
         char (*names)[64] = (char (*)[64])malloc((size_t)n * 64);
-        if (!names) { free(it); return 0; }
+        if (!names) PLEX_BROWSE_DONE(0);
         for (int i = 0; i < n; i++) {
             const PlexItem *e = &it[i];
             const char *mark = (plex_playable(e) && e->viewed) ? "* " : "";
@@ -6061,18 +6074,35 @@ static int plex_browse(void) {
         s_plex_items = NULL; s_plex_n = 0;
         branding_show();                      /* the logo back while the next list loads */
         free(names);
-        if (sel < 0 || sel >= n) { free(it); if (depth == 0) return 0; depth--; if (depth == 0) lib3d = 0; continue; }
+        if (sel < 0 || sel >= n) { PLEX_UP(); if (depth == 0) lib3d = 0; continue; }
         presel[depth] = sel;
-        PlexItem pick = it[sel]; free(it);
+        PlexItem pick = it[sel];
         if (plex_playable(&pick)) {
-            if (plex_play(&c, &pick, lib3d, -1) == MOFLEX_QUIT_EXIT) return 1;
+            /* the list may be a saved copy: take the resume point fresh from the server */
+            {   char mp[64]; snprintf(mp, sizeof mp, "/library/metadata/%s", pick.rating);
+                PlexItem *fr = NULL;
+                if (plex_list(&c, mp, &fr) > 0) { pick.offset_ms = fr[0].offset_ms; pick.viewed = fr[0].viewed; }
+                free(fr); }
+            if (plex_play(&c, &pick, lib3d, -1) == MOFLEX_QUIT_EXIT) PLEX_BROWSE_DONE(1);
+            /* small lists (a season's episodes) reload for the new watched marks; a whole library
+             * just marks what was played */
+            if (n < 200) { free(lst[depth]); lst[depth] = NULL; }
+            else {
+                PlexItem *fr = NULL; char mp[64]; snprintf(mp, sizeof mp, "/library/metadata/%s", pick.rating);
+                if (plex_list(&c, mp, &fr) > 0) { it[sel].viewed = fr[0].viewed; it[sel].offset_ms = fr[0].offset_ms; }
+                free(fr);
+            }
         } else if (depth < 7 && pick.key[0]) {
             if (depth == 0) lib3d = ci_contains(pick.title, "3d");
             depth++; presel[depth] = 0;
+            free(lst[depth]); lst[depth] = NULL;
+            stamp[depth] = depth == 1 ? pick.stamp : 0;     /* a whole library: cache it */
             snprintf(path[depth], sizeof path[depth], "%s", pick.key);
             snprintf(ttl[depth], sizeof ttl[depth], "%s", pick.title);
         }
     }
+    #undef PLEX_UP
+    #undef PLEX_BROWSE_DONE
 }
 
 /* X on home: everything that is a setting rather than a video */
