@@ -5737,32 +5737,55 @@ static int plex_link(PlexCfg *c) {
     return 1;
 }
 
-/* Pick one of the linked account's servers on this network (own first, then friends' shared
- * ones). Switching never needs a new link: plex.tv gives each server's own access token. */
+/* Pick one of the linked account's servers (own first, then friends' shared ones) -- each at
+ * whichever of its addresses answers from here: home network, or its remote-access address when
+ * away. Switching never needs a new link: plex.tv gives each server's own access token. */
 static int plex_choose_server(PlexCfg *c) {
     if (!c->account[0] && !c->token[0]) { msg_screen("CHOOSE SERVER", "Link your Plex account first."); return 0; }
-    msg_screen_nowait("CHOOSE SERVER", "Asking plex.tv for your servers...");
+    msg_screen_nowait("CHOOSE SERVER", "Finding your Plex servers...\n(this can take a few seconds)");
     PlexServer sv[8]; int n = plex_servers(c, sv, 8);
     if (n < 0) { char m[160]; snprintf(m, sizeof m, "Could not reach plex.tv.\n%s", plex_error()); msg_screen("CHOOSE SERVER", m); return 0; }
-    if (n == 0) { msg_screen("CHOOSE SERVER", "No Plex server answered on this\nnetwork. Use ENTER ADDRESS instead."); return 0; }
+    if (n == 0) { msg_screen("CHOOSE SERVER", "None of your Plex servers answered.\n\nAway from home, the server needs\nRemote Access turned on -- or use\nENTER ADDRESS instead."); return 0; }
     char lbl[8][80]; const char *rows[9];
     for (int i = 0; i < n; i++) {
         snprintf(lbl[i], sizeof lbl[i], "%s%s", sv[i].name, sv[i].owned ? "" : " (SHARED)");
         rows[i] = lbl[i];
     }
     rows[n] = "CANCEL";
-    int pick = ui_menu("CHOOSE SERVER", "Plex servers on this network", rows, n + 1);
+    int pick = ui_menu("CHOOSE SERVER", "Your Plex servers", rows, n + 1);
     if (pick < 0 || pick >= n) return 0;
     snprintf(c->url, sizeof c->url, "%s", sv[pick].url);
     snprintf(c->token, sizeof c->token, "%s", sv[pick].token);
     snprintf(c->name, sizeof c->name, "%s", sv[pick].name);
+    snprintf(c->machine, sizeof c->machine, "%s", sv[pick].machine);
     plex_cfg_save(c);
     return 1;
+}
+/* plex_list, but if the saved server no longer answers at its address (chosen at home, now away
+ * -- or the other way round) find it again through the account and retry once. Long listings
+ * show how far along they are. */
+static char s_plex_load_title[96];
+static void plex_load_progress(int got, int total) {
+    char m[64];
+    if (total > 0) snprintf(m, sizeof m, "Loading... %d of %d", got, total);
+    else snprintf(m, sizeof m, "Loading... %d", got);
+    msg_screen_nowait(s_plex_load_title, m);
+}
+static int plex_list_here(PlexCfg *c, const char *path, PlexItem **it, const char *title) {
+    snprintf(s_plex_load_title, sizeof s_plex_load_title, "%s", title);
+    plex_set_progress(plex_load_progress);
+    int n = plex_list(c, path, it);
+    if (n < 0 && plex_unreachable() && c->account[0] && (c->machine[0] || c->name[0])) {
+        msg_screen_nowait(title, "The server didn't answer.\nLooking for it at another address...");
+        if (plex_relocate(c)) { free(*it); *it = NULL; n = plex_list(c, path, it); }
+    }
+    plex_set_progress(NULL);
+    return n;
 }
 static void plex_test(PlexCfg *c) {
     if (!c->url[0]) { msg_screen("PLEX SERVER", "Choose a server first."); return; }
     msg_screen_nowait("PLEX SERVER", "Connecting...");
-    PlexItem *it = NULL; int n = plex_list(c, "/library/sections", &it);
+    PlexItem *it = NULL; int n = plex_list_here(c, "/library/sections", &it, "PLEX SERVER");
     free(it);
     char m[200];
     if (n >= 0) snprintf(m, sizeof m, "Connected to %s.\n%d librar%s found.", c->name[0] ? c->name : "the server",
@@ -5798,7 +5821,7 @@ static void plex_setup(void) {
             if (a == 0) { if (plex_link(&c) && plex_choose_server(&c)) plex_test(&c); }
             else if (a == 1 && any) {
                 if (prompt2("SIGN OUT", "Forget the Plex account, server\nand token on this 3DS?", "SIGN OUT", "KEEP") == 0) {
-                    c.url[0] = 0; c.token[0] = 0; c.account[0] = 0; c.name[0] = 0;
+                    c.url[0] = 0; c.token[0] = 0; c.account[0] = 0; c.name[0] = 0; c.machine[0] = 0;
                     plex_cfg_save(&c);
                 }
             }
@@ -5816,7 +5839,7 @@ static void plex_setup(void) {
                 if (!strncmp(b, "http://", 7)) b += 7;
                 if (strchr(b, ':')) snprintf(c.url, sizeof c.url, "http://%s", b);   /* port given */
                 else snprintf(c.url, sizeof c.url, "http://%s:32400", b);
-                c.name[0] = 0;
+                c.name[0] = 0; c.machine[0] = 0;   /* typed: never moved by plex_relocate */
                 if (c.account[0] && !c.token[0]) snprintf(c.token, sizeof c.token, "%s", c.account);
                 plex_cfg_save(&c); plex_cfg_load(&c);
                 plex_test(&c);
@@ -5989,7 +6012,7 @@ static int plex_resume_home(void) {
         if (g) { if (fgets(ln, sizeof ln, g)) lib3d = atoi(ln); fclose(g); } }
     msg_screen_nowait("PLEX", "Connecting...");
     char path[64]; snprintf(path, sizeof path, "/library/metadata/%s", rk);
-    PlexItem *it = NULL; int n = plex_list(&c, path, &it);
+    PlexItem *it = NULL; int n = plex_list_here(&c, path, &it, "PLEX");
     if (n <= 0) { free(it); char m[160]; snprintf(m, sizeof m, "Could not reach the Plex server.\n%s", plex_error()); msg_screen("PLEX", m); return 0; }
     PlexItem pick = it[0]; free(it);
     long long at = moflex_resume_get(g_now_playing_path);          /* where it stopped on THIS 3DS */
@@ -6014,7 +6037,7 @@ static int plex_browse(void) {
     for (;;) {
         msg_screen_nowait(ttl[depth], "Loading...");
         PlexItem *it = NULL;
-        int n = plex_list(&c, path[depth], &it);
+        int n = plex_list_here(&c, path[depth], &it, ttl[depth]);
         if (n < 0) { msg_screen("PLEX", plex_error()); if (depth == 0) return 0; depth--; continue; }
         if (n == 0) { free(it); msg_screen(ttl[depth], "Nothing here."); if (depth == 0) return 0; depth--; continue; }
         char (*names)[64] = (char (*)[64])malloc((size_t)n * 64);

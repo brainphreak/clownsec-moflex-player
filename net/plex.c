@@ -11,20 +11,28 @@
 
 #define PLEX_CFG "sdmc:/moflex_player/plex.cfg"
 static char g_err[96] = "";
+static int  g_unreach = 0;      /* the last failure was "no answer", not an error from the server */
+static int  g_probe = 0;        /* next request is a quick reachability probe: short timeouts */
+static int  g_once = 0;         /* next request is a whole listing in one reply: 90 s cap */
+static int  g_slow = 0;         /* the last request was cut off part-way (too slow / too big) */
+static void (*g_progress)(int, int) = NULL;
 const char *plex_error(void) { return g_err; }
+int  plex_unreachable(void) { return g_unreach; }
+void plex_set_progress(void (*fn)(int, int)) { g_progress = fn; }
 
 int plex_cfg_load(PlexCfg *c) {
     memset(c, 0, sizeof *c);
     FILE *f = fopen(PLEX_CFG, "rb");
     if (f) {
         char ln[200]; int i = 0;
-        while (fgets(ln, sizeof ln, f) && i < 5) {
+        while (fgets(ln, sizeof ln, f) && i < 6) {
             char *e = strpbrk(ln, "\r\n"); if (e) *e = 0;
             if (i == 0) snprintf(c->url, sizeof c->url, "%s", ln);
             if (i == 1) snprintf(c->token, sizeof c->token, "%s", ln);
             if (i == 2) snprintf(c->client, sizeof c->client, "%s", ln);
             if (i == 3) snprintf(c->account, sizeof c->account, "%s", ln);
             if (i == 4) snprintf(c->name, sizeof c->name, "%s", ln);
+            if (i == 5) snprintf(c->machine, sizeof c->machine, "%s", ln);
             i++;
         }
         fclose(f);
@@ -41,7 +49,7 @@ int plex_cfg_load(PlexCfg *c) {
 void plex_cfg_save(const PlexCfg *c) {
     mkdir("sdmc:/moflex_player", 0777);
     FILE *f = fopen(PLEX_CFG, "wb"); if (!f) return;
-    fprintf(f, "%s\n%s\n%s\n%s\n%s\n", c->url, c->token, c->client, c->account, c->name);
+    fprintf(f, "%s\n%s\n%s\n%s\n%s\n%s\n", c->url, c->token, c->client, c->account, c->name, c->machine);
     fclose(f);
 }
 
@@ -89,15 +97,30 @@ static long plex_req(const PlexCfg *c, const char *url, char **out, int json, in
     curl_easy_setopt(e, CURLOPT_SSL_VERIFYPEER, 0L);
     curl_easy_setopt(e, CURLOPT_SSL_VERIFYHOST, 0L);
     curl_easy_setopt(e, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(e, CURLOPT_CONNECTTIMEOUT, 8L);
-    curl_easy_setopt(e, CURLOPT_TIMEOUT, 30L);
+    if (g_probe) {                                       /* is anything there? answer fast */
+        curl_easy_setopt(e, CURLOPT_CONNECTTIMEOUT, 3L);
+        curl_easy_setopt(e, CURLOPT_TIMEOUT, 5L);
+    } else {
+        /* a remote server's upload can be slow but steady: give up when it stalls (under
+         * 256 bytes/s for 20 s); a whole listing also stops at 90 s and is fetched in pages */
+        curl_easy_setopt(e, CURLOPT_CONNECTTIMEOUT, 10L);
+        curl_easy_setopt(e, CURLOPT_LOW_SPEED_LIMIT, 256L);
+        curl_easy_setopt(e, CURLOPT_LOW_SPEED_TIME, 20L);
+        if (g_once) curl_easy_setopt(e, CURLOPT_TIMEOUT, 90L);
+    }
     curl_easy_setopt(e, CURLOPT_ACCEPT_ENCODING, "");
     curl_easy_setopt(e, CURLOPT_WRITEFUNCTION, on_mem);
     curl_easy_setopt(e, CURLOPT_WRITEDATA, &m);
     CURLcode rc = curl_easy_perform(e);
     long code = 0; curl_easy_getinfo(e, CURLINFO_RESPONSE_CODE, &code);
     curl_slist_free_all(hl); curl_easy_cleanup(e);
+    g_unreach = 0; g_slow = 0;
     if (rc != CURLE_OK) {
+        /* cut off part-way: the server IS there, the reply is just too slow or too big */
+        g_slow = (rc == CURLE_OPERATION_TIMEDOUT && m.n > 0) || rc == CURLE_WRITE_ERROR;
+        if (!g_slow) g_unreach = rc == CURLE_COULDNT_CONNECT || rc == CURLE_OPERATION_TIMEDOUT ||
+                    rc == CURLE_COULDNT_RESOLVE_HOST || rc == CURLE_RECV_ERROR || rc == CURLE_SEND_ERROR ||
+                    rc == CURLE_GOT_NOTHING;
         snprintf(g_err, sizeof g_err, "Can't reach the Plex server (%s).", curl_easy_strerror(rc));
         free(m.p); return -1;
     }
@@ -120,22 +143,22 @@ static long long jnum(cJSON *o, const char *k) {
     return cJSON_IsNumber(v) ? (long long)v->valuedouble : 0;
 }
 
-int plex_list(const PlexCfg *c, const char *path, PlexItem **items) {
-    *items = NULL;
-    char url[512]; snprintf(url, sizeof url, "%s%s", c->url, path);
-    char *body = NULL;
-    long code = plex_get(c, url, &body, 1);
-    if (code != 200 || !body) { free(body); return -1; }
-    cJSON *root = cJSON_Parse(body); free(body);
-    cJSON *mc = root ? cJSON_GetObjectItemCaseSensitive(root, "MediaContainer") : NULL;
-    if (!mc) { cJSON_Delete(root); snprintf(g_err, sizeof g_err, "Unexpected reply from Plex."); return -1; }
+/* One page of a listing: append its entries to *v (grown as needed). Returns how many entries the
+ * page held (titled or not, so paging can tell a short page), and the container's totalSize. */
+static int plex_parse_page(cJSON *mc, int sections, PlexItem **pv, int *pn, int *pcap, int *total_size) {
     /* sections and folders come as Directory, playable items as Metadata */
     cJSON *arrs[2] = { cJSON_GetObjectItemCaseSensitive(mc, "Directory"),
                        cJSON_GetObjectItemCaseSensitive(mc, "Metadata") };
-    int total = cJSON_GetArraySize(arrs[0]) + cJSON_GetArraySize(arrs[1]);
-    PlexItem *v = (PlexItem *)calloc((size_t)(total ? total : 1), sizeof(PlexItem));
-    if (!v) { cJSON_Delete(root); return -1; }
-    int n = 0, sections = !strcmp(path, "/library/sections");
+    int here = cJSON_GetArraySize(arrs[0]) + cJSON_GetArraySize(arrs[1]);
+    *total_size = (int)jnum(mc, "totalSize");
+    if (*pn + here > *pcap) {
+        int nc = *pcap ? *pcap : 64; while (nc < *pn + here) nc *= 2;
+        PlexItem *g = (PlexItem *)realloc(*pv, (size_t)nc * sizeof(PlexItem));
+        if (!g) return -1;
+        memset(g + *pcap, 0, (size_t)(nc - *pcap) * sizeof(PlexItem));
+        *pv = g; *pcap = nc;
+    }
+    PlexItem *v = *pv; int n = *pn;
     for (int a = 0; a < 2; a++) {
         cJSON *e; cJSON_ArrayForEach(e, arrs[a]) {
             PlexItem *it = &v[n];
@@ -176,7 +199,54 @@ int plex_list(const PlexCfg *c, const char *path, PlexItem **items) {
             if (it->title[0]) n++;
         }
     }
+    *pn = n;
+    return here;
+}
+
+/* GET url and append its entries. Returns how many the reply held, or -1. */
+static int plex_fetch(const PlexCfg *c, const char *url, int sections, PlexItem **v, int *n, int *cap, int *total) {
+    char *body = NULL;
+    long code = plex_get(c, url, &body, 1);
+    if (code != 200 || !body) { free(body); return -1; }
+    cJSON *root = cJSON_Parse(body); free(body);
+    cJSON *mc = root ? cJSON_GetObjectItemCaseSensitive(root, "MediaContainer") : NULL;
+    if (!mc) {
+        cJSON_Delete(root);
+        if (!root) g_slow = 1;                 /* a reply too big to parse: try it in pages */
+        snprintf(g_err, sizeof g_err, "Unexpected reply from Plex."); return -1;
+    }
+    int here = plex_parse_page(mc, sections, v, n, cap, total);
     cJSON_Delete(root);
+    if (here < 0) { g_slow = 1; snprintf(g_err, sizeof g_err, "Out of memory for this list."); }
+    return here;
+}
+
+#define PLEX_PAGE 200
+int plex_list(const PlexCfg *c, const char *path, PlexItem **items) {
+    *items = NULL;
+    int sections = !strcmp(path, "/library/sections");
+    PlexItem *v = NULL; int n = 0, cap = 0, total = 0;
+    /* the whole list in one reply -- fine on the home network, even for thousands of items */
+    char url[640]; snprintf(url, sizeof url, "%s%s", c->url, path);
+    g_once = 1; int r = plex_fetch(c, url, sections, &v, &n, &cap, &total); g_once = 0;
+    if (r < 0 && g_slow) {
+        /* cut off part-way (a big library through a remote server's home upload is several MB):
+         * fetch it again a page at a time, each one small enough to arrive */
+        free(v); v = NULL; n = cap = 0;
+        for (int start = 0;;) {
+            snprintf(url, sizeof url, "%s%s%cX-Plex-Container-Start=%d&X-Plex-Container-Size=%d",
+                     c->url, path, strchr(path, '?') ? '&' : '?', start, PLEX_PAGE);
+            r = plex_fetch(c, url, sections, &v, &n, &cap, &total);
+            if (r < 0) break;
+            start += r;
+            /* done: a short page, or everything (a server that ignores paging sends no totalSize) */
+            if (r < PLEX_PAGE || total <= 0 || start >= total) break;
+            if (g_progress) g_progress(start, total);
+        }
+    }
+    if (r < 0) { free(v); return -1; }
+    if (!v) v = (PlexItem *)calloc(1, sizeof(PlexItem));
+    if (!v) return -1;
     *items = v;
     return n;
 }
@@ -272,6 +342,24 @@ int plex_pin_poll(const PlexCfg *c, long long id, char *token, int cap) {
     cJSON_Delete(r);
     return token[0] ? 1 : 0;
 }
+/* Does THIS Plex server (machine id; "" = any) answer at url? Quick: a few seconds at most. A
+ * home-network address can belong to some other device -- or another Plex server -- on whatever
+ * network the 3DS is on now, so the id it answers with has to match. */
+static int plex_answers(const PlexCfg *c, const char *url, const char *token, const char *machine) {
+    PlexCfg t = *c; snprintf(t.token, sizeof t.token, "%s", token);
+    char u[200], *body = NULL; snprintf(u, sizeof u, "%s/identity", url);
+    g_probe = 1; long st = plex_get(&t, u, &body, 1); g_probe = 0;
+    int ok = st == 200 && body;
+    if (ok && machine && machine[0]) {
+        cJSON *r = cJSON_Parse(body);
+        cJSON *mc = r ? cJSON_GetObjectItemCaseSensitive(r, "MediaContainer") : NULL;
+        char id[48] = ""; if (mc) jstr(mc, "machineIdentifier", id, sizeof id);
+        ok = !strcmp(id, machine);
+        cJSON_Delete(r);
+    }
+    free(body);
+    return ok;
+}
 int plex_servers(const PlexCfg *c, PlexServer *out, int max) {
     PlexCfg acct = *c;                        /* plex.tv wants the ACCOUNT token */
     if (c->account[0]) snprintf(acct.token, sizeof acct.token, "%s", c->account);
@@ -280,30 +368,57 @@ int plex_servers(const PlexCfg *c, PlexServer *out, int max) {
     if (st != 200 || !body) { free(body); return -1; }
     cJSON *r = cJSON_Parse(body); free(body);
     int n = 0;
-    for (int pass = 0; pass < 2; pass++) {    /* owned servers first, then shared ones */
+    for (int pass = 0; pass < 2 && n < max; pass++) {    /* owned servers first, then shared ones */
         cJSON *e; cJSON_ArrayForEach(e, r) {
+            if (n >= max) break;
             char prov[64] = ""; jstr(e, "provides", prov, sizeof prov);
             if (!strstr(prov, "server")) continue;
-            cJSON *ow = cJSON_GetObjectItemCaseSensitive(e, "owned");
-            int owned = cJSON_IsTrue(ow);
+            int owned = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(e, "owned"));
             if ((pass == 0) != owned) continue;
-            cJSON *cs = cJSON_GetObjectItemCaseSensitive(e, "connections"), *cn;
-            cJSON_ArrayForEach(cn, cs) {
-                char proto[8] = ""; jstr(cn, "protocol", proto, sizeof proto);
-                if (!cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(cn, "local")) || strcmp(proto, "http")) continue;
-                if (n >= max) break;
-                char addr[64] = ""; jstr(cn, "address", addr, sizeof addr);
-                jstr(e, "name", out[n].name, sizeof out[n].name);
-                out[n].token[0] = 0; jstr(e, "accessToken", out[n].token, sizeof out[n].token);
-                if (!out[n].token[0]) snprintf(out[n].token, sizeof out[n].token, "%s", acct.token);
-                snprintf(out[n].url, sizeof out[n].url, "http://%s:%lld", addr, jnum(cn, "port"));
-                out[n].owned = owned; n++;
-                break;                        /* one local address per server */
+            PlexServer *s = &out[n]; memset(s, 0, sizeof *s);
+            jstr(e, "name", s->name, sizeof s->name);
+            jstr(e, "clientIdentifier", s->machine, sizeof s->machine);
+            jstr(e, "accessToken", s->token, sizeof s->token);
+            if (!s->token[0]) snprintf(s->token, sizeof s->token, "%s", acct.token);
+            s->owned = owned;
+            /* its addresses: the home network's first (fast, and the only ones that work when the
+             * router can't loop back), then the internet ones remote access publishes */
+            cJSON *cs = cJSON_GetObjectItemCaseSensitive(e, "connections");
+            for (int want_local = 1; want_local >= 0 && !s->url[0]; want_local--) {
+                cJSON *cn; cJSON_ArrayForEach(cn, cs) {
+                    char proto[8] = "", addr[64] = "";
+                    jstr(cn, "protocol", proto, sizeof proto); jstr(cn, "address", addr, sizeof addr);
+                    int local = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(cn, "local"));
+                    int relay = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(cn, "relay"));
+                    if (local != want_local || relay || strcmp(proto, "http") || !addr[0] || strchr(addr, ':'))
+                        continue;                 /* (IPv6 addresses skipped) */
+                    char url[128]; snprintf(url, sizeof url, "http://%s:%lld", addr, jnum(cn, "port"));
+                    if (plex_answers(c, url, s->token, s->machine)) { snprintf(s->url, sizeof s->url, "%s", url); break; }
+                }
             }
+            if (s->url[0]) n++;                   /* answered somewhere: list it */
         }
     }
     cJSON_Delete(r);
     return n;
+}
+
+int plex_relocate(PlexCfg *c) {
+    if (!c->account[0] || (!c->machine[0] && !c->name[0])) return 0;   /* a typed address: leave it */
+    char err[96]; snprintf(err, sizeof err, "%s", g_err);
+    PlexServer sv[8]; int n = plex_servers(c, sv, 8);
+    for (int i = 0; i < n; i++) {
+        /* the same server: by its id, or (set up before ids were kept) by its name */
+        int same = c->machine[0] ? !strcmp(sv[i].machine, c->machine) : !strcmp(sv[i].name, c->name);
+        if (!same) continue;
+        snprintf(c->url, sizeof c->url, "%s", sv[i].url);
+        snprintf(c->token, sizeof c->token, "%s", sv[i].token);
+        snprintf(c->machine, sizeof c->machine, "%s", sv[i].machine);
+        plex_cfg_save(c);
+        return 1;
+    }
+    snprintf(g_err, sizeof g_err, "%s", err);   /* keep the original reason for the screen */
+    return 0;
 }
 
 int plex_token_is_account(const PlexCfg *c, const char *token) {
