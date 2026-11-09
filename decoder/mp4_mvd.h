@@ -40,4 +40,8 @@ void mp4_mvd_present(int slot, int sbs);
  * `stride` pixels apart (the coded width). For callers that present it themselves. */
 const u16 *mp4_mvd_frame(int slot, int *w, int *h, int *stride);
 
+/* decoder statistics since the last reset: "fed N, pictures M, feed results: ..." */
+void mp4_mvd_stats_reset(void);
+void mp4_mvd_stats(char *out, int cap);
+
 #endif

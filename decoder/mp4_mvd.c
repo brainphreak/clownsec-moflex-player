@@ -239,6 +239,15 @@ int mp4_mvd_pending(void) { return g_skip_feed; }
 
 /* One output attempt. If `sample` is non-NULL and no pictures are pending, it is fed
  * (*consumed = 1). Returns slot+1 when a picture was obtained, 0 otherwise. */
+/* what the decoder made of the stream, for the Plex log: frames fed, pictures out, and the
+ * first distinct results of feeding (a decoder that never outputs says why here) */
+static unsigned g_st_fed = 0, g_st_out = 0; static unsigned long g_st_res[6]; static int g_st_nres = 0;
+void mp4_mvd_stats_reset(void) { g_st_fed = g_st_out = 0; g_st_nres = 0; }
+void mp4_mvd_stats(char *out, int cap) {
+    int n = snprintf(out, (size_t)cap, "fed %u, pictures %u, feed results:", g_st_fed, g_st_out);
+    for (int i = 0; i < g_st_nres && n > 0 && n < cap; i++)
+        n += snprintf(out + n, (size_t)(cap - n), " %08lX", g_st_res[i]);
+}
 int mp4_mvd_pump(const uint8_t *sample, int size, int *consumed) {
     if (consumed) *consumed = 0;
     if (!g_ready) return 0;
@@ -263,6 +272,9 @@ int mp4_mvd_pump(const uint8_t *sample, int size, int *consumed) {
         void *pkt_mvd = osConvertOldLINEARMemToNew(g_pkt);   /* mvd needs NEW-range addresses */
         Result r = mvdstdProcessVideoFrame(pkt_mvd, off, 0, NULL);
         if (g_first) { mvdstdProcessVideoFrame(pkt_mvd, off, 0, NULL); g_first = 0; }
+        g_st_fed++;
+        {   int seen = 0; for (int i = 0; i < g_st_nres; i++) if (g_st_res[i] == (unsigned long)r) seen = 1;
+            if (!seen && g_st_nres < 6) g_st_res[g_st_nres++] = (unsigned long)r; }
         int lg = (g_logframes < 6); if (lg) { g_logframes++;
             mvd_log("FEED %d bytes r=%08lX", off, (unsigned long)r); }
         got = slot_take();
@@ -278,5 +290,6 @@ int mp4_mvd_pump(const uint8_t *sample, int size, int *consumed) {
         }
         if (!got) g_skip_feed = 0;   /* decoder is dry -> next pump must feed */
     }
+    if (got) g_st_out++;
     return got;
 }
