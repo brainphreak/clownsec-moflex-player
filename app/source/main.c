@@ -5993,6 +5993,7 @@ static MoflexResult plex_play(const PlexCfg *c, const PlexItem *it, int lib3d, l
     consoleInit(GFX_BOTTOM, NULL);
     gfxSetDoubleBuffering(GFX_BOTTOM, false);
     branding_show();
+    if (r != MOFLEX_QUIT_EXIT && stream_last_error()[0]) msg_screen("PLEX", stream_last_error());
     return r;
 }
 static int plex_playable(const PlexItem *it) {
