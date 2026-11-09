@@ -349,6 +349,9 @@ static void mp4_msg(const char *m) {
      * were re-initialised double-buffered, so the box went into a buffer never shown -- a dark
      * screen waiting for B. Single-buffered like the menus, it is drawn where it is seen. */
     gfxSetDoubleBuffering(GFX_BOTTOM, false);
+    /* the new format and buffering only take effect on a swap: without it the LCD read our
+     * RGB565 pixels as the old 24-bit layout -- the box came out scrambled and repeated */
+    gfxSwapBuffers(); gspWaitForVBlank();
     char lines[12][48]; int nl = 0;
     const int maxw = UI_W - 20;
     const char *p = m;
@@ -1021,6 +1024,13 @@ MoflexResult stream_play(const StreamSrc *src) {
         if (vid && (aud || g_sv.n > 48)) {
             plex_log("stream: video %dx%d found after %llu ms, %llu bytes, audio %s", w, h,
                      (unsigned long long)(osGetTime() - t_open), (unsigned long long)hs_total(hs), aud ? "yes" : "no");
+            {   /* the encoder's H.264 settings: profile/level, and the SPS itself */
+                char hx[200]; int k = 0;
+                for (int i = 0; i < al && i < 64 && k + 3 < (int)sizeof hx; i++) k += snprintf(hx + k, sizeof hx - (size_t)k, "%02X", avcc[i]);
+                plex_log("stream: H.264 profile %d, constraints %02X, level %d.%d; avcC %s",
+                         al > 3 ? avcc[1] : -1, al > 3 ? avcc[2] : 0, al > 3 ? avcc[3] / 10 : 0, al > 3 ? avcc[3] % 10 : 0, hx);
+            }
+            mp4_mvd_stats_reset();
             if ((long)((w + 15) & ~15) * ((h + 15) & ~15) > 1280L * 720L) {
                 snprintf(why, sizeof why, "The stream is %dx%d -- too large for the 3DS.", w, h); break; }
             mp4_mvd_hint_max_sample(256 * 1024);
@@ -1293,6 +1303,7 @@ MoflexResult stream_play(const StreamSrc *src) {
     #undef GATE_ARM
     #undef PREBUF_US
     #undef REBUF_US
+    {   char ds[160]; mp4_mvd_stats(ds, sizeof ds); plex_log("decoder: %s", ds); }
     plex_log("stream: ended: \"%s\" result %d at %lld ms; gate %d (fed %d) rebuf %d shown %d drops %d; "
              "HTTP %ld done %d, %llu bytes; queued %d video / %d audio, %d pictures waiting",
              why[0] ? why : (result == MOFLEX_EOF ? "end of video" : "stopped by the viewer"), (int)result,
