@@ -364,15 +364,31 @@ server) → Remote Access** instead of the local one.
 
 ### Plex server settings that matter
 
-- **Secure connections** (Settings → *server* → Network): leave it on **Preferred** (the
-  default). The 3DS talks to the server over plain HTTP; **Required** will block it.
-- **Transcoder** (Settings → *server* → Transcoder): every stream to the 3DS is transcoded. If
-  **Maximum simultaneous video transcode** is low and others are watching, the 3DS has to wait
-  for a free slot.
-- **Remote Access** (Settings → *server* → Remote Access) — only for watching away from home. It
-  must show *"Fully accessible outside your network"*. Under **Show Advanced**, set **Internet
-  upload speed** to your real upload, and keep **Limit remote stream bitrate** at **2 Mbps** or
-  more (or Original): the 3DS asks for about 0.7 Mbps in 2D and 2 Mbps in 3D.
+All of these are in Plex Web (app.plex.tv) or the Plex desktop app: click the **wrench
+(Settings)** icon at the top right, then pick the page in the left sidebar under **your server's
+name** (not the account section). Click **Show Advanced** at the top of a page to see every
+option, and **Save Changes** when done. Only the server's owner can change them.
+
+- **Network → Secure connections:** leave it on **Preferred** (the default). The 3DS talks to
+  the server over plain HTTP; **Required** blocks it.
+- **Transcoder:** every stream to the 3DS is transcoded by the server.
+  - **Maximum simultaneous video transcode** — if it's low (1–2) and others are watching, the 3DS
+    waits for a free slot or fails to start. Raise it, or set Unlimited.
+  - **Use hardware acceleration when available** — recommended if your server supports it
+    (needs Plex Pass): streams start faster and the server copes better with several at once.
+  - **Transcoder temporary directory** — needs free disk space; a full drive breaks transcoding.
+- **Remote Access** — only needed for watching **away from home**:
+  - It must show *"Fully accessible outside your network"* (green).
+  - If your router forwards a different public port (not 32400) and you set the server up with
+    **ENTER ADDRESS**, type that port too, e.g. `203.0.113.5:45678`.
+  - Under **Show Advanced**: set **Internet upload speed** to your real upload, and keep
+    **Limit remote stream bitrate** at **2 Mbps** or more (or *Original*) — the 3DS asks for
+    about 0.7 Mbps in 2D and 2 Mbps in 3D.
+
+**Checking a stream:** open the Plex **Dashboard** (the activity icon at the top of Plex Web)
+while you press play on the 3DS. A transcode session for *Nintendo 3DS* should appear and start
+moving. If it appears but sits still, the server is struggling (busy transcoder, slow upload); if
+nothing appears, the request isn't reaching the server.
 
 ### Signing out
 
@@ -403,6 +419,8 @@ descriptions, genres and watched counts, and pick something to play:
 | *Could not connect* (TEST CONNECTION) | Wrong IP/port, server off, or a firewall on the server PC blocking port 32400. Check that Plex Web works from another device using the same address. |
 | *Plex refused access: check the token* | The token is wrong or was revoked — link again, or enter a fresh token. Also check **Secure connections** isn't set to *Required*. |
 | *No Plex server is set up* | Open **SETTINGS → PLEX SERVER** and do option 1 or 2 first. |
+| *The server sent no video for 30 seconds* / black screen | The server couldn't start the transcode in time — check the Dashboard (above), free transcoder slots, and, away from home, the remote bitrate limit and upload speed. |
+| *Looking for it at another address...* | The saved address stopped answering (e.g. you left home); the 3DS is finding the server again through your account. Nothing to do. |
 
 **Away from home:** big libraries load more slowly, because the list comes through your server's
 home internet upload; the 3DS waits for it (and fetches it in parts if it has to) instead of
