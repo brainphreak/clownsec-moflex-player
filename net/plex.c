@@ -9,6 +9,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <stdarg.h>
 
 #define PLEX_CFG "sdmc:/moflex_player/plex.cfg"
 static char g_err[96] = "";
@@ -18,6 +19,33 @@ static int  g_once = 0;         /* next request is a whole listing in one reply:
 static int  g_slow = 0;         /* the last request was cut off part-way (too slow / too big) */
 static void (*g_progress)(int, int) = NULL;
 const char *plex_error(void) { return g_err; }
+
+#define PLEX_LOG "sdmc:/moflex_player/plex_log.txt"
+static int g_log_on = 0; static u64 g_log_t0 = 0;
+void plex_log_begin(const char *what) {
+    mkdir("sdmc:/moflex_player", 0777);
+    FILE *f = fopen(PLEX_LOG, "wb"); if (!f) return;
+#ifdef BUILD_TAG
+    fprintf(f, "Clownsec player %s -- Plex log\n", BUILD_TAG);
+#endif
+    fprintf(f, "%s\n", what);
+    fclose(f);
+    g_log_on = 1; g_log_t0 = osGetTime();
+}
+void plex_log(const char *fmt, ...) {
+    if (!g_log_on) return;
+    FILE *f = fopen(PLEX_LOG, "ab"); if (!f) return;
+    fprintf(f, "[%7.2fs] ", (double)(osGetTime() - g_log_t0) / 1000.0);
+    va_list ap; va_start(ap, fmt); vfprintf(f, fmt, ap); va_end(ap);
+    fputc('\n', f); fclose(f);
+}
+void plex_log_end(void) { plex_log("-- end --"); g_log_on = 0; }
+/* a URL fit for the log: no token, no long transcode profile, bounded */
+static void log_url(const char *u, char *o, size_t cap) {
+    snprintf(o, cap, "%s", u);
+    char *t = strstr(o, "X-Plex-Token="); if (t) snprintf(t, cap - (size_t)(t - o), "X-Plex-Token=(hidden)");
+    char *pe = strstr(o, "&X-Plex-Client-Profile-Extra="); if (pe) *pe = 0;
+}
 int  plex_unreachable(void) { return g_unreach; }
 void plex_set_progress(void (*fn)(int, int)) { g_progress = fn; }
 
@@ -112,9 +140,16 @@ static long plex_req(const PlexCfg *c, const char *url, char **out, int json, in
     curl_easy_setopt(e, CURLOPT_ACCEPT_ENCODING, "");
     curl_easy_setopt(e, CURLOPT_WRITEFUNCTION, on_mem);
     curl_easy_setopt(e, CURLOPT_WRITEDATA, &m);
+    u64 t_req = osGetTime();
     CURLcode rc = curl_easy_perform(e);
     long code = 0; curl_easy_getinfo(e, CURLINFO_RESPONSE_CODE, &code);
     curl_slist_free_all(hl); curl_easy_cleanup(e);
+    if (g_log_on) {
+        char lu[400]; log_url(url, lu, sizeof lu);
+        plex_log("%s %s -> HTTP %ld, %s, %u bytes, %llu ms", post == 1 ? "POST" : post == 2 ? "PUT" : "GET",
+                 lu, code, rc == CURLE_OK ? "ok" : curl_easy_strerror(rc), (unsigned)m.n,
+                 (unsigned long long)(osGetTime() - t_req));
+    }
     g_unreach = 0; g_slow = 0;
     if (rc != CURLE_OK) {
         /* cut off part-way: the server IS there, the reply is just too slow or too big */
@@ -353,6 +388,10 @@ static int plex_decide(const PlexCfg *c, const char *q) {
         static const char *keys[3][2] = { { "generalDecisionCode", "generalDecisionText" },
                                           { "transcodeDecisionCode", "transcodeDecisionText" },
                                           { "mdeDecisionCode", "mdeDecisionText" } };
+        for (int i = 0; i < 3; i++) {
+            char t[96] = ""; jstr(mc, keys[i][1], t, sizeof t);
+            plex_log("decision %s=%lld \"%s\"", keys[i][0], jnum(mc, keys[i][0]), t);
+        }
         for (int i = 0; i < 3 && ok; i++) {
             long long dc = jnum(mc, keys[i][0]);
             if (dc >= 2000) {
@@ -380,15 +419,17 @@ HttpStream *plex_stream_open(const PlexCfg *c, const char *rating_key, int64_t o
     char url[2400];
     snprintf(url, sizeof url, "%s/video/:/transcode/universal/start.ts?%s", c->url, q);
     char hb[10][96]; const char *hp[11]; plex_headers(c, hb, hp, 0);
+    { char lu[400]; log_url(url, lu, sizeof lu); plex_log("stream open: GET %s", lu); }
     HttpStream *s = hs_open(url, hp, 2u << 20);
-    if (!s) snprintf(g_err, sizeof g_err, "Could not start the stream.");
+    if (!s) { snprintf(g_err, sizeof g_err, "Could not start the stream."); plex_log("stream open failed (no memory/thread)"); }
     return s;
 }
 void plex_stream_stop(const PlexCfg *c, const char *session) {
     if (!session || !session[0]) return;
     char url[400], *body = NULL;
     snprintf(url, sizeof url, "%s/video/:/transcode/universal/stop?session=%s", c->url, session);
-    plex_get(c, url, &body, 0); free(body);
+    g_probe = 1; plex_get(c, url, &body, 0); g_probe = 0;   /* a courtesy: never hold up the screen */
+    free(body);
 }
 void plex_timeline(const PlexCfg *c, const char *rating_key, const char *state,
                    long long pos_ms, long long dur_ms) {

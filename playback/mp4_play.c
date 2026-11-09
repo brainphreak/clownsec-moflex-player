@@ -885,6 +885,7 @@ MoflexResult mp4_play(const char *path) {
  * stream from the server at the target; its timestamps restart near zero, so every time below
  * is base_us (where this stream starts in the film) + the unit's own timestamp. */
 #include "ts_demux.h"
+void plex_log(const char *fmt, ...);   /* net/plex.c: the play-attempt log (a no-op unless on) */
 
 typedef struct { int64_t pts, dts; int key; uint8_t *data; size_t len; } SAu;
 typedef struct { SAu *v; int cap, h, n; size_t bytes; } SFifo;
@@ -1002,12 +1003,20 @@ MoflexResult stream_play(const StreamSrc *src) {
     /* ---- connect + learn the stream: SPS/PPS (size, decoder config) and the audio format ---- */
     if (!hs) snprintf(why, sizeof why, "%s", src->error ? src->error(src->ctx) : "Could not open the stream.");
     u64 t_open = osGetTime();
+    int logged_bytes = 0;
+    if (!hs) plex_log("stream: not opened: %s", why);
     while (hs && aptMainLoop()) {
         stream_fill(hs, td);
+        if (!logged_bytes && hs_total(hs) > 0) {
+            logged_bytes = 1;
+            plex_log("stream: first bytes after %llu ms (HTTP %ld)", (unsigned long long)(osGetTime() - t_open), hs_http(hs));
+        }
         const uint8_t *avcc; int al; int w = 0, h = 0; uint8_t asc[2]; int ar, ac;
         int vid = ts_video_avcc(td, &avcc, &al) && ts_video_dims(td, &w, &h);
         int aud = ts_audio_config(td, asc, &ar, &ac);
         if (vid && (aud || g_sv.n > 48)) {
+            plex_log("stream: video %dx%d found after %llu ms, %llu bytes, audio %s", w, h,
+                     (unsigned long long)(osGetTime() - t_open), (unsigned long long)hs_total(hs), aud ? "yes" : "no");
             if ((long)((w + 15) & ~15) * ((h + 15) & ~15) > 1280L * 720L) {
                 snprintf(why, sizeof why, "The stream is %dx%d -- too large for the 3DS.", w, h); break; }
             mp4_mvd_hint_max_sample(256 * 1024);
@@ -1046,9 +1055,13 @@ MoflexResult stream_play(const StreamSrc *src) {
         gspWaitForVBlank();
     }
     if (!mvd_up) {
+        plex_log("stream: gave up after %llu ms: \"%s\" (HTTP %ld, done %d, %llu bytes, %d video / %d audio units)",
+                 (unsigned long long)(osGetTime() - t_open), why[0] ? why : "(back pressed)", hs ? hs_http(hs) : 0L,
+                 hs ? hs_done(hs) : 0, hs ? (unsigned long long)hs_total(hs) : 0ULL, g_sv.n, g_sa.n);
         if (!aptMainLoop()) result = MOFLEX_QUIT_EXIT;
         goto teardown_early;
     }
+    plex_log("stream: playing");
 
     g_playing = 1;
     g_pq_n = 0; g_ftn = 0; g_ft_full = 0; g_ft_dry = 0; g_ft_push = 0; g_ft_pop = 0;
@@ -1300,6 +1313,9 @@ teardown_early:
     ts_free(td);
     tex_free();
     kit_gpu_end(&gpu, result == MOFLEX_QUIT_EXIT);
-    if (why[0]) mp4_msg(why);
+    if (why[0]) {
+        char wm[300]; snprintf(wm, sizeof wm, "%s\n\nDetails: moflex_player/plex_log.txt", why);
+        mp4_msg(wm);
+    }
     return result;
 }
