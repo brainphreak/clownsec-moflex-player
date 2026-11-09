@@ -78,7 +78,7 @@
 
 ## Extras
 
-* Built-in Wi-Fi file server to upload files from PC, tablet or phone
+* Built-in Wi-Fi file server to upload files from PC, tablet or phone -- and download any file from the 3DS (e.g. moflex_player/plex_log.txt)
 * File manager to browse, rename, move and delete files
 * Default themes and custom color picker for custom user themes
 * Recently played list for quick access

@@ -164,6 +164,8 @@ This is the short tour — the complete list of everything the player does lives
   isn't acted on. Video playback is never interrupted.
 - **Built-in web server** — upload any files to the console from a browser over Wi-Fi, with
   live speed and ETA; an interrupted upload resumes, and uploaded movies join the library.
+  Every file in the page's folder list also has a **download** button, to copy files off the
+  3DS (for example `moflex_player/plex_log.txt` when reporting a Plex problem).
 - **File manager** — browse, move, delete, and create folders on the SD card (all files, with a
   movies-only toggle).
 - **Local artwork + info** — poster and details show on the top screen for your own movies in
@@ -424,6 +426,7 @@ descriptions, genres and watched counts, and pick something to play:
 | *Plex refused access: check the token* | The token is wrong or was revoked — link again, or enter a fresh token. Also check **Secure connections** isn't set to *Required*. |
 | *No Plex server is set up* | Open **SETTINGS → PLEX SERVER** and do option 1 or 2 first. |
 | *The server sent no video for 30 seconds* / black screen | The server couldn't start the transcode in time — check the Dashboard (above), free transcoder slots, and, away from home, the remote bitrate limit and upload speed. |
+| Anything else / to report a problem | Each Plex play attempt writes `moflex_player/plex_log.txt` (requests, the server's answers, timing — never your token). Open **ADD VIDEOS → upload** on the 3DS, open the address it shows in a browser, go to `moflex_player/` and press **download** next to the file. |
 | *Looking for it at another address...* | The saved address stopped answering (e.g. you left home); the 3DS is finding the server again through your account. Nothing to do. |
 
 **Away from home:** big libraries load more slowly, because the list comes through your server's
