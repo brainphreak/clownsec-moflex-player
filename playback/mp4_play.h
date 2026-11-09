@@ -29,6 +29,8 @@ typedef struct {
     int         subs_on;      /* the player's subtitle switch at start */
     void        (*set_burn)(void *ctx, int on);   /* burnable: the switch flipped (stream restarts) */
 } StreamSrc;
+/* why the last stream_play ended early ("" = it didn't): shown by the caller in its own UI */
+const char *stream_last_error(void);
 MoflexResult stream_play(const StreamSrc *src);
 
 #endif

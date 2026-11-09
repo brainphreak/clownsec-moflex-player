@@ -971,7 +971,10 @@ static void stream_audio_reset(void) {
     g_a_played = 0; g_a_started = 0; g_sa_base_set = 0;
 }
 
+static char g_stream_err[300] = "";
+const char *stream_last_error(void) { return g_stream_err; }
 MoflexResult stream_play(const StreamSrc *src) {
+    g_stream_err[0] = 0;
     bool isnew = false; APT_CheckNew3DS(&isnew);
     if (!isnew) { mp4_msg("Streaming needs a New 3DS (hardware H.264)."); return MOFLEX_QUIT_BACK; }
     int fmt = src->fmt;
@@ -1339,9 +1342,9 @@ teardown_early:
     ts_free(td);
     tex_free();
     kit_gpu_end(&gpu, result == MOFLEX_QUIT_EXIT);
-    if (why[0]) {
-        char wm[300]; snprintf(wm, sizeof wm, "%s\n\nDetails: moflex_player/plex_log.txt", why);
-        mp4_msg(wm);
-    }
+    /* the reason is shown by the caller, once its menus have the screens again -- drawing a box
+     * here, between the playback graphics' teardown and the menus' setup, is where a retry of a
+     * failed stream crashed the system's graphics service (gsp, invalid handle) */
+    if (why[0]) snprintf(g_stream_err, sizeof g_stream_err, "%s\n\nDetails: moflex_player/plex_log.txt", why);
     return result;
 }
