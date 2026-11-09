@@ -343,7 +343,9 @@ another address..."* and switches to whichever of the server's addresses works.
 Use this if the 3DS can't reach plex.tv, or if **CHOOSE SERVER** says *"None of your Plex servers
 answered"*. A typed address stays exactly as typed (it is never switched automatically). Away
 from home, type the server's **public** address and port from Plex Web → **Settings → (your
-server) → Remote Access** instead of the local one.
+server) → Remote Access** instead of the local one. **HTTPS addresses work too** — e.g. a
+reverse proxy or your own domain: type the whole thing, `https://plex.example.com` (port 443
+unless you add one).
 
 1. **Find your server's local IP address**, e.g. in Plex Web → **Settings → (your server) →
    Remote Access** (shown as the *private* address), or in your router's list of devices.
@@ -386,6 +388,10 @@ option, and **Save Changes** when done. Only the server's owner can change them.
   - Under **Show Advanced**: set **Internet upload speed** to your real upload, and keep
     **Limit remote stream bitrate** at **2 Mbps** or more (or *Original*) — the 3DS asks for
     about 0.7 Mbps in 2D and 2 Mbps in 3D.
+- **Network → Custom server access URLs** — if you reach your server from outside through your
+  own domain or a reverse proxy (e.g. `https://plex.example.com:443`) instead of Plex's Remote
+  Access, add it here. plex.tv then lists it, and **CHOOSE FROM MY ACCOUNT** finds the server
+  through it when you're away from home.
 
 **Checking a stream:** open the Plex **Dashboard** (the activity icon at the top of Plex Web)
 while you press play on the 3DS. A transcode session for *Nintendo 3DS* should appear and start

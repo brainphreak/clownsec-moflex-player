@@ -127,8 +127,8 @@ static long plex_req(const PlexCfg *c, const char *url, char **out, int json, in
     curl_easy_setopt(e, CURLOPT_SSL_VERIFYHOST, 0L);
     curl_easy_setopt(e, CURLOPT_NOSIGNAL, 1L);
     if (g_probe) {                                       /* is anything there? answer fast */
-        curl_easy_setopt(e, CURLOPT_CONNECTTIMEOUT, 3L);
-        curl_easy_setopt(e, CURLOPT_TIMEOUT, 5L);
+        curl_easy_setopt(e, CURLOPT_CONNECTTIMEOUT, 4L);
+        curl_easy_setopt(e, CURLOPT_TIMEOUT, 8L);          /* an HTTPS handshake is slow on a 3DS */
     } else {
         /* a remote server's upload can be slow but steady: give up when it stalls (under
          * 256 bytes/s for 20 s); a whole listing also stops at 90 s and is fetched in pages */
@@ -486,13 +486,43 @@ static int plex_answers(const PlexCfg *c, const char *url, const char *token, co
     free(body);
     return ok;
 }
+/* Try a server's connections of one kind (home-network or internet; plain-HTTP or HTTPS) until
+ * one answers as this server. 1 = s->url set. */
+static int plex_try_conns(const PlexCfg *c, cJSON *e, int want_local, int want_https, PlexServer *s) {
+    cJSON *cn; cJSON_ArrayForEach(cn, cJSON_GetObjectItemCaseSensitive(e, "connections")) {
+        char proto[8] = "", addr[64] = "", uri[128] = "";
+        jstr(cn, "protocol", proto, sizeof proto); jstr(cn, "address", addr, sizeof addr);
+        jstr(cn, "uri", uri, sizeof uri);
+        int local = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(cn, "local"));
+        int relay = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(cn, "relay"));
+        if (local != want_local || relay) continue;
+        char url[128];
+        if (want_https) {                     /* plex.direct names and custom https:// addresses */
+            if (strcmp(proto, "https") || strncmp(uri, "https://", 8)) continue;
+            snprintf(url, sizeof url, "%s", uri);
+        } else {
+            if (strcmp(proto, "http") || !addr[0] || strchr(addr, ':')) continue;   /* (IPv6 skipped) */
+            snprintf(url, sizeof url, "http://%s:%lld", addr, jnum(cn, "port"));
+        }
+        size_t L = strlen(url); while (L && url[L - 1] == '/') url[--L] = 0;
+        if (plex_answers(c, url, s->token, s->machine)) { snprintf(s->url, sizeof s->url, "%s", url); return 1; }
+    }
+    return 0;
+}
+static cJSON *plex_resources(const PlexCfg *acct, int https) {
+    char *body = NULL;
+    long st = plex_get(acct, https ? "https://plex.tv/api/v2/resources?includeHttps=1&includeRelay=0"
+                                   : "https://plex.tv/api/v2/resources?includeHttps=0&includeRelay=0", &body, 1);
+    if (st != 200 || !body) { free(body); return NULL; }
+    cJSON *r = cJSON_Parse(body); free(body);
+    return r;
+}
 int plex_servers(const PlexCfg *c, PlexServer *out, int max) {
     PlexCfg acct = *c;                        /* plex.tv wants the ACCOUNT token */
     if (c->account[0]) snprintf(acct.token, sizeof acct.token, "%s", c->account);
-    char *body = NULL;
-    long st = plex_get(&acct, "https://plex.tv/api/v2/resources?includeHttps=0&includeRelay=0", &body, 1);
-    if (st != 200 || !body) { free(body); return -1; }
-    cJSON *r = cJSON_Parse(body); free(body);
+    cJSON *r = plex_resources(&acct, 0);
+    if (!r) return -1;
+    cJSON *rs = NULL; int rs_tried = 0;       /* the HTTPS listing: fetched only if needed */
     int n = 0;
     for (int pass = 0; pass < 2 && n < max; pass++) {    /* owned servers first, then shared ones */
         cJSON *e; cJSON_ArrayForEach(e, r) {
@@ -507,25 +537,25 @@ int plex_servers(const PlexCfg *c, PlexServer *out, int max) {
             jstr(e, "accessToken", s->token, sizeof s->token);
             if (!s->token[0]) snprintf(s->token, sizeof s->token, "%s", acct.token);
             s->owned = owned;
-            /* its addresses: the home network's first (fast, and the only ones that work when the
-             * router can't loop back), then the internet ones remote access publishes */
-            cJSON *cs = cJSON_GetObjectItemCaseSensitive(e, "connections");
-            for (int want_local = 1; want_local >= 0 && !s->url[0]; want_local--) {
-                cJSON *cn; cJSON_ArrayForEach(cn, cs) {
-                    char proto[8] = "", addr[64] = "";
-                    jstr(cn, "protocol", proto, sizeof proto); jstr(cn, "address", addr, sizeof addr);
-                    int local = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(cn, "local"));
-                    int relay = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(cn, "relay"));
-                    if (local != want_local || relay || strcmp(proto, "http") || !addr[0] || strchr(addr, ':'))
-                        continue;                 /* (IPv6 addresses skipped) */
-                    char url[128]; snprintf(url, sizeof url, "http://%s:%lld", addr, jnum(cn, "port"));
-                    if (plex_answers(c, url, s->token, s->machine)) { snprintf(s->url, sizeof s->url, "%s", url); break; }
+            /* plain HTTP first -- home network, then internet (remote access) -- as it costs the
+             * 3DS least; then the server's HTTPS addresses (plex.direct names, and custom
+             * https:// access URLs such as a reverse proxy), home network first */
+            for (int want_local = 1; want_local >= 0 && !s->url[0]; want_local--)
+                plex_try_conns(c, e, want_local, 0, s);
+            if (!s->url[0]) {
+                if (!rs_tried) { rs_tried = 1; rs = plex_resources(&acct, 1); }
+                cJSON *f; cJSON_ArrayForEach(f, rs) {
+                    char id[48] = ""; jstr(f, "clientIdentifier", id, sizeof id);
+                    if (strcmp(id, s->machine)) continue;
+                    for (int want_local = 1; want_local >= 0 && !s->url[0]; want_local--)
+                        plex_try_conns(c, f, want_local, 1, s);
+                    break;
                 }
             }
             if (s->url[0]) n++;                   /* answered somewhere: list it */
         }
     }
-    cJSON_Delete(r);
+    cJSON_Delete(r); cJSON_Delete(rs);
     return n;
 }
 

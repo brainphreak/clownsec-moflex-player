@@ -5805,7 +5805,7 @@ static void plex_setup(void) {
     }
     for (;;) {
         char r0[64], r1[96], r2[48];
-        const char *u = c.url; if (!strncmp(u, "http://", 7)) u += 7;
+        const char *u = c.url; if (!strncmp(u, "http://", 7)) u += 7;   /* https:// stays visible */
         snprintf(r0, sizeof r0, "ACCOUNT: %s", c.account[0] ? "LINKED" : "NOT LINKED");
         snprintf(r1, sizeof r1, "SERVER: %s", !c.url[0] ? "(none)" : c.name[0] ? c.name : u);
         snprintf(r2, sizeof r2, "TOKEN: %s", c.token[0] ? "SET" : "NONE");
@@ -5832,13 +5832,18 @@ static void plex_setup(void) {
             else if (a == 1) {
                 SwkbdState s; char buf[128];
                 swkbdInit(&s, SWKBD_TYPE_NORMAL, 2, -1);
-                swkbdSetHintText(&s, "Server address, e.g. 192.168.1.20:32400");
+                swkbdSetHintText(&s, "e.g. 192.168.1.20 or https://plex.example.com");
                 swkbdSetInitialText(&s, u);
                 if (swkbdInputText(&s, buf, sizeof buf) != SWKBD_BUTTON_RIGHT || !buf[0]) continue;
                 char *b = buf; while (*b == ' ') b++;
-                if (!strncmp(b, "http://", 7)) b += 7;
-                if (strchr(b, ':')) snprintf(c.url, sizeof c.url, "http://%s", b);   /* port given */
-                else snprintf(c.url, sizeof c.url, "http://%s:32400", b);
+                { size_t L = strlen(b); while (L && (b[L - 1] == ' ' || b[L - 1] == '/')) b[--L] = 0; }
+                if (!strncasecmp(b, "https://", 8))   /* a secure address (reverse proxy, custom URL): as typed, port 443 unless given */
+                    snprintf(c.url, sizeof c.url, "https://%s", b + 8);
+                else {
+                    if (!strncasecmp(b, "http://", 7)) b += 7;
+                    if (strchr(b, ':')) snprintf(c.url, sizeof c.url, "http://%s", b);   /* port given */
+                    else snprintf(c.url, sizeof c.url, "http://%s:32400", b);
+                }
                 c.name[0] = 0; c.machine[0] = 0;   /* typed: never moved by plex_relocate */
                 if (c.account[0] && !c.token[0]) snprintf(c.token, sizeof c.token, "%s", c.account);
                 plex_cfg_save(&c); plex_cfg_load(&c);
