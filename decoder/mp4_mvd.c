@@ -64,6 +64,7 @@ static int            g_cw = 0, g_ch = 0;   /* CODED dims: 16-aligned macroblock
                                              * sized -- for the CODED frame, or the sysmodule
                                              * itself data-aborts (hard system crash). The blit
                                              * crops back to the display size. */
+static int            g_off = 0;            /* crop offset (top*stride + left) of the display area */
 static uint8_t        g_avcc[512];         /* saved SPS/PPS, for re-priming after a seek */
 static int            g_avcc_len = 0;
 
@@ -100,11 +101,91 @@ static void prime_sps_pps(void) {
         for (int i = 0; i < npps && p + 2 <= avcc_len; i++) { int l = (avcc[p]<<8)|avcc[p+1]; p+=2; if (p+l>avcc_len) break; feed_annexb(avcc+p, l); p+=l; } }
 }
 
+/* ---- the SPS's own coded size ----
+ * An encoder may code more macroblocks than the display needs and crop the rest: Intel Quick
+ * Sync codes a 398x170 picture as 416x192 (x264 uses 400x176). MVD must be set up for the
+ * CODED size -- configured for (display rounded up to 16) it accepted every frame and never
+ * output a picture. So read pic_width_in_mbs / pic_height_in_map_units and the crop from the SPS. */
+typedef struct { const uint8_t *b; int n, pos; } Bits;
+static int bit1(Bits *r) { if (r->pos >= r->n * 8) return -1; int v = (r->b[r->pos >> 3] >> (7 - (r->pos & 7))) & 1; r->pos++; return v; }
+static long ue(Bits *r) {
+    int z = 0, b;
+    while ((b = bit1(r)) == 0) if (++z > 31) return -1;
+    if (b < 0) return -1;
+    long v = 0; for (int i = 0; i < z; i++) { int x = bit1(r); if (x < 0) return -1; v = (v << 1) | x; }
+    return (1L << z) - 1 + v;
+}
+static long se(Bits *r) { long k = ue(r); if (k < 0) return 0; return (k & 1) ? (k + 1) / 2 : -(k / 2); }
+static void skip_scaling_list(Bits *r, int size) {
+    int last = 8, next = 8;
+    for (int j = 0; j < size; j++) {
+        if (next) next = (last + (int)se(r) + 256) % 256;
+        last = next ? next : last;
+    }
+}
+/* 1 = parsed: coded size and crop (left/top in pixels) of the first SPS in avcC */
+static int sps_coded(const uint8_t *avcc, int len, int *cw, int *ch, int *cl, int *ct) {
+    if (len < 8 || avcc[0] != 1 || (avcc[5] & 0x1F) < 1) return 0;
+    int sl = (avcc[6] << 8) | avcc[7];
+    if (sl < 4 || 8 + sl > len) return 0;
+    uint8_t rb[128]; int n = 0;                       /* the SPS without emulation-prevention bytes */
+    for (int i = 1; i < sl && n < (int)sizeof rb; i++) {   /* (skip the NAL header byte) */
+        if (i >= 3 && avcc[8 + i] == 3 && avcc[8 + i - 1] == 0 && avcc[8 + i - 2] == 0) continue;
+        rb[n++] = avcc[8 + i];
+    }
+    Bits r = { rb, n, 0 };
+    int profile = rb[0]; r.pos = 24;                  /* profile, constraints, level */
+    if (ue(&r) < 0) return 0;                         /* seq_parameter_set_id */
+    int chroma = 1;
+    if (profile == 100 || profile == 110 || profile == 122 || profile == 244 || profile == 44 ||
+        profile == 83 || profile == 86 || profile == 118 || profile == 128 || profile == 138 ||
+        profile == 139 || profile == 134 || profile == 135) {
+        chroma = (int)ue(&r);
+        if (chroma == 3) bit1(&r);                    /* separate_colour_plane_flag */
+        ue(&r); ue(&r); bit1(&r);                     /* bit depths, qpprime_y_zero_transform_bypass */
+        if (bit1(&r) == 1)                            /* seq_scaling_matrix_present */
+            for (int i = 0; i < (chroma != 3 ? 8 : 12); i++)
+                if (bit1(&r) == 1) skip_scaling_list(&r, i < 6 ? 16 : 64);
+    }
+    ue(&r);                                           /* log2_max_frame_num_minus4 */
+    long poc = ue(&r);
+    if (poc == 0) ue(&r);
+    else if (poc == 1) {
+        bit1(&r); se(&r); se(&r);
+        long k = ue(&r); if (k < 0 || k > 255) return 0;
+        for (long i = 0; i < k; i++) se(&r);
+    }
+    ue(&r); bit1(&r);                                 /* max_num_ref_frames, gaps_in_frame_num */
+    long wm = ue(&r), hm = ue(&r);
+    int fmo = bit1(&r);
+    if (wm < 0 || hm < 0 || fmo < 0 || wm > 255 || hm > 255) return 0;
+    if (!fmo) bit1(&r);                               /* mb_adaptive_frame_field */
+    bit1(&r);                                         /* direct_8x8_inference */
+    *cw = (int)(wm + 1) * 16; *ch = (int)(hm + 1) * 16 * (2 - fmo);
+    *cl = *ct = 0;
+    if (bit1(&r) == 1) {                              /* frame_cropping */
+        long l = ue(&r), rr = ue(&r), t = ue(&r), b = ue(&r); (void)rr; (void)b;
+        int ux = (chroma == 1 || chroma == 2) ? 2 : 1, uy = (chroma == 1 ? 2 : 1) * (2 - fmo);
+        if (l > 0 && l * ux < *cw) *cl = (int)(l * ux);
+        if (t > 0 && t * uy < *ch) *ct = (int)(t * uy);
+    }
+    return 1;
+}
+
 int mp4_mvd_init(int w, int h, const uint8_t *avcc, int avcc_len, int nal_len_size) {
     g_first = 1;
     g_nal_len = (nal_len_size == 1 || nal_len_size == 2 || nal_len_size == 4) ? nal_len_size : 4;
     g_w = w; g_h = h;
     g_cw = (w + 15) & ~15; g_ch = (h + 15) & ~15;
+    g_off = 0;
+    {   int sw = 0, sh = 0, cl = 0, ct = 0;          /* the stream's real coded size, if larger */
+        if (avcc && sps_coded(avcc, avcc_len, &sw, &sh, &cl, &ct) && sw >= w && sh >= h &&
+            sw <= 1920 + 64 && sh <= 1088 + 64) {
+            if (sw > g_cw) g_cw = sw;
+            if (sh > g_ch) g_ch = sh;
+            if (cl + w <= g_cw && ct + h <= g_ch) g_off = ct * g_cw + cl;
+        }
+    }
     g_avcc_len = (avcc && avcc_len > 0 && avcc_len <= (int)sizeof g_avcc) ? avcc_len : 0;
     if (g_avcc_len) memcpy(g_avcc, avcc, g_avcc_len);
 
@@ -179,7 +260,7 @@ static void blit_eye(gfx3dSide_t side, int sx, int sw) {
 
     /* precompute the source row for each destination row (avoids a divide per pixel) */
     static int srcrow[TOP_H];
-    for (int dy = 0; dy < dh; dy++) srcrow[dy] = (dy * sh / dh) * g_cw;   /* stride = CODED width */
+    for (int dy = 0; dy < dh; dy++) srcrow[dy] = g_off + (dy * sh / dh) * g_cw;   /* stride = CODED width */
 
     for (int dx = 0; dx < TOP_W; dx++) {
         u8 *col = fb + (size_t)dx * TOP_H * 3;
@@ -211,7 +292,7 @@ void mp4_mvd_present(int slot, int sbs) {
 const u16 *mp4_mvd_frame(int slot, int *w, int *h, int *stride) {
     if (slot < 0 || slot >= MVD_SLOTS || !g_outs[slot]) return NULL;
     *w = g_w; *h = g_h; *stride = g_cw;
-    return g_outs[slot];
+    return g_outs[slot] + g_off;
 }
 
 /* ---- reference-player decode state machine (modeled on Video_player_for_3DS) ----
