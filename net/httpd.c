@@ -74,6 +74,18 @@ static void send_all(int fd, const char *buf, int len) {
 
 static void send_str(int fd, const char *s) { send_all(fd, s, (int)strlen(s)); }
 
+/* for a query value: everything but unreserved characters as %XX */
+static void url_encode(const char *in, char *out, size_t cap) {
+    static const char hx[] = "0123456789ABCDEF";
+    size_t o = 0;
+    for (const unsigned char *p = (const unsigned char *)in; *p && o + 4 < cap; p++) {
+        if ((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') || (*p >= '0' && *p <= '9') ||
+            *p == '-' || *p == '_' || *p == '.' || *p == '~' || *p == '/' || *p == ':') out[o++] = (char)*p;
+        else { out[o++] = '%'; out[o++] = hx[*p >> 4]; out[o++] = hx[*p & 15]; }
+    }
+    out[o] = 0;
+}
+
 static void send_status(int fd, const char *status, const char *ctype, const char *body) {
     char hdr[256];
     int bl = body ? (int)strlen(body) : 0;
@@ -107,9 +119,44 @@ static int is_moflex(const char *n) {
     return L > 7 && strcasecmp(n + L - 7, ".moflex") == 0;
 }
 
+/* GET /get?path=sdmc:/...: send one file to the browser as a download (logs, saves, anything) */
+static void serve_file(int fd, const char *fpath) {
+    struct stat st;
+    FILE *f = NULL;
+    if (fpath[0] && !strncmp(fpath, "sdmc:/", 6) && stat(fpath, &st) == 0 && !S_ISDIR(st.st_mode))
+        f = fopen(fpath, "rb");
+    if (!f) { send_status(fd, "404 Not Found", "text/plain", "no such file"); return; }
+    const char *name = strrchr(fpath, '/'); name = name ? name + 1 : fpath;
+    char safe[256]; size_t k = 0;
+    for (const char *s = name; *s && k + 1 < sizeof safe; s++)
+        safe[k++] = (*s == '"' || *s == '\\' || (unsigned char)*s < 32) ? '_' : *s;
+    safe[k] = 0;
+    char hdr[512];
+    snprintf(hdr, sizeof hdr,
+             "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: %lld\r\n"
+             "Content-Disposition: attachment; filename=\"%s\"\r\nConnection: close\r\n\r\n",
+             (long long)st.st_size, safe);
+    send_str(fd, hdr);
+    char *buf = (char *)malloc(32 * 1024);
+    if (buf) {
+        size_t n;
+        while (!g_stop && (n = fread(buf, 1, 32 * 1024, f)) > 0) {
+            size_t off = 0;
+            while (off < n) {
+                int s = send(fd, buf + off, n - off, 0);
+                if (s <= 0) { n = 0; break; }      /* the browser went away */
+                off += (size_t)s;
+            }
+            if (!n) break;
+        }
+        free(buf);
+    }
+    fclose(f);
+}
+
 static void serve_listing(int fd, const char *dir) {
     /* stream the page directly to the socket in chunks */
-    char line[2048], esc[1024], enc[1024];
+    static char line[4096]; char esc[1024], enc[1024];
 
     send_str(fd,
         "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n"
@@ -165,11 +212,13 @@ static void serve_listing(int fd, const char *dir) {
                     "<li class=d>&#128193; <a href='/?dir=%s'>%s/</a></li>", subesc, esc);
             } else {
                 char fullesc[1024]; html_escape(full, fullesc, sizeof(fullesc));
+                static char fullurl[1200]; url_encode(full, fullurl, sizeof(fullurl));
                 long kb = (long)(st.st_size / 1024);
                 snprintf(line, sizeof(line),
-                    "<li>&#127909; %s <small>(%ld KB)</small> "
+                    "<li>&#127909; <a href='/get?path=%s' download>%s</a> <small>(%ld KB)</small> "
+                    "<a href='/get?path=%s' download><button>download</button></a> "
                     "<button onclick=\"rm('%s')\">delete</button></li>",
-                    esc, kb, fullesc);
+                    fullurl, esc, kb, fullurl, fullesc);
             }
             send_str(fd, line);
             (void)enc;
@@ -375,6 +424,10 @@ static void handle_client(int fd) {
             if (fpath[0] && !strncmp(fpath, "sdmc:/", 6) && stat(fpath, &st) == 0) sz = st.st_size;
             char b[32]; snprintf(b, sizeof b, "%lld", sz);
             send_status(fd, "200 OK", "text/plain", b);
+        } else if (!strncmp(path, "/get", 4)) {     /* download a file */
+            char fpath[1024];
+            get_query(path, "path", fpath, sizeof(fpath));
+            serve_file(fd, fpath);
         } else if (!strncmp(path, "/rm", 3)) {
             char fpath[1024];
             get_query(path, "path", fpath, sizeof(fpath));
