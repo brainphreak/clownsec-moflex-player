@@ -5923,7 +5923,14 @@ static MoflexResult plex_play(const PlexCfg *c, const PlexItem *it, int lib3d, l
     int fmt = plex_fmt(it, lib3d);
     static char subfile[96]; subfile[0] = 0;
     PlexSub subs[16]; long long part = 0, orig_sel = 0, burn_id = 0; char alang[8] = "";
+    /* the steps before the playback screen say what they're doing: the playback screen stays
+     * dark until the first frame, so a slow or refusing server must be visible HERE */
+    msg_screen_nowait(it->title, "Getting the video's details...");
     int ns = plex_item_streams(c, it->rating, subs, 16, &part, alang, sizeof alang);
+    if (ns < 0 && part == 0) {
+        char m[200]; snprintf(m, sizeof m, "The server didn't send the video's\ndetails.\n\n%s", plex_error());
+        msg_screen("PLEX", m); return MOFLEX_QUIT_BACK;
+    }
     {   int saved = moflex_fmt_load_key(key); if (saved >= 0) fmt = saved; }   /* the Format row's choice */
     int burnable = 0, subs_on = moflex_subs_wanted(key, alang);   /* the PLAYER's switch decides */
     if (ns > 0) {
@@ -5941,6 +5948,7 @@ static MoflexResult plex_play(const PlexCfg *c, const PlexItem *it, int lib3d, l
             int text = !strcmp(s->codec, "srt") || !strcmp(s->codec, "ass") || !strcmp(s->codec, "ssa") ||
                        !strcmp(s->codec, "subrip");
             if (s->key[0] && text) {              /* an external text file: drawn by the player */
+                msg_screen_nowait(it->title, "Getting subtitles...");
                 snprintf(subfile, sizeof subfile, "sdmc:/moflex_player/.plexsub.%s", strcmp(s->codec, "srt") ? s->codec : "srt");
                 if (!plex_download(c, s->key, subfile)) subfile[0] = 0;
             } else if (fmt == 0) {                /* embedded: Plex burns the selected track in */
@@ -5951,6 +5959,17 @@ static MoflexResult plex_play(const PlexCfg *c, const PlexItem *it, int lib3d, l
         }
     }
 
+    /* will the server make the stream? (it answers why not -- shown here, not on a dark screen) */
+    {   int sfmt = moflex_fmt_load_key(key); if (sfmt < 0) sfmt = plex_fmt(it, lib3d);
+        msg_screen_nowait(it->title, "Asking the server to prepare\nthe video...");
+        if (!plex_stream_check(c, it->rating, start, sfmt != 0, p.burn && sfmt == 0)) {
+            char m[220]; snprintf(m, sizeof m, "The server can't stream this.\n\n%s", plex_error());
+            msg_screen("PLEX", m);
+            if (burn_id && burn_id != orig_sel) plex_select_sub(c, part, orig_sel);
+            return MOFLEX_QUIT_BACK;
+        }
+        msg_screen_nowait(it->title, "Starting the video...\n(the screen stays dark until it\narrives -- up to 30 seconds)");
+    }
     /* the home card now offers THIS item (survives restarts like a local file) */
     snprintf(g_now_playing_path, sizeof g_now_playing_path, "%s", key);
     snprintf(g_now_playing, sizeof g_now_playing, "%s", title);
@@ -6032,16 +6051,29 @@ static int plex_browse(void) {
     int lib3d = 0;                            /* inside a library named "...3D..." */
     static char path[8][192], ttl[8][96];
     int depth = 0, presel[8] = { 0 };
+    /* each level's list is kept while you're below it, so going back never downloads it again;
+     * a whole library (stamp > 0) is also kept on the SD card for next time */
+    PlexItem *lst[8] = { 0 }; int lstn[8] = { 0 }; long long stamp[8] = { 0 };
+    #define PLEX_BROWSE_DONE(rv) do { for (int d_ = 0; d_ < 8; d_++) free(lst[d_]); return (rv); } while (0)
+    #define PLEX_UP() do { free(lst[depth]); lst[depth] = NULL; if (depth == 0) PLEX_BROWSE_DONE(0); depth--; } while (0)
     snprintf(path[0], sizeof path[0], "/library/sections");
     snprintf(ttl[0], sizeof ttl[0], "%s", c.name[0] ? c.name : "PLEX");   /* which server this is */
     for (;;) {
-        msg_screen_nowait(ttl[depth], "Loading...");
-        PlexItem *it = NULL;
-        int n = plex_list_here(&c, path[depth], &it, ttl[depth]);
-        if (n < 0) { msg_screen("PLEX", plex_error()); if (depth == 0) return 0; depth--; continue; }
-        if (n == 0) { free(it); msg_screen(ttl[depth], "Nothing here."); if (depth == 0) return 0; depth--; continue; }
+        if (!lst[depth]) {
+            msg_screen_nowait(ttl[depth], "Loading...");
+            PlexItem *got = NULL;
+            int k = plex_cache_load(&c, path[depth], stamp[depth], &got);
+            if (k < 0) {
+                k = plex_list_here(&c, path[depth], &got, ttl[depth]);
+                if (k > 0) plex_cache_save(&c, path[depth], stamp[depth], got, k);
+            }
+            if (k < 0) { msg_screen("PLEX", plex_error()); PLEX_UP(); continue; }
+            if (k == 0) { free(got); msg_screen(ttl[depth], "Nothing here."); PLEX_UP(); continue; }
+            lst[depth] = got; lstn[depth] = k;
+        }
+        PlexItem *it = lst[depth]; int n = lstn[depth];
         char (*names)[64] = (char (*)[64])malloc((size_t)n * 64);
-        if (!names) { free(it); return 0; }
+        if (!names) PLEX_BROWSE_DONE(0);
         for (int i = 0; i < n; i++) {
             const PlexItem *e = &it[i];
             const char *mark = (plex_playable(e) && e->viewed) ? "* " : "";
@@ -6061,18 +6093,35 @@ static int plex_browse(void) {
         s_plex_items = NULL; s_plex_n = 0;
         branding_show();                      /* the logo back while the next list loads */
         free(names);
-        if (sel < 0 || sel >= n) { free(it); if (depth == 0) return 0; depth--; if (depth == 0) lib3d = 0; continue; }
+        if (sel < 0 || sel >= n) { PLEX_UP(); if (depth == 0) lib3d = 0; continue; }
         presel[depth] = sel;
-        PlexItem pick = it[sel]; free(it);
+        PlexItem pick = it[sel];
         if (plex_playable(&pick)) {
-            if (plex_play(&c, &pick, lib3d, -1) == MOFLEX_QUIT_EXIT) return 1;
+            /* the list may be a saved copy: take the resume point fresh from the server */
+            {   char mp[64]; snprintf(mp, sizeof mp, "/library/metadata/%s", pick.rating);
+                PlexItem *fr = NULL;
+                if (plex_list(&c, mp, &fr) > 0) { pick.offset_ms = fr[0].offset_ms; pick.viewed = fr[0].viewed; }
+                free(fr); }
+            if (plex_play(&c, &pick, lib3d, -1) == MOFLEX_QUIT_EXIT) PLEX_BROWSE_DONE(1);
+            /* small lists (a season's episodes) reload for the new watched marks; a whole library
+             * just marks what was played */
+            if (n < 200) { free(lst[depth]); lst[depth] = NULL; }
+            else {
+                PlexItem *fr = NULL; char mp[64]; snprintf(mp, sizeof mp, "/library/metadata/%s", pick.rating);
+                if (plex_list(&c, mp, &fr) > 0) { it[sel].viewed = fr[0].viewed; it[sel].offset_ms = fr[0].offset_ms; }
+                free(fr);
+            }
         } else if (depth < 7 && pick.key[0]) {
             if (depth == 0) lib3d = ci_contains(pick.title, "3d");
             depth++; presel[depth] = 0;
+            free(lst[depth]); lst[depth] = NULL;
+            stamp[depth] = depth == 1 ? pick.stamp : 0;     /* a whole library: cache it */
             snprintf(path[depth], sizeof path[depth], "%s", pick.key);
             snprintf(ttl[depth], sizeof ttl[depth], "%s", pick.title);
         }
     }
+    #undef PLEX_UP
+    #undef PLEX_BROWSE_DONE
 }
 
 /* X on home: everything that is a setting rather than a video */

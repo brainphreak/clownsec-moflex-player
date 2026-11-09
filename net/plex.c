@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 
 #define PLEX_CFG "sdmc:/moflex_player/plex.cfg"
 static char g_err[96] = "";
@@ -196,6 +197,7 @@ static int plex_parse_page(cJSON *mc, int sections, PlexItem **pv, int *pn, int 
             it->leaf_count = (int)jnum(e, "leafCount"); it->viewed_leaf = (int)jnum(e, "viewedLeafCount");
             it->viewed = jnum(e, "viewCount") > 0;
             it->duration_ms = jnum(e, "duration"); it->offset_ms = jnum(e, "viewOffset");
+            it->stamp = jnum(e, "contentChangedAt"); if (!it->stamp) it->stamp = jnum(e, "updatedAt");
             if (it->title[0]) n++;
         }
     }
@@ -251,6 +253,47 @@ int plex_list(const PlexCfg *c, const char *path, PlexItem **items) {
     return n;
 }
 
+/* ---- SD cache of big listings ---- */
+#define PLEX_CACHE_DIR "sdmc:/moflex_player/plexcache"
+#define PLEX_CACHE_MAGIC 0x31435850u              /* "PXC1" */
+#define PLEX_CACHE_MAX_AGE (3 * 24 * 3600)
+typedef struct { uint32_t magic, item_size; int32_t n, pad; int64_t stamp, saved; } PlexCacheHdr;
+static void plex_cache_name(const PlexCfg *c, const char *path, char *out, size_t cap) {
+    /* one file per server + listing: the server's id when known (survives an address change) */
+    uint32_t h = 2166136261u;
+    for (const char *s = c->machine[0] ? c->machine : c->url; *s; s++) { h ^= (uint8_t)*s; h *= 16777619u; }
+    h ^= '|'; h *= 16777619u;
+    for (const char *s = path; *s; s++) { h ^= (uint8_t)*s; h *= 16777619u; }
+    snprintf(out, cap, PLEX_CACHE_DIR "/%08lx.bin", (unsigned long)h);
+}
+int plex_cache_load(const PlexCfg *c, const char *path, long long stamp, PlexItem **items) {
+    *items = NULL;
+    if (stamp <= 0) return -1;
+    char fn[96]; plex_cache_name(c, path, fn, sizeof fn);
+    FILE *f = fopen(fn, "rb"); if (!f) return -1;
+    PlexCacheHdr hd; long long now = (long long)time(NULL);
+    int ok = fread(&hd, sizeof hd, 1, f) == 1 && hd.magic == PLEX_CACHE_MAGIC &&
+             hd.item_size == sizeof(PlexItem) && hd.n > 0 && hd.n < 100000 && hd.stamp == stamp &&
+             now - hd.saved < PLEX_CACHE_MAX_AGE && now >= hd.saved;
+    PlexItem *v = ok ? (PlexItem *)malloc((size_t)hd.n * sizeof(PlexItem)) : NULL;
+    if (v && fread(v, sizeof(PlexItem), (size_t)hd.n, f) != (size_t)hd.n) { free(v); v = NULL; }
+    fclose(f);
+    if (!v) return -1;
+    *items = v;
+    return hd.n;
+}
+void plex_cache_save(const PlexCfg *c, const char *path, long long stamp, const PlexItem *items, int n) {
+    if (stamp <= 0 || n <= 0) return;
+    mkdir("sdmc:/moflex_player", 0777); mkdir(PLEX_CACHE_DIR, 0777);
+    char fn[96], tmp[100]; plex_cache_name(c, path, fn, sizeof fn); snprintf(tmp, sizeof tmp, "%s.tmp", fn);
+    FILE *f = fopen(tmp, "wb"); if (!f) return;
+    PlexCacheHdr hd = { PLEX_CACHE_MAGIC, sizeof(PlexItem), n, 0, stamp, (int64_t)time(NULL) };
+    int ok = fwrite(&hd, sizeof hd, 1, f) == 1 && fwrite(items, sizeof(PlexItem), (size_t)n, f) == (size_t)n;
+    ok = (fclose(f) == 0) && ok;
+    remove(fn);
+    if (!ok || rename(tmp, fn) != 0) remove(tmp);   /* never leave a half-written copy */
+}
+
 static void urlenc(const char *s, char *o, size_t cap) {
     size_t n = 0;
     for (; *s && n + 4 < cap; s++) {
@@ -262,13 +305,10 @@ static void urlenc(const char *s, char *o, size_t cap) {
     o[n] = 0;
 }
 
-HttpStream *plex_stream_open(const PlexCfg *c, const char *rating_key, int64_t offset_us,
-                             int is3d, int burn_subs, char *session) {
-    static unsigned seq = 0;
-    u64 t = svcGetSystemTick();
-    snprintf(session, 24, "c3ds%08lx%04x", (unsigned long)(t >> 8), (++seq) & 0xFFFF);
+/* The universal transcoder's query for this item: one MPEG-TS stream of H.264 + AAC at our size. */
+static void plex_stream_query(const char *rating_key, int64_t offset_us, int is3d, int burn_subs,
+                              const char *session, char *q, size_t qcap) {
     int W = is3d ? 800 : 400, H = is3d ? 480 : 240;
-    /* the profile that makes Plex answer with one MPEG-TS stream of H.264 + AAC at our size */
     char prof[800];
     snprintf(prof, sizeof prof,
              "add-transcode-target(type=videoProfile&context=streaming&protocol=http&container=mpegts"
@@ -279,20 +319,65 @@ HttpStream *plex_stream_open(const PlexCfg *c, const char *rating_key, int64_t o
              "+add-limitation(scope=videoAudioCodec&scopeName=aac&type=upperBound&name=audio.channels&value=2)",
              W, H);
     char pe[1600]; urlenc(prof, pe, sizeof pe);
-    char q[2048];
-    snprintf(q, sizeof q,
+    snprintf(q, qcap,
              "path=%%2Flibrary%%2Fmetadata%%2F%s&mediaIndex=0&partIndex=0&protocol=http"
              "&offset=%lld&fastSeek=1&directPlay=0&directStream=0&videoResolution=%dx%d"
              "&maxVideoBitrate=%d&subtitles=%s&session=%s&X-Plex-Session-Identifier=%s"
              "&X-Plex-Client-Profile-Extra=%s",
              rating_key, (long long)(offset_us / 1000000), W, H, is3d ? 2000 : 700,
              burn_subs ? "burn" : "none", session, session, pe);
+}
+static void plex_new_session(char *session) {
+    static unsigned seq = 0;
+    u64 t = svcGetSystemTick();
+    snprintf(session, 24, "c3ds%08lx%04x", (unsigned long)(t >> 8), (++seq) & 0xFFFF);
+}
+/* Ask the transcoder whether it will make this stream. HTTP 200 alone is not a yes: the body
+ * carries Plex's decision codes (1xxx fine; 2xxx/3xxx/4xxx it won't or can't) and the reason. */
+static int plex_decide(const PlexCfg *c, const char *q) {
     char url[2400], *body = NULL;
-    /* the decision first: newer servers expect it, and it says whether the item can be played */
     snprintf(url, sizeof url, "%s/video/:/transcode/universal/decision?%s", c->url, q);
     long code = plex_get(c, url, &body, 1);
-    free(body);
-    if (code != 200) return NULL;
+    if (code != 200) {
+        if (code > 0 && body && body[0]) {          /* a reason in the error page, if short */
+            char t[64]; snprintf(t, sizeof t, "%s", body);
+            for (char *p = t; *p; p++) if (*p == '\n' || *p == '\r' || *p == '<') { *p = 0; break; }
+            if (t[0]) snprintf(g_err, sizeof g_err, "Plex answered HTTP %ld: %s", code, t);
+        }
+        free(body); return 0;
+    }
+    int ok = 1;
+    cJSON *r = body ? cJSON_Parse(body) : NULL;
+    cJSON *mc = r ? cJSON_GetObjectItemCaseSensitive(r, "MediaContainer") : NULL;
+    if (mc) {
+        static const char *keys[3][2] = { { "generalDecisionCode", "generalDecisionText" },
+                                          { "transcodeDecisionCode", "transcodeDecisionText" },
+                                          { "mdeDecisionCode", "mdeDecisionText" } };
+        for (int i = 0; i < 3 && ok; i++) {
+            long long dc = jnum(mc, keys[i][0]);
+            if (dc >= 2000) {
+                char t[72] = ""; jstr(mc, keys[i][1], t, sizeof t);
+                snprintf(g_err, sizeof g_err, "Plex won't stream it (%lld): %s", dc, t[0] ? t : "no reason given");
+                ok = 0;
+            }
+        }
+    }
+    cJSON_Delete(r); free(body);
+    return ok;
+}
+int plex_stream_check(const PlexCfg *c, const char *rating_key, int64_t offset_us, int is3d, int burn_subs) {
+    char session[24]; plex_new_session(session);
+    char q[2048]; plex_stream_query(rating_key, offset_us, is3d, burn_subs, session, q, sizeof q);
+    return plex_decide(c, q);
+}
+
+HttpStream *plex_stream_open(const PlexCfg *c, const char *rating_key, int64_t offset_us,
+                             int is3d, int burn_subs, char *session) {
+    plex_new_session(session);
+    char q[2048]; plex_stream_query(rating_key, offset_us, is3d, burn_subs, session, q, sizeof q);
+    /* the decision first: newer servers expect it, and it says whether the item can be played */
+    if (!plex_decide(c, q)) return NULL;
+    char url[2400];
     snprintf(url, sizeof url, "%s/video/:/transcode/universal/start.ts?%s", c->url, q);
     char hb[10][96]; const char *hp[11]; plex_headers(c, hb, hp, 0);
     HttpStream *s = hs_open(url, hp, 2u << 20);

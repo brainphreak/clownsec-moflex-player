@@ -407,6 +407,10 @@ descriptions, genres and watched counts, and pick something to play:
 - **Side-by-side 3D** (`3D Half SBS` / `3D Full SBS` editions, or a 3D library) plays in real 3D.
 - **Subtitles** are either drawn by the player or burned in by Plex — choose in
   **SETTINGS → PLAYBACK DEFAULTS**.
+- **Big libraries open instantly after the first time.** The 3DS keeps a copy of each library's
+  list on the SD card (`moflex_player/plexcache/`) and only downloads it again when Plex says the
+  library changed (e.g. a new movie was added), or after 3 days. Going back out of a show or
+  movie never reloads the list. Resume points are always fetched fresh before playing.
 
 ### Troubleshooting
 

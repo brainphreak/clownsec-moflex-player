@@ -37,6 +37,7 @@ typedef struct {
     int    leaf_count, viewed_leaf;   /* shows/seasons: episodes, watched */
     int    viewed;
     long long duration_ms, offset_ms; /* offset = Plex's resume point */
+    long long stamp;    /* a library (section): when its contents last changed -- the SD cache's key */
 } PlexItem;
 
 int  plex_cfg_load(PlexCfg *c);          /* 1 = a server is configured */
@@ -72,6 +73,11 @@ void plex_cfg_save(const PlexCfg *c);
  * Returns the count, or -1 (plex_error() says why). */
 int  plex_list(const PlexCfg *c, const char *path, PlexItem **items);
 const char *plex_error(void);
+/* SD-card copy of a big listing (a whole library), so it opens at once next time. Valid only
+ * while the library's stamp (PlexItem.stamp from /library/sections) is unchanged and the copy is
+ * under 3 days old. load: count, or -1 = no valid copy. */
+int  plex_cache_load(const PlexCfg *c, const char *path, long long stamp, PlexItem **items);
+void plex_cache_save(const PlexCfg *c, const char *path, long long stamp, const PlexItem *items, int n);
 /* URL of the server's resized JPEG for a thumb path (fits w x h), for the poster cache. */
 void plex_art_url(const PlexCfg *c, const char *thumb, int w, int h, char *out, int cap);
 
@@ -99,6 +105,9 @@ int  plex_item_streams(const PlexCfg *c, const char *rating_key, PlexSub *subs, 
 int  plex_select_sub(const PlexCfg *c, long long part_id, long long sub_id);   /* 0 = none */
 int  plex_download(const PlexCfg *c, const char *path, const char *dest);     /* 1 = saved */
 void plex_stream_stop(const PlexCfg *c, const char *session);
+/* Ask the server, before the playback screen, whether it will transcode this item (same request
+ * as plex_stream_open makes). 1 = yes; 0 = no / no answer, plex_error() has Plex's reason. */
+int  plex_stream_check(const PlexCfg *c, const char *rating_key, int64_t offset_us, int is3d, int burn_subs);
 /* Tell Plex where playback is (state: "playing" "paused" "stopped") -- resume + watched sync. */
 void plex_timeline(const PlexCfg *c, const char *rating_key, const char *state,
                    long long pos_ms, long long dur_ms);
