@@ -345,6 +345,10 @@ static int fmt_from_name(const char *path) {
  * screen -- the long ones used to run off both edges. */
 static void mp4_msg(const char *m) {
     gfxSetScreenFormat(GFX_BOTTOM, GSP_RGB565_OES);
+    /* ui_present() writes the CURRENT framebuffer and never swaps. After playback the graphics
+     * were re-initialised double-buffered, so the box went into a buffer never shown -- a dark
+     * screen waiting for B. Single-buffered like the menus, it is drawn where it is seen. */
+    gfxSetDoubleBuffering(GFX_BOTTOM, false);
     char lines[12][48]; int nl = 0;
     const int maxw = UI_W - 20;
     const char *p = m;
@@ -1289,6 +1293,12 @@ MoflexResult stream_play(const StreamSrc *src) {
     #undef GATE_ARM
     #undef PREBUF_US
     #undef REBUF_US
+    plex_log("stream: ended: \"%s\" result %d at %lld ms; gate %d (fed %d) rebuf %d shown %d drops %d; "
+             "HTTP %ld done %d, %llu bytes; queued %d video / %d audio, %d pictures waiting",
+             why[0] ? why : (result == MOFLEX_EOF ? "end of video" : "stopped by the viewer"), (int)result,
+             (long long)(cur_us / 1000), gate, gate_fed, rebuf, shown, drops,
+             hs ? hs_http(hs) : 0L, hs ? hs_done(hs) : 0, hs ? (unsigned long long)hs_total(hs) : 0ULL,
+             g_sv.n, g_sa.n, g_pq_n);
     if (vol_dirty) kit_vol_save();
     kit_flush_saves(src->key);
     if (src->report) src->report(src->ctx, "stopped", result == MOFLEX_EOF ? dur_us : cur_us);
