@@ -17,6 +17,8 @@ typedef struct {
     char client[40];    /* this console's X-Plex-Client-Identifier, made once */
     char account[64];   /* the plex.tv account token from linking; "" = not linked */
     char name[64];      /* the server's name, for the screens */
+    char machine[48];   /* the server's clientIdentifier (from the account list); "" = typed address.
+                         * Lets a saved server be found again at another address (home <-> away). */
 } PlexCfg;
 
 typedef struct {
@@ -47,13 +49,26 @@ int  plex_pin_poll(const PlexCfg *c, long long id, char *token, int cap);
 /* Is this token a plex.tv ACCOUNT token? (A link made before the account was stored apart left
  * it only as the server token.) 1 = yes, 0 = no / can't tell. */
 int  plex_token_is_account(const PlexCfg *c, const char *token);
-/* The linked account's servers that answer on this network (plain HTTP), owned ones first;
- * each with its own access token (a friend's shared server has one of its own). */
-typedef struct { char name[64]; char url[128]; char token[64]; int owned; } PlexServer;
+/* The linked account's servers that answer from where this 3DS is (plain HTTP), owned ones first;
+ * each with its own access token (a friend's shared server has one of its own). Every server's
+ * addresses are tried -- home-network ones first, then its internet (remote access) ones -- and
+ * the first that answers is the one returned; servers that answer on none are left out. */
+typedef struct { char name[64]; char url[128]; char token[64]; char machine[48]; int owned; } PlexServer;
 int  plex_servers(const PlexCfg *c, PlexServer *out, int max);
+/* The saved server stopped answering (e.g. it was chosen at home and this 3DS is now away):
+ * look it up again through the linked account and switch to whichever of its addresses answers.
+ * 1 = found at a working address (c updated and saved), 0 = not. */
+int  plex_relocate(PlexCfg *c);
+/* 1 = the last failed request never reached the server (no answer / timeout), as opposed to the
+ * server answering with an error. Only then is plex_relocate worth trying. */
+int  plex_unreachable(void);
+/* Optional: called while a long listing loads page by page (got so far, total; total 0 = unknown). */
+void plex_set_progress(void (*fn)(int got, int total));
 void plex_cfg_save(const PlexCfg *c);
 
 /* GET path (e.g. "/library/sections") and return its entries. *items is malloc'd (free it).
+ * One reply as a rule; if that is cut off part-way (a big library through a slow remote
+ * connection), it is fetched again in pages, so thousands of items load remotely too.
  * Returns the count, or -1 (plex_error() says why). */
 int  plex_list(const PlexCfg *c, const char *path, PlexItem **items);
 const char *plex_error(void);
