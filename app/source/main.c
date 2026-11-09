@@ -5925,11 +5925,14 @@ static MoflexResult plex_play(const PlexCfg *c, const PlexItem *it, int lib3d, l
     PlexSub subs[16]; long long part = 0, orig_sel = 0, burn_id = 0; char alang[8] = "";
     /* the steps before the playback screen say what they're doing: the playback screen stays
      * dark until the first frame, so a slow or refusing server must be visible HERE */
+    {   char lw[200]; snprintf(lw, sizeof lw, "Playing \"%s\" (item %s) from %s, start %llds, 3D fmt %d",
+                               it->title, it->rating, c->url, start / 1000000, plex_fmt(it, lib3d));
+        plex_log_begin(lw); }
     msg_screen_nowait(it->title, "Getting the video's details...");
     int ns = plex_item_streams(c, it->rating, subs, 16, &part, alang, sizeof alang);
     if (ns < 0 && part == 0) {
-        char m[200]; snprintf(m, sizeof m, "The server didn't send the video's\ndetails.\n\n%s", plex_error());
-        msg_screen("PLEX", m); return MOFLEX_QUIT_BACK;
+        char m[240]; snprintf(m, sizeof m, "The server didn't send the video's\ndetails.\n\n%s\n\nDetails: moflex_player/plex_log.txt", plex_error());
+        plex_log_end(); msg_screen("PLEX", m); return MOFLEX_QUIT_BACK;
     }
     {   int saved = moflex_fmt_load_key(key); if (saved >= 0) fmt = saved; }   /* the Format row's choice */
     int burnable = 0, subs_on = moflex_subs_wanted(key, alang);   /* the PLAYER's switch decides */
@@ -5963,8 +5966,8 @@ static MoflexResult plex_play(const PlexCfg *c, const PlexItem *it, int lib3d, l
     {   int sfmt = moflex_fmt_load_key(key); if (sfmt < 0) sfmt = plex_fmt(it, lib3d);
         msg_screen_nowait(it->title, "Asking the server to prepare\nthe video...");
         if (!plex_stream_check(c, it->rating, start, sfmt != 0, p.burn && sfmt == 0)) {
-            char m[220]; snprintf(m, sizeof m, "The server can't stream this.\n\n%s", plex_error());
-            msg_screen("PLEX", m);
+            char m[260]; snprintf(m, sizeof m, "The server can't stream this.\n\n%s\n\nDetails: moflex_player/plex_log.txt", plex_error());
+            plex_log_end(); msg_screen("PLEX", m);
             if (burn_id && burn_id != orig_sel) plex_select_sub(c, part, orig_sel);
             return MOFLEX_QUIT_BACK;
         }
@@ -5980,6 +5983,7 @@ static MoflexResult plex_play(const PlexCfg *c, const PlexItem *it, int lib3d, l
                     plex_src_open, plex_src_close, plex_src_report, plex_src_error, subfile,
                     burnable, subs_on, plex_src_set_burn };
     MoflexResult r = stream_play(&s);
+    plex_log_end();
     if (burn_id && burn_id != orig_sel) plex_select_sub(c, part, orig_sel);   /* leave Plex's choice as it was */
     consoleInit(GFX_BOTTOM, NULL);
     gfxSetDoubleBuffering(GFX_BOTTOM, false);

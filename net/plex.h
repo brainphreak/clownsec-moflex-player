@@ -73,6 +73,13 @@ void plex_cfg_save(const PlexCfg *c);
  * Returns the count, or -1 (plex_error() says why). */
 int  plex_list(const PlexCfg *c, const char *path, PlexItem **items);
 const char *plex_error(void);
+/* Play-attempt log on the SD card (sdmc:/moflex_player/plex_log.txt): every request with its
+ * answer and timing, the transcoder's decision, and how the stream arrived -- one file a user
+ * can send when playback fails. plex_log_begin starts a fresh file and turns logging on;
+ * plex_log_end turns it off. Tokens are never written. */
+void plex_log_begin(const char *what);
+void plex_log(const char *fmt, ...);
+void plex_log_end(void);
 /* SD-card copy of a big listing (a whole library), so it opens at once next time. Valid only
  * while the library's stamp (PlexItem.stamp from /library/sections) is unchanged and the copy is
  * under 3 days old. load: count, or -1 = no valid copy. */
