@@ -305,13 +305,10 @@ static void urlenc(const char *s, char *o, size_t cap) {
     o[n] = 0;
 }
 
-HttpStream *plex_stream_open(const PlexCfg *c, const char *rating_key, int64_t offset_us,
-                             int is3d, int burn_subs, char *session) {
-    static unsigned seq = 0;
-    u64 t = svcGetSystemTick();
-    snprintf(session, 24, "c3ds%08lx%04x", (unsigned long)(t >> 8), (++seq) & 0xFFFF);
+/* The universal transcoder's query for this item: one MPEG-TS stream of H.264 + AAC at our size. */
+static void plex_stream_query(const char *rating_key, int64_t offset_us, int is3d, int burn_subs,
+                              const char *session, char *q, size_t qcap) {
     int W = is3d ? 800 : 400, H = is3d ? 480 : 240;
-    /* the profile that makes Plex answer with one MPEG-TS stream of H.264 + AAC at our size */
     char prof[800];
     snprintf(prof, sizeof prof,
              "add-transcode-target(type=videoProfile&context=streaming&protocol=http&container=mpegts"
@@ -322,20 +319,65 @@ HttpStream *plex_stream_open(const PlexCfg *c, const char *rating_key, int64_t o
              "+add-limitation(scope=videoAudioCodec&scopeName=aac&type=upperBound&name=audio.channels&value=2)",
              W, H);
     char pe[1600]; urlenc(prof, pe, sizeof pe);
-    char q[2048];
-    snprintf(q, sizeof q,
+    snprintf(q, qcap,
              "path=%%2Flibrary%%2Fmetadata%%2F%s&mediaIndex=0&partIndex=0&protocol=http"
              "&offset=%lld&fastSeek=1&directPlay=0&directStream=0&videoResolution=%dx%d"
              "&maxVideoBitrate=%d&subtitles=%s&session=%s&X-Plex-Session-Identifier=%s"
              "&X-Plex-Client-Profile-Extra=%s",
              rating_key, (long long)(offset_us / 1000000), W, H, is3d ? 2000 : 700,
              burn_subs ? "burn" : "none", session, session, pe);
+}
+static void plex_new_session(char *session) {
+    static unsigned seq = 0;
+    u64 t = svcGetSystemTick();
+    snprintf(session, 24, "c3ds%08lx%04x", (unsigned long)(t >> 8), (++seq) & 0xFFFF);
+}
+/* Ask the transcoder whether it will make this stream. HTTP 200 alone is not a yes: the body
+ * carries Plex's decision codes (1xxx fine; 2xxx/3xxx/4xxx it won't or can't) and the reason. */
+static int plex_decide(const PlexCfg *c, const char *q) {
     char url[2400], *body = NULL;
-    /* the decision first: newer servers expect it, and it says whether the item can be played */
     snprintf(url, sizeof url, "%s/video/:/transcode/universal/decision?%s", c->url, q);
     long code = plex_get(c, url, &body, 1);
-    free(body);
-    if (code != 200) return NULL;
+    if (code != 200) {
+        if (code > 0 && body && body[0]) {          /* a reason in the error page, if short */
+            char t[64]; snprintf(t, sizeof t, "%s", body);
+            for (char *p = t; *p; p++) if (*p == '\n' || *p == '\r' || *p == '<') { *p = 0; break; }
+            if (t[0]) snprintf(g_err, sizeof g_err, "Plex answered HTTP %ld: %s", code, t);
+        }
+        free(body); return 0;
+    }
+    int ok = 1;
+    cJSON *r = body ? cJSON_Parse(body) : NULL;
+    cJSON *mc = r ? cJSON_GetObjectItemCaseSensitive(r, "MediaContainer") : NULL;
+    if (mc) {
+        static const char *keys[3][2] = { { "generalDecisionCode", "generalDecisionText" },
+                                          { "transcodeDecisionCode", "transcodeDecisionText" },
+                                          { "mdeDecisionCode", "mdeDecisionText" } };
+        for (int i = 0; i < 3 && ok; i++) {
+            long long dc = jnum(mc, keys[i][0]);
+            if (dc >= 2000) {
+                char t[72] = ""; jstr(mc, keys[i][1], t, sizeof t);
+                snprintf(g_err, sizeof g_err, "Plex won't stream it (%lld): %s", dc, t[0] ? t : "no reason given");
+                ok = 0;
+            }
+        }
+    }
+    cJSON_Delete(r); free(body);
+    return ok;
+}
+int plex_stream_check(const PlexCfg *c, const char *rating_key, int64_t offset_us, int is3d, int burn_subs) {
+    char session[24]; plex_new_session(session);
+    char q[2048]; plex_stream_query(rating_key, offset_us, is3d, burn_subs, session, q, sizeof q);
+    return plex_decide(c, q);
+}
+
+HttpStream *plex_stream_open(const PlexCfg *c, const char *rating_key, int64_t offset_us,
+                             int is3d, int burn_subs, char *session) {
+    plex_new_session(session);
+    char q[2048]; plex_stream_query(rating_key, offset_us, is3d, burn_subs, session, q, sizeof q);
+    /* the decision first: newer servers expect it, and it says whether the item can be played */
+    if (!plex_decide(c, q)) return NULL;
+    char url[2400];
     snprintf(url, sizeof url, "%s/video/:/transcode/universal/start.ts?%s", c->url, q);
     char hb[10][96]; const char *hp[11]; plex_headers(c, hb, hp, 0);
     HttpStream *s = hs_open(url, hp, 2u << 20);

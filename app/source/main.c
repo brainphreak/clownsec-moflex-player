@@ -5923,7 +5923,14 @@ static MoflexResult plex_play(const PlexCfg *c, const PlexItem *it, int lib3d, l
     int fmt = plex_fmt(it, lib3d);
     static char subfile[96]; subfile[0] = 0;
     PlexSub subs[16]; long long part = 0, orig_sel = 0, burn_id = 0; char alang[8] = "";
+    /* the steps before the playback screen say what they're doing: the playback screen stays
+     * dark until the first frame, so a slow or refusing server must be visible HERE */
+    msg_screen_nowait(it->title, "Getting the video's details...");
     int ns = plex_item_streams(c, it->rating, subs, 16, &part, alang, sizeof alang);
+    if (ns < 0 && part == 0) {
+        char m[200]; snprintf(m, sizeof m, "The server didn't send the video's\ndetails.\n\n%s", plex_error());
+        msg_screen("PLEX", m); return MOFLEX_QUIT_BACK;
+    }
     {   int saved = moflex_fmt_load_key(key); if (saved >= 0) fmt = saved; }   /* the Format row's choice */
     int burnable = 0, subs_on = moflex_subs_wanted(key, alang);   /* the PLAYER's switch decides */
     if (ns > 0) {
@@ -5941,6 +5948,7 @@ static MoflexResult plex_play(const PlexCfg *c, const PlexItem *it, int lib3d, l
             int text = !strcmp(s->codec, "srt") || !strcmp(s->codec, "ass") || !strcmp(s->codec, "ssa") ||
                        !strcmp(s->codec, "subrip");
             if (s->key[0] && text) {              /* an external text file: drawn by the player */
+                msg_screen_nowait(it->title, "Getting subtitles...");
                 snprintf(subfile, sizeof subfile, "sdmc:/moflex_player/.plexsub.%s", strcmp(s->codec, "srt") ? s->codec : "srt");
                 if (!plex_download(c, s->key, subfile)) subfile[0] = 0;
             } else if (fmt == 0) {                /* embedded: Plex burns the selected track in */
@@ -5951,6 +5959,17 @@ static MoflexResult plex_play(const PlexCfg *c, const PlexItem *it, int lib3d, l
         }
     }
 
+    /* will the server make the stream? (it answers why not -- shown here, not on a dark screen) */
+    {   int sfmt = moflex_fmt_load_key(key); if (sfmt < 0) sfmt = plex_fmt(it, lib3d);
+        msg_screen_nowait(it->title, "Asking the server to prepare\nthe video...");
+        if (!plex_stream_check(c, it->rating, start, sfmt != 0, p.burn && sfmt == 0)) {
+            char m[220]; snprintf(m, sizeof m, "The server can't stream this.\n\n%s", plex_error());
+            msg_screen("PLEX", m);
+            if (burn_id && burn_id != orig_sel) plex_select_sub(c, part, orig_sel);
+            return MOFLEX_QUIT_BACK;
+        }
+        msg_screen_nowait(it->title, "Starting the video...\n(the screen stays dark until it\narrives -- up to 30 seconds)");
+    }
     /* the home card now offers THIS item (survives restarts like a local file) */
     snprintf(g_now_playing_path, sizeof g_now_playing_path, "%s", key);
     snprintf(g_now_playing, sizeof g_now_playing, "%s", title);

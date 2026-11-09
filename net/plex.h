@@ -105,6 +105,9 @@ int  plex_item_streams(const PlexCfg *c, const char *rating_key, PlexSub *subs, 
 int  plex_select_sub(const PlexCfg *c, long long part_id, long long sub_id);   /* 0 = none */
 int  plex_download(const PlexCfg *c, const char *path, const char *dest);     /* 1 = saved */
 void plex_stream_stop(const PlexCfg *c, const char *session);
+/* Ask the server, before the playback screen, whether it will transcode this item (same request
+ * as plex_stream_open makes). 1 = yes; 0 = no / no answer, plex_error() has Plex's reason. */
+int  plex_stream_check(const PlexCfg *c, const char *rating_key, int64_t offset_us, int is3d, int burn_subs);
 /* Tell Plex where playback is (state: "playing" "paused" "stopped") -- resume + watched sync. */
 void plex_timeline(const PlexCfg *c, const char *rating_key, const char *state,
                    long long pos_ms, long long dur_ms);
