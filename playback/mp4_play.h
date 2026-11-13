@@ -28,6 +28,15 @@ typedef struct {
     int         burnable;     /* the server can burn a subtitle track into the picture */
     int         subs_on;      /* the player's subtitle switch at start */
     void        (*set_burn)(void *ctx, int on);   /* burnable: the switch flipped (stream restarts) */
+    /* audio tracks for the SOUND menu (n_audio < 2: no choice). set_audio is called when the
+     * viewer picks one; the stream then restarts where it is. */
+    int         n_audio, audio_sel;
+    const char  (*audio_lang)[8];
+    const char  (*audio_name)[48];
+    void        (*set_audio)(void *ctx, int idx);
+    /* subtitles that arrive while the video plays: whole SRT blocks in movie time, 0 = none yet.
+     * NULL = no such track. */
+    int         (*subs_take)(void *ctx, long long now_us, char *buf, int cap);
 } StreamSrc;
 /* why the last stream_play ended early ("" = it didn't): shown by the caller in its own UI */
 const char *stream_last_error(void);

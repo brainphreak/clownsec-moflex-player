@@ -916,6 +916,42 @@ static int subs_load_ass(FILE *f) {
      * builder's ass_to_srt.karaoke_styles */
     return g_nsubs;
 }
+/* SRT cues from a file or from text in memory (a stream's subtitles arrive in pieces) */
+typedef struct { FILE *f; const char *p; } SubSrc;
+static char *sub_gets(char *buf, int n, SubSrc *s) {
+    if (s->f) return fgets(buf, n, s->f);
+    if (!s->p || !*s->p) return NULL;
+    const char *nl = strchr(s->p, '\n');
+    size_t len = nl ? (size_t)(nl - s->p) + 1 : strlen(s->p);
+    if (len > (size_t)n - 1) len = (size_t)n - 1;
+    memcpy(buf, s->p, len); buf[len] = 0; s->p += len;
+    return buf;
+}
+static void subs_parse_srt(SubSrc *src) {
+    char line[512];
+    while (g_nsubs < SUB_MAX && sub_gets(line, sizeof line, src)) {
+        if (!strstr(line, "-->")) continue;                   /* the timing line of a cue */
+        char sb[40], eb[40]; int64_t s, e;
+        if (sscanf(line, "%39s --> %39s", sb, eb) != 2) continue;
+        if (!sub_parse_ts(sb, &s) || !sub_parse_ts(eb, &e)) continue;
+        char txt[SUB_TXT]; txt[0] = 0;
+        SubTags tg; sub_tags_init(&tg);
+        while (sub_gets(line, sizeof line, src)) {                 /* text lines until a blank line */
+            char *nl = strpbrk(line, "\r\n"); if (nl) *nl = 0;
+            if (!line[0]) break;
+            char tagless[512]; sub_tags(line, tagless, sizeof tagless, &tg);   /* {\an8}, <i> */
+            char clean[256]; sub_clean(tagless, clean, sizeof clean);   /* tags + smart quotes/accents -> ASCII */
+            size_t tl = strlen(txt);
+            if (tl && tl + 1 < SUB_TXT) txt[tl++] = '\n';
+            snprintf(txt + tl, SUB_TXT - tl, "%s", clean);
+        }
+        SubCue *c = &g_subs[g_nsubs]; c->s = s; c->e = e; c->ord = (u16)g_nsubs; c->sty = 0;
+        c->top = tg.pos ? 0 : (tg.an >= 4);               /* SRT has no PlayRes: \pos stays put */
+        c->ital = tg.ital > 0; c->bold = tg.bold > 0; c->col = tg.col;
+        snprintf(c->t, sizeof c->t, "%s", txt);
+        g_nsubs++;
+    }
+}
 static int subs_load(const char *path) {
     FILE *f = fopen(path, "rb"); if (!f) return 0;
     if (!g_subs) g_subs = (SubCue *)malloc(sizeof(SubCue) * SUB_MAX);
@@ -926,29 +962,8 @@ static int subs_load(const char *path) {
     if (sub_is_ass(f)) {
         subs_load_ass(f);
     } else {
-        char line[512];
-        while (g_nsubs < SUB_MAX && fgets(line, sizeof line, f)) {
-            if (!strstr(line, "-->")) continue;                   /* the timing line of a cue */
-            char sb[40], eb[40]; int64_t s, e;
-            if (sscanf(line, "%39s --> %39s", sb, eb) != 2) continue;
-            if (!sub_parse_ts(sb, &s) || !sub_parse_ts(eb, &e)) continue;
-            char txt[SUB_TXT]; txt[0] = 0;
-            SubTags tg; sub_tags_init(&tg);
-            while (fgets(line, sizeof line, f)) {                 /* text lines until a blank line */
-                char *nl = strpbrk(line, "\r\n"); if (nl) *nl = 0;
-                if (!line[0]) break;
-                char tagless[512]; sub_tags(line, tagless, sizeof tagless, &tg);   /* {\an8}, <i> */
-                char clean[256]; sub_clean(tagless, clean, sizeof clean);   /* tags + smart quotes/accents -> ASCII */
-                size_t tl = strlen(txt);
-                if (tl && tl + 1 < SUB_TXT) txt[tl++] = '\n';
-                snprintf(txt + tl, SUB_TXT - tl, "%s", clean);
-            }
-            SubCue *c = &g_subs[g_nsubs]; c->s = s; c->e = e; c->ord = (u16)g_nsubs; c->sty = 0;
-            c->top = tg.pos ? 0 : (tg.an >= 4);               /* SRT has no PlayRes: \pos stays put */
-            c->ital = tg.ital > 0; c->bold = tg.bold > 0; c->col = tg.col;
-            snprintf(c->t, sizeof c->t, "%s", txt);
-            g_nsubs++;
-        }
+        SubSrc src = { f, NULL };
+        subs_parse_srt(&src);
     }
     fclose(f);
     subs_finish();
@@ -1114,8 +1129,10 @@ static int trsub_stash(const char *path, int k) {
 /* ---- dual-audio track selection (e.g. English first for the official player, original
  * language second for ours). Filled at open from the stream table; persisted per movie
  * with the subtitle settings. ---- */
-static int g_atrk_streams[4]; static int g_atrk_n = 0;   /* audio stream indices in this file */
-static char g_atrk_lbl[4][4];                            /* button labels: "ENG"/"JPN"/"A1".. */
+#define ATRK_MAX 8                                       /* moflex files fill 4 at most; streams more */
+static int g_atrk_streams[ATRK_MAX]; static int g_atrk_n = 0;   /* audio stream indices in this file */
+static char g_atrk_lbl[ATRK_MAX][4];                     /* button labels: "ENG"/"JPN"/"A1".. */
+static char g_atrk_name[ATRK_MAX][40];                   /* a stream's own track names ("" = use the label) */
 static int g_atrk_sel = 0;                               /* chosen track ordinal (0 = first) */
 static volatile int g_atrk_apply = 0;                    /* menu changed the track: player re-locks */
 
@@ -2681,8 +2698,10 @@ static int snd_rows(int *act) {
 }
 static void snd_label(int a, char *r, int cap) {
     if (a == 0) {
-        const char *l = (g_atrk_sel < 4 && g_atrk_lbl[g_atrk_sel][0]) ? g_atrk_lbl[g_atrk_sel] : "A?";
-        snprintf(r, cap, "Language:  %s  (%d/%d)", l, g_atrk_sel + 1, g_atrk_n);
+        const char *l = (g_atrk_sel < ATRK_MAX && g_atrk_lbl[g_atrk_sel][0]) ? g_atrk_lbl[g_atrk_sel] : "A?";
+        if (g_atrk_sel < ATRK_MAX && g_atrk_name[g_atrk_sel][0])
+            snprintf(r, cap, "%.26s  (%d/%d)", g_atrk_name[g_atrk_sel], g_atrk_sel + 1, g_atrk_n);
+        else snprintf(r, cap, "Language:  %s  (%d/%d)", l, g_atrk_sel + 1, g_atrk_n);
     } else {
         static const char *N[3] = { "OFF", "LOW", "HIGH" };
         snprintf(r, cap, "Auto level:  %s", N[g_autolvl < 0 || g_autolvl > 2 ? 0 : g_autolvl]);
@@ -2929,6 +2948,7 @@ static MoflexResult moflex_play_gpu(const char *path) {
     MfxDemux m;
     if (mfx_open_auto(&m, f, path) != 0) { fclose(f); return MOFLEX_ERROR; }
     int vi = -1, ai = -1;
+    memset(g_atrk_name, 0, sizeof g_atrk_name);
     g_atrk_n = 0; g_atrk_sel = 0;   /* re-filled per file; subcfg_load below restores a saved choice */
     for (int i = 0; i < m.nb_streams; i++) {
         if (m.streams[i].media_type == MFX_TYPE_VIDEO && vi < 0) vi = i;
@@ -4110,6 +4130,7 @@ static MoflexResult moflex_play_ring(const char *path) {
                            : mfx_open_auto(&m, f, path);
     if (mo != 0) { fclose(f); return MOFLEX_ERROR; }
     int vi = -1, ai = -1;
+    memset(g_atrk_name, 0, sizeof g_atrk_name);
     g_atrk_n = 0; g_atrk_sel = 0;   /* re-filled per file; subcfg_load below restores a saved choice */
     for (int i = 0; i < m.nb_streams; i++) {
         if (m.streams[i].media_type == MFX_TYPE_VIDEO && vi < 0) vi = i;
@@ -5413,6 +5434,7 @@ static MoflexResult moflex_play_soft(const char *path) {
     MfxDemux m;
     if (mfx_open_auto(&m, f, path) != 0) { fclose(f); return MOFLEX_ERROR; }
     int vi = -1, ai = -1;
+    memset(g_atrk_name, 0, sizeof g_atrk_name);
     g_atrk_n = 0; g_atrk_sel = 0;   /* re-filled per file; subcfg_load below restores a saved choice */
     for (int i = 0; i < m.nb_streams; i++) {
         if (m.streams[i].media_type == MFX_TYPE_VIDEO && vi < 0) vi = i;
@@ -5895,6 +5917,7 @@ void kit_film_begin(int is3d) {
     g_panel_cheap = 0; g_panel_force = 1;
     g_view_is3d = is3d;
     g_atrk_n = 1; g_atrk_sel = 0; g_atrk_apply = 0;   /* one track: SOUND shows auto level only */
+    memset(g_atrk_name, 0, sizeof g_atrk_name);
     lb_reset(); al_reset();
     g_kit_redraw = 0;
     g_kit_fmt_row = 1; g_kit_fmt_changed = 0;
@@ -5957,6 +5980,23 @@ void kit_fmt_save(const char *movie, int fmt) {
     fprintf(f, "%d\n", fmt); fclose(f);
 }
 void kit_set_subs_any(int on) { g_kit_subs_any = on; }
+void kit_set_audio_tracks(int n, const char lang[][8], const char name[][48], int sel) {
+    if (n > ATRK_MAX) n = ATRK_MAX;
+    if (n < 1) { g_atrk_n = 1; g_atrk_sel = 0; return; }
+    for (int i = 0; i < n; i++) {
+        snprintf(g_atrk_lbl[i], sizeof g_atrk_lbl[i], "%.3s", lang[i][0] ? lang[i] : "A?");
+        for (char *c = g_atrk_lbl[i]; *c; c++) if (*c >= 'a' && *c <= 'z') *c -= 32;
+        snprintf(g_atrk_name[i], sizeof g_atrk_name[i], "%s", name[i]);
+    }
+    g_atrk_n = n; g_atrk_sel = sel >= 0 && sel < n ? sel : 0; g_atrk_apply = 0;
+    g_kit_menu_dirty = 1;
+}
+int kit_take_audio_change(int *sel) {
+    if (!g_atrk_apply) return 0;
+    g_atrk_apply = 0; *sel = g_atrk_sel;
+    return 1;
+}
+int moflex_lang_match(const char *tag, int li) { return lang_match(tag, li); }
 void kit_film_end(void) {
     g_kit_subs_any = 0;
     g_kit_defer = 0;                      /* (the caller flushed before this) */
@@ -6134,6 +6174,24 @@ int moflex_subs_load_file(const char *path) {
     int n = subs_load(path);
     if (n > 0) g_sub_on = 1;
     return n;
+}
+/* ...or as SRT text in pieces while the video plays (Plex: an embedded track it copies out) */
+int moflex_subs_stream_begin(void) {
+    if (!g_subs) g_subs = (SubCue *)malloc(sizeof(SubCue) * SUB_MAX);
+    if (!g_subs) return 0;
+    g_nsubs = 0; g_sub_mode = -1;                             /* Plex sends UTF-8 */
+    g_sub_file[0] = 0;
+    return 1;
+}
+int moflex_subs_append_srt(const char *text) {
+    if (!g_subs || !text || !*text) return 0;
+    int before = g_nsubs;
+    int64_t last = g_nsubs ? g_subs[g_nsubs - 1].s : 0;
+    SubSrc src = { NULL, text };
+    subs_parse_srt(&src);
+    if (g_nsubs == before) return 0;
+    if (g_subs[before].s < last) subs_finish();               /* the part before the resume point */
+    return g_nsubs - before;
 }
 int moflex_fmt_load_key(const char *key) { return kit_fmt_load(key); }
 int moflex_subs_wanted(const char *key, const char *audio_lang) {

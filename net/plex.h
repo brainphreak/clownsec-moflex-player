@@ -96,8 +96,9 @@ HttpStream *plex_stream_open(const PlexCfg *c, const char *rating_key, int64_t o
 
 /* ---- subtitles ----
  * External text files download as-is and are drawn by the player (size/position/3D depth). An
- * EMBEDDED track can only be burned into the video by Plex (its other route is HLS/DASH-only),
- * and only once it is the part's selected subtitle -- so: select, stream with burn, restore. */
+ * EMBEDDED text track is copied out by Plex as a sidecar while the video plays (below) and drawn
+ * the same way; an embedded PICTURE track (PGS, VobSub) can only be burned into the video. Either
+ * needs the track to be the part's selected subtitle -- so: select, play, restore. */
 typedef struct {
     long long id;
     char codec[12];      /* "srt" "ass" "pgs" "vobsub" ... */
@@ -106,9 +107,31 @@ typedef struct {
     char key[96];        /* external file: "/library/streams/<id>"; "" = embedded */
     int  forced, selected;
 } PlexSub;
-/* The item's subtitle tracks, its part id, and its selected audio language. Returns the count, -1. */
+typedef struct {
+    long long id;
+    char lang[8];        /* "eng" */
+    char title[48];      /* Plex's own name: "English (AC3 5.1)" */
+    int  selected;
+} PlexAudio;
+/* The item's subtitle tracks, its part id, its selected audio language and (aud != NULL) every
+ * audio track. Returns the subtitle count, -1. */
 int  plex_item_streams(const PlexCfg *c, const char *rating_key, PlexSub *subs, int max,
-                       long long *part_id, char *audio_lang, int alcap);
+                       long long *part_id, char *audio_lang, int alcap,
+                       PlexAudio *aud, int amax, int *nau);
+/* make this the part's audio track: the transcoder plays the selected one. Like any Plex client,
+ * the choice stays with the item for next time. */
+int  plex_select_audio(const PlexCfg *c, long long part_id, long long audio_id);
+int  plex_sub_is_text(const char *codec);   /* a text codec (srt, ass...), not a picture (pgs, vobsub) */
+/* An EMBEDDED text track, copied out by Plex while the video plays (the track must be the part's
+ * selected subtitle until finish). take() hands over whole SRT blocks in movie time as they come;
+ * finish() stops it and, if the whole track arrived, saves it at save_path (1 = saved). */
+typedef struct PlexSubFetch PlexSubFetch;
+/* select_sub_id != 0: make that the part's selected subtitle first (the caller restores it) */
+PlexSubFetch *plex_subs_fetch_start(const PlexCfg *c, const char *rating_key, long long start_s,
+                                    long long part_id, long long select_sub_id);
+int  plex_subs_fetch_take(PlexSubFetch *f, char *buf, int cap);
+int  plex_subs_fetch_finish(PlexSubFetch *f, const char *save_path);
+void plex_sub_cache_path(const PlexCfg *c, long long stream_id, char *out, int cap);
 int  plex_select_sub(const PlexCfg *c, long long part_id, long long sub_id);   /* 0 = none */
 int  plex_download(const PlexCfg *c, const char *path, const char *dest);     /* 1 = saved */
 void plex_stream_stop(const PlexCfg *c, const char *session);

@@ -991,14 +991,20 @@ MoflexResult stream_play(const StreamSrc *src) {
         img[st][e] = (C2D_Image){ &g_tex[st][e < g_tex_n ? e : 0], &g_texsub };
     moflex_subs_autoload(src->key);       /* per-item settings (zoom etc.) */
     if (src->subfile && src->subfile[0]) moflex_subs_load_file(src->subfile);   /* the server's text track */
-    if (src->burnable || (src->subfile && src->subfile[0])) moflex_subs_set(src->subs_on);
-    kit_set_subs_any(src->burnable);      /* the CC menu's on/off works for burned-in subtitles too */
+    else if (src->subs_take) moflex_subs_stream_begin();                        /* ...or one on its way */
+    int subs_any = src->burnable || src->subs_take || (src->subfile && src->subfile[0]);
+    if (subs_any) moflex_subs_set(src->subs_on);
+    kit_set_subs_any(src->burnable || src->subs_take);   /* the CC menu's on/off works before any cue is here */
     int last_subs = moflex_subs_on();     /* burnable: Y / CC on-off re-requests the stream */
     kit_film_begin(is3d);
+    if (src->n_audio > 1 && src->audio_lang && src->audio_name)
+        kit_set_audio_tracks(src->n_audio, src->audio_lang, src->audio_name, src->audio_sel);
     kit_fmt_set(fmt);
     kit_saves_baseline();
     aptHook(&g_mp4_apt_cookie, mp4_apt_hook, NULL);
     for (int f = 0; f < 2; f++) kit_draw(&gpu, img[0][0], img[0][1], is3d, title, src->start_us, dur_us, 1);
+    static char subs_buf[32 * 1024];
+    u64 subs_next = 0;
 
     MoflexResult result = MOFLEX_QUIT_BACK;
     memset(&g_sv, 0, sizeof g_sv); memset(&g_sa, 0, sizeof g_sa);
@@ -1176,6 +1182,24 @@ MoflexResult stream_play(const StreamSrc *src) {
             src->set_burn(src->ctx, last_subs);
             if (!want_seek) { seek_to = cur_us; want_seek = 1; }
             dirty = 1;
+        }
+
+        /* Another audio track is another stream from the server: ask for it from here. */
+        {   int asel;
+            if (kit_take_audio_change(&asel) && src->set_audio) {
+                src->set_audio(src->ctx, asel);
+                if (!want_seek) { seek_to = cur_us; want_seek = 1; }
+                dirty = 1;
+            }
+        }
+        /* subtitles still arriving: pick up whatever came, about once a second */
+        if (src->subs_take && osGetTime() >= subs_next) {
+            subs_next = osGetTime() + 1000;
+            int got;
+            while ((got = src->subs_take(src->ctx, cur_us, subs_buf, sizeof subs_buf)) > 0) {
+                moflex_subs_append_srt(subs_buf);
+                if (got < (int)sizeof subs_buf / 2) break;
+            }
         }
 
         /* ---- seek = a new stream from the server at the target ---- */

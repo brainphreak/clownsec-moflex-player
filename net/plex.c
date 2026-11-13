@@ -594,7 +594,9 @@ void plex_art_url(const PlexCfg *c, const char *thumb, int w, int h, char *out, 
 }
 
 int plex_item_streams(const PlexCfg *c, const char *rating_key, PlexSub *subs, int max,
-                      long long *part_id, char *audio_lang, int alcap) {
+                      long long *part_id, char *audio_lang, int alcap,
+                      PlexAudio *aud, int amax, int *nau) {
+    if (nau) *nau = 0;
     char url[256], *body = NULL;
     snprintf(url, sizeof url, "%s/library/metadata/%s", c->url, rating_key);
     *part_id = 0; if (alcap) audio_lang[0] = 0;
@@ -612,6 +614,13 @@ int plex_item_streams(const PlexCfg *c, const char *rating_key, PlexSub *subs, i
             int sel = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(st, "selected"));
             if (type == 2 && alcap && (sel || !have_audio)) {     /* the audio that will play */
                 jstr(st, "languageCode", audio_lang, (size_t)alcap); have_audio = 1;
+            }
+            if (type == 2 && aud && nau && *nau < amax) {          /* every audio track, for the picker */
+                PlexAudio *a = &aud[(*nau)++]; memset(a, 0, sizeof *a);
+                a->id = jnum(st, "id");
+                jstr(st, "languageCode", a->lang, sizeof a->lang);
+                jstr(st, "displayTitle", a->title, sizeof a->title);
+                a->selected = sel;
             }
             if (type != 3 || n >= max) continue;
             PlexSub *s = &subs[n++]; memset(s, 0, sizeof *s);
@@ -635,6 +644,236 @@ int plex_select_sub(const PlexCfg *c, long long part_id, long long sub_id) {
     free(body);
     return st == 200;
 }
+int plex_select_audio(const PlexCfg *c, long long part_id, long long audio_id) {
+    if (!part_id || !audio_id) return 0;
+    char url[256], *body = NULL;
+    snprintf(url, sizeof url, "%s/library/parts/%lld?audioStreamID=%lld&allParts=1", c->url, part_id, audio_id);
+    long st = plex_req(c, url, &body, 0, 2);
+    free(body);
+    return st == 200;
+}
+int plex_sub_is_text(const char *codec) {
+    static const char *const T[] = { "srt", "subrip", "ass", "ssa", "mov_text", "webvtt", "vtt", "text", "smi" };
+    for (size_t i = 0; i < sizeof T / sizeof T[0]; i++) if (!strcmp(codec, T[i])) return 1;
+    return 0;
+}
+
+/* ---- embedded text subtitles, fetched while the video plays ----
+ * Plex has no download for a track inside the file, but its transcoder will copy the SELECTED
+ * text track out as a sidecar .srt (subtitles=sidecar + an srt subtitle target), streamed as it
+ * reads through the file -- about 15x real time. The session copies the video and audio (no
+ * encoding, so it costs the server next to nothing) and nobody reads them. Cue times count from
+ * the request's offset, so each cue is shifted back to movie time here.
+ * Pass A runs from the resume point to the end (so the subtitles in front of the viewer come
+ * first), pass B fills 0..resume point. A finished track is saved for next time by the caller. */
+struct PlexSubFetch {
+    PlexCfg c; char rating[16];
+    long long start_s, part_id, sub_id;
+    Thread th; volatile int quit, noabort;
+    LightLock lk;
+    char *out; size_t on, ocap, taken;     /* whole SRT blocks in movie time */
+    char raw[8192]; size_t rn;             /* bytes of a block still arriving */
+    long long off_ms, cut_ms; int cut_hit, idx;
+    int ok_a, ok_b, ncue; long code_a; int rc_a;
+};
+static int sf_ts(const char *p, long long *ms) {
+    int h, m, sec, f; if (sscanf(p, "%d:%d:%d%*[,.]%d", &h, &m, &sec, &f) != 4) return 0;
+    *ms = ((long long)h * 3600 + m * 60 + sec) * 1000 + f; return 1;
+}
+static void sf_fmt(long long ms, char *o) {
+    if (ms < 0) ms = 0;
+    sprintf(o, "%02lld:%02lld:%02lld,%03lld", ms / 3600000, (ms / 60000) % 60, (ms / 1000) % 60, ms % 1000);
+}
+static void sf_emit(PlexSubFetch *f, const char *b, size_t n) {
+    LightLock_Lock(&f->lk);
+    if (f->on + n + 1 > f->ocap) {
+        size_t nc = f->ocap ? f->ocap : 65536; while (nc < f->on + n + 1) nc *= 2;
+        char *g = nc <= (2u << 20) ? (char *)realloc(f->out, nc) : NULL;
+        if (!g) { LightLock_Unlock(&f->lk); return; }
+        f->out = g; f->ocap = nc;
+    }
+    memcpy(f->out + f->on, b, n); f->on += n; f->out[f->on] = 0;
+    LightLock_Unlock(&f->lk);
+}
+/* one SRT block (no blank lines inside): retimed and emitted; 0 = past the cut, stop */
+static int sf_block(PlexSubFetch *f, char *blk) {
+    char *arrow = strstr(blk, "-->"); if (!arrow) return 1;
+    char *ls = arrow; while (ls > blk && ls[-1] != '\n') ls--;     /* the timing line */
+    long long s, e;
+    if (!sf_ts(ls, &s) || !sf_ts(arrow + 3 + strspn(arrow + 3, " "), &e)) return 1;
+    s += f->off_ms; e += f->off_ms;
+    if (f->cut_ms > 0 && s >= f->cut_ms) { f->cut_hit = 1; return 0; }
+    char *text = strchr(arrow, '\n'); text = text ? text + 1 : (char *)"";
+    char tb[2][16]; sf_fmt(s, tb[0]); sf_fmt(e, tb[1]);
+    char hd[64]; int hn = snprintf(hd, sizeof hd, "%d\n%s --> %s\n", ++f->idx, tb[0], tb[1]);
+    size_t tn = strlen(text); while (tn && text[tn - 1] == '\n') tn--;
+    if (!tn) return 1;
+    char *o = (char *)malloc((size_t)hn + tn + 3); if (!o) return 1;
+    memcpy(o, hd, (size_t)hn); memcpy(o + hn, text, tn); memcpy(o + hn + tn, "\n\n", 2);
+    sf_emit(f, o, (size_t)hn + tn + 2); free(o);
+    f->ncue++;
+    return 1;
+}
+/* split what has arrived into blocks at blank lines; leave a partial block for next time */
+static int sf_scan(PlexSubFetch *f, int final) {
+    f->raw[f->rn] = 0;
+    char *p = f->raw;
+    for (;;) {
+        char *end = strstr(p, "\n\n");
+        if (!end) break;
+        *end = 0;
+        if (!sf_block(f, p)) return 0;
+        p = end + 2;
+    }
+    if (final && *p) { if (!sf_block(f, p)) return 0; p += strlen(p); }
+    size_t left = f->rn - (size_t)(p - f->raw);
+    memmove(f->raw, p, left); f->rn = left;
+    return 1;
+}
+static size_t sf_write(char *d, size_t sz, size_t nm, void *u) {
+    PlexSubFetch *f = (PlexSubFetch *)u; size_t k = sz * nm;
+    if (f->quit) return 0;
+    for (size_t i = 0; i < k; i++) {
+        if (d[i] == '\r') continue;
+        if (f->rn >= sizeof f->raw - 1) f->rn = 0;            /* a "block" this big is junk: drop it */
+        f->raw[f->rn++] = d[i];
+    }
+    return sf_scan(f, 0) ? k : 0;                             /* 0 past the cut: curl stops */
+}
+static int sf_abort(void *u, curl_off_t a, curl_off_t b, curl_off_t c2, curl_off_t d) {
+    (void)a; (void)b; (void)c2; (void)d;
+    PlexSubFetch *f = (PlexSubFetch *)u; return f->quit && !f->noabort;
+}
+static long sf_get(PlexSubFetch *f, const char *url, int stream, int *rc_out, int put) {
+    CURL *e = curl_easy_init(); if (!e) return -1;
+    char hb[10][96]; const char *hp[11]; plex_headers(&f->c, hb, hp, 0);
+    struct curl_slist *hl = NULL;
+    for (int i = 0; hp[i]; i++) hl = curl_slist_append(hl, hp[i]);
+    Mem m = { 0 };
+    curl_easy_setopt(e, CURLOPT_URL, url);
+    curl_easy_setopt(e, CURLOPT_HTTPHEADER, hl);
+    if (put) curl_easy_setopt(e, CURLOPT_CUSTOMREQUEST, "PUT");
+    curl_easy_setopt(e, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(e, CURLOPT_SSL_VERIFYPEER, 0L);
+    curl_easy_setopt(e, CURLOPT_SSL_VERIFYHOST, 0L);
+    curl_easy_setopt(e, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(e, CURLOPT_CONNECTTIMEOUT, 15L);
+    /* a film can go minutes without a line: only a long silence counts as dead */
+    curl_easy_setopt(e, CURLOPT_LOW_SPEED_LIMIT, 1L);
+    curl_easy_setopt(e, CURLOPT_LOW_SPEED_TIME, stream ? 300L : 30L);
+    if (f->noabort) { curl_easy_setopt(e, CURLOPT_CONNECTTIMEOUT, 4L); curl_easy_setopt(e, CURLOPT_TIMEOUT, 5L); }
+    curl_easy_setopt(e, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(e, CURLOPT_XFERINFOFUNCTION, sf_abort);
+    curl_easy_setopt(e, CURLOPT_XFERINFODATA, f);
+    curl_easy_setopt(e, CURLOPT_WRITEFUNCTION, stream ? sf_write : on_mem);
+    curl_easy_setopt(e, CURLOPT_WRITEDATA, stream ? (void *)f : (void *)&m);
+    CURLcode rc = curl_easy_perform(e);
+    long code = 0; curl_easy_getinfo(e, CURLINFO_RESPONSE_CODE, &code);
+    curl_slist_free_all(hl); curl_easy_cleanup(e); free(m.p);
+    if (rc_out) *rc_out = (int)rc;
+    return rc == CURLE_OK || (stream && rc == CURLE_WRITE_ERROR && f->cut_hit) ? code : -1;
+}
+static int sf_pass(PlexSubFetch *f, long long off_s, long long cut_s) {
+    char session[24]; plex_new_session(session);
+    const char *prof =
+        "add-transcode-target(type=videoProfile&context=streaming&protocol=http&container=mpegts"
+        "&videoCodec=h264,hevc,mpeg4,mpeg2video,vc1&audioCodec=aac,ac3,eac3,dca,mp3,flac,truehd,opus,vorbis)"
+        "+add-transcode-target(type=subtitleProfile&context=streaming&protocol=http&container=srt&subtitleCodec=srt)";
+    char pe[600]; urlenc(prof, pe, sizeof pe);
+    char q[1400];
+    snprintf(q, sizeof q, "path=%%2Flibrary%%2Fmetadata%%2F%s&mediaIndex=0&partIndex=0&protocol=http&offset=%lld"
+             "&fastSeek=1&directPlay=0&directStream=1&directStreamAudio=1&subtitles=sidecar"
+             "&session=%s&X-Plex-Session-Identifier=%s&X-Plex-Client-Profile-Extra=%s",
+             f->rating, off_s, session, session, pe);
+    char url[1700];
+    snprintf(url, sizeof url, "%s/video/:/transcode/universal/decision?%s", f->c.url, q);
+    long st = sf_get(f, url, 0, NULL, 0);
+    long code = -1; int rc = 0;
+    if (st == 200 && !f->quit) {
+        f->off_ms = off_s * 1000; f->cut_ms = cut_s * 1000; f->cut_hit = 0; f->rn = 0;
+        snprintf(url, sizeof url, "%s/video/:/transcode/universal/subtitles?%s", f->c.url, q);
+        code = sf_get(f, url, 1, &rc, 0);
+        if (code == 200 && !f->cut_hit) sf_scan(f, 1);       /* the last block may lack its blank line */
+    }
+    snprintf(url, sizeof url, "%s/video/:/transcode/universal/stop?session=%s", f->c.url, session);
+    f->noabort = 1; sf_get(f, url, 0, NULL, 0); f->noabort = 0;   /* always end the server's session */
+    if (!cut_s) { f->code_a = st == 200 ? code : st; f->rc_a = rc; }
+    return code == 200 && !f->quit;
+}
+static void sf_thread(void *a) {
+    PlexSubFetch *f = (PlexSubFetch *)a;
+    /* let the video's own session get going first */
+    for (int i = 0; i < 30 && !f->quit; i++) svcSleepThread(100000000LL);
+    if (f->quit) return;
+    if (f->sub_id) {                                          /* Plex copies out the SELECTED track */
+        char url[256];
+        snprintf(url, sizeof url, "%s/library/parts/%lld?subtitleStreamID=%lld&allParts=1",
+                 f->c.url, f->part_id, f->sub_id);
+        if (sf_get(f, url, 0, NULL, 1) != 200) return;
+    }
+    f->ok_a = sf_pass(f, f->start_s, 0);
+    if (f->quit) return;
+    f->ok_b = f->start_s < 5 ? 1 : sf_pass(f, 0, f->start_s);
+}
+PlexSubFetch *plex_subs_fetch_start(const PlexCfg *c, const char *rating_key, long long start_s,
+                                    long long part_id, long long select_sub_id) {
+    PlexSubFetch *f = (PlexSubFetch *)calloc(1, sizeof *f); if (!f) return NULL;
+    f->c = *c; snprintf(f->rating, sizeof f->rating, "%s", rating_key);
+    f->part_id = part_id; f->sub_id = select_sub_id;
+    f->start_s = start_s < 0 ? 0 : start_s;
+    LightLock_Init(&f->lk);
+    /* off the video's core (2) where possible; lowest priority -- it only waits on the network */
+    f->th = threadCreate(sf_thread, f, 64 * 1024, 0x3F, 1, false);
+    if (!f->th) f->th = threadCreate(sf_thread, f, 64 * 1024, 0x3F, -2, false);
+    if (!f->th) { free(f); return NULL; }
+    plex_log("subtitles: fetching the embedded track from %llds", f->start_s);
+    return f;
+}
+int plex_subs_fetch_take(PlexSubFetch *f, char *buf, int cap) {
+    if (!f || cap < 2) return 0;
+    LightLock_Lock(&f->lk);
+    size_t avail = f->on - f->taken, n = avail;
+    if (n > (size_t)cap - 1) {                                /* whole blocks only */
+        n = (size_t)cap - 1;
+        while (n > 1 && !(f->out[f->taken + n - 1] == '\n' && f->out[f->taken + n - 2] == '\n')) n--;
+        if (n <= 1) n = 0;
+    }
+    if (n) memcpy(buf, f->out + f->taken, n);
+    f->taken += n;
+    LightLock_Unlock(&f->lk);
+    buf[n] = 0;
+    return (int)n;
+}
+int plex_subs_fetch_finish(PlexSubFetch *f, const char *save_path) {
+    if (!f) return 0;
+    f->quit = 1;
+    threadJoin(f->th, U64_MAX); threadFree(f->th);
+    int done = f->ok_a && f->ok_b && f->ncue > 0;
+    plex_log("subtitles: %d cues, from resume point %s (HTTP %ld, curl %d), before it %s",
+             f->ncue, f->ok_a ? "complete" : "incomplete", f->code_a, f->rc_a,
+             f->start_s < 5 ? "n/a" : f->ok_b ? "complete" : "incomplete");
+    int saved = 0;
+    if (done && save_path && save_path[0]) {
+        mkdir("sdmc:/moflex_player", 0777); mkdir(PLEX_CACHE_DIR, 0777);
+        char tmp[120]; snprintf(tmp, sizeof tmp, "%s.tmp", save_path);
+        FILE *o = fopen(tmp, "wb");
+        if (o) {
+            int ok = fwrite(f->out, 1, f->on, o) == f->on;
+            ok = (fclose(o) == 0) && ok;
+            remove(save_path);
+            saved = ok && rename(tmp, save_path) == 0;
+            if (!saved) remove(tmp);
+        }
+    }
+    free(f->out); free(f);
+    return saved;
+}
+void plex_sub_cache_path(const PlexCfg *c, long long stream_id, char *out, int cap) {
+    uint32_t h = 2166136261u;
+    for (const char *s = c->machine[0] ? c->machine : c->url; *s; s++) { h ^= (uint8_t)*s; h *= 16777619u; }
+    snprintf(out, (size_t)cap, PLEX_CACHE_DIR "/sub_%08lx_%lld.srt", (unsigned long)h, stream_id);
+}
+
 int plex_download(const PlexCfg *c, const char *path, const char *dest) {
     char url[400], *body = NULL;
     snprintf(url, sizeof url, "%s%s", c->url, path);

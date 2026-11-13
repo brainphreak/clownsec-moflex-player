@@ -5862,8 +5862,29 @@ static void plex_setup(void) {
     }
 }
 
-typedef struct { PlexCfg c; PlexItem it; char session[24]; int burn; } PlexPlay;
+typedef struct {
+    PlexCfg c; PlexItem it; char session[24]; int burn;
+    long long part;
+    PlexAudio aud[8]; int naud;
+    char alang[8][8], aname[8][48];
+    /* an embedded text track Plex copies out while the video plays (started once subtitles are on) */
+    long long fetch_id, fetch_select; PlexSubFetch *fetch; int fetch_tried;
+} PlexPlay;
 static void plex_src_set_burn(void *ctx, int on) { ((PlexPlay *)ctx)->burn = on; }
+static void plex_src_set_audio(void *ctx, int idx) {
+    PlexPlay *p = (PlexPlay *)ctx;
+    if (idx < 0 || idx >= p->naud) return;
+    plex_log("audio: switching to %s", p->aud[idx].title);
+    plex_select_audio(&p->c, p->part, p->aud[idx].id);       /* the next stream plays it */
+}
+static int plex_src_subs_take(void *ctx, long long now_us, char *buf, int cap) {
+    PlexPlay *p = (PlexPlay *)ctx;
+    if (!p->fetch && !p->fetch_tried && moflex_subs_on()) {
+        p->fetch_tried = 1;
+        p->fetch = plex_subs_fetch_start(&p->c, p->it.rating, now_us / 1000000, p->part, p->fetch_select);
+    }
+    return p->fetch ? plex_subs_fetch_take(p->fetch, buf, cap) : 0;
+}
 static HttpStream *plex_src_open(void *ctx, long long at_us, int fmt) {
     PlexPlay *p = (PlexPlay *)ctx;
     /* burned-in subtitles would straddle both eyes of a side-by-side frame */
@@ -5911,6 +5932,7 @@ static int plex_fmt(const PlexItem *it, int lib3d) {
 static MoflexResult plex_play(const PlexCfg *c, const PlexItem *it, int lib3d, long long from_us) {
     static PlexPlay p;
     p.c = *c; p.it = *it; p.session[0] = 0; p.burn = 0;
+    p.part = 0; p.naud = 0; p.fetch_id = 0; p.fetch_select = 0; p.fetch = NULL; p.fetch_tried = 0;
     long long start = from_us > 0 ? from_us : 0;
     if (from_us < 0 && it->offset_ms > 10000 && (it->duration_ms <= 0 || it->offset_ms < it->duration_ms - 30000)) {
         long t = (long)(it->offset_ms / 1000);
@@ -5934,7 +5956,25 @@ static MoflexResult plex_play(const PlexCfg *c, const PlexItem *it, int lib3d, l
                                it->title, it->rating, c->url, start / 1000000, plex_fmt(it, lib3d));
         plex_log_begin(lw); }
     msg_screen_nowait(it->title, "Getting the video's details...");
-    int ns = plex_item_streams(c, it->rating, subs, 16, &part, alang, sizeof alang);
+    int ns = plex_item_streams(c, it->rating, subs, 16, &part, alang, sizeof alang, p.aud, 8, &p.naud);
+    p.part = part;
+    /* audio: the track Plex has selected for this item -- unless Playback Defaults names a
+     * language that track isn't and another one is (then that becomes Plex's choice too) */
+    int asel = 0;
+    for (int i = 0; i < p.naud; i++) if (p.aud[i].selected) asel = i;
+    {   MoflexDefaults d; moflex_defaults_get(&d);
+        if (p.naud > 1 && d.alang > 0 && !moflex_lang_match(p.aud[asel].lang, d.alang))
+            for (int i = 0; i < p.naud; i++)
+                if (moflex_lang_match(p.aud[i].lang, d.alang)) {
+                    if (plex_select_audio(c, part, p.aud[i].id)) asel = i;
+                    break;
+                }
+    }
+    for (int i = 0; i < p.naud; i++) {
+        snprintf(p.alang[i], sizeof p.alang[i], "%s", p.aud[i].lang);
+        snprintf(p.aname[i], sizeof p.aname[i], "%s", p.aud[i].title[0] ? p.aud[i].title : p.aud[i].lang);
+    }
+    if (p.naud > 0) snprintf(alang, sizeof alang, "%s", p.aud[asel].lang);
     if (ns < 0 && part == 0) {
         char m[240]; snprintf(m, sizeof m, "The server didn't send the video's\ndetails.\n\n%s\n\nDetails: moflex_player/plex_log.txt", plex_error());
         plex_log_end(); msg_screen("PLEX", m); return MOFLEX_QUIT_BACK;
@@ -5953,13 +5993,18 @@ static MoflexResult plex_play(const PlexCfg *c, const PlexItem *it, int lib3d, l
         if (pick < 0) pick = 0;
         if (pick >= 0) {
             const PlexSub *s = &subs[pick];
-            int text = !strcmp(s->codec, "srt") || !strcmp(s->codec, "ass") || !strcmp(s->codec, "ssa") ||
-                       !strcmp(s->codec, "subrip");
+            int text = plex_sub_is_text(s->codec);
             if (s->key[0] && text) {              /* an external text file: drawn by the player */
                 msg_screen_nowait(it->title, "Getting subtitles...");
                 snprintf(subfile, sizeof subfile, "sdmc:/moflex_player/.plexsub.%s", strcmp(s->codec, "srt") ? s->codec : "srt");
                 if (!plex_download(c, s->key, subfile)) subfile[0] = 0;
-            } else if (fmt == 0) {                /* embedded: Plex burns the selected track in */
+            } else if (text) {                    /* embedded text: drawn by the player too (both eyes in 3D) */
+                char cp[96]; plex_sub_cache_path(c, s->id, cp, sizeof cp);
+                FILE *cf = fopen(cp, "rb");
+                if (cf) { fclose(cf); snprintf(subfile, sizeof subfile, "%s", cp); }   /* fetched before */
+                else { p.fetch_id = s->id; p.fetch_select = s->id == orig_sel ? 0 : s->id; }
+                plex_log("subtitles: embedded %s track %lld, %s", s->codec, s->id, cf ? "saved copy" : "fetched while playing");
+            } else if (fmt == 0) {                /* a picture track: Plex burns the selected one in */
                 if (s->id == orig_sel || plex_select_sub(c, part, s->id)) {
                     burnable = 1; burn_id = s->id; p.burn = subs_on;
                 }
@@ -5986,8 +6031,15 @@ static MoflexResult plex_play(const PlexCfg *c, const PlexItem *it, int lib3d, l
         if (g) { fprintf(g, "%d\n%s\n", lib3d, title); fclose(g); } }
     StreamSrc s = { &p, title, key, it->duration_ms * 1000, start, plex_fmt(it, lib3d),
                     plex_src_open, plex_src_close, plex_src_report, plex_src_error, subfile,
-                    burnable, subs_on, plex_src_set_burn };
+                    burnable, subs_on, plex_src_set_burn,
+                    p.naud, asel, (const char (*)[8])p.alang, (const char (*)[48])p.aname, plex_src_set_audio,
+                    p.fetch_id ? plex_src_subs_take : NULL };
     MoflexResult r = stream_play(&s);
+    if (p.fetch) {                        /* keep a whole track for next time; put Plex's choice back */
+        char cp[96]; plex_sub_cache_path(c, p.fetch_id, cp, sizeof cp);
+        plex_subs_fetch_finish(p.fetch, cp); p.fetch = NULL;
+        if (p.fetch_select) plex_select_sub(c, part, orig_sel);
+    }
     plex_log_end();
     if (burn_id && burn_id != orig_sel) plex_select_sub(c, part, orig_sel);   /* leave Plex's choice as it was */
     consoleInit(GFX_BOTTOM, NULL);
