@@ -21,7 +21,8 @@
 #define HB_AHEAD    24              /* fetched ahead while reading straight through (~1.5 MB) */
 #define HB_AHEAD_J  2               /* ...and just after a jump, until reading settles */
 #define HF_STALL_MS 20000           /* a block that doesn't arrive in this long: the read fails */
-#define HB_BATCH    4               /* read-ahead fetches this many blocks per request (256 KB) */
+#define HB_BATCH    8               /* steady read-ahead fetches up to this many blocks per request
+                                     * (512 KB): an Old 3DS pays a lot per request */
 #define HF_LOG      "sdmc:/moflex_player/bigtop_log.txt"
 
 /* why the last network read gave up: 0 = it didn't, 1 = the viewer held B, 2 = the server went quiet */
@@ -36,6 +37,14 @@ void httpfile_reset(void) { g_hf_gave_up = 0; }
 
 enum { SL_EMPTY = 0, SL_PENDING, SL_READY, SL_FAILED };
 typedef struct { long long blk; int state, len; u64 used; uint8_t *data; } Slot;
+
+/* The player opens a video twice in a row -- a quick look (2D or 3D?), then playback. The first
+ * one's blocks are kept here for the second instead of downloading the start again. */
+static struct { char *url; Slot *slots; uint8_t *mem; int nslots; u64 t; } g_park;
+void httpfile_drop_cache(void) {
+    free(g_park.slots); free(g_park.mem); free(g_park.url);
+    memset(&g_park, 0, sizeof g_park);
+}
 
 typedef struct {
     char *url;
@@ -115,13 +124,16 @@ static int next_jobs(HFile *h) {
         if (i >= 0) h->fills[h->nfill++] = &h->slots[i];
         return h->nfill;
     }
-    int ahead = h->seq >= 3 ? HB_AHEAD : HB_AHEAD_J;
+    /* the window grows with straight reading: a short look at the file (the player's 2D/3D probe)
+     * mustn't pull 1.5 MB it will never read -- that was ~7 s of waiting on an Old 3DS */
+    int ahead = h->seq / 2; if (ahead < HB_AHEAD_J) ahead = HB_AHEAD_J; if (ahead > HB_AHEAD) ahead = HB_AHEAD;
+    int batch = h->seq >= 16 ? HB_BATCH : h->seq >= 3 ? 4 : 1;
     for (long long b = h->cur; b < h->cur + ahead && b < nblk; b++) {
         if (slot_of(h, b) >= 0) { if (h->nfill) break; continue; }   /* a run of missing blocks only */
         int i = claim(h, b);
         if (i < 0) break;
         h->fills[h->nfill++] = &h->slots[i];
-        if (h->nfill == (h->seq >= 3 ? HB_BATCH : 1)) break;
+        if (h->nfill == batch) break;
     }
     return h->nfill;
 }
@@ -173,7 +185,8 @@ static void worker(void *arg) {
         int ok = rc == CURLE_OK && (code == 206 || (code == 200 && a == 0)) && got == (int)(b - a + 1);
         LightLock_Lock(&h->lk);
         for (int j = 0; j < n; j++) h->fills[j]->state = ok ? SL_READY : SL_FAILED;
-        h->fetches++; h->fetch_ms += osGetTime() - t; h->bytes += got; if (!ok) h->failed++;
+        h->fetches++; h->fetch_ms += osGetTime() - t; h->bytes += got;
+        if (!ok && !h->stop) h->failed++;      /* a request cut off by closing the file isn't a failure */
         LightLock_Unlock(&h->lk);
         if (!ok && !h->stop) svcSleepThread(200 * 1000 * 1000LL);   /* don't hammer a failing server */
     }
@@ -262,7 +275,12 @@ static int hf_close(void *c) {
             fclose(lf);
         }
     }
-    free(h->mem); free(h->slots); free(h->url); free(h);
+    /* keep the blocks a moment for the playback that usually reopens this file right away */
+    httpfile_drop_cache();
+    for (int i = 0; i < h->nslots; i++) if (h->slots[i].state != SL_READY) h->slots[i].state = SL_EMPTY;
+    g_park.url = h->url; g_park.slots = h->slots; g_park.mem = h->mem; g_park.nslots = h->nslots;
+    g_park.t = osGetTime();
+    free(h);
     return 0;
 }
 
@@ -276,15 +294,27 @@ FILE *httpfile_open(const char *url, long long size, size_t ring_bytes) {
     h->nslots = ring_bytes ? (int)(ring_bytes / HB_SIZE) : (g_hf_open == 0 ? HB_SLOTS : HB_SLOTS_2ND);
     if (h->nslots < HB_AHEAD + 8) h->nslots = HB_AHEAD + 8;
     h->url = strdup(url); h->size = size; h->want = -1; h->last = -10; h->t_open = osGetTime();
-    h->slots = (Slot *)calloc((size_t)h->nslots, sizeof(Slot));
-    h->mem = (uint8_t *)malloc((size_t)h->nslots * HB_SIZE);
+    if (g_park.url && h->url && !strcmp(g_park.url, h->url) && g_park.nslots == h->nslots &&
+        osGetTime() - g_park.t < 20000) {
+        h->slots = g_park.slots; h->mem = g_park.mem;     /* the same file again: its blocks are here */
+        free(g_park.url); memset(&g_park, 0, sizeof g_park);
+    } else {
+        httpfile_drop_cache();
+        h->slots = (Slot *)calloc((size_t)h->nslots, sizeof(Slot));
+        h->mem = (uint8_t *)malloc((size_t)h->nslots * HB_SIZE);
+        if (h->slots) for (int i = 0; i < h->nslots; i++) h->slots[i].data = h->mem + (size_t)i * HB_SIZE;
+    }
     if (!h->url || !h->slots || !h->mem) { free(h->mem); free(h->slots); free(h->url); free(h); return NULL; }
-    for (int i = 0; i < h->nslots; i++) h->slots[i].data = h->mem + (size_t)i * HB_SIZE;
     LightLock_Init(&h->lk);
-    /* the system core: the moflex decoder owns core 2 and would starve a lowest-priority fetch */
-    h->th = threadCreate(worker, h, 64 * 1024, 0x3F, 1, false);
-    if (!h->th) { s32 prio = 0x30; svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
-                  h->th = threadCreate(worker, h, 64 * 1024, prio - 1, -2, false); }
+    s32 prio = 0x30; svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
+    bool isnew = false; APT_CheckNew3DS(&isnew);
+    if (isnew)   /* the system core: the moflex decoder owns core 2 and would starve a lowest-priority fetch */
+        h->th = threadCreate(worker, h, 64 * 1024, 0x3F, 1, false);
+    else         /* Old 3DS: the engine's audio runs on the system core, and a download sharing that
+                  * core's small time budget made the sound stutter. The app core instead, just above
+                  * the decoder: the fetch mostly waits on the network, so it only steps in briefly. */
+        h->th = threadCreate(worker, h, 64 * 1024, prio - 1, 0, false);
+    if (!h->th) h->th = threadCreate(worker, h, 64 * 1024, prio - 1, -2, false);
     if (!h->th) { free(h->mem); free(h->slots); free(h->url); free(h); return NULL; }
     cookie_io_functions_t io = { hf_read, NULL, hf_seek, hf_close };
     g_hf_open++;

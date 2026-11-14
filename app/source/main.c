@@ -6595,6 +6595,7 @@ static int bt_play(const BtCfg *c, const BtItem *it, const char *title) {
     msg_screen_nowait(title, "Connecting to Big Top...");
     httpfile_reset();
     MoflexResult r = play_movie(path);
+    httpfile_drop_cache();                                /* the video's kept blocks: memory back */
     long long at = moflex_resume_get(path);               /* where the engine stopped (0 = the end) */
     long long dur = (long long)it->runtime * 60000;
     int gave_up = httpfile_gave_up();
