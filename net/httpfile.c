@@ -318,12 +318,12 @@ FILE *httpfile_open(const char *url, long long size, size_t ring_bytes) {
     LightLock_Init(&h->lk);
     s32 prio = 0x30; svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
     bool isnew = false; APT_CheckNew3DS(&isnew);
-    if (isnew)   /* the system core: the moflex decoder owns core 2 and would starve a lowest-priority fetch */
-        h->th = threadCreate(worker, h, 64 * 1024, 0x3F, 1, false);
-    else         /* Old 3DS: the engine's audio runs on the system core, and a download sharing that
-                  * core's small time budget made the sound stutter. The app core instead, just above
-                  * the decoder: the fetch mostly waits on the network, so it only steps in briefly. */
-        h->th = threadCreate(worker, h, 64 * 1024, prio - 1, 0, false);
+    (void)isnew;
+    /* Both models: the system core at the lowest priority. The decoder owns the app core (and
+     * core 2 on a New 3DS); the audio thread on the system core outranks this one, so the
+     * fetch only takes what's left. (On the app core, above the decoder, it took frames from
+     * Old 3DS video; the 2D audio stutter blamed on this core was the 2D player itself.) */
+    h->th = threadCreate(worker, h, 64 * 1024, 0x3F, 1, false);
     if (!h->th) h->th = threadCreate(worker, h, 64 * 1024, prio - 1, -2, false);
     if (!h->th) { free(h->mem); free(h->slots); free(h->url); free(h); return NULL; }
     cookie_io_functions_t io = { hf_read, NULL, hf_seek, hf_close };

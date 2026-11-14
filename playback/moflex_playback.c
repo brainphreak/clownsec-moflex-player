@@ -5863,8 +5863,11 @@ MoflexResult moflex_play(const char *path) {
      * texture into the framebuffer, a whole extra read+write of every frame, and that console is
      * memory-bandwidth-bound -- the same reason threading its decode made things WORSE (d52->d91).
      * Nothing about 2D playback needs the ring, so Old-3DS keeps the path already proven on it. */
-    int use_ring = is3d;
-    if (!use_ring) { bool isnew = false; APT_CheckNew3DS(&isnew); use_ring = isnew; }
+    /* Old-3DS 2D now takes the ring too. Classic decodes, converts and
+     * shows each frame inline with nothing banked, and it could not hold real time on an Old 3DS --
+     * it only looked smooth because the whole thing ran slow (the sound gaps were the symptom).
+     * The ring's decode-ahead bank is what lets Old-3DS 3D (the same 24 frames/s) play. */
+    int use_ring = 1;
     if (use_ring) {                                       /* New-3DS threaded, Old-3DS inline.
                                                            * Falls back to classic if the ring
                                                            * can't allocate its buffers. */
