@@ -15,7 +15,9 @@
 #include <sys/types.h>
 
 #define HB_SIZE     (64 * 1024)
-#define HB_SLOTS    48              /* 3 MB of blocks */
+#define HB_SLOTS    96              /* 6 MB: what was just played stays, so a seek to here (an audio
+                                     * track switch scans ~20 s back for a keyframe) reads memory */
+#define HB_SLOTS_2ND 32             /* a second file open at once (the trailer's audio): 2 MB */
 #define HB_AHEAD    24              /* fetched ahead while reading straight through (~1.5 MB) */
 #define HB_AHEAD_J  2               /* ...and just after a jump, until reading settles */
 #define HF_STALL_MS 20000           /* a block that doesn't arrive in this long: the read fails */
@@ -24,6 +26,7 @@
 
 /* why the last network read gave up: 0 = it didn't, 1 = the viewer held B, 2 = the server went quiet */
 static volatile int g_hf_gave_up;
+static int g_hf_open;               /* files open now: only the first gets the big cache */
 int  httpfile_gave_up(void) { return g_hf_gave_up; }
 void httpfile_reset(void) { g_hf_gave_up = 0; }
 
@@ -240,6 +243,7 @@ static int hf_close(void *c) {
     HFile *h = (HFile *)c;
     h->stop = 1;
     if (h->th) { threadJoin(h->th, U64_MAX); threadFree(h->th); }
+    if (g_hf_open > 0) g_hf_open--;
     /* one line per opened file: was playback waiting on the network, or not? */
     u64 secs = (osGetTime() - h->t_open) / 1000;
     if (secs >= 3) {
@@ -268,7 +272,7 @@ FILE *httpfile_open(const char *url, long long size, size_t ring_bytes) {
     if (!downloader_init()) return NULL;
     HFile *h = (HFile *)calloc(1, sizeof *h);
     if (!h) return NULL;
-    h->nslots = ring_bytes ? (int)(ring_bytes / HB_SIZE) : HB_SLOTS;
+    h->nslots = ring_bytes ? (int)(ring_bytes / HB_SIZE) : (g_hf_open == 0 ? HB_SLOTS : HB_SLOTS_2ND);
     if (h->nslots < HB_AHEAD + 8) h->nslots = HB_AHEAD + 8;
     h->url = strdup(url); h->size = size; h->want = -1; h->last = -10; h->t_open = osGetTime();
     h->slots = (Slot *)calloc((size_t)h->nslots, sizeof(Slot));
@@ -282,6 +286,7 @@ FILE *httpfile_open(const char *url, long long size, size_t ring_bytes) {
                   h->th = threadCreate(worker, h, 64 * 1024, prio - 1, -2, false); }
     if (!h->th) { free(h->mem); free(h->slots); free(h->url); free(h); return NULL; }
     cookie_io_functions_t io = { hf_read, NULL, hf_seek, hf_close };
+    g_hf_open++;
     FILE *f = fopencookie(h, "rb", io);
     if (!f) { hf_close(h); return NULL; }
     setvbuf(f, NULL, _IOFBF, 32 * 1024);
