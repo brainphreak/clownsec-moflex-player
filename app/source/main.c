@@ -6548,7 +6548,142 @@ static void bt_setup(void) {
 
 /* Play one video: the server's resume point is offered (it knows where this console -- or this
  * console before a reinstall -- stopped), then progress goes back to it. 1 = the app is closing. */
+/* ---- Big Top: MP4/MKV/AVI, transcoded by the server to the stream the Plex path plays ---- */
+typedef struct {
+    BtCfg c; char id[40];
+    int audio;                      /* index into t.aname (-1: the file's default) */
+    int burn, burn_sel, is3d;       /* burn: a picture track is burned in (2D); burn_sel: which */
+    BtTracks t;
+    BtSub subs[16]; int ntext;      /* text tracks (sidecar files + the file's own): files we draw */
+    int nsub, cur; char sname[24][48];
+    char err[200];
+} BtPlay;
+static void bts_set_burn(void *ctx, int on) { ((BtPlay *)ctx)->burn = on; }
+static void bts_set_audio(void *ctx, int idx) {
+    BtPlay *p = (BtPlay *)ctx;
+    if (idx >= 0 && idx < p->t.n_audio) p->audio = idx;   /* the player restarts the stream */
+}
+/* track idx of the CC list: text tracks first (downloaded, drawn by the player -- both eyes in
+ * 3D), then picture tracks (burned in by the server, 2D only) */
+static int bts_apply(BtPlay *p, int idx, char *path, int cap) {
+    path[0] = 0;
+    if (idx < 0 || idx >= p->nsub) return 0;
+    int was_burn = p->burn, was_sel = p->burn_sel, fl = 0;
+    p->burn = 0; p->cur = idx;
+    if (idx < p->ntext) {
+        snprintf(path, (size_t)cap, "sdmc:/moflex_player/.btsub.%s", p->subs[idx].ext[0] ? p->subs[idx].ext : "srt");
+        if (bt_sub_download(&p->c, p->id, p->subs[idx].n, path)) fl = STREAM_SUB_FILE; else path[0] = 0;
+    } else if (!p->is3d) {
+        p->burn = 1; p->burn_sel = idx - p->ntext; fl = STREAM_SUB_BURN;
+    }
+    if (was_burn != p->burn || (p->burn && was_sel != p->burn_sel)) fl |= STREAM_SUB_RESTART;
+    return fl;
+}
+static int bts_set_sub(void *ctx, int idx, long long now_us, char *path, int cap) {
+    (void)now_us; return bts_apply((BtPlay *)ctx, idx, path, cap);
+}
+static HttpStream *bts_open(void *ctx, long long at_us, int fmt) {
+    BtPlay *p = (BtPlay *)ctx;
+    p->is3d = fmt != 0;
+    HttpStream *s = bt_stream_open(&p->c, p->id, at_us / 1000, fmt,
+                                   p->audio, (p->burn && fmt == 0) ? p->burn_sel : -1);
+    if (!s) snprintf(p->err, sizeof p->err, "%s", bt_error());
+    return s;
+}
+static void bts_close(void *ctx, HttpStream *s) { (void)ctx; hs_close(s); }
+typedef struct { BtCfg c; char id[40]; char state[12]; long long pos, dur; } BtRep;
+static void bt_rep_thread(void *a) {
+    BtRep *r = (BtRep *)a;
+    bt_progress(&r->c, r->id, r->pos, r->dur, r->state);
+    free(r);
+}
+static long long s_bts_dur;
+static void bts_report(void *ctx, const char *state, long long pos_us) {
+    BtPlay *p = (BtPlay *)ctx;
+    BtRep *r = (BtRep *)malloc(sizeof *r); if (!r) return;
+    r->c = p->c; snprintf(r->id, sizeof r->id, "%s", p->id); snprintf(r->state, sizeof r->state, "%s", state);
+    r->pos = pos_us / 1000; r->dur = s_bts_dur;
+    if (!strcmp(state, "stopped")) { bt_rep_thread(r); return; }   /* the last word: wait for it */
+    if (!threadCreate(bt_rep_thread, r, 16 * 1024, 0x3F, -2, true)) free(r);
+}
+static const char *bts_error(void *ctx) {
+    BtPlay *p = (BtPlay *)ctx;
+    return p->err[0] ? p->err : "Big Top didn't send the video. Is FFmpeg working on the Big Top computer?";
+}
+static MoflexResult bt_stream_play(const BtCfg *c, const BtItem *it, const char *title) {
+    static BtPlay p;
+    memset(&p, 0, sizeof p);
+    p.c = *c; snprintf(p.id, sizeof p.id, "%s", it->id); p.audio = -1; p.burn_sel = -1;
+    msg_screen_nowait(title, "Getting the video's details...");
+    BtItem fresh;
+    long long pos_ms = bt_item(c, it->id, &fresh) ? fresh.pos : it->pos;
+    long long dur_ms = it->dur > 0 ? it->dur : (long long)it->runtime * 60000;
+    s_bts_dur = dur_ms;
+    if (!bt_tracks(c, it->id, &p.t)) { msg_screen("BIG TOP", bt_error()); return MOFLEX_QUIT_BACK; }
+    if (p.t.err[0]) { msg_screen("BIG TOP", p.t.err); return MOFLEX_QUIT_BACK; }
+    long long start = 0;
+    if (pos_ms > 10000 && (dur_ms <= 0 || pos_ms < dur_ms - 30000)) {
+        long t = (long)(pos_ms / 1000);
+        char m[80]; snprintf(m, sizeof m, "Resume from %ld:%02ld:%02ld?", t / 3600, (t / 60) % 60, t % 60);
+        int a = prompt2(title, m, "RESUME", "START OVER");
+        if (a < 0) return MOFLEX_QUIT_BACK;
+        if (a == 0) start = pos_ms * 1000;
+    }
+    char key[48]; snprintf(key, sizeof key, "bigtop:%s", it->id);
+    /* the frame's layout: what the server says, the Format row's choice over it */
+    int fmt = 0;
+    if (it->is3d) fmt = !strcmp(it->layout, "fsbs") ? 1 : 2;
+    /* audio: the file's default, unless Playback Defaults names a language another track is */
+    int asel = p.t.audio_def >= 0 ? p.t.audio_def : 0;
+    {   MoflexDefaults d; moflex_defaults_get(&d);
+        if (p.t.n_audio > 1 && d.alang > 0 && !moflex_lang_match(p.t.alang[asel], d.alang))
+            for (int i = 0; i < p.t.n_audio; i++)
+                if (moflex_lang_match(p.t.alang[i], d.alang)) { asel = i; p.audio = i; break; }
+    }
+    const char *alang = p.t.n_audio > 0 ? p.t.alang[asel] : "";
+    {   int saved = moflex_fmt_load_key(key); if (saved >= 0) fmt = saved; }
+    p.is3d = fmt != 0;
+    /* subtitles: the text tracks (sidecar files + the file's own), then the picture ones */
+    msg_screen_nowait(title, "Getting subtitles...");
+    int ns = bt_subs(c, it->id, p.subs, 16);
+    p.ntext = ns > 0 ? ns : 0;
+    for (int i = 0; i < p.ntext; i++)
+        snprintf(p.sname[i], sizeof p.sname[i], "%.36s%s [%s]", p.subs[i].label[0] ? p.subs[i].label : "Default",
+                 p.subs[i].forced && !ci_contains(p.subs[i].label, "forced") ? " Forced" : "", p.subs[i].ext);
+    p.nsub = p.ntext;
+    for (int i = 0; i < p.t.n_burn && p.nsub < 24; i++, p.nsub++)
+        snprintf(p.sname[p.nsub], sizeof p.sname[0], "%.38s [burn]", p.t.bname[i]);
+    static char subfile[64]; subfile[0] = 0;
+    int burnable = 0, subs_on = moflex_subs_wanted(key, alang), pick = -1;
+    if (p.nsub > 0) {
+        MoflexDefaults d; moflex_defaults_get(&d);
+        int want = d.slang > 0 ? d.slang : 1;
+        for (int i = 0; i < p.ntext && pick < 0; i++) {   /* the preferred language, not forced-only */
+            char tok[16]; snprintf(tok, sizeof tok, "%s", p.subs[i].label);
+            char *q = strpbrk(tok, ". -"); if (q) *q = 0;
+            if (!p.subs[i].forced && moflex_lang_match(tok, want)) pick = i;
+        }
+        if (pick < 0) pick = 0;
+        int fl = bts_apply(&p, pick, subfile, sizeof subfile);
+        if (fl & STREAM_SUB_BURN) { burnable = 1; p.burn = subs_on; }
+    }
+    msg_screen_nowait(title, "Starting the video...\n(the screen stays dark until it\narrives)");
+    StreamSrc s = { &p, title, key, dur_ms * 1000, start, fmt,
+                    bts_open, bts_close, bts_report, bts_error, subfile,
+                    burnable, subs_on, bts_set_burn,
+                    p.t.n_audio, asel, (const char (*)[8])p.t.alang, (const char (*)[48])p.t.aname, bts_set_audio,
+                    NULL,
+                    p.nsub, pick, (const char (*)[48])p.sname, bts_set_sub };
+    MoflexResult r = stream_play(&s);
+    consoleInit(GFX_BOTTOM, NULL);
+    gfxSetDoubleBuffering(GFX_BOTTOM, false);
+    branding_show();
+    if (r != MOFLEX_QUIT_EXIT && stream_last_error()[0]) msg_screen("BIG TOP", stream_last_error());
+    return r;
+}
+
 static int bt_play(const BtCfg *c, const BtItem *it, const char *title) {
+    if (it->stream) return bt_stream_play(c, it, title) == MOFLEX_QUIT_EXIT;
     static char path[300];
     bt_media_path(c, it, title, path, sizeof path);
     BtItem fresh;                                         /* the list may be minutes old */

@@ -24,7 +24,24 @@ typedef struct {
     long long pos, size;          /* resume point (ms), file size */
     char genres[96];
     char summary[420];
+    int  stream;                  /* not moflex (MP4/MKV/AVI...): the server transcodes it -> stream_play */
+    long long dur;                /* stream: length in ms */
+    char layout[8];               /* stream 3D: "hsbs" / "fsbs" */
 } BtItem;
+
+/* a streamed video's tracks (GET /api/items/<id>) */
+typedef struct {
+    int  n_audio, audio_def;
+    char alang[8][8], aname[8][48];
+    int  n_burn;                  /* picture subtitles the server can burn in */
+    char bname[8][48];
+    char err[160];                /* why it can't stream now ("needs FFmpeg..."), "" = it can */
+} BtTracks;
+int  bt_tracks(const BtCfg *c, const char *id, BtTracks *t);     /* 1 = read */
+/* The transcoded stream from at_ms: MPEG-TS of H.264 + AAC. fmt = the player's layout (non-zero:
+ * a 3D-sized frame); audio / burn = track indexes (-1 = default / none). */
+#include "httpstream.h"
+HttpStream *bt_stream_open(const BtCfg *c, const char *id, long long at_ms, int fmt, int audio, int burn);
 
 typedef struct { char url[128]; char name[64]; char id[24]; char version[24]; } BtServer;
 
