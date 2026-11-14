@@ -6555,6 +6555,42 @@ static int bt_play(const BtCfg *c, const BtItem *it, const char *title) {
     long long pos_ms = bt_item(c, it->id, &fresh) ? fresh.pos : it->pos;
     if (pos_ms > 10000) moflex_resume_save(path, pos_ms * 1000);
     else moflex_resume_clear(path);
+    /* subtitle files beside the video on the server: into moviedata/ under the video's name, where
+     * the player looks for a movie's subtitles -- the default track (or the preferred language)
+     * as "<name>.srt" so it loads by itself, the rest labelled for CC > Load subtitle file... */
+    {   BtSub subs[16]; int ns = bt_subs(c, it->id, subs, 16);
+        if (ns > 0) {
+            msg_screen_nowait(title, "Getting subtitles...");
+            const char *bn = strrchr(path, '/'); bn = bn ? bn + 1 : path;
+            char stem[200]; snprintf(stem, sizeof stem, "%s", bn);
+            char *dot = strrchr(stem, '.'); if (dot) *dot = 0;
+            mkdir("sdmc:/moflex_player/moviedata", 0777);
+            static const char *const ex[3] = { "srt", "ass", "ssa" };
+            char fn[320];
+            for (int k = 0; k < 3; k++) {         /* last time's copies: a file gone from the server goes */
+                snprintf(fn, sizeof fn, "sdmc:/moflex_player/moviedata/%s.%s", stem, ex[k]); remove(fn);
+            }
+            int def = -1;
+            for (int i = 0; i < ns && def < 0; i++) if (!subs[i].label[0]) def = i;
+            if (def < 0) {                        /* no plain one: the preferred language, not forced */
+                MoflexDefaults d; moflex_defaults_get(&d);
+                for (int i = 0; i < ns && def < 0; i++) {
+                    char tok[16]; snprintf(tok, sizeof tok, "%s", subs[i].label);
+                    char *q = strpbrk(tok, ". "); if (q) *q = 0;
+                    if (!subs[i].forced && moflex_lang_match(tok, d.slang > 0 ? d.slang : 1)) def = i;
+                }
+            }
+            for (int i = 0; i < ns; i++) {
+                if (i == def) snprintf(fn, sizeof fn, "sdmc:/moflex_player/moviedata/%s.%s", stem, subs[i].ext);
+                else {
+                    char lab[48]; snprintf(lab, sizeof lab, "%s", subs[i].label);
+                    for (char *q = lab; *q; q++) if (strchr("/\\:*?\"<>|", *q)) *q = '-';
+                    snprintf(fn, sizeof fn, "sdmc:/moflex_player/moviedata/%s.%s.%s", stem, lab[0] ? lab : "track", subs[i].ext);
+                }
+                bt_sub_download(c, it->id, subs[i].n, fn);
+            }
+        }
+    }
     /* the first seconds are the player reading the start (and end) of the file over Wi-Fi */
     msg_screen_nowait(title, "Connecting to Big Top...");
     httpfile_reset();

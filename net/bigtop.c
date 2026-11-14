@@ -274,6 +274,35 @@ void bt_watched(const BtCfg *c, const char *item_id, int on) {
     free(body);
 }
 
+int bt_subs(const BtCfg *c, const char *item_id, BtSub *out, int max) {
+    char path[96], *body = NULL;
+    snprintf(path, sizeof path, "/api/items/%s/subs", item_id);
+    long code = bt_req(c->url, c->client, path, &body, 0, 1);
+    if (code != 200 || !body) { free(body); return -1; }
+    cJSON *r = cJSON_Parse(body); free(body);
+    int n = 0; cJSON *e;
+    if (cJSON_IsArray(r)) cJSON_ArrayForEach(e, r) {
+        if (n >= max) break;
+        BtSub *x = &out[n++]; memset(x, 0, sizeof *x);
+        x->n = (int)jn(e, "n"); x->forced = (int)jn(e, "forced");
+        js(e, "label", x->label, sizeof x->label); js(e, "ext", x->ext, sizeof x->ext);
+    }
+    cJSON_Delete(r);
+    return n;
+}
+int bt_sub_download(const BtCfg *c, const char *item_id, int n, const char *dest) {
+    char path[112], *body = NULL;
+    snprintf(path, sizeof path, "/api/items/%s/subs/%d", item_id, n);
+    long code = bt_req(c->url, c->client, path, &body, 0, 0);
+    int ok = 0;
+    if (code == 200 && body) {
+        FILE *f = fopen(dest, "wb");
+        if (f) { size_t L = strlen(body); ok = fwrite(body, 1, L, f) == L; fclose(f); }
+    }
+    free(body);
+    return ok;
+}
+
 /* ---- playback paths ---- */
 static BtCfg g_play_cfg;                 /* the server the last path was made for */
 static struct { char id[40]; long long size; } g_sizes[8];
@@ -291,7 +320,8 @@ void bt_media_path(const BtCfg *c, const BtItem *it, const char *title, char *ou
     /* the title is the path's last part: the player shows it and keys this video's settings by it.
      * '/' would split it, so it goes. */
     char t[100]; snprintf(t, sizeof t, "%s", title && title[0] ? title : it->title);
-    for (char *p = t; *p; p++) if (*p == '/' || *p == '\\' || *p == ':') *p = '-';
+    /* it also names files on the card (subtitles in moviedata/): nothing FAT can't hold */
+    for (char *p = t; *p; p++) if (strchr("/\\:*?\"<>|", *p)) *p = '-';
     snprintf(out, (size_t)cap, "bigtop:/%s/%s/%s.moflex", c->id[0] ? c->id : "server", it->id, t);
 }
 

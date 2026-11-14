@@ -45,6 +45,11 @@ void bt_poster_url(const BtCfg *c, const BtItem *it, int w, int h, char *out, in
 void bt_progress(const BtCfg *c, const char *item_id, long long pos_ms, long long dur_ms, const char *state);
 void bt_watched(const BtCfg *c, const char *item_id, int on);
 
+/* sidecar subtitle files next to the video on the server ("Movie.en.srt" -> label "en") */
+typedef struct { int n; char label[48]; char ext[8]; int forced; } BtSub;
+int  bt_subs(const BtCfg *c, const char *item_id, BtSub *out, int max);   /* count, -1 */
+int  bt_sub_download(const BtCfg *c, const char *item_id, int n, const char *dest);   /* 1 = saved */
+
 /* The player's path for an item: "bigtop:/<server id>/<item id>/<title>.moflex" -- the title so
  * the playback screen and the per-video settings read right. */
 void bt_media_path(const BtCfg *c, const BtItem *it, const char *title, char *out, int cap);
