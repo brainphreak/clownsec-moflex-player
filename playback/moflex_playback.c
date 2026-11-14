@@ -5218,6 +5218,15 @@ static MoflexResult moflex_play_classic(const char *path) {
         awt = threadCreate(audio_worker, (void *)path, 16 * 1024, aprio - 1, 1, false);
     }
     int64_t aw_off_since = -1;   /* ms when the audio clock went offline (start/seek) */
+    /* moflex stamps a time per BLOCK (~1 s of frames), not per frame: pacing every frame to that
+     * held the block's first frame, then let the rest go at once -- a few frames, then a pause.
+     * Per-frame time = the block's time + frames since it began x the frame duration. */
+    int64_t fdur = 40000, v_bts = -1; int v_k = 0;
+    if (m.streams[vi].tb_den > 0) {
+        int64_t pd = (int64_t)m.streams[vi].tb_num * 1000000 / m.streams[vi].tb_den;
+        if (pd >= 8000 && pd <= 100000) fdur = pd;
+    }
+    if (is3d && !m.tb_is_eye) fdur /= 2;   /* 3D: frames are eyes; the timebase may be the pair rate */
     if (have_audio && !awt) {
         ndspChnReset(0);
         ndspChnSetInterp(0, NDSP_INTERP_POLYPHASE);
@@ -5369,6 +5378,7 @@ static MoflexResult moflex_play_classic(const char *path) {
             }
             /* show the landing frame right away; audio then resumes synced to it */
             prime_after_seek(&m, &ctx, out, W, H, &cur_us, &vidx, &left_ok, &left_vidx, is3d);
+            v_bts = -1;
             if (awt) {   /* audio restarts where the VIDEO landed (a keyframe), not the raw target */
                 g_aud_play_us = -1; g_aw_seek_us = cur_us; g_aw_seek = 1; g_aw_paused = !playing;
                 aw_off_since = -1;
@@ -5421,10 +5431,13 @@ static MoflexResult moflex_play_classic(const char *path) {
                     u64 t0 = svcGetSystemTick();
                     int ok = (mobi_decode(&ctx, out, &got, &ap) >= 0 && got);  /* decode every frame (keeps ref chain) */
                     dbg_dec += svcGetSystemTick() - t0; dbg_vf++;
+                    int64_t vts;
+                    if (m.ts != v_bts) { v_bts = m.ts; v_k = 0; }
+                    vts = v_bts + (int64_t)v_k++ * fdur;
                     if (awt && ok && (!is3d || eye == 1)) {   /* pace to the audio clock */
-                        int64_t late = classic_pace(cur_us, &aw_off_since);
+                        int64_t late = classic_pace(vts, &aw_off_since);
                         if (late > 2000000 && !g_aw_paused) {   /* fell far behind: bring the audio back to the picture */
-                            g_aud_play_us = -1; g_aw_seek_us = cur_us; g_aw_seek = 1; aw_off_since = -1;
+                            g_aud_play_us = -1; g_aw_seek_us = vts; g_aw_seek = 1; aw_off_since = -1;
                         } else if (late > 150000) ok = 0;     /* behind: decode only, skip the blit to catch up */
                     }
                     (void)y2r_started; (void)use_y2r;
