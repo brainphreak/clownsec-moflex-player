@@ -212,7 +212,13 @@ int bt_libraries(const BtCfg *c, BtItem **out) {
     int n = fill_array(r, out, "lib");
     /* the counts, for the row: movies in "episodes", shows in "seen" (fill read neither) */
     int i = 0; cJSON *e;
-    cJSON_ArrayForEach(e, r) { if (i < n) { (*out)[i].episodes = (int)jn(e, "movies"); (*out)[i].seen = (int)jn(e, "shows"); } i++; }
+    cJSON_ArrayForEach(e, r) {
+        if (i < n) {
+            js(e, "name", (*out)[i].title, sizeof (*out)[i].title);   /* a library sends "name", not "title" */
+            (*out)[i].episodes = (int)jn(e, "movies"); (*out)[i].seen = (int)jn(e, "shows");
+        }
+        i++;
+    }
     cJSON_Delete(r);
     return n;
 }

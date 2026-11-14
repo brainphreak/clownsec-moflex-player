@@ -6554,6 +6554,8 @@ static int bt_play(const BtCfg *c, const BtItem *it, const char *title) {
     long long pos_ms = bt_item(c, it->id, &fresh) ? fresh.pos : it->pos;
     if (pos_ms > 10000) moflex_resume_save(path, pos_ms * 1000);
     else moflex_resume_clear(path);
+    /* the first seconds are the player reading the start (and end) of the file over Wi-Fi */
+    msg_screen_nowait(title, "Connecting to Big Top...");
     MoflexResult r = play_movie(path);
     long long at = moflex_resume_get(path);               /* where the engine stopped (0 = the end) */
     long long dur = (long long)it->runtime * 60000;
