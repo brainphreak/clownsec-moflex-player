@@ -5906,6 +5906,7 @@ static int plex_sub_apply(PlexPlay *p, int idx, char *path, int cap) {
     }
     p->fetch_id = 0; p->fetch_select = 0; p->fetch_tried = 0;
     int was_burn = p->burn, fl = 0; p->burn = 0;
+    long long was_sel = p->plex_sel;
     const PlexSub *s = &p->subs[idx]; p->cur = idx;
     int text = plex_sub_is_text(s->codec);
     if (s->key[0] && text) {              /* an external text file: drawn by the player */
@@ -5924,7 +5925,8 @@ static int plex_sub_apply(PlexPlay *p, int idx, char *path, int cap) {
     plex_log("subtitles: track %lld (%s%s) -> %s", s->id, s->codec, s->key[0] ? ", external" : "",
              fl & STREAM_SUB_FILE ? "file" : fl & STREAM_SUB_ARRIVE ? "fetched while playing" :
              fl & STREAM_SUB_BURN ? "burned in" : "not shown");
-    if (was_burn != p->burn) fl |= STREAM_SUB_RESTART;
+    /* the picture changes when burning starts or stops -- or moves to another picture track */
+    if (was_burn != p->burn || (p->burn && was_sel != p->plex_sel)) fl |= STREAM_SUB_RESTART;
     return fl;
 }
 static int plex_src_set_sub(void *ctx, int idx, long long now_us, char *path, int cap) {
