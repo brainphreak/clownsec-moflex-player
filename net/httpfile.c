@@ -19,6 +19,13 @@
 #define HB_AHEAD    24              /* fetched ahead while reading straight through (~1.5 MB) */
 #define HB_AHEAD_J  2               /* ...and just after a jump, until reading settles */
 #define HF_STALL_MS 20000           /* a block that doesn't arrive in this long: the read fails */
+#define HB_BATCH    4               /* read-ahead fetches this many blocks per request (256 KB) */
+#define HF_LOG      "sdmc:/moflex_player/bigtop_log.txt"
+
+/* why the last network read gave up: 0 = it didn't, 1 = the viewer held B, 2 = the server went quiet */
+static volatile int g_hf_gave_up;
+int  httpfile_gave_up(void) { return g_hf_gave_up; }
+void httpfile_reset(void) { g_hf_gave_up = 0; }
 
 enum { SL_EMPTY = 0, SL_PENDING, SL_READY, SL_FAILED };
 typedef struct { long long blk; int state, len; u64 used; uint8_t *data; } Slot;
@@ -34,7 +41,11 @@ typedef struct {
     long long want;                 /* the block a read is waiting for (-1: none) */
     long long cur;                  /* where reading is: the prefetch window starts here */
     long long last; int seq;        /* sequential-read detection */
-    CURL *e; Slot *fill;            /* worker-only */
+    int aborted;                    /* the viewer gave up waiting: every read fails from now on */
+    /* worker-only */
+    CURL *e; Slot *fills[HB_BATCH]; int nfill, fill_i;
+    /* for the log */
+    u64 t_open, wait_ms, wait_max, fetch_ms; int waits, fetches, failed; long long bytes;
 } HFile;
 
 /* ---- the file's size: one HEAD (cached for the last few URLs; a file is opened several times) ---- */
@@ -64,12 +75,17 @@ static long long hf_size(const char *url) {
 }
 
 /* ---- the worker ---- */
+/* the response fills the batch's slots in order, each up to a whole block */
 static size_t on_block(char *p, size_t sz, size_t nm, void *u) {
-    HFile *h = (HFile *)u; size_t k = sz * nm;
+    HFile *h = (HFile *)u; size_t k = sz * nm, done = 0;
     if (h->stop) return 0;
-    Slot *s = h->fill;
-    if ((size_t)s->len + k > HB_SIZE) return 0;          /* more than asked for: the range was ignored */
-    memcpy(s->data + s->len, p, k); s->len += (int)k;
+    while (done < k) {
+        if (h->fill_i >= h->nfill) return 0;            /* more than asked for: the range was ignored */
+        Slot *s = h->fills[h->fill_i];
+        size_t room = HB_SIZE - (size_t)s->len, n = k - done < room ? k - done : room;
+        memcpy(s->data + s->len, p + done, n); s->len += (int)n; done += n;
+        if (s->len == HB_SIZE) h->fill_i++;
+    }
     return k;
 }
 static int on_abort(void *u, curl_off_t a, curl_off_t b, curl_off_t c, curl_off_t d) {
@@ -80,19 +96,31 @@ static int slot_of(HFile *h, long long blk) {
         if (h->slots[i].state != SL_EMPTY && h->slots[i].blk == blk) return i;
     return -1;
 }
-/* the next block to fetch (caller holds lk): the one a read waits for, else the next missing one
- * in the read-ahead window. Claims a slot for it; -1 when there's nothing to do. */
-static int next_job(HFile *h) {
-    long long nblk = (h->size + HB_SIZE - 1) / HB_SIZE, target = -1;
-    if (h->want >= 0 && slot_of(h, h->want) < 0) target = h->want;
-    if (target < 0) {
-        int ahead = h->seq >= 3 ? HB_AHEAD : HB_AHEAD_J;
-        for (long long b = h->cur; b < h->cur + ahead && b < nblk; b++)
-            if (slot_of(h, b) < 0) { target = b; break; }
+static int claim(HFile *h, long long target);
+/* the next blocks to fetch (caller holds lk): the one a read waits for, alone (quick); else the
+ * next missing run in the read-ahead window, up to HB_BATCH in one request. Fills h->fills;
+ * returns how many (0 = nothing to do). */
+static int next_jobs(HFile *h) {
+    long long nblk = (h->size + HB_SIZE - 1) / HB_SIZE;
+    h->nfill = 0; h->fill_i = 0;
+    if (h->want >= 0 && slot_of(h, h->want) < 0) {
+        int i = claim(h, h->want);
+        if (i >= 0) h->fills[h->nfill++] = &h->slots[i];
+        return h->nfill;
     }
-    if (target < 0) return -1;
-    int best = -1; u64 oldest = ~0ULL;               /* an empty slot, else the least recently used
-                                                      * one outside the window */
+    int ahead = h->seq >= 3 ? HB_AHEAD : HB_AHEAD_J;
+    for (long long b = h->cur; b < h->cur + ahead && b < nblk; b++) {
+        if (slot_of(h, b) >= 0) { if (h->nfill) break; continue; }   /* a run of missing blocks only */
+        int i = claim(h, b);
+        if (i < 0) break;
+        h->fills[h->nfill++] = &h->slots[i];
+        if (h->nfill == (h->seq >= 3 ? HB_BATCH : 1)) break;
+    }
+    return h->nfill;
+}
+/* a slot for block target: an empty one, else the least recently used one outside the window */
+static int claim(HFile *h, long long target) {
+    int best = -1; u64 oldest = ~0ULL;
     for (int i = 0; i < h->nslots; i++) {
         Slot *s = &h->slots[i];
         if (s->state == SL_PENDING) continue;
@@ -124,20 +152,21 @@ static void worker(void *arg) {
     }
     while (!h->stop && h->e) {
         LightLock_Lock(&h->lk);
-        int i = next_job(h);
+        int n = next_jobs(h);
         LightLock_Unlock(&h->lk);
-        if (i < 0) { svcSleepThread(3 * 1000 * 1000LL); continue; }   /* idle: no socket wait */
-        Slot *s = &h->slots[i];
-        long long a = s->blk * HB_SIZE, b = a + HB_SIZE - 1;
+        if (!n) { svcSleepThread(3 * 1000 * 1000LL); continue; }   /* idle: no socket wait */
+        long long a = h->fills[0]->blk * HB_SIZE, b = (h->fills[n - 1]->blk + 1) * HB_SIZE - 1;
         if (b >= h->size) b = h->size - 1;
         char range[48]; snprintf(range, sizeof range, "%lld-%lld", a, b);
-        h->fill = s;
         curl_easy_setopt(h->e, CURLOPT_RANGE, range);
+        u64 t = osGetTime();
         CURLcode rc = curl_easy_perform(h->e);                /* the same connection, kept alive */
         long code = 0; curl_easy_getinfo(h->e, CURLINFO_RESPONSE_CODE, &code);
-        int ok = rc == CURLE_OK && (code == 206 || (code == 200 && a == 0)) && s->len == (int)(b - a + 1);
+        int got = 0; for (int j = 0; j < n; j++) got += h->fills[j]->len;
+        int ok = rc == CURLE_OK && (code == 206 || (code == 200 && a == 0)) && got == (int)(b - a + 1);
         LightLock_Lock(&h->lk);
-        s->state = ok ? SL_READY : SL_FAILED;
+        for (int j = 0; j < n; j++) h->fills[j]->state = ok ? SL_READY : SL_FAILED;
+        h->fetches++; h->fetch_ms += osGetTime() - t; h->bytes += got; if (!ok) h->failed++;
         LightLock_Unlock(&h->lk);
         if (!ok && !h->stop) svcSleepThread(200 * 1000 * 1000LL);   /* don't hammer a failing server */
     }
@@ -147,6 +176,7 @@ static void worker(void *arg) {
 /* ---- the FILE side ---- */
 static ssize_t hf_read(void *c, char *buf, size_t n) {
     HFile *h = (HFile *)c;
+    if (h->aborted) return -1;
     if (h->pos >= h->size) return 0;
     long long blk = h->pos / HB_SIZE;
     int off = (int)(h->pos % HB_SIZE), fails = 0;
@@ -158,6 +188,8 @@ static ssize_t hf_read(void *c, char *buf, size_t n) {
         int i = slot_of(h, blk);
         if (i >= 0 && h->slots[i].state == SL_READY) {
             Slot *s = &h->slots[i];
+            u64 w = osGetTime() - t0;                     /* this read had to wait for the network */
+            if (w >= 5) { h->waits++; h->wait_ms += w; if (w > h->wait_max) h->wait_max = w; }
             size_t k = (size_t)(s->len - off); if (k > n) k = n;
             memcpy(buf, s->data + off, k);
             s->used = osGetTime();
@@ -172,7 +204,22 @@ static ssize_t hf_read(void *c, char *buf, size_t n) {
         }
         h->want = blk;
         LightLock_Unlock(&h->lk);
-        if (osGetTime() - t0 > HF_STALL_MS) { LightLock_Lock(&h->lk); h->want = -1; LightLock_Unlock(&h->lk); return -1; }
+        u64 waited = osGetTime() - t0;
+        if (waited > HF_STALL_MS) {
+            LightLock_Lock(&h->lk); h->want = -1; h->waits++; h->wait_ms += waited; LightLock_Unlock(&h->lk);
+            g_hf_gave_up = 2; h->aborted = 1;
+            return -1;
+        }
+        /* a seek is a run of reads with the player's controls dead until it ends: holding B
+         * (or START) while we wait gives up, and playback closes like at the end of the file */
+        if (waited > 300 && (waited / 50) % 2 == 0) {
+            hidScanInput();
+            if (hidKeysHeld() & (KEY_B | KEY_START)) {
+                LightLock_Lock(&h->lk); h->want = -1; LightLock_Unlock(&h->lk);
+                g_hf_gave_up = 1; h->aborted = 1;
+                return -1;
+            }
+        }
         svcSleepThread(2 * 1000 * 1000LL);
         LightLock_Lock(&h->lk);
     }
@@ -193,6 +240,23 @@ static int hf_close(void *c) {
     HFile *h = (HFile *)c;
     h->stop = 1;
     if (h->th) { threadJoin(h->th, U64_MAX); threadFree(h->th); }
+    /* one line per opened file: was playback waiting on the network, or not? */
+    u64 secs = (osGetTime() - h->t_open) / 1000;
+    if (secs >= 3) {
+        FILE *lf = fopen(HF_LOG, "ab");
+        if (lf) {
+            const char *nm = strrchr(h->url, '/');
+            fprintf(lf, "%llus open, %lld KB in %d requests (%d failed), %llu ms/request avg, "
+                        "%.0f KB/s while fetching; reads waited %d times, %llu ms total, longest %llu ms%s  [%s]\n",
+                    secs, h->bytes / 1024, h->fetches, h->failed,
+                    h->fetches ? h->fetch_ms / (u64)h->fetches : 0ULL,
+                    h->fetch_ms ? (double)h->bytes / 1024.0 / ((double)h->fetch_ms / 1000.0) : 0.0,
+                    h->waits, h->wait_ms, h->wait_max,
+                    h->aborted ? (g_hf_gave_up == 1 ? ", stopped with B" : ", gave up (no data)") : "",
+                    nm ? nm : h->url);
+            fclose(lf);
+        }
+    }
     free(h->mem); free(h->slots); free(h->url); free(h);
     return 0;
 }
@@ -206,7 +270,7 @@ FILE *httpfile_open(const char *url, long long size, size_t ring_bytes) {
     if (!h) return NULL;
     h->nslots = ring_bytes ? (int)(ring_bytes / HB_SIZE) : HB_SLOTS;
     if (h->nslots < HB_AHEAD + 8) h->nslots = HB_AHEAD + 8;
-    h->url = strdup(url); h->size = size; h->want = -1; h->last = -10;
+    h->url = strdup(url); h->size = size; h->want = -1; h->last = -10; h->t_open = osGetTime();
     h->slots = (Slot *)calloc((size_t)h->nslots, sizeof(Slot));
     h->mem = (uint8_t *)malloc((size_t)h->nslots * HB_SIZE);
     if (!h->url || !h->slots || !h->mem) { free(h->mem); free(h->slots); free(h->url); free(h); return NULL; }

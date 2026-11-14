@@ -12,4 +12,9 @@
 /* size < 0: ask the server (one HEAD request). ring_bytes: read-ahead (0 = default 2 MB). */
 FILE *httpfile_open(const char *url, long long size, size_t ring_bytes);
 
+/* Why the last network read gave up: 0 = none did, 1 = the viewer held B while it waited (a
+ * seek or a track switch), 2 = the server stopped answering. Cleared by httpfile_reset. */
+int  httpfile_gave_up(void);
+void httpfile_reset(void);
+
 #endif

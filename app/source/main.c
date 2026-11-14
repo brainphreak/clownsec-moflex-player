@@ -30,6 +30,7 @@
 #include "store.h"
 #include "plex.h"
 #include "bigtop.h"
+#include "httpfile.h"
 
 #define APP_VERSION "v1.0"
 #ifndef BUILD_TAG
@@ -6556,10 +6557,17 @@ static int bt_play(const BtCfg *c, const BtItem *it, const char *title) {
     else moflex_resume_clear(path);
     /* the first seconds are the player reading the start (and end) of the file over Wi-Fi */
     msg_screen_nowait(title, "Connecting to Big Top...");
+    httpfile_reset();
     MoflexResult r = play_movie(path);
     long long at = moflex_resume_get(path);               /* where the engine stopped (0 = the end) */
     long long dur = (long long)it->runtime * 60000;
-    if (r == MOFLEX_EOF) { bt_progress(c, it->id, dur, dur, "stopped"); bt_watched(c, it->id, 1); }
+    int gave_up = httpfile_gave_up();
+    if (gave_up) {
+        /* a read gave up, which the engine takes for the end of the file: not watched, and the
+         * place it was is the last one the server heard (it may have been mid-seek) */
+        moflex_resume_save(path, pos_ms * 1000);
+        if (gave_up == 2) msg_screen("BIG TOP", "Lost the connection to Big Top.\n\nIs the computer still on and on\nthis Wi-Fi?");
+    } else if (r == MOFLEX_EOF) { bt_progress(c, it->id, dur, dur, "stopped"); bt_watched(c, it->id, 1); }
     else if (r != MOFLEX_QUIT_EXIT || at > 0) bt_progress(c, it->id, at / 1000, dur, "stopped");
     return r == MOFLEX_QUIT_EXIT;
 }
