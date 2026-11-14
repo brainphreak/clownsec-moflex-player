@@ -126,9 +126,17 @@ static int next_jobs(HFile *h) {
     }
     /* the window grows with straight reading: a short look at the file (the player's 2D/3D probe)
      * mustn't pull 1.5 MB it will never read -- that was ~7 s of waiting on an Old 3DS */
-    int ahead = h->seq / 2; if (ahead < HB_AHEAD_J) ahead = HB_AHEAD_J; if (ahead > HB_AHEAD) ahead = HB_AHEAD;
-    int batch = h->seq >= 16 ? HB_BATCH : h->seq >= 3 ? 4 : 1;
-    for (long long b = h->cur; b < h->cur + ahead && b < nblk; b++) {
+    int ahead = h->seq / 2 + HB_AHEAD_J; if (ahead > HB_AHEAD) ahead = HB_AHEAD;
+    int batch = h->seq >= 12 ? HB_BATCH : h->seq >= 3 ? 4 : 1;
+    /* Top up in whole batches, not a block at a time: as reading moves on one block, the window's
+     * end moves one block too, and refilling just that made every request 64 KB. On a 3DS each
+     * request costs ~150-250 ms of its own, so wait until a batch is missing -- unless what's
+     * buffered ahead of the reader is getting short. */
+    long long b0 = h->cur;
+    while (b0 < h->cur + ahead && b0 < nblk && slot_of(h, b0) >= 0) b0++;
+    if (b0 >= nblk || b0 >= h->cur + ahead) return 0;               /* window full */
+    if (b0 - h->cur > ahead - batch && b0 + batch <= nblk) return 0; /* plenty buffered: wait for a batch */
+    for (long long b = b0; b < h->cur + ahead && b < nblk; b++) {
         if (slot_of(h, b) >= 0) { if (h->nfill) break; continue; }   /* a run of missing blocks only */
         int i = claim(h, b);
         if (i < 0) break;
@@ -203,7 +211,9 @@ static ssize_t hf_read(void *c, char *buf, size_t n) {
     int off = (int)(h->pos % HB_SIZE), fails = 0;
     u64 t0 = osGetTime();
     LightLock_Lock(&h->lk);
-    h->seq = (blk == h->last || blk == h->last + 1) ? h->seq + 1 : 0;   /* straight through, or a jump */
+    /* straight-through reading, counted in BLOCKS: stdio calls this per small buffer, and counting
+     * calls let a short look at the file (the 2D/3D probe) ramp the read-ahead to its maximum */
+    h->seq = blk == h->last ? h->seq : blk == h->last + 1 ? h->seq + 1 : 0;
     h->last = blk; h->cur = blk;
     for (;;) {
         int i = slot_of(h, blk);
