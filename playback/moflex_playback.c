@@ -1146,6 +1146,12 @@ static char g_atrk_lbl[ATRK_MAX][4];                     /* button labels: "ENG"
 static char g_atrk_name[ATRK_MAX][40];                   /* a stream's own track names ("" = use the label) */
 static int g_atrk_sel = 0;                               /* chosen track ordinal (0 = first) */
 static volatile int g_atrk_apply = 0;                    /* menu changed the track: player re-locks */
+/* ...once the choice has rested this long: the button shows each press at once, and stepping
+ * through four languages costs one re-lock (a network stream buffers for each), not four */
+static u64 g_atrk_apply_at = 0;
+#define ATRK_SETTLE_MS 800
+static void atrk_pick(void) { g_atrk_apply = 1; g_atrk_apply_at = osGetTime() + ATRK_SETTLE_MS; }
+static int atrk_due(void) { return g_atrk_apply && osGetTime() >= g_atrk_apply_at; }
 
 /* ---- playback defaults (sdmc:/moflex_player/defaults.cfg) ----
  * A video with no .sub of its own used to start from fixed values (size 1, 10 px, first audio
@@ -2752,7 +2758,7 @@ static int snd_input(u32 kd, u32 kh, touchPosition tp) {
     if (act[g_snd_sel] == 0) {
         if (g_atrk_n > 1) {
             g_atrk_sel = (g_atrk_sel + g_atrk_n + dir) % g_atrk_n;
-            g_atrk_apply = 1;                    /* the loop swaps the source in place */
+            atrk_pick();                         /* the loop swaps the source in place, once it rests */
         }
     } else {
         g_autolvl = (g_autolvl + 3 + dir) % 3;   /* off -> low -> high, and back with LEFT */
@@ -2863,7 +2869,7 @@ static int submenu_input(u32 kd, u32 kh, touchPosition tp, int is3d, const char 
                              if (g_sub_file[0]) { char w[512]; snprintf(w, sizeof w, "%s", g_sub_file); subs_load(w); } } break;
         case 7: if (press && g_atrk_n > 1) {
                     g_atrk_sel = (g_atrk_sel + g_atrk_n + (press < 0 ? -1 : 1)) % g_atrk_n;
-                    g_atrk_apply = 1;   /* the player loop retunes + re-locks at the current spot */
+                    atrk_pick();        /* the player loop retunes + re-locks at the current spot */
                 } break;
         case 9: if (press) g_sub_font = !g_sub_font; break;
         case 10: if (rep) sub_nudge(0, rep * sub_ramp(g_sub_rep)); break;   /* left/down lower, right/up higher */
@@ -4576,7 +4582,7 @@ static MoflexResult moflex_play_ring(const char *path) {
 
         /* ---- seek: pause the worker (own demux+decoder), reset ring/demux/audio, PRIME the landing
          *      frame into slot 0, then resume. Held D-pad only accumulates the target; fires on release. ---- */
-        if (g_atrk_apply) {   /* Audio track switched in the menu */
+        if (atrk_due()) {   /* Audio track switched in the menu (and left there a moment) */
             g_atrk_apply = 0;
             /* Swap the audio SOURCE in place -- including across the in-band/trailer boundary,
              * which used to re-open the whole movie and blank both screens. Nothing about the
@@ -6023,7 +6029,7 @@ void kit_set_audio_tracks(int n, const char lang[][8], const char name[][48], in
     g_kit_menu_dirty = 1;
 }
 int kit_take_audio_change(int *sel) {
-    if (!g_atrk_apply) return 0;
+    if (!atrk_due()) return 0;
     g_atrk_apply = 0; *sel = g_atrk_sel;
     return 1;
 }
