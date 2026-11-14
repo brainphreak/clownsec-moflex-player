@@ -24,10 +24,108 @@
 
 static u32 *g_soc_buf;
 static volatile int g_listen_fd = -1;
+static volatile int g_listen80_fd = -1;   /* port 80 too: http://clownsec.local/ needs no :8080 */
+static volatile int g_mdns_fd = -1;
 static volatile int g_client_fd = -1;
 static volatile bool g_stop;
 static Thread g_thread;
 static char g_url[64] = "wifi off";
+static char g_url_name[64] = "";
+
+/* ---------- mDNS: answer "clownsec.local" ----------
+ * Computers on the network resolve NAME.local by asking on multicast 224.0.0.251:5353 (Bonjour /
+ * mDNS); this answers with the console's address, so the page opens at http://clownsec.local/.
+ * Polled from the server loop -- never a blocking wait (the app's sockets share one session). */
+#define MDNS_NAME "clownsec"
+static const unsigned char MDNS_QNAME[] = "\x08" MDNS_NAME "\x05local";   /* + the root 0 */
+
+static int mdns_open(void) {
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return -1;
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    struct sockaddr_in sa; memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET; sa.sin_port = htons(5353); sa.sin_addr.s_addr = INADDR_ANY;
+    struct ip_mreq mr; memset(&mr, 0, sizeof mr);
+    mr.imr_multiaddr.s_addr = inet_addr("224.0.0.251");
+    mr.imr_interface.s_addr = gethostid();
+    if (bind(fd, (struct sockaddr *)&sa, sizeof sa) != 0 ||
+        setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mr, sizeof mr) != 0) {
+        closesocket(fd); return -1;
+    }
+    unsigned char ttl = 255;
+    setsockopt(fd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof ttl);
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+    return fd;
+}
+/* our A record: the name, then type A / class IN (+cache-flush), TTL 120 s, the address */
+static int mdns_answer(unsigned char *o, int flush) {
+    int n = 0;
+    memcpy(o, MDNS_QNAME, sizeof MDNS_QNAME); n += sizeof MDNS_QNAME;   /* includes the 0 */
+    unsigned char rr[10] = { 0, 1, flush ? 0x80 : 0, 1, 0, 0, 0, 120, 0, 4 };
+    memcpy(o + n, rr, 10); n += 10;
+    u32 ip = (u32)gethostid(); memcpy(o + n, &ip, 4); n += 4;   /* already network order */
+    return n;
+}
+static void mdns_send(int fd, const struct sockaddr_in *to, u16 id, int legacy) {
+    unsigned char o[128]; memset(o, 0, 12);
+    o[0] = id >> 8; o[1] = id & 0xff; o[2] = 0x84;                 /* response, authoritative */
+    int n = 12;
+    if (legacy) {                                                    /* a plain DNS client: echo the question */
+        o[5] = 1;
+        memcpy(o + n, MDNS_QNAME, sizeof MDNS_QNAME); n += sizeof MDNS_QNAME;
+        unsigned char q[4] = { 0, 1, 0, 1 }; memcpy(o + n, q, 4); n += 4;
+    }
+    o[7] = 1;
+    n += mdns_answer(o + n, !legacy);
+    sendto(fd, o, (size_t)n, 0, (const struct sockaddr *)to, sizeof *to);
+}
+static void mdns_announce(int fd) {
+    struct sockaddr_in to; memset(&to, 0, sizeof to);
+    to.sin_family = AF_INET; to.sin_port = htons(5353); to.sin_addr.s_addr = inet_addr("224.0.0.251");
+    mdns_send(fd, &to, 0, 0);
+}
+/* read a (possibly compressed) name at *pos into out as "a.b.c"; 0 on a malformed packet */
+static int mdns_name(const unsigned char *p, int len, int *pos, char *out, int cap) {
+    int i = *pos, o = 0, jumped = 0, hops = 0;
+    while (i < len) {
+        int l = p[i];
+        if (l == 0) { i++; break; }
+        if ((l & 0xC0) == 0xC0) {
+            if (i + 1 >= len || ++hops > 8) return 0;
+            if (!jumped) *pos = i + 2;
+            jumped = 1; i = ((l & 0x3F) << 8) | p[i + 1];
+            continue;
+        }
+        if (i + 1 + l > len || o + l + 2 > cap) return 0;
+        if (o) out[o++] = '.';
+        memcpy(out + o, p + i + 1, (size_t)l); o += l; i += 1 + l;
+    }
+    out[o] = 0;
+    if (!jumped) *pos = i;
+    return 1;
+}
+static void mdns_poll(int fd) {
+    unsigned char p[512];
+    struct sockaddr_in from; socklen_t fl = sizeof from;
+    for (int k = 0; k < 8; k++) {                                    /* drain what's waiting */
+        int len = recvfrom(fd, p, sizeof p, 0, (struct sockaddr *)&from, &fl);
+        if (len < 12) return;
+        if (p[2] & 0x80) continue;                                   /* a response, not a question */
+        int qd = (p[4] << 8) | p[5], pos = 12;
+        for (int q = 0; q < qd && pos < len; q++) {
+            char nm[256];
+            if (!mdns_name(p, len, &pos, nm, sizeof nm) || pos + 4 > len) break;
+            int type = (p[pos] << 8) | p[pos + 1], cls = (p[pos + 2] << 8) | p[pos + 3];
+            pos += 4;
+            if (strcasecmp(nm, MDNS_NAME ".local") || (type != 1 && type != 255)) continue;
+            int legacy = ntohs(from.sin_port) != 5353;               /* e.g. nslookup: answer it directly */
+            if (legacy || (cls & 0x8000)) mdns_send(fd, &from, legacy ? ((p[0] << 8) | p[1]) : 0, legacy);
+            else mdns_announce(fd);
+            break;
+        }
+    }
+}
 
 /* ---------- helpers ---------- */
 
@@ -456,10 +554,16 @@ static void handle_client(int fd) {
 
 static void server_thread(void *arg) {
     (void)arg;
+    u64 announce_at = osGetTime() + 1000;   /* a second announcement: the first can be missed */
     while (!g_stop) {
+        if (g_mdns_fd >= 0) {
+            mdns_poll(g_mdns_fd);
+            if (announce_at && osGetTime() >= announce_at) { mdns_announce(g_mdns_fd); announce_at = 0; }
+        }
         struct sockaddr_in cli;
         socklen_t cl = sizeof(cli);
         int c = accept(g_listen_fd, (struct sockaddr *)&cli, &cl);
+        if (c < 0 && g_listen80_fd >= 0) { cl = sizeof(cli); c = accept(g_listen80_fd, (struct sockaddr *)&cli, &cl); }
         if (c < 0) {
             if (g_stop) break;
             svcSleepThread(50000000);   /* 50ms; listen sock is non-blocking */
@@ -498,6 +602,21 @@ bool httpd_start(void) {
     in.s_addr = gethostid();
     snprintf(g_url, sizeof(g_url), "http://%s:%d", inet_ntoa(in), PORT);
 
+    /* port 80 as well, so the short name needs no port; and answer for clownsec.local */
+    int f80 = socket(AF_INET, SOCK_STREAM, 0);
+    if (f80 >= 0) {
+        sa.sin_port = htons(80);
+        if (bind(f80, (struct sockaddr *)&sa, sizeof(sa)) == 0 && listen(f80, 4) == 0) {
+            fcntl(f80, F_SETFL, fcntl(f80, F_GETFL, 0) | O_NONBLOCK);
+            g_listen80_fd = f80;
+        } else closesocket(f80);
+    }
+    g_mdns_fd = mdns_open();
+    if (g_mdns_fd >= 0) {
+        mdns_announce(g_mdns_fd);
+        snprintf(g_url_name, sizeof g_url_name, g_listen80_fd >= 0 ? "http://" MDNS_NAME ".local" : "http://" MDNS_NAME ".local:%d", PORT);
+    } else g_url_name[0] = 0;
+
     /* server thread: freeing syscore time lets it run on core 1 (old+new 3DS) */
     APT_SetAppCpuTimeLimit(30);
     g_thread = threadCreate(server_thread, NULL, 16 * 1024, 0x3F, 1, false);
@@ -509,9 +628,12 @@ void httpd_stop(void) {
     g_stop = true;
     if (g_client_fd >= 0) shutdown(g_client_fd, SHUT_RDWR);   /* unblock an in-flight recv NOW
                                                                * (owner thread still closes it) */
-    if (g_listen_fd >= 0) { closesocket(g_listen_fd); g_listen_fd = -1; }
     if (g_thread) { threadJoin(g_thread, 2000000000ULL); threadFree(g_thread); g_thread = NULL; }
-    strcpy(g_url, "wifi off");
+    if (g_listen_fd >= 0) { closesocket(g_listen_fd); g_listen_fd = -1; }
+    if (g_listen80_fd >= 0) { closesocket(g_listen80_fd); g_listen80_fd = -1; }
+    if (g_mdns_fd >= 0) { closesocket(g_mdns_fd); g_mdns_fd = -1; }
+    strcpy(g_url, "wifi off"); g_url_name[0] = 0;
 }
 
 const char *httpd_url(void) { return g_url; }
+const char *httpd_url_name(void) { return g_url_name; }

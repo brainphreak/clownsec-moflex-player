@@ -28,7 +28,25 @@ typedef struct {
     int         burnable;     /* the server can burn a subtitle track into the picture */
     int         subs_on;      /* the player's subtitle switch at start */
     void        (*set_burn)(void *ctx, int on);   /* burnable: the switch flipped (stream restarts) */
+    /* audio tracks for the SOUND menu (n_audio < 2: no choice). set_audio is called when the
+     * viewer picks one; the stream then restarts where it is. */
+    int         n_audio, audio_sel;
+    const char  (*audio_lang)[8];
+    const char  (*audio_name)[48];
+    void        (*set_audio)(void *ctx, int idx);
+    /* subtitles that arrive while the video plays: whole SRT blocks in movie time, 0 = none yet.
+     * NULL = no such track. */
+    int         (*subs_take)(void *ctx, long long now_us, char *buf, int cap);
+    /* the server's subtitle tracks for the CC menu (n_subs < 2: no choice). set_sub is called
+     * when the viewer picks one and answers with STREAM_SUB_* flags; path gets a file to load. */
+    int         n_subs, sub_sel;
+    const char  (*sub_name)[48];
+    int         (*set_sub)(void *ctx, int idx, long long now_us, char *path, int cap);
 } StreamSrc;
+#define STREAM_SUB_FILE    1   /* load the file in path */
+#define STREAM_SUB_ARRIVE  2   /* cues will come through subs_take: start empty */
+#define STREAM_SUB_BURN    4   /* burned in by the server from now on */
+#define STREAM_SUB_RESTART 8   /* the picture changes (burn on/off): restart the stream here */
 /* why the last stream_play ended early ("" = it didn't): shown by the caller in its own UI */
 const char *stream_last_error(void);
 MoflexResult stream_play(const StreamSrc *src);

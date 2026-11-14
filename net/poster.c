@@ -77,6 +77,15 @@ void poster_save_meta(const char *cache_key, const char *nfo_text) {
     fclose(f);
 }
 
+int poster_cached(const char *cache_key, u16 *out, int pw, int ph) {
+    if (!cache_key || !cache_key[0]) return 0;
+    size_t need = (size_t)pw * ph * sizeof(u16);
+    char safe[128]; sanitize(cache_key, safe, sizeof(safe));
+    char path[256]; snprintf(path, sizeof(path), "%s/%s_%dx%d.p565", ART_DIR, safe, pw, ph);
+    FILE *cf = fopen(path, "rb"); if (!cf) return 0;
+    size_t rd = fread(out, 1, need, cf); fclose(cf);
+    return rd == need;
+}
 int poster_get(const char *art_url, const char *cache_key, u16 *out, int pw, int ph) {
     if (!art_url || !art_url[0]) return 0;
     size_t need = (size_t)pw * ph * sizeof(u16);

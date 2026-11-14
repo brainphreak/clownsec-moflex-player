@@ -68,6 +68,29 @@ static void vol_save(void) {
     if (f) { fprintf(f, "%.2f\n", g_vol); fclose(f); }
 }
 
+/* ---- where a video's bytes come from: the SD card, or (via the app's hook) a server ---- */
+static FILE *(*g_open_hook)(const char *path) = NULL;
+void moflex_set_open_hook(FILE *(*fn)(const char *path)) { g_open_hook = fn; }
+/* A seek over a slow source (a Big Top stream) can take a while, and it runs with the controls
+ * dead. While its reads wait, the source asks moflex_seek_wait_hook: a new seek target (a touch, a
+ * left/right step) or B drops the seek -- the press is then handled like any other, so the viewer
+ * goes straight to the place they meant instead of waiting out the one they didn't. */
+static volatile int g_seek_busy = 0, g_seek_cut = 0;
+static u32 g_seek_cut_kd = 0;
+int moflex_seek_wait_hook(int poll) {
+    if (!g_seek_busy) return 0;
+    if (g_seek_cut) return 1;
+    if (!poll) return 0;
+    hidScanInput();
+    u32 kd = hidKeysDown();
+    if (kd & (KEY_B | KEY_START | KEY_TOUCH | KEY_LEFT | KEY_RIGHT)) { g_seek_cut_kd |= kd; g_seek_cut = 1; return 1; }
+    return 0;
+}
+static FILE *media_fopen(const char *path) {
+    if (g_open_hook) { FILE *f = g_open_hook(path); if (f) return f; }
+    return fopen(path, "rb");
+}
+
 /* ---- per-movie resume position, persisted to sdmc ---- */
 /* sanitized basename + CIA embed suffix. off>=0 forces a specific embedded video;
  * off<0 uses the active selection (empty for a plain moflex). */
@@ -141,6 +164,9 @@ static int g_kit_defer = 0, g_kit_pq_pending = 0, g_kit_sub_pending = 0;
  * subtitle text is loaded, so the CC menu's on/off row must work without g_nsubs. Never set by
  * the moflex engines. */
 static int g_kit_subs_any = 0;
+/* a stream's subtitle tracks (the server's): the CC menu's Track row; the stream code acts on a pick */
+#define KSTRK_MAX 16
+static char g_kstrk_name[KSTRK_MAX][40]; static int g_kstrk_n = 0, g_kstrk_sel = 0, g_kstrk_apply = 0;
 static void pq_save(void) {
     if (g_kit_defer) { g_kit_pq_pending = 1; return; }
     mkdir("sdmc:/moflex_player", 0777);
@@ -916,6 +942,42 @@ static int subs_load_ass(FILE *f) {
      * builder's ass_to_srt.karaoke_styles */
     return g_nsubs;
 }
+/* SRT cues from a file or from text in memory (a stream's subtitles arrive in pieces) */
+typedef struct { FILE *f; const char *p; } SubSrc;
+static char *sub_gets(char *buf, int n, SubSrc *s) {
+    if (s->f) return fgets(buf, n, s->f);
+    if (!s->p || !*s->p) return NULL;
+    const char *nl = strchr(s->p, '\n');
+    size_t len = nl ? (size_t)(nl - s->p) + 1 : strlen(s->p);
+    if (len > (size_t)n - 1) len = (size_t)n - 1;
+    memcpy(buf, s->p, len); buf[len] = 0; s->p += len;
+    return buf;
+}
+static void subs_parse_srt(SubSrc *src) {
+    char line[512];
+    while (g_nsubs < SUB_MAX && sub_gets(line, sizeof line, src)) {
+        if (!strstr(line, "-->")) continue;                   /* the timing line of a cue */
+        char sb[40], eb[40]; int64_t s, e;
+        if (sscanf(line, "%39s --> %39s", sb, eb) != 2) continue;
+        if (!sub_parse_ts(sb, &s) || !sub_parse_ts(eb, &e)) continue;
+        char txt[SUB_TXT]; txt[0] = 0;
+        SubTags tg; sub_tags_init(&tg);
+        while (sub_gets(line, sizeof line, src)) {                 /* text lines until a blank line */
+            char *nl = strpbrk(line, "\r\n"); if (nl) *nl = 0;
+            if (!line[0]) break;
+            char tagless[512]; sub_tags(line, tagless, sizeof tagless, &tg);   /* {\an8}, <i> */
+            char clean[256]; sub_clean(tagless, clean, sizeof clean);   /* tags + smart quotes/accents -> ASCII */
+            size_t tl = strlen(txt);
+            if (tl && tl + 1 < SUB_TXT) txt[tl++] = '\n';
+            snprintf(txt + tl, SUB_TXT - tl, "%s", clean);
+        }
+        SubCue *c = &g_subs[g_nsubs]; c->s = s; c->e = e; c->ord = (u16)g_nsubs; c->sty = 0;
+        c->top = tg.pos ? 0 : (tg.an >= 4);               /* SRT has no PlayRes: \pos stays put */
+        c->ital = tg.ital > 0; c->bold = tg.bold > 0; c->col = tg.col;
+        snprintf(c->t, sizeof c->t, "%s", txt);
+        g_nsubs++;
+    }
+}
 static int subs_load(const char *path) {
     FILE *f = fopen(path, "rb"); if (!f) return 0;
     if (!g_subs) g_subs = (SubCue *)malloc(sizeof(SubCue) * SUB_MAX);
@@ -926,29 +988,8 @@ static int subs_load(const char *path) {
     if (sub_is_ass(f)) {
         subs_load_ass(f);
     } else {
-        char line[512];
-        while (g_nsubs < SUB_MAX && fgets(line, sizeof line, f)) {
-            if (!strstr(line, "-->")) continue;                   /* the timing line of a cue */
-            char sb[40], eb[40]; int64_t s, e;
-            if (sscanf(line, "%39s --> %39s", sb, eb) != 2) continue;
-            if (!sub_parse_ts(sb, &s) || !sub_parse_ts(eb, &e)) continue;
-            char txt[SUB_TXT]; txt[0] = 0;
-            SubTags tg; sub_tags_init(&tg);
-            while (fgets(line, sizeof line, f)) {                 /* text lines until a blank line */
-                char *nl = strpbrk(line, "\r\n"); if (nl) *nl = 0;
-                if (!line[0]) break;
-                char tagless[512]; sub_tags(line, tagless, sizeof tagless, &tg);   /* {\an8}, <i> */
-                char clean[256]; sub_clean(tagless, clean, sizeof clean);   /* tags + smart quotes/accents -> ASCII */
-                size_t tl = strlen(txt);
-                if (tl && tl + 1 < SUB_TXT) txt[tl++] = '\n';
-                snprintf(txt + tl, SUB_TXT - tl, "%s", clean);
-            }
-            SubCue *c = &g_subs[g_nsubs]; c->s = s; c->e = e; c->ord = (u16)g_nsubs; c->sty = 0;
-            c->top = tg.pos ? 0 : (tg.an >= 4);               /* SRT has no PlayRes: \pos stays put */
-            c->ital = tg.ital > 0; c->bold = tg.bold > 0; c->col = tg.col;
-            snprintf(c->t, sizeof c->t, "%s", txt);
-            g_nsubs++;
-        }
+        SubSrc src = { f, NULL };
+        subs_parse_srt(&src);
     }
     fclose(f);
     subs_finish();
@@ -1086,7 +1127,7 @@ static int g_trsub_sel = 0;
 #define EMB_SRT "sdmc:/moflex_player/.embedded.srt"
 static int trsub_stash(const char *path, int k) {
     if (k < 0 || k >= g_tra.sub_n) return 0;
-    FILE *sf = fopen(path, "rb");
+    FILE *sf = media_fopen(path);
     if (!sf) return 0;
     /* in chunks: a raw fansub track can run to megabytes, and the heap is needed for video */
     static char buf[32 * 1024];
@@ -1114,10 +1155,18 @@ static int trsub_stash(const char *path, int k) {
 /* ---- dual-audio track selection (e.g. English first for the official player, original
  * language second for ours). Filled at open from the stream table; persisted per movie
  * with the subtitle settings. ---- */
-static int g_atrk_streams[4]; static int g_atrk_n = 0;   /* audio stream indices in this file */
-static char g_atrk_lbl[4][4];                            /* button labels: "ENG"/"JPN"/"A1".. */
+#define ATRK_MAX 8                                       /* moflex files fill 4 at most; streams more */
+static int g_atrk_streams[ATRK_MAX]; static int g_atrk_n = 0;   /* audio stream indices in this file */
+static char g_atrk_lbl[ATRK_MAX][4];                     /* button labels: "ENG"/"JPN"/"A1".. */
+static char g_atrk_name[ATRK_MAX][40];                   /* a stream's own track names ("" = use the label) */
 static int g_atrk_sel = 0;                               /* chosen track ordinal (0 = first) */
 static volatile int g_atrk_apply = 0;                    /* menu changed the track: player re-locks */
+/* ...once the choice has rested this long: the button shows each press at once, and stepping
+ * through four languages costs one re-lock (a network stream buffers for each), not four */
+static u64 g_atrk_apply_at = 0;
+#define ATRK_SETTLE_MS 800
+static void atrk_pick(void) { g_atrk_apply = 1; g_atrk_apply_at = osGetTime() + ATRK_SETTLE_MS; }
+static int atrk_due(void) { return g_atrk_apply && osGetTime() >= g_atrk_apply_at; }
 
 /* ---- playback defaults (sdmc:/moflex_player/defaults.cfg) ----
  * A video with no .sub of its own used to start from fixed values (size 1, 10 px, first audio
@@ -2400,6 +2449,7 @@ static int submenu_actions(int is3d, int *act) {
      * track the row was hidden, so loading an external .srt was a one-way trip: nothing on
      * screen could put the built-in subtitles back. */
     if (g_tra.sub_n > 0) act[n++] = 8;   /* built-in subtitle track */
+    if (g_kstrk_n > 1) act[n++] = 13;    /* a stream's tracks (the server's list) */
     if (is3d) act[n++] = 4;
     act[n++] = 5;
     return n;
@@ -2422,6 +2472,7 @@ static void submenu_label(int a, char *r, int cap) {
         case 12: snprintf(r, cap, "Link top & bottom:  %s", g_sub_link ? "ON" : "OFF"); break;
         case 4: snprintf(r, cap, "Depth (3D):  %+d", g_sub_depth); break;
         case 7: snprintf(r, cap, "Audio:  Track %d / %d", g_atrk_sel + 1, g_atrk_n); break;
+        case 13: snprintf(r, cap, "Track:  %.24s (%d/%d)", g_kstrk_name[g_kstrk_sel], g_kstrk_sel + 1, g_kstrk_n); break;
         case 8: snprintf(r, cap, "Built-in:  %s (%d/%d)%s",
                          g_trsub_sel < g_tra.sub_n && g_tra.sub_lang[g_trsub_sel][0]
                              ? g_tra.sub_lang[g_trsub_sel] : "---",
@@ -2432,7 +2483,7 @@ static void submenu_label(int a, char *r, int cap) {
     }
 }
 static void submenu_render(int is3d) {
-    int act[12]; int n = submenu_actions(is3d, act);
+    int act[16]; int n = submenu_actions(is3d, act);
     int top, step, bh; submenu_layout(n, &top, &step, &bh);
     ui_begin(GFX_BOTTOM);
     ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
@@ -2681,8 +2732,10 @@ static int snd_rows(int *act) {
 }
 static void snd_label(int a, char *r, int cap) {
     if (a == 0) {
-        const char *l = (g_atrk_sel < 4 && g_atrk_lbl[g_atrk_sel][0]) ? g_atrk_lbl[g_atrk_sel] : "A?";
-        snprintf(r, cap, "Language:  %s  (%d/%d)", l, g_atrk_sel + 1, g_atrk_n);
+        const char *l = (g_atrk_sel < ATRK_MAX && g_atrk_lbl[g_atrk_sel][0]) ? g_atrk_lbl[g_atrk_sel] : "A?";
+        if (g_atrk_sel < ATRK_MAX && g_atrk_name[g_atrk_sel][0])
+            snprintf(r, cap, "%.26s  (%d/%d)", g_atrk_name[g_atrk_sel], g_atrk_sel + 1, g_atrk_n);
+        else snprintf(r, cap, "Language:  %s  (%d/%d)", l, g_atrk_sel + 1, g_atrk_n);
     } else {
         static const char *N[3] = { "OFF", "LOW", "HIGH" };
         snprintf(r, cap, "Auto level:  %s", N[g_autolvl < 0 || g_autolvl > 2 ? 0 : g_autolvl]);
@@ -2720,7 +2773,7 @@ static int snd_input(u32 kd, u32 kh, touchPosition tp) {
     if (act[g_snd_sel] == 0) {
         if (g_atrk_n > 1) {
             g_atrk_sel = (g_atrk_sel + g_atrk_n + dir) % g_atrk_n;
-            g_atrk_apply = 1;                    /* the loop swaps the source in place */
+            atrk_pick();                         /* the loop swaps the source in place, once it rests */
         }
     } else {
         g_autolvl = (g_autolvl + 3 + dir) % 3;   /* off -> low -> high, and back with LEFT */
@@ -2791,7 +2844,7 @@ static int submenu_input(u32 kd, u32 kh, touchPosition tp, int is3d, const char 
         }
         return 0;
     }
-    int act[12]; int n = submenu_actions(is3d, act);
+    int act[16]; int n = submenu_actions(is3d, act);
     if (g_sub_sel >= n) g_sub_sel = n - 1;
     if (g_sub_sel < 0)  g_sub_sel = 0;
     if (kd & KEY_B) { subcfg_save(moviepath); g_submenu = 0; return 1; }
@@ -2831,12 +2884,17 @@ static int submenu_input(u32 kd, u32 kh, touchPosition tp, int is3d, const char 
                              if (g_sub_file[0]) { char w[512]; snprintf(w, sizeof w, "%s", g_sub_file); subs_load(w); } } break;
         case 7: if (press && g_atrk_n > 1) {
                     g_atrk_sel = (g_atrk_sel + g_atrk_n + (press < 0 ? -1 : 1)) % g_atrk_n;
-                    g_atrk_apply = 1;   /* the player loop retunes + re-locks at the current spot */
+                    atrk_pick();        /* the player loop retunes + re-locks at the current spot */
                 } break;
         case 9: if (press) g_sub_font = !g_sub_font; break;
         case 10: if (rep) sub_nudge(0, rep * sub_ramp(g_sub_rep)); break;   /* left/down lower, right/up higher */
         case 11: if (rep) sub_nudge(1, rep * sub_ramp(g_sub_rep)); break;   /* left/right: closer/further from the top edge */
         case 12: if (press) sub_link_toggle(); break;
+        case 13: if (press && g_kstrk_n > 1) {
+                    g_kstrk_sel = (g_kstrk_sel + g_kstrk_n + (press < 0 ? -1 : 1)) % g_kstrk_n;
+                    g_kstrk_apply = 1;  /* the stream loop fetches it (or restarts to burn it) */
+                    g_sub_on = 1;       /* picking a track implies wanting it shown */
+                } break;
         case 8: if (press && g_tra.sub_n > 0) {
                     /* A on this row means "show the built-in subtitles". Only advance the
                      * language when they are ALREADY what is showing -- otherwise the first
@@ -2864,7 +2922,7 @@ static volatile int64_t g_aud_start = -1;/* audio timeline anchor (astart) -> vi
 static volatile int64_t g_vid_us;        /* content timestamp the video has reached (main thread) */
 static void audio_worker(void *arg) {
     const char *path = (const char *)arg;
-    FILE *af = fopen(path, "rb");
+    FILE *af = media_fopen(path);
     if (!af) return;
     MfxDemux am;
     if (mfx_open_auto(&am, af, path) != 0) { fclose(af); return; }
@@ -2924,11 +2982,12 @@ static void audio_worker(void *arg) {
 
 static MoflexResult moflex_play_gpu(const char *path) {
     vol_load();
-    FILE *f = fopen(path, "rb");
+    FILE *f = media_fopen(path);
     if (!f) return MOFLEX_ERROR;
     MfxDemux m;
     if (mfx_open_auto(&m, f, path) != 0) { fclose(f); return MOFLEX_ERROR; }
     int vi = -1, ai = -1;
+    memset(g_atrk_name, 0, sizeof g_atrk_name); g_kstrk_n = 0;
     g_atrk_n = 0; g_atrk_sel = 0;   /* re-filled per file; subcfg_load below restores a saved choice */
     for (int i = 0; i < m.nb_streams; i++) {
         if (m.streams[i].media_type == MFX_TYPE_VIDEO && vi < 0) vi = i;
@@ -4102,7 +4161,7 @@ static void embsub_scan(MfxDemux *m) {
 
 static MoflexResult moflex_play_ring(const char *path) {
     vol_load();
-    FILE *f = fopen(path, "rb");
+    FILE *f = media_fopen(path);
     if (!f) return MOFLEX_ERROR;
     trailer_probe(f);
     MfxDemux m;
@@ -4110,6 +4169,7 @@ static MoflexResult moflex_play_ring(const char *path) {
                            : mfx_open_auto(&m, f, path);
     if (mo != 0) { fclose(f); return MOFLEX_ERROR; }
     int vi = -1, ai = -1;
+    memset(g_atrk_name, 0, sizeof g_atrk_name); g_kstrk_n = 0;
     g_atrk_n = 0; g_atrk_sel = 0;   /* re-filled per file; subcfg_load below restores a saved choice */
     for (int i = 0; i < m.nb_streams; i++) {
         if (m.streams[i].media_type == MFX_TYPE_VIDEO && vi < 0) vi = i;
@@ -4346,7 +4406,7 @@ static MoflexResult moflex_play_ring(const char *path) {
     s.aidx = ai;
     s.trf = NULL; s.tr_cur = 0; s.tr_active = 0;
     if (use_trailer_audio) {
-        s.trf = fopen(path, "rb");
+        s.trf = media_fopen(path);
         if (s.trf) { s.tr_active = 1; s.aidx = -2; }   /* -2: no in-band stream feeds the DSP */
     }
     g_panel_cheap = !r3_isnew;   /* lighten the software panel on Old-3DS to free decode CPU */
@@ -4380,9 +4440,11 @@ static MoflexResult moflex_play_ring(const char *path) {
         C3D_FrameEnd(0);
     }
 
+    u32 cut_kd = 0;                       /* the press that dropped a seek, handled this frame */
     while (aptMainLoop()) {
         hidScanInput();
-        u32 kd = hidKeysDown(), kh = hidKeysHeld();
+        u32 kd = hidKeysDown() | cut_kd, kh = hidKeysHeld();
+        cut_kd = 0;
         touchPosition tp; hidTouchRead(&tp);
         /* Lid watchdog: with sleep denied (background downloads) closing the lid doesn't sleep --
          * the movie keeps playing dark -- and reopening fires NO wake event, so a missed system
@@ -4537,7 +4599,7 @@ static MoflexResult moflex_play_ring(const char *path) {
 
         /* ---- seek: pause the worker (own demux+decoder), reset ring/demux/audio, PRIME the landing
          *      frame into slot 0, then resume. Held D-pad only accumulates the target; fires on release. ---- */
-        if (g_atrk_apply) {   /* Audio track switched in the menu */
+        if (atrk_due()) {   /* Audio track switched in the menu (and left there a moment) */
             g_atrk_apply = 0;
             /* Swap the audio SOURCE in place -- including across the in-band/trailer boundary,
              * which used to re-open the whole movie and blank both screens. Nothing about the
@@ -4554,7 +4616,7 @@ static MoflexResult moflex_play_ring(const char *path) {
                         { nrate = (int)g_tra.aud_rate; nchn = (int)g_tra.aud_chn; }
                     else ok = 0;
                     if (ok && !s.trf) {               /* first crossing needs its private handle */
-                        s.trf = fopen(path, "rb");
+                        s.trf = media_fopen(path);
                         if (!s.trf) ok = 0;
                     }
                 } else if (newsi < m.nb_streams) {
@@ -4575,8 +4637,9 @@ static MoflexResult moflex_play_ring(const char *path) {
                 seek_to_us = cur_us; want_seek = 1;
             }
         }
-        if (want_seek && !(kh & (KEY_LEFT | KEY_RIGHT))) {
+        if (want_seek && !scrubbing && !(kh & (KEY_LEFT | KEY_RIGHT))) {
             WORKER_LOCK();   /* blocks until the decode thread finishes its current pair and releases */
+            g_seek_busy = 1; g_seek_cut = 0;     /* a slow source may drop this seek if the viewer moves on */
             if (dur_us > 0) { if (seek_to_us < 0) seek_to_us = 0; if (seek_to_us > dur_us) seek_to_us = dur_us; }
             /* Land on the last KEYFRAME at/before the target. P-frames don't decode after a flush
              * (references freed), so the old forward hunt started 3-20s LATE on sparse-keyframe
@@ -4747,9 +4810,28 @@ static MoflexResult moflex_play_ring(const char *path) {
              * something re-opened the file (switching tracks and back "fixed" it). */
             if (s.tr_active && g_tra.aud_pktsamp && g_tra.aud_rate)
                 s.tr_cur = (u32)(cur_us * (s64)g_tra.aud_rate / 1000000 / g_tra.aud_pktsamp);
-            s.paused = 0;
-            WORKER_UNLOCK();   /* resume the decode thread from the new position */
-            want_seek = 0;
+            g_seek_busy = 0;
+            if (g_seek_cut) {
+                /* dropped mid-way: nothing it read counts. Empty the ring, hold the decoder, and
+                 * keep the seek pending at its target -- the press that dropped it is handled next
+                 * frame: a touch on the bar starts a new scrub (the seek waits for the release), a
+                 * step moves on from this target, B leaves; anything else just seeks here again. */
+                g_seek_cut = 0;
+                clearerr(m.f); m.eof = 0;
+                for (int i = 0; i < NB; i++) ready[i] = 0;
+                s.wr = 0; rd = 0; s.rd = 0; s.dpair = 0; s.done = 0; s.has_pending = 0; last_shown = -1;
+                r3_vq_clear();
+                if (have_audio) { r3_audio_flush(); ndspChnSetPaused(0, true); }
+                gated = 0; s.paused = 1;
+                WORKER_UNLOCK();
+                cut_kd = g_seek_cut_kd; g_seek_cut_kd = 0;
+                dirty = 1;
+            } else {
+                s.paused = 0;
+                WORKER_UNLOCK();   /* resume the decode thread from the new position */
+                LightEvent_Signal(&s.wake);   /* in case a dropped seek had left it parked */
+                want_seek = 0;
+            }
         }
 
         if (kd) dirty = 1;   /* any control input -> repaint the held frame / panel */
@@ -5013,7 +5095,7 @@ static MoflexResult moflex_play_classic(const char *path) {
     vol_load();
     g_hq_avail = 0;   /* the HQ (color-depth) toggle is a ring-only feature; classic is always 24-bit */
 
-    FILE *f = fopen(path, "rb");
+    FILE *f = media_fopen(path);
     if (!f) { printf("\x1b[2J\x1b[Hfopen failed\npress A\n"); mp_wait_key(); return MOFLEX_ERROR; }
 
     mobi_opt = 14;   /* prefetch + idct-skip + DC-only: bit-exact, ~6-8% faster decode (esp. Old 3DS) */
@@ -5408,11 +5490,12 @@ static void sr_wrap(AVFrame *f, uint8_t *b, int W, int H) {      /* view over a 
 
 static MoflexResult moflex_play_soft(const char *path) {
     init_luts(); vol_load();
-    FILE *f = fopen(path, "rb");
+    FILE *f = media_fopen(path);
     if (!f) return MOFLEX_ERROR;
     MfxDemux m;
     if (mfx_open_auto(&m, f, path) != 0) { fclose(f); return MOFLEX_ERROR; }
     int vi = -1, ai = -1;
+    memset(g_atrk_name, 0, sizeof g_atrk_name); g_kstrk_n = 0;
     g_atrk_n = 0; g_atrk_sel = 0;   /* re-filled per file; subcfg_load below restores a saved choice */
     for (int i = 0; i < m.nb_streams; i++) {
         if (m.streams[i].media_type == MFX_TYPE_VIDEO && vi < 0) vi = i;
@@ -5688,7 +5771,7 @@ static MoflexResult moflex_play_soft(const char *path) {
 #define USE_RING_3D 1
 MoflexResult moflex_play(const char *path) {
     int is3d = 0;
-    FILE *f = fopen(path, "rb");
+    FILE *f = media_fopen(path);
     if (f) {
         MfxDemux *m = (MfxDemux *)malloc(sizeof *m);
         if (m) {
@@ -5895,6 +5978,8 @@ void kit_film_begin(int is3d) {
     g_panel_cheap = 0; g_panel_force = 1;
     g_view_is3d = is3d;
     g_atrk_n = 1; g_atrk_sel = 0; g_atrk_apply = 0;   /* one track: SOUND shows auto level only */
+    memset(g_atrk_name, 0, sizeof g_atrk_name);
+    g_kstrk_n = 0; g_kstrk_sel = 0; g_kstrk_apply = 0;
     lb_reset(); al_reset();
     g_kit_redraw = 0;
     g_kit_fmt_row = 1; g_kit_fmt_changed = 0;
@@ -5957,6 +6042,35 @@ void kit_fmt_save(const char *movie, int fmt) {
     fprintf(f, "%d\n", fmt); fclose(f);
 }
 void kit_set_subs_any(int on) { g_kit_subs_any = on; }
+void kit_set_sub_tracks(int n, const char name[][48], int sel) {
+    if (n > KSTRK_MAX) n = KSTRK_MAX;
+    if (n < 0) n = 0;
+    for (int i = 0; i < n; i++) snprintf(g_kstrk_name[i], sizeof g_kstrk_name[i], "%s", name[i]);
+    g_kstrk_n = n; g_kstrk_sel = sel >= 0 && sel < n ? sel : 0; g_kstrk_apply = 0;
+    g_kit_menu_dirty = 1;
+}
+int kit_take_sub_change(int *sel) {
+    if (!g_kstrk_apply) return 0;
+    g_kstrk_apply = 0; *sel = g_kstrk_sel;
+    return 1;
+}
+void kit_set_audio_tracks(int n, const char lang[][8], const char name[][48], int sel) {
+    if (n > ATRK_MAX) n = ATRK_MAX;
+    if (n < 1) { g_atrk_n = 1; g_atrk_sel = 0; return; }
+    for (int i = 0; i < n; i++) {
+        snprintf(g_atrk_lbl[i], sizeof g_atrk_lbl[i], "%.3s", lang[i][0] ? lang[i] : "A?");
+        for (char *c = g_atrk_lbl[i]; *c; c++) if (*c >= 'a' && *c <= 'z') *c -= 32;
+        snprintf(g_atrk_name[i], sizeof g_atrk_name[i], "%s", name[i]);
+    }
+    g_atrk_n = n; g_atrk_sel = sel >= 0 && sel < n ? sel : 0; g_atrk_apply = 0;
+    g_kit_menu_dirty = 1;
+}
+int kit_take_audio_change(int *sel) {
+    if (!atrk_due()) return 0;
+    g_atrk_apply = 0; *sel = g_atrk_sel;
+    return 1;
+}
+int moflex_lang_match(const char *tag, int li) { return lang_match(tag, li); }
 void kit_film_end(void) {
     g_kit_subs_any = 0;
     g_kit_defer = 0;                      /* (the caller flushed before this) */
@@ -6134,6 +6248,24 @@ int moflex_subs_load_file(const char *path) {
     int n = subs_load(path);
     if (n > 0) g_sub_on = 1;
     return n;
+}
+/* ...or as SRT text in pieces while the video plays (Plex: an embedded track it copies out) */
+int moflex_subs_stream_begin(void) {
+    if (!g_subs) g_subs = (SubCue *)malloc(sizeof(SubCue) * SUB_MAX);
+    if (!g_subs) return 0;
+    g_nsubs = 0; g_sub_mode = -1;                             /* Plex sends UTF-8 */
+    g_sub_file[0] = 0;
+    return 1;
+}
+int moflex_subs_append_srt(const char *text) {
+    if (!g_subs || !text || !*text) return 0;
+    int before = g_nsubs;
+    int64_t last = g_nsubs ? g_subs[g_nsubs - 1].s : 0;
+    SubSrc src = { NULL, text };
+    subs_parse_srt(&src);
+    if (g_nsubs == before) return 0;
+    if (g_subs[before].s < last) subs_finish();               /* the part before the resume point */
+    return g_nsubs - before;
 }
 int moflex_fmt_load_key(const char *key) { return kit_fmt_load(key); }
 int moflex_subs_wanted(const char *key, const char *audio_lang) {

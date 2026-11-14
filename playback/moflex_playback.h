@@ -26,6 +26,13 @@ typedef enum {
  * the saved position and checkpoints it as it plays. */
 MoflexResult moflex_play(const char *path);
 
+/* A video path the hook recognises (e.g. "bigtop:/...") is opened by it -- any FILE*, such as a
+ * network stream; for anything else it returns NULL and the file is opened from the card. */
+#include <stdio.h>
+void moflex_set_open_hook(FILE *(*fn)(const char *path));
+/* For a slow source's wait loop (httpfile_set_wait_hook): drops a seek the viewer moved on from. */
+int  moflex_seek_wait_hook(int poll);
+
 /* Saved resume position (microseconds) for a movie, or 0 if none. */
 long long moflex_resume_get(const char *path);
 
@@ -66,11 +73,14 @@ void moflex_defaults_reset(MoflexDefaults *d);             /* the built-in value
 int  moflex_defaults_from_movie(const char *path, MoflexDefaults *d);   /* 0 = no saved settings */
 int  moflex_lang_count(void);
 const char *moflex_lang_code(int i);                       /* "ENG", "JPN" ... ("" for 0) */
+int  moflex_lang_match(const char *tag, int i);           /* "eng"/"zho"/"fra" vs a language index */
 const char *moflex_lang_name(int i);                       /* "English", "Japanese" ... */
 int  moflex_sub_size_max(void);
 int  moflex_sub_pos_max(void);
 void moflex_defaults_apply_subs(const char *alang);        /* MP4 path: after autoload */
 int  moflex_subs_load_file(const char *path);              /* load + show a subtitle file (streams) */
+int  moflex_subs_stream_begin(void);                      /* subtitles that will arrive while playing */
+int  moflex_subs_append_srt(const char *text);            /* whole SRT blocks; returns cues added */
 int  moflex_fmt_load_key(const char *key);                 /* a video's saved 3D Format choice, -1 = none */
 /* Would the player show subtitles for this video at start? Its own saved on/off if it has one,
  * else the Playback Defaults (As found = off: nothing is "found" until a track is drawn). */

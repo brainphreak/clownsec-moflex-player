@@ -29,6 +29,8 @@
 #include "branding.h"
 #include "store.h"
 #include "plex.h"
+#include "bigtop.h"
+#include "httpfile.h"
 
 #define APP_VERSION "v1.0"
 #ifndef BUILD_TAG
@@ -616,9 +618,17 @@ static void upload_screen(void) {
                 }
             } else {
                 ui_text_center(UI_W / 2, 62, 1, UI_INK, "Server ON. On the same Wi-Fi, open:");
-                ui_text_center_fit(UI_W / 2, 84, 2, UI_NEONC, httpd_url(), UI_W - 16);
-                ui_text_center(UI_W / 2, 118, 1, UI_DIM, "Upload any files from the page.");
-                ui_text_center(UI_W / 2, 134, 1, UI_DIM, "Browse folders + delete there too.");
+                if (httpd_url_name()[0]) {   /* the short name, with the address as a fallback */
+                    ui_text_center_fit(UI_W / 2, 80, 2, UI_NEONC, httpd_url_name(), UI_W - 16);
+                    ui_text_center(UI_W / 2, 100, 1, UI_DIM, "or");
+                    ui_text_center_fit(UI_W / 2, 112, 1, UI_NEONC, httpd_url(), UI_W - 16);
+                    ui_text_center(UI_W / 2, 136, 1, UI_DIM, "Upload any files from the page.");
+                    ui_text_center(UI_W / 2, 152, 1, UI_DIM, "Browse folders + delete there too.");
+                } else {
+                    ui_text_center_fit(UI_W / 2, 84, 2, UI_NEONC, httpd_url(), UI_W - 16);
+                    ui_text_center(UI_W / 2, 118, 1, UI_DIM, "Upload any files from the page.");
+                    ui_text_center(UI_W / 2, 134, 1, UI_DIM, "Browse folders + delete there too.");
+                }
             }
             ui_present();
             redraw = 0;
@@ -1624,6 +1634,8 @@ static const signed char *s_pick_status = NULL;         /* optional per-item bad
  * screen, so a list used to leave whatever was already up there -- which is why every episode of
  * a show showed the SHOW's info. Set this to draw the highlighted item instead. */
 static void (*s_pick_top)(int item) = NULL;
+/* set (from any thread) when the top screen's art just arrived: the picker repaints its row */
+static volatile int s_pick_top_refresh = 0;
 static int s_pick_init = 0;   /* initial highlight ROW for the NEXT catalog_pick (one-shot):
                                * callers set it when re-showing a list so B-back lands where you were */
 static int catalog_pick(const char *title, const char *subtitle, char items[][64], int n, int show_all, const char *extra) {
@@ -1635,7 +1647,7 @@ static int catalog_pick(const char *title, const char *subtitle, char items[][64
     int sel = 0, top = 0, redraw = 1, td = 0, tx0 = 0, ty0 = 0, tsc0 = 0, tmv = 0;
     if (s_pick_init > 0) sel = s_pick_init < total ? s_pick_init : (total ? total - 1 : 0);
     s_pick_init = 0;   /* one-shot (the follow logic below scrolls it into view) */
-    int hfu = 0, hfd = 0;
+    int hfu = 0, hfd = 0, hfl = 0, hfr = 0;
     const int VIS = 5, ry0 = 54, rh = 30, gap = 4;
     while (aptMainLoop()) {
         hidScanInput();
@@ -1645,8 +1657,9 @@ static int catalog_pick(const char *title, const char *subtitle, char items[][64
         /* same fast navigation as the movie lists: hold to repeat, left/right = page jump */
         if (nav_repeat(k, kh, NAV_DOWN, &hfd)) { if (sel < total - 1) sel++; redraw = 1; }
         if (nav_repeat(k, kh, NAV_UP, &hfu))   { if (sel > 0) sel--; redraw = 1; }
-        if (k & KEY_RIGHT) { sel += VIS; if (sel > total - 1) sel = total - 1; redraw = 1; }
-        if (k & KEY_LEFT)  { sel -= VIS; if (sel < 0) sel = 0; redraw = 1; }
+        /* page jumps repeat while held, speeding up -- a 5000-movie library is 1000 pages */
+        if (nav_repeat(k, kh, KEY_RIGHT, &hfr)) { sel += VIS; if (sel > total - 1) sel = total - 1; redraw = 1; }
+        if (nav_repeat(k, kh, KEY_LEFT, &hfl))  { sel -= VIS; if (sel < 0) sel = 0; redraw = 1; }
         int act = (k & KEY_A) ? sel : -1;
         touchPosition tp; hidTouchRead(&tp);
         if (k & KEY_TOUCH) { td = 1; tx0 = tp.px; ty0 = tp.py; tsc0 = top; tmv = 0; }
@@ -1681,6 +1694,8 @@ static int catalog_pick(const char *title, const char *subtitle, char items[][64
                 else if (ptop_first || ++ptop_settle >= 5) {
                     ptop(item); ptop_drawn = item; ptop_settle = 0; ptop_first = 0;
                 }
+            } else if (s_pick_top_refresh && !(kh & (NAV_UP | NAV_DOWN | KEY_LEFT | KEY_RIGHT))) {
+                s_pick_top_refresh = 0; ptop(item);     /* its poster came in the background */
             }
         }
         if (redraw) {
@@ -5010,8 +5025,10 @@ static int extplay_launch(const char *path) {
 }
 
 static MoflexResult play_movie(const char *path) {
+    /* a Big Top video streams from the server: none of the card checks below apply to it */
+    int remote = !strncmp(path, "bigtop:", 7);
     /* filenames with FAT-illegal characters list fine but can never be OPENED -- offer to fix */
-    { const char *b0 = strrchr(path, '/'); b0 = b0 ? b0 + 1 : path;
+    if (!remote) { const char *b0 = strrchr(path, '/'); b0 = b0 ? b0 + 1 : path;
       static char fixed[PATHLEN + NAMELEN];
       if (fat_has_illegal(b0)) {
           if (prompt2("FILENAME", "This name has characters the 3DS\ncannot open (* ? \" < > | :).\nRename it and play?", "RENAME", "BACK") != 0)
@@ -5023,7 +5040,7 @@ static MoflexResult play_movie(const char *path) {
           lib_note_renamed(path, fixed);   /* keep the library entry pointed at the new name */
           path = fixed;
       } }
-    {   /* a library / recently-played entry still pointing where the file USED to be */
+    if (!remote) {   /* a library / recently-played entry still pointing where the file USED to be */
         struct stat st0;
         if (stat(path, &st0) != 0) {
             msg_screen("FILE NOT FOUND", "This video is not where it was. It may\nhave been moved, renamed or deleted.\n\n"
@@ -5033,7 +5050,7 @@ static MoflexResult play_movie(const char *path) {
         } }
     cia_clear_selection();
     const char *title_src = path; char titlebuf[NAMELEN];
-    if (cia_is_cia(path)) {
+    if (!remote && cia_is_cia(path)) {
         CiaMoflex list[64];
         int nc = cia_list_moflex(path, list, 64);
         if (nc == 0) {
@@ -5085,7 +5102,7 @@ static MoflexResult play_movie(const char *path) {
     }
     /* Movie Player mode: plain .moflex only (it cannot open a CIA or an MP4). It keeps its own
      * resume point, so ours is not asked about. */
-    if (g_extplay_ok && !cia_is_cia(path)) {
+    if (g_extplay_ok && !remote && !cia_is_cia(path)) {
         size_t L = strlen(path);
         if (L > 7 && !strcasecmp(path + L - 7, ".moflex")) {
             int use = extplay_pick(movie_is_3d(path));
@@ -5862,8 +5879,73 @@ static void plex_setup(void) {
     }
 }
 
-typedef struct { PlexCfg c; PlexItem it; char session[24]; int burn; } PlexPlay;
+typedef struct {
+    PlexCfg c; PlexItem it; char session[24]; int burn;
+    long long part;
+    PlexAudio aud[8]; int naud;
+    char alang[8][8], aname[8][48];
+    /* an embedded text track Plex copies out while the video plays (started once subtitles are on) */
+    long long fetch_id, fetch_select; PlexSubFetch *fetch; int fetch_tried;
+    /* the subtitle tracks (CC menu's Track row) and Plex's selection: put back as found */
+    PlexSub subs[16]; int nsub, cur; char sname[16][48];
+    long long orig_sel, plex_sel; int is3d;
+} PlexPlay;
 static void plex_src_set_burn(void *ctx, int on) { ((PlexPlay *)ctx)->burn = on; }
+static void plex_src_set_audio(void *ctx, int idx) {
+    PlexPlay *p = (PlexPlay *)ctx;
+    if (idx < 0 || idx >= p->naud) return;
+    plex_log("audio: switching to track %lld, %s", p->aud[idx].id, p->aname[idx]);
+    plex_select_audio(&p->c, p->part, p->aud[idx].id);       /* the next stream plays it */
+    plex_log("audio: the server now has track %lld selected", plex_selected_audio(&p->c, p->it.rating));
+}
+static int plex_src_subs_take(void *ctx, long long now_us, char *buf, int cap) {
+    PlexPlay *p = (PlexPlay *)ctx;
+    if (!p->fetch && !p->fetch_tried && p->fetch_id && moflex_subs_on()) {
+        p->fetch_tried = 1;
+        p->fetch = plex_subs_fetch_start(&p->c, p->it.rating, now_us / 1000000, p->part, p->fetch_select);
+        if (p->fetch && p->fetch_select) p->plex_sel = p->fetch_select;
+    }
+    return p->fetch ? plex_subs_fetch_take(p->fetch, buf, cap) : 0;
+}
+/* Make track idx the one shown: a text file (external, or a saved copy of an embedded one) loads
+ * as a file; an embedded text track without a copy streams in; a picture track is burned in by
+ * the server (2D only). Returns STREAM_SUB_* flags; path gets a file to load. */
+static int plex_sub_apply(PlexPlay *p, int idx, char *path, int cap) {
+    path[0] = 0;
+    if (idx < 0 || idx >= p->nsub) return 0;
+    if (p->fetch) {                       /* the previous track's fetch: keep it if it finished */
+        char cp[96]; plex_sub_cache_path(&p->c, p->fetch_id, cp, sizeof cp);
+        plex_subs_fetch_finish(p->fetch, cp); p->fetch = NULL;
+    }
+    p->fetch_id = 0; p->fetch_select = 0; p->fetch_tried = 0;
+    int was_burn = p->burn, fl = 0; p->burn = 0;
+    long long was_sel = p->plex_sel;
+    const PlexSub *s = &p->subs[idx]; p->cur = idx;
+    int text = plex_sub_is_text(s->codec);
+    if (s->key[0] && text) {              /* an external text file: drawn by the player */
+        snprintf(path, (size_t)cap, "sdmc:/moflex_player/.plexsub.%s", strcmp(s->codec, "srt") ? s->codec : "srt");
+        if (plex_download(&p->c, s->key, path)) fl = STREAM_SUB_FILE; else path[0] = 0;
+    } else if (plex_sub_fetchable(s->codec)) {   /* embedded SRT-type text: drawn by the player (both eyes in 3D) */
+        char cp[96]; plex_sub_cache_path(&p->c, s->id, cp, sizeof cp);
+        FILE *cf = fopen(cp, "rb");
+        if (cf) { fclose(cf); snprintf(path, (size_t)cap, "%s", cp); fl = STREAM_SUB_FILE; }   /* fetched before */
+        else { p->fetch_id = s->id; p->fetch_select = s->id == p->plex_sel ? 0 : s->id; fl = STREAM_SUB_ARRIVE; }
+    } else if (!p->is3d) {                /* a picture track, or embedded ASS (Plex won't copy that out): burned in */
+        if (s->id == p->plex_sel || plex_select_sub(&p->c, p->part, s->id)) {
+            p->plex_sel = s->id; p->burn = 1; fl = STREAM_SUB_BURN;
+        }
+    }
+    plex_log("subtitles: track %lld (%s%s) -> %s", s->id, s->codec, s->key[0] ? ", external" : "",
+             fl & STREAM_SUB_FILE ? "file" : fl & STREAM_SUB_ARRIVE ? "fetched while playing" :
+             fl & STREAM_SUB_BURN ? "burned in" : "not shown");
+    /* the picture changes when burning starts or stops -- or moves to another picture track */
+    if (was_burn != p->burn || (p->burn && was_sel != p->plex_sel)) fl |= STREAM_SUB_RESTART;
+    return fl;
+}
+static int plex_src_set_sub(void *ctx, int idx, long long now_us, char *path, int cap) {
+    (void)now_us;                         /* the fetch starts from where playback is, via subs_take */
+    return plex_sub_apply((PlexPlay *)ctx, idx, path, cap);
+}
 static HttpStream *plex_src_open(void *ctx, long long at_us, int fmt) {
     PlexPlay *p = (PlexPlay *)ctx;
     /* burned-in subtitles would straddle both eyes of a side-by-side frame */
@@ -5894,23 +5976,29 @@ static void plex_src_report(void *ctx, const char *state, long long pos_us) {
 }
 static const char *plex_src_error(void *ctx) { (void)ctx; return plex_error(); }
 
-/* 3D layout of a Plex item: the edition says it ("3D Half SBS" / "3D Full SBS"); untagged, a
- * double-wide frame is full SBS and anything else in a "3D" library is half SBS. */
+/* 3D layout of a Plex item, from the item alone (a "3D" library can hold 2D copies too): the
+ * edition says it ("2D" / "3D Half SBS" / "3D Full SBS"); else "3D"/"SBS" in the edition or the
+ * title, laid out full SBS when the frame is double-wide and half SBS otherwise; else a
+ * double-wide frame is full SBS; else 2D. */
 static int plex_fmt(const PlexItem *it, int lib3d) {
+    (void)lib3d;
     if (ci_contains(it->edition, "full sbs") || ci_contains(it->edition, "fsbs")) return 1;
     if (ci_contains(it->edition, "half sbs") || ci_contains(it->edition, "hsbs") ||
         ci_contains(it->edition, "half-sbs")) return 2;
-    if (ci_contains(it->edition, "sbs") || ci_contains(it->edition, "3d") || lib3d) {
-        if (it->width && it->height && it->width * 10 > it->height * 27) return 1;
-        return 2;
-    }
-    return 0;
+    int wide = it->width && it->height && it->width * 10 > it->height * 27;
+    if (ci_contains(it->edition, "2d")) return 0;
+    if (ci_contains(it->edition, "sbs") || ci_contains(it->edition, "3d") ||
+        ci_contains(it->title, " 3d") || ci_contains(it->title, "sbs"))
+        return wide ? 1 : 2;
+    return wide ? 1 : 0;
 }
 /* returns the player's result (MOFLEX_QUIT_EXIT = the app is closing). from_us >= 0: start there
  * without asking (RESUME on the home card); < 0: offer Plex's resume point. */
 static MoflexResult plex_play(const PlexCfg *c, const PlexItem *it, int lib3d, long long from_us) {
     static PlexPlay p;
     p.c = *c; p.it = *it; p.session[0] = 0; p.burn = 0;
+    p.part = 0; p.naud = 0; p.fetch_id = 0; p.fetch_select = 0; p.fetch = NULL; p.fetch_tried = 0;
+    p.nsub = 0; p.cur = 0; p.orig_sel = 0; p.plex_sel = 0; p.is3d = 0;
     long long start = from_us > 0 ? from_us : 0;
     if (from_us < 0 && it->offset_ms > 10000 && (it->duration_ms <= 0 || it->offset_ms < it->duration_ms - 30000)) {
         long t = (long)(it->offset_ms / 1000);
@@ -5927,44 +6015,81 @@ static MoflexResult plex_play(const PlexCfg *c, const PlexItem *it, int lib3d, l
     /* ---- subtitles: which track (Playback Defaults), and how (drawn by us / burned by Plex) ---- */
     int fmt = plex_fmt(it, lib3d);
     static char subfile[96]; subfile[0] = 0;
-    PlexSub subs[16]; long long part = 0, orig_sel = 0, burn_id = 0; char alang[8] = "";
+    PlexSub *subs = p.subs; long long part = 0; char alang[8] = "";
     /* the steps before the playback screen say what they're doing: the playback screen stays
      * dark until the first frame, so a slow or refusing server must be visible HERE */
     {   char lw[200]; snprintf(lw, sizeof lw, "Playing \"%s\" (item %s) from %s, start %llds, 3D fmt %d",
                                it->title, it->rating, c->url, start / 1000000, plex_fmt(it, lib3d));
         plex_log_begin(lw); }
     msg_screen_nowait(it->title, "Getting the video's details...");
-    int ns = plex_item_streams(c, it->rating, subs, 16, &part, alang, sizeof alang);
+    int ns = plex_item_streams(c, it->rating, subs, 16, &part, alang, sizeof alang, p.aud, 8, &p.naud);
+    p.part = part;
+    /* audio: the track Plex has selected for this item -- unless Playback Defaults names a
+     * language that track isn't and another one is (then that becomes Plex's choice too) */
+    int asel = 0;
+    for (int i = 0; i < p.naud; i++) if (p.aud[i].selected) asel = i;
+    {   MoflexDefaults d; moflex_defaults_get(&d);
+        if (p.naud > 1 && d.alang > 0 && !moflex_lang_match(p.aud[asel].lang, d.alang))
+            for (int i = 0; i < p.naud; i++)
+                if (moflex_lang_match(p.aud[i].lang, d.alang)) {
+                    if (plex_select_audio(c, part, p.aud[i].id)) asel = i;
+                    break;
+                }
+    }
+    for (int i = 0; i < p.naud; i++) {
+        /* Plex names a track in its language's own script ("日本語 (Opus Stereo)"), which the
+         * player's font can't draw: name it from the language code instead */
+        const PlexAudio *a = &p.aud[i];
+        const char *ln = plex_lang_name(a->lang);
+        char par[32]; plex_paren(a->title, par, sizeof par);
+        char base[40]; snprintf(base, sizeof base, "%s", ln[0] ? ln : a->lang[0] ? a->lang : "Track");
+        if (!ln[0] && !a->lang[0] && a->title[0] && (unsigned char)a->title[0] < 0x80)
+            snprintf(base, sizeof base, "%.39s", a->title);              /* no language: Plex's name, if readable */
+        if (a->name[0] && !ci_contains(base, a->name))
+            snprintf(p.aname[i], sizeof p.aname[i], "%.16s - %.14s%s%.12s%s", base, a->name,
+                     par[0] ? " (" : "", par, par[0] ? ")" : "");
+        else
+            snprintf(p.aname[i], sizeof p.aname[i], "%.30s%s%.14s%s", base, par[0] ? " (" : "", par, par[0] ? ")" : "");
+        snprintf(p.alang[i], sizeof p.alang[i], "%s", a->lang);
+    }
+    if (p.naud > 0) snprintf(alang, sizeof alang, "%s", p.aud[asel].lang);
     if (ns < 0 && part == 0) {
         char m[240]; snprintf(m, sizeof m, "The server didn't send the video's\ndetails.\n\n%s\n\nDetails: moflex_player/plex_log.txt", plex_error());
         plex_log_end(); msg_screen("PLEX", m); return MOFLEX_QUIT_BACK;
     }
     {   int saved = moflex_fmt_load_key(key); if (saved >= 0) fmt = saved; }   /* the Format row's choice */
     int burnable = 0, subs_on = moflex_subs_wanted(key, alang);   /* the PLAYER's switch decides */
+    int pick = -1;
+    p.is3d = fmt != 0;
     if (ns > 0) {
         MoflexDefaults d; moflex_defaults_get(&d);
-        int pick = -1, sel = -1;
-        for (int i = 0; i < ns; i++) if (subs[i].selected) { sel = i; orig_sel = subs[i].id; }
+        int sel = -1;
+        p.nsub = ns;
+        for (int i = 0; i < ns; i++) {
+            if (subs[i].selected) { sel = i; p.orig_sel = p.plex_sel = subs[i].id; }
+            char cu[12]; snprintf(cu, sizeof cu, "%s", subs[i].codec);
+            for (char *q = cu; *q; q++) if (*q >= 'a' && *q <= 'z') *q -= 32;
+            const char *ln = plex_lang_name(subs[i].lang);   /* Plex's own title may be in a script we can't draw */
+            const char *t = ln[0] ? ln : subs[i].lang[0] ? subs[i].lang
+                          : (subs[i].title[0] && (unsigned char)subs[i].title[0] < 0x80) ? subs[i].title : "Track";
+            /* the file's own track name says what Plex's title hides: two "English" tracks are
+             * often the full one and a forced-only one */
+            const char *nm = subs[i].name;
+            if (nm[0] && !ci_contains(t, nm))
+                snprintf(p.sname[i], sizeof p.sname[i], "%.20s - %.14s [%s]", t, nm, cu);
+            else
+                snprintf(p.sname[i], sizeof p.sname[i], "%.30s%s [%s]", t,
+                         subs[i].forced && !ci_contains(t, "forced") ? " Forced" : "", cu);
+        }
         /* the track to use whenever subtitles are on: Plex's own selection, else the preferred
          * language (not a forced-only track), else the first */
         const char *want = d.slang > 0 ? moflex_lang_code(d.slang) : "ENG";
         pick = sel;
         for (int i = 0; i < ns && pick < 0; i++) if (!subs[i].forced && !strcasecmp(subs[i].lang, want)) pick = i;
         if (pick < 0) pick = 0;
-        if (pick >= 0) {
-            const PlexSub *s = &subs[pick];
-            int text = !strcmp(s->codec, "srt") || !strcmp(s->codec, "ass") || !strcmp(s->codec, "ssa") ||
-                       !strcmp(s->codec, "subrip");
-            if (s->key[0] && text) {              /* an external text file: drawn by the player */
-                msg_screen_nowait(it->title, "Getting subtitles...");
-                snprintf(subfile, sizeof subfile, "sdmc:/moflex_player/.plexsub.%s", strcmp(s->codec, "srt") ? s->codec : "srt");
-                if (!plex_download(c, s->key, subfile)) subfile[0] = 0;
-            } else if (fmt == 0) {                /* embedded: Plex burns the selected track in */
-                if (s->id == orig_sel || plex_select_sub(c, part, s->id)) {
-                    burnable = 1; burn_id = s->id; p.burn = subs_on;
-                }
-            }
-        }
+        msg_screen_nowait(it->title, "Getting subtitles...");
+        int fl = plex_sub_apply(&p, pick, subfile, sizeof subfile);
+        if (fl & STREAM_SUB_BURN) { burnable = 1; p.burn = subs_on; }
     }
 
     /* will the server make the stream? (it answers why not -- shown here, not on a dark screen) */
@@ -5973,7 +6098,7 @@ static MoflexResult plex_play(const PlexCfg *c, const PlexItem *it, int lib3d, l
         if (!plex_stream_check(c, it->rating, start, sfmt != 0, p.burn && sfmt == 0)) {
             char m[260]; snprintf(m, sizeof m, "The server can't stream this.\n\n%s\n\nDetails: moflex_player/plex_log.txt", plex_error());
             plex_log_end(); msg_screen("PLEX", m);
-            if (burn_id && burn_id != orig_sel) plex_select_sub(c, part, orig_sel);
+            if (p.plex_sel != p.orig_sel) plex_select_sub(c, part, p.orig_sel);
             return MOFLEX_QUIT_BACK;
         }
         msg_screen_nowait(it->title, "Starting the video...\n(the screen stays dark until it\narrives -- up to 30 seconds)");
@@ -5986,10 +6111,17 @@ static MoflexResult plex_play(const PlexCfg *c, const PlexItem *it, int lib3d, l
         if (g) { fprintf(g, "%d\n%s\n", lib3d, title); fclose(g); } }
     StreamSrc s = { &p, title, key, it->duration_ms * 1000, start, plex_fmt(it, lib3d),
                     plex_src_open, plex_src_close, plex_src_report, plex_src_error, subfile,
-                    burnable, subs_on, plex_src_set_burn };
+                    burnable, subs_on, plex_src_set_burn,
+                    p.naud, asel, (const char (*)[8])p.alang, (const char (*)[48])p.aname, plex_src_set_audio,
+                    p.nsub > 0 ? plex_src_subs_take : NULL,
+                    p.nsub, pick, (const char (*)[48])p.sname, plex_src_set_sub };
     MoflexResult r = stream_play(&s);
+    if (p.fetch) {                        /* keep a whole track for next time */
+        char cp[96]; plex_sub_cache_path(c, p.fetch_id, cp, sizeof cp);
+        plex_subs_fetch_finish(p.fetch, cp); p.fetch = NULL;
+    }
+    if (p.plex_sel != p.orig_sel) plex_select_sub(c, part, p.orig_sel);   /* leave Plex's choice as it was */
     plex_log_end();
-    if (burn_id && burn_id != orig_sel) plex_select_sub(c, part, orig_sel);   /* leave Plex's choice as it was */
     consoleInit(GFX_BOTTOM, NULL);
     gfxSetDoubleBuffering(GFX_BOTTOM, false);
     branding_show();
@@ -6004,6 +6136,15 @@ static int plex_playable(const PlexItem *it) {
  * resizes it; cached on the card like catalog art), title, year, genres, rating, runtime, summary. */
 static const PlexItem *s_plex_items = NULL; static int s_plex_n = 0;
 static PlexCfg s_plex_cfg;
+/* one poster download at a time, off the UI thread; the picker repaints when it lands */
+static volatile int s_pf_busy = 0;
+static char s_pf_url[640], s_pf_key[200];                /* the last one asked for (never twice) */
+static void plex_poster_thread(void *a) {
+    (void)a;
+    static u16 buf[POSTER_W * POSTER_H];
+    poster_get(s_pf_url, s_pf_key, buf, POSTER_W, POSTER_H);   /* lands in the card's art cache */
+    s_pf_busy = 0; s_pick_top_refresh = 1;
+}
 static void plex_draw_top(int i) {
     if (!s_plex_items || i < 0 || i >= s_plex_n) return;
     const PlexItem *e = &s_plex_items[i];
@@ -6024,9 +6165,16 @@ static void plex_draw_top(int i) {
     static u16 art[POSTER_W * POSTER_H];
     int have = 0;
     if (e->poster[0] && strncmp(e->poster, "/:/resources", 12)) {   /* skip Plex's stock section icons */
-        char url[640]; plex_art_url(&s_plex_cfg, e->poster, POSTER_W, POSTER_H, url, sizeof url);
         char key[200]; snprintf(key, sizeof key, "plex%s", e->poster);   /* the thumb path is versioned */
-        have = poster_get(url, key, art, POSTER_W, POSTER_H);
+        have = poster_cached(key, art, POSTER_W, POSTER_H);
+        /* not on the card yet: fetch it in the background so the list keeps moving (it used to
+         * download right here, holding the buttons for a second per row over a slow link) */
+        if (!have && !s_pf_busy && strcmp(key, s_pf_key)) {
+            plex_art_url(&s_plex_cfg, e->poster, POSTER_W, POSTER_H, s_pf_url, sizeof s_pf_url);
+            snprintf(s_pf_key, sizeof s_pf_key, "%s", key);
+            s_pf_busy = 1;
+            if (!threadCreate(plex_poster_thread, NULL, 128 * 1024, 0x3F, -2, true)) s_pf_busy = 0;
+        }
     }
     draw_info_top(&m, have ? art : NULL);
 }
@@ -6061,6 +6209,8 @@ static int plex_browse(void) {
     int lib3d = 0;                            /* inside a library named "...3D..." */
     static char path[8][192], ttl[8][96];
     int depth = 0, presel[8] = { 0 };
+    static char filt[8][64];                  /* X: a search typed at each level ("" = none) */
+    for (int d = 0; d < 8; d++) filt[d][0] = 0;
     /* each level's list is kept while you're below it, so going back never downloads it again;
      * a whole library (stamp > 0) is also kept on the SD card for next time */
     PlexItem *lst[8] = { 0 }; int lstn[8] = { 0 }; long long stamp[8] = { 0 };
@@ -6083,27 +6233,61 @@ static int plex_browse(void) {
         }
         PlexItem *it = lst[depth]; int n = lstn[depth];
         char (*names)[64] = (char (*)[64])malloc((size_t)n * 64);
-        if (!names) PLEX_BROWSE_DONE(0);
+        int *map = (int *)malloc((size_t)n * sizeof(int));     /* shown row -> list index */
+        if (!names || !map) { free(names); free(map); PLEX_BROWSE_DONE(0); }
+        int shown = 0;
         for (int i = 0; i < n; i++) {
             const PlexItem *e = &it[i];
+            if (filt[depth][0] && !ci_contains(e->title, filt[depth])) continue;
+            map[shown] = i;
             const char *mark = (plex_playable(e) && e->viewed) ? "* " : "";
+            char *nm = names[shown++];
             if (!strcmp(e->type, "episode"))
-                snprintf(names[i], 64, "%s%d. %s", mark, e->index, e->title);
+                snprintf(nm, 64, "%s%d. %s", mark, e->index, e->title);
             else if (e->year && (!strcmp(e->type, "movie") || !strcmp(e->type, "show")))
-                snprintf(names[i], 64, "%s%s (%d)%s%s%s", mark, e->title, e->year,
+                snprintf(nm, 64, "%s%s (%d)%s%s%s", mark, e->title, e->year,
                          e->edition[0] ? " [" : "", e->edition, e->edition[0] ? "]" : "");
-            else snprintf(names[i], 64, "%s%s%s%s%s", mark, e->title,
+            else snprintf(nm, 64, "%s%s%s%s%s", mark, e->title,
                           e->edition[0] ? " [" : "", e->edition, e->edition[0] ? "]" : "");
         }
-        s_pick_init = presel[depth];
-        s_plex_items = it; s_plex_n = n; s_plex_cfg = c;
+        if (filt[depth][0] && shown == 0) {
+            free(names); free(map);
+            char m[120]; snprintf(m, sizeof m, "Nothing here matches\n\"%s\".", filt[depth]);
+            msg_screen(ttl[depth], m);
+            filt[depth][0] = 0; continue;
+        }
+        /* the highlighted row survives a search: find the same item among the rows shown */
+        s_pick_init = 0;
+        for (int r = 0; r < shown; r++) if (map[r] == presel[depth]) { s_pick_init = r; break; }
+        char sub[80] = "";
+        if (filt[depth][0]) snprintf(sub, sizeof sub, "Search: %s  (B clears)", filt[depth]);
+        /* the info view reads the rows it is shown: hand it the filtered items */
+        PlexItem *view = it;
+        if (filt[depth][0]) {
+            view = (PlexItem *)malloc((size_t)shown * sizeof(PlexItem));
+            if (view) for (int r = 0; r < shown; r++) view[r] = it[map[r]];
+            else view = it;
+        }
+        s_plex_items = view; s_plex_n = view == it ? n : shown; s_plex_cfg = c;
         s_pick_top = plex_draw_top;           /* poster + info for the highlighted row */
         gfxSet3D(false);                      /* the info view is 2D: the 3D logo must not stay in the right eye */
-        int sel = catalog_pick(ttl[depth], NULL, names, n, 0, NULL);
+        int sel = catalog_pick(ttl[depth], sub[0] ? sub : NULL, names, shown, 0, NULL);
         s_plex_items = NULL; s_plex_n = 0;
+        if (view != it) free(view);
         branding_show();                      /* the logo back while the next list loads */
         free(names);
-        if (sel < 0 || sel >= n) { PLEX_UP(); if (depth == 0) lib3d = 0; continue; }
+        if (sel == -4) {                      /* X: search this list (B clears it) */
+            free(map);
+            char q[64]; snprintf(q, sizeof q, "%s", filt[depth]);
+            if (kbd_text("Search", q, sizeof q)) snprintf(filt[depth], sizeof filt[depth], "%s", q);
+            continue;
+        }
+        if (sel < 0 || sel >= shown) {
+            free(map);
+            if (filt[depth][0]) { filt[depth][0] = 0; continue; }   /* B: drop the search first */
+            PLEX_UP(); if (depth == 0) lib3d = 0; continue;
+        }
+        sel = map[sel]; free(map);
         presel[depth] = sel;
         PlexItem pick = it[sel];
         if (plex_playable(&pick)) {
@@ -6123,7 +6307,7 @@ static int plex_browse(void) {
             }
         } else if (depth < 7 && pick.key[0]) {
             if (depth == 0) lib3d = ci_contains(pick.title, "3d");
-            depth++; presel[depth] = 0;
+            depth++; presel[depth] = 0; filt[depth][0] = 0;
             free(lst[depth]); lst[depth] = NULL;
             stamp[depth] = depth == 1 ? pick.stamp : 0;     /* a whole library: cache it */
             snprintf(path[depth], sizeof path[depth], "%s", pick.key);
@@ -6134,18 +6318,21 @@ static int plex_browse(void) {
     #undef PLEX_BROWSE_DONE
 }
 
+static void bt_setup(void);   /* the Big Top server screen (defined with BIG TOP below) */
 /* X on home: everything that is a setting rather than a video */
 static void settings_menu(void) {
     for (;;) {
-        char r1[40]; const char *rows[4]; int act[4], n = 0;
+        char r1[40]; const char *rows[6]; int act[6], n = 0;
         rows[n] = "PLAYBACK DEFAULTS"; act[n++] = 0;
         rows[n] = "PLEX SERVER"; act[n++] = 2;
+        rows[n] = "BIG TOP SERVER"; act[n++] = 3;
         if (g_extplay_ok) { snprintf(r1, sizeof r1, "OLD 3DS: PLAY MOVIES WITH..."); rows[n] = r1; act[n++] = 1; }
         rows[n] = "DONE"; act[n++] = -1;
         int c = ui_menu("SETTINGS", g_extplay_ok ? "Audio, subtitles and players" : "Audio and subtitles", rows, n);
         if (c < 0 || act[c] < 0) return;
         if (act[c] == 0) playback_defaults_screen();
         else if (act[c] == 2) plex_setup();
+        else if (act[c] == 3) bt_setup();
         else extplay_choose();
     }
 }
@@ -6294,18 +6481,316 @@ static int recent_pick(char *out, size_t cap) {
     return 1;
 }
 
+
+/* ---------- CLOWNSEC BIG TOP (moflex from a computer on the network) ----------
+ * The server is the Big Top app (Windows / macOS / Linux). Moflex files stream as they are --
+ * the server converts nothing -- through a "bigtop:" path that the playback engine opens over
+ * HTTP (moflex_set_open_hook -> bt_open_media). */
+static void bt_draw_top(int i);
+static const BtItem *s_bt_items = NULL; static int s_bt_n = 0;
+static BtCfg s_bt_cfg;
+
+/* "192.168.1.20" / "192.168.1.20:32500" / "http://..." -> a full base URL */
+static void bt_norm_url(const char *in, char *out, int cap) {
+    while (*in == ' ') in++;
+    char host[120]; snprintf(host, sizeof host, "%s", strncmp(in, "http://", 7) ? in : in + 7);
+    size_t L = strlen(host); while (L && (host[L - 1] == '/' || host[L - 1] == ' ')) host[--L] = 0;
+    snprintf(out, (size_t)cap, strchr(host, ':') ? "http://%s" : "http://%s:32500", host);
+}
+
+static void bt_setup(void) {
+    for (;;) {
+        BtCfg c; int have = bt_cfg_load(&c);
+        char sub[120];
+        snprintf(sub, sizeof sub, "%s", have ? (c.name[0] ? c.name : c.url) : "No server chosen yet");
+        const char *rows[4] = { "FIND SERVERS ON THIS WI-FI", "ENTER ADDRESS", have ? "FORGET THIS SERVER" : "DONE", "DONE" };
+        int k = ui_menu("BIG TOP SERVER", sub, rows, have ? 4 : 3);
+        if (k < 0 || (!have && k == 2) || k == 3) return;
+        if (k == 0) {
+            msg_screen_nowait("BIG TOP SERVER", "Looking for Big Top on this Wi-Fi...");
+            BtServer sv[8]; int n = bt_discover(sv, 8, 2500);
+            if (n <= 0) {
+                msg_screen("BIG TOP SERVER", "No Big Top server answered.\n\nIs Big Top running on the computer,\nand allowed through its firewall?\n\n"
+                                             "Or choose ENTER ADDRESS and type\nthe address its setup page shows.");
+                continue;
+            }
+            int pick = 0;
+            if (n > 1) {
+                char names[8][64];
+                for (int i = 0; i < n; i++) snprintf(names[i], 64, "%s", sv[i].name[0] ? sv[i].name : sv[i].url);
+                pick = catalog_pick("CHOOSE A SERVER", NULL, names, n, 0, NULL);
+                if (pick < 0) continue;
+            }
+            snprintf(c.url, sizeof c.url, "%s", sv[pick].url); snprintf(c.name, sizeof c.name, "%s", sv[pick].name);
+            snprintf(c.id, sizeof c.id, "%s", sv[pick].id);
+            bt_cfg_save(&c);
+            char m[200]; snprintf(m, sizeof m, "Using %s\n%s", c.name, c.url);
+            msg_screen("BIG TOP SERVER", m);
+            return;
+        }
+        if (k == 1) {
+            char in[96] = "";
+            if (!kbd_text("Big Top address, e.g. 192.168.1.20", in, sizeof in)) continue;
+            char url[128]; bt_norm_url(in, url, sizeof url);
+            msg_screen_nowait("BIG TOP SERVER", "Connecting...");
+            BtServer info;
+            if (!bt_ping(url, &info)) { char m[260]; snprintf(m, sizeof m, "No Big Top at %s\n\n%s", url, bt_error()); msg_screen("BIG TOP SERVER", m); continue; }
+            snprintf(c.url, sizeof c.url, "%s", url); snprintf(c.name, sizeof c.name, "%s", info.name);
+            snprintf(c.id, sizeof c.id, "%s", info.id);
+            bt_cfg_save(&c);
+            char m[200]; snprintf(m, sizeof m, "Using %s\n%s", c.name, c.url);
+            msg_screen("BIG TOP SERVER", m);
+            return;
+        }
+        if (k == 2 && have) { c.url[0] = c.name[0] = c.id[0] = 0; bt_cfg_save(&c); }
+    }
+}
+
+/* Play one video: the server's resume point is offered (it knows where this console -- or this
+ * console before a reinstall -- stopped), then progress goes back to it. 1 = the app is closing. */
+static int bt_play(const BtCfg *c, const BtItem *it, const char *title) {
+    static char path[300];
+    bt_media_path(c, it, title, path, sizeof path);
+    BtItem fresh;                                         /* the list may be minutes old */
+    long long pos_ms = bt_item(c, it->id, &fresh) ? fresh.pos : it->pos;
+    if (pos_ms > 10000) moflex_resume_save(path, pos_ms * 1000);
+    else moflex_resume_clear(path);
+    /* subtitle files beside the video on the server: into moviedata/ under the video's name, where
+     * the player looks for a movie's subtitles -- the default track (or the preferred language)
+     * as "<name>.srt" so it loads by itself, the rest labelled for CC > Load subtitle file... */
+    {   BtSub subs[16]; int ns = bt_subs(c, it->id, subs, 16);
+        if (ns > 0) {
+            msg_screen_nowait(title, "Getting subtitles...");
+            const char *bn = strrchr(path, '/'); bn = bn ? bn + 1 : path;
+            char stem[200]; snprintf(stem, sizeof stem, "%s", bn);
+            char *dot = strrchr(stem, '.'); if (dot) *dot = 0;
+            mkdir("sdmc:/moflex_player/moviedata", 0777);
+            static const char *const ex[3] = { "srt", "ass", "ssa" };
+            char fn[320];
+            for (int k = 0; k < 3; k++) {         /* last time's copies: a file gone from the server goes */
+                snprintf(fn, sizeof fn, "sdmc:/moflex_player/moviedata/%s.%s", stem, ex[k]); remove(fn);
+            }
+            int def = -1;
+            for (int i = 0; i < ns && def < 0; i++) if (!subs[i].label[0]) def = i;
+            if (def < 0) {                        /* no plain one: the preferred language, not forced */
+                MoflexDefaults d; moflex_defaults_get(&d);
+                for (int i = 0; i < ns && def < 0; i++) {
+                    char tok[16]; snprintf(tok, sizeof tok, "%s", subs[i].label);
+                    char *q = strpbrk(tok, ". "); if (q) *q = 0;
+                    if (!subs[i].forced && moflex_lang_match(tok, d.slang > 0 ? d.slang : 1)) def = i;
+                }
+            }
+            for (int i = 0; i < ns; i++) {
+                if (i == def) snprintf(fn, sizeof fn, "sdmc:/moflex_player/moviedata/%s.%s", stem, subs[i].ext);
+                else {
+                    char lab[48]; snprintf(lab, sizeof lab, "%s", subs[i].label);
+                    for (char *q = lab; *q; q++) if (strchr("/\\:*?\"<>|", *q)) *q = '-';
+                    snprintf(fn, sizeof fn, "sdmc:/moflex_player/moviedata/%s.%s.%s", stem, lab[0] ? lab : "track", subs[i].ext);
+                }
+                bt_sub_download(c, it->id, subs[i].n, fn);
+            }
+        }
+    }
+    /* the first seconds are the player reading the start (and end) of the file over Wi-Fi */
+    msg_screen_nowait(title, "Connecting to Big Top...");
+    httpfile_reset();
+    MoflexResult r = play_movie(path);
+    long long at = moflex_resume_get(path);               /* where the engine stopped (0 = the end) */
+    long long dur = (long long)it->runtime * 60000;
+    int gave_up = httpfile_gave_up();
+    if (gave_up) {
+        /* a read gave up, which the engine takes for the end of the file: not watched, and the
+         * place it was is the last one the server heard (it may have been mid-seek) */
+        moflex_resume_save(path, pos_ms * 1000);
+        if (gave_up == 2) msg_screen("BIG TOP", "Lost the connection to Big Top.\n\nIs the computer still on and on\nthis Wi-Fi?");
+    } else if (r == MOFLEX_EOF) { bt_progress(c, it->id, dur, dur, "stopped"); bt_watched(c, it->id, 1); }
+    else if (r != MOFLEX_QUIT_EXIT || at > 0) bt_progress(c, it->id, at / 1000, dur, "stopped");
+    return r == MOFLEX_QUIT_EXIT;
+}
+
+static void bt_row(const BtItem *e, char *out) {
+    const char *mark = e->watched ? "* " : "";
+    if (!strcmp(e->type, "lib")) snprintf(out, 64, "%s", e->title);
+    else if (!strcmp(e->type, "episode")) snprintf(out, 64, "%s%d. %s", mark, e->episode, e->title);
+    else if (!strcmp(e->type, "season")) snprintf(out, 64, "%s  (%d/%d)", e->title, e->seen, e->episodes);
+    else if (!strcmp(e->type, "show")) snprintf(out, 64, "%s%s%.0d%s", e->title, e->year ? " (" : "", e->year, e->year ? ")" : "");
+    else if (e->year) snprintf(out, 64, "%s%s (%d)", mark, e->title, e->year);
+    else snprintf(out, 64, "%s%s", mark, e->title);
+}
+
+/* the top screen for the highlighted row: the same info view as the library and Plex */
+static void bt_draw_top(int i) {
+    if (!s_bt_items || i < 0 || i >= s_bt_n) return;
+    const BtItem *e = &s_bt_items[i];
+    CatEntry m; memset(&m, 0, sizeof m);
+    if (!strcmp(e->type, "lib")) {
+        snprintf(m.name, sizeof m.name, "%s", e->title);
+        snprintf(m.desc, sizeof m.desc, "%d movies, %d shows", e->episodes, e->seen);
+        snprintf(m.category, sizeof m.category, "Big Top");
+        draw_info_top(&m, NULL);
+        return;
+    }
+    if (!strcmp(e->type, "episode")) snprintf(m.name, sizeof m.name, "S%02dE%02d %s", e->season, e->episode, e->title);
+    else if (e->year) snprintf(m.name, sizeof m.name, "%s (%d)", e->title, e->year);
+    else snprintf(m.name, sizeof m.name, "%s", e->title);
+    snprintf(m.title, sizeof m.title, "%s", e->title);
+    snprintf(m.genres, sizeof m.genres, "%s", e->genres);
+    snprintf(m.desc, sizeof m.desc, "%s", e->summary);
+    if (!m.desc[0] && e->episodes) snprintf(m.desc, sizeof m.desc, "%d episodes, %d watched", e->episodes, e->seen);
+    snprintf(m.category, sizeof m.category, "Big Top");
+    m.year = e->year; m.runtime = e->runtime; m.is3d = e->is3d;
+    static u16 art[POSTER_W * POSTER_H];
+    int have = 0;
+    if (e->poster) {
+        char key[96];
+        snprintf(key, sizeof key, "bigtop_%s_%s", s_bt_cfg.id, e->id);
+        for (char *q = key; *q; q++) if (*q == '/') *q = '_';
+        have = poster_cached(key, art, POSTER_W, POSTER_H);
+        if (!have && !s_pf_busy && strcmp(key, s_pf_key)) {   /* fetched in the background (see Plex) */
+            bt_poster_url(&s_bt_cfg, e, POSTER_W, POSTER_H, s_pf_url, sizeof s_pf_url);
+            snprintf(s_pf_key, sizeof s_pf_key, "%s", key);
+            s_pf_busy = 1;
+            if (!threadCreate(plex_poster_thread, NULL, 128 * 1024, 0x3F, -2, true)) s_pf_busy = 0;
+        }
+    }
+    draw_info_top(&m, have ? art : NULL);
+}
+
+/* OPEN VIDEO -> BIG TOP: libraries -> movies and shows -> seasons -> episodes. 1 = exit app. */
+static int bt_browse(void) {
+    BtCfg c;
+    if (!bt_cfg_load(&c)) {
+        if (prompt2("BIG TOP", "No Big Top server is set up yet.\n\nBig Top streams the moflex files on\nyour computer to this 3DS.",
+                    "SET UP", "BACK") != 0) return 0;
+        bt_setup();
+        if (!bt_cfg_load(&c)) return 0;
+    }
+    s_bt_cfg = c;
+    static char path[6][128], ttl[6][96], filt[6][64];
+    int depth = 0, presel[6] = { 0 };
+    BtItem *lst[6] = { 0 }; int lstn[6] = { 0 };
+    for (int d = 0; d < 6; d++) filt[d][0] = 0;
+    #define BT_DONE(rv) do { for (int d_ = 0; d_ < 6; d_++) free(lst[d_]); return (rv); } while (0)
+    #define BT_UP() do { free(lst[depth]); lst[depth] = NULL; if (depth == 0) BT_DONE(0); depth--; } while (0)
+    snprintf(ttl[0], sizeof ttl[0], "%s", c.name[0] ? c.name : "BIG TOP");
+    path[0][0] = 0;                                       /* level 0: the libraries */
+    for (;;) {
+        if (!lst[depth]) {
+            msg_screen_nowait(ttl[depth], "Loading...");
+            BtItem *got = NULL;
+            int k = depth == 0 ? bt_libraries(&c, &got) : bt_list(&c, path[depth], &got);
+            if (k < 0) {
+                free(got);
+                if (depth == 0 && prompt2("BIG TOP", bt_error(), "CHANGE SERVER", "BACK") == 0) {
+                    bt_setup(); if (!bt_cfg_load(&c)) BT_DONE(0);
+                    s_bt_cfg = c; snprintf(ttl[0], sizeof ttl[0], "%s", c.name[0] ? c.name : "BIG TOP");
+                    continue;
+                }
+                if (depth > 0) msg_screen("BIG TOP", bt_error());
+                BT_UP(); continue;
+            }
+            if (k == 0) {
+                free(got);
+                msg_screen(ttl[depth], depth == 0 ? "This server has no libraries yet.\n\nAdd your moflex folders in Big Top's\nsetup page on the computer."
+                                                  : "Nothing here.");
+                BT_UP(); continue;
+            }
+            /* a library with one movie list and no shows still goes through this level */
+            lst[depth] = got; lstn[depth] = k;
+        }
+        BtItem *it = lst[depth]; int n = lstn[depth];
+        char (*names)[64] = (char (*)[64])malloc((size_t)n * 64);
+        int *map = (int *)malloc((size_t)n * sizeof(int));
+        if (!names || !map) { free(names); free(map); BT_DONE(0); }
+        int shown = 0;
+        for (int i = 0; i < n; i++) {
+            if (filt[depth][0] && !ci_contains(it[i].title, filt[depth])) continue;
+            map[shown] = i; bt_row(&it[i], names[shown]); shown++;
+        }
+        if (filt[depth][0] && shown == 0) {
+            free(names); free(map);
+            char m[120]; snprintf(m, sizeof m, "Nothing here matches\n\"%s\".", filt[depth]);
+            msg_screen(ttl[depth], m); filt[depth][0] = 0; continue;
+        }
+        s_pick_init = 0;
+        for (int r = 0; r < shown; r++) if (map[r] == presel[depth]) { s_pick_init = r; break; }
+        char sub[80] = "";
+        if (filt[depth][0]) snprintf(sub, sizeof sub, "Search: %s  (B clears)", filt[depth]);
+        BtItem *view = it;
+        if (filt[depth][0]) {
+            view = (BtItem *)malloc((size_t)shown * sizeof(BtItem));
+            if (view) for (int r = 0; r < shown; r++) view[r] = it[map[r]]; else view = it;
+        }
+        s_bt_items = view; s_bt_n = view == it ? n : shown;
+        s_pick_top = bt_draw_top;
+        gfxSet3D(false);
+        int sel = catalog_pick(ttl[depth], sub[0] ? sub : NULL, names, shown, 0, NULL);
+        s_bt_items = NULL; s_bt_n = 0;
+        if (view != it) free(view);
+        branding_show();
+        free(names);
+        if (sel == -4) {                                  /* X: search this list */
+            free(map);
+            char q[64]; snprintf(q, sizeof q, "%s", filt[depth]);
+            if (kbd_text("Search", q, sizeof q)) snprintf(filt[depth], sizeof filt[depth], "%s", q);
+            continue;
+        }
+        if (sel < 0 || sel >= shown) {
+            free(map);
+            if (filt[depth][0]) { filt[depth][0] = 0; continue; }
+            BT_UP(); continue;
+        }
+        sel = map[sel]; free(map);
+        presel[depth] = sel;
+        BtItem pick = it[sel];
+        if (!strcmp(pick.type, "movie") || !strcmp(pick.type, "episode")) {
+            char title[128];
+            if (!strcmp(pick.type, "episode") && depth >= 2)       /* "Show S01E02 Title": unique per video */
+                snprintf(title, sizeof title, "%s S%02dE%02d %s", ttl[depth - 1], pick.season, pick.episode, pick.title);
+            else snprintf(title, sizeof title, "%s", pick.title);
+            if (bt_play(&c, &pick, title)) BT_DONE(1);
+            free(lst[depth]); lst[depth] = NULL;                   /* reload: watched marks, resume points */
+        } else if (depth < 5) {
+            depth++; presel[depth] = 0; filt[depth][0] = 0;
+            free(lst[depth]); lst[depth] = NULL;
+            if (!strcmp(pick.type, "lib")) snprintf(path[depth], sizeof path[depth], "/api/libraries/%s", pick.id);
+            else if (!strcmp(pick.type, "show")) snprintf(path[depth], sizeof path[depth], "/api/shows/%s", pick.id);
+            else if (!strcmp(pick.type, "season")) {               /* id is "<show>/<n>" */
+                char sid[40]; snprintf(sid, sizeof sid, "%s", pick.id);
+                char *sl = strchr(sid, '/'); if (sl) *sl = 0;
+                snprintf(path[depth], sizeof path[depth], "/api/shows/%s/seasons/%d", sid, pick.season);
+            }
+            snprintf(ttl[depth], sizeof ttl[depth], "%s", pick.title);
+            /* a show with a single season: straight to its episodes */
+            if (!strcmp(pick.type, "show")) {
+                BtItem *ss = NULL; int ns = bt_list(&c, path[depth], &ss);
+                if (ns == 1) {
+                    snprintf(path[depth], sizeof path[depth], "/api/shows/%s/seasons/%d", pick.id, ss[0].season);
+                    free(ss);
+                } else if (ns > 1) { lst[depth] = ss; lstn[depth] = ns; }
+                else free(ss);
+            }
+        }
+    }
+    #undef BT_UP
+    #undef BT_DONE
+}
+
 static int open_pick(void) {
     int sel = 0, redraw = 1;
     while (aptMainLoop()) {
         hidScanInput();
         u32 k = hidKeysDown();
         if (k & KEY_B) return -1;
-        if (k & (KEY_DOWN | KEY_RIGHT)) { if (sel < 4) sel++; redraw = 1; }
-        if (k & (KEY_UP | KEY_LEFT))    { if (sel > 0) sel--; redraw = 1; }
+        /* five rows; the last is PLEX | BIG TOP side by side (sel 4 / 5) */
+        if (k & KEY_DOWN)  { if (sel < 4) sel++; redraw = 1; }
+        if (k & KEY_UP)    { if (sel == 5) sel = 3; else if (sel > 0) sel--; redraw = 1; }
+        if (k & KEY_RIGHT) { if (sel == 4) sel = 5; else if (sel < 4) sel++; redraw = 1; }
+        if (k & KEY_LEFT)  { if (sel == 5) sel = 4; else if (sel > 0) sel--; redraw = 1; }
         if (k & KEY_A) return sel;
-        /* five rows: PLEX joined LIBRARY / FILESYSTEM / RECENTLY PLAYED / WALK THE AISLE */
         if (k & KEY_TOUCH) { touchPosition tp; hidTouchRead(&tp);
-            for (int i = 0; i < 5; i++) if (tp.py >= 40 + i * 39 && tp.py < 40 + i * 39 + 34) return i; }
+            for (int i = 0; i < 5; i++) if (tp.py >= 40 + i * 39 && tp.py < 40 + i * 39 + 34)
+                return i == 4 && tp.px >= UI_W / 2 ? 5 : i; }
         if (redraw) {
             ui_begin(GFX_BOTTOM);
             ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
@@ -6314,7 +6799,8 @@ static int open_pick(void) {
             ui_button(34,  79, UI_W - 68, 34, "FILESYSTEM",      sel == 1, UI_NEONP);
             ui_button(34, 118, UI_W - 68, 34, "RECENTLY PLAYED", sel == 2, UI_NEONC);
             ui_button(34, 157, UI_W - 68, 34, "WALK THE AISLE",  sel == 3, UI_NEON);
-            ui_button(34, 196, UI_W - 68, 34, "PLEX",            sel == 4, UI_NEONP);
+            ui_button(34, 196, (UI_W - 68) / 2 - 4, 34, "PLEX",  sel == 4, UI_NEONP);
+            ui_button(UI_W / 2 + 4, 196, (UI_W - 68) / 2 - 4, 34, "BIG TOP", sel == 5, UI_NEONC);
             ui_present(); redraw = 0;
         }
         gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
@@ -6384,6 +6870,7 @@ static int open_video(char *out, size_t cap) {
                                            "This Old 3DS can still play\nmoflex files from LIBRARY.");
             else if (plex_browse()) return 1;
         }
+        else if (pick == 5) { if (bt_browse()) return 1; }
         else if (pick == 3) { int r = store_pick(out, cap);
                               if (r < 0) return 1;
                               if (r == 1) { s_pick_origin = PLAY_FROM_STORE; return 2; } }
@@ -6480,6 +6967,8 @@ int main(void) {
     osSetSpeedupEnable(true);   /* unlock New 3DS 804MHz clock (no-op on old 3DS) */
     gfxInitDefault();
     romfsInit();                /* files shipped inside the app (the store's song) */
+    moflex_set_open_hook(bt_open_media);   /* "bigtop:" videos stream from a Big Top server */
+    httpfile_set_wait_hook(moflex_seek_wait_hook);   /* ...and a seek over Wi-Fi can be changed mid-way */
     ndspInit();
     theme_load();               /* restore the saved theme before anything draws */
 
