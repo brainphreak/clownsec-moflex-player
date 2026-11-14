@@ -12,6 +12,9 @@ typedef struct HttpStream HttpStream;
 /* Start fetching url. headers: NULL-terminated "Name: value" strings (copied), or NULL.
  * ring_bytes: buffer size (e.g. 2 MB). NULL if the worker could not start. */
 HttpStream *hs_open(const char *url, const char *const *headers, size_t ring_bytes);
+/* the same, with the worker on a chosen core first (1 = the system core: a moflex plays its
+ * decode on core 2, which would starve a lowest-priority download there) */
+HttpStream *hs_open_core(const char *url, const char *const *headers, size_t ring_bytes, int core);
 /* Copy up to n buffered bytes into p; returns how many (0 = nothing yet). Never blocks. */
 size_t hs_read(HttpStream *s, void *p, size_t n);
 size_t hs_buffered(HttpStream *s);

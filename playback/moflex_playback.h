@@ -26,6 +26,11 @@ typedef enum {
  * the saved position and checkpoints it as it plays. */
 MoflexResult moflex_play(const char *path);
 
+/* A video path the hook recognises (e.g. "bigtop:/...") is opened by it -- any FILE*, such as a
+ * network stream; for anything else it returns NULL and the file is opened from the card. */
+#include <stdio.h>
+void moflex_set_open_hook(FILE *(*fn)(const char *path));
+
 /* Saved resume position (microseconds) for a movie, or 0 if none. */
 long long moflex_resume_get(const char *path);
 

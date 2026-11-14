@@ -70,7 +70,14 @@ static void worker(void *arg) {
     curl_easy_cleanup(e);
 }
 
+static HttpStream *hs_open_on(const char *url, const char *const *headers, size_t ring_bytes, int prefer_core);
 HttpStream *hs_open(const char *url, const char *const *headers, size_t ring_bytes) {
+    return hs_open_on(url, headers, ring_bytes, 2);
+}
+HttpStream *hs_open_core(const char *url, const char *const *headers, size_t ring_bytes, int core) {
+    return hs_open_on(url, headers, ring_bytes, core);
+}
+static HttpStream *hs_open_on(const char *url, const char *const *headers, size_t ring_bytes, int prefer_core) {
     if (!downloader_init()) return NULL;     /* curl's one-time global init */
     HttpStream *s = (HttpStream *)calloc(1, sizeof *s);
     if (!s) return NULL;
@@ -82,9 +89,11 @@ HttpStream *hs_open(const char *url, const char *const *headers, size_t ring_byt
     LightLock_Init(&s->lock);
     if (!s->url || !s->hdr || !s->ring) { hs_close(s); return NULL; }
     s32 prio = 0x30; svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
-    /* the downloads' placement: core 2 on New-3DS, else the system core, else the app core */
-    s->th = threadCreate(worker, s, 64 * 1024, 0x3F, 2, false);
-    if (!s->th) s->th = threadCreate(worker, s, 64 * 1024, 0x3F, 1, false);
+    /* the downloads' placement: core 2 on New-3DS (or the core asked for), else the system
+     * core, else the app core */
+    s->th = threadCreate(worker, s, 64 * 1024, 0x3F, prefer_core, false);
+    if (!s->th && prefer_core != 2) s->th = threadCreate(worker, s, 64 * 1024, 0x3F, 2, false);
+    if (!s->th && prefer_core != 1) s->th = threadCreate(worker, s, 64 * 1024, 0x3F, 1, false);
     if (!s->th) s->th = threadCreate(worker, s, 64 * 1024, prio - 1, -2, false);
     if (!s->th) { hs_close(s); return NULL; }
     return s;

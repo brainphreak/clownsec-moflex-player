@@ -29,6 +29,7 @@
 #include "branding.h"
 #include "store.h"
 #include "plex.h"
+#include "bigtop.h"
 
 #define APP_VERSION "v1.0"
 #ifndef BUILD_TAG
@@ -5023,8 +5024,10 @@ static int extplay_launch(const char *path) {
 }
 
 static MoflexResult play_movie(const char *path) {
+    /* a Big Top video streams from the server: none of the card checks below apply to it */
+    int remote = !strncmp(path, "bigtop:", 7);
     /* filenames with FAT-illegal characters list fine but can never be OPENED -- offer to fix */
-    { const char *b0 = strrchr(path, '/'); b0 = b0 ? b0 + 1 : path;
+    if (!remote) { const char *b0 = strrchr(path, '/'); b0 = b0 ? b0 + 1 : path;
       static char fixed[PATHLEN + NAMELEN];
       if (fat_has_illegal(b0)) {
           if (prompt2("FILENAME", "This name has characters the 3DS\ncannot open (* ? \" < > | :).\nRename it and play?", "RENAME", "BACK") != 0)
@@ -5036,7 +5039,7 @@ static MoflexResult play_movie(const char *path) {
           lib_note_renamed(path, fixed);   /* keep the library entry pointed at the new name */
           path = fixed;
       } }
-    {   /* a library / recently-played entry still pointing where the file USED to be */
+    if (!remote) {   /* a library / recently-played entry still pointing where the file USED to be */
         struct stat st0;
         if (stat(path, &st0) != 0) {
             msg_screen("FILE NOT FOUND", "This video is not where it was. It may\nhave been moved, renamed or deleted.\n\n"
@@ -5046,7 +5049,7 @@ static MoflexResult play_movie(const char *path) {
         } }
     cia_clear_selection();
     const char *title_src = path; char titlebuf[NAMELEN];
-    if (cia_is_cia(path)) {
+    if (!remote && cia_is_cia(path)) {
         CiaMoflex list[64];
         int nc = cia_list_moflex(path, list, 64);
         if (nc == 0) {
@@ -5098,7 +5101,7 @@ static MoflexResult play_movie(const char *path) {
     }
     /* Movie Player mode: plain .moflex only (it cannot open a CIA or an MP4). It keeps its own
      * resume point, so ours is not asked about. */
-    if (g_extplay_ok && !cia_is_cia(path)) {
+    if (g_extplay_ok && !remote && !cia_is_cia(path)) {
         size_t L = strlen(path);
         if (L > 7 && !strcasecmp(path + L - 7, ".moflex")) {
             int use = extplay_pick(movie_is_3d(path));
@@ -6314,18 +6317,21 @@ static int plex_browse(void) {
     #undef PLEX_BROWSE_DONE
 }
 
+static void bt_setup(void);   /* the Big Top server screen (defined with BIG TOP below) */
 /* X on home: everything that is a setting rather than a video */
 static void settings_menu(void) {
     for (;;) {
-        char r1[40]; const char *rows[4]; int act[4], n = 0;
+        char r1[40]; const char *rows[6]; int act[6], n = 0;
         rows[n] = "PLAYBACK DEFAULTS"; act[n++] = 0;
         rows[n] = "PLEX SERVER"; act[n++] = 2;
+        rows[n] = "BIG TOP SERVER"; act[n++] = 3;
         if (g_extplay_ok) { snprintf(r1, sizeof r1, "OLD 3DS: PLAY MOVIES WITH..."); rows[n] = r1; act[n++] = 1; }
         rows[n] = "DONE"; act[n++] = -1;
         int c = ui_menu("SETTINGS", g_extplay_ok ? "Audio, subtitles and players" : "Audio and subtitles", rows, n);
         if (c < 0 || act[c] < 0) return;
         if (act[c] == 0) playback_defaults_screen();
         else if (act[c] == 2) plex_setup();
+        else if (act[c] == 3) bt_setup();
         else extplay_choose();
     }
 }
@@ -6474,18 +6480,271 @@ static int recent_pick(char *out, size_t cap) {
     return 1;
 }
 
+
+/* ---------- CLOWNSEC BIG TOP (moflex from a computer on the network) ----------
+ * The server is the Big Top app (Windows / macOS / Linux). Moflex files stream as they are --
+ * the server converts nothing -- through a "bigtop:" path that the playback engine opens over
+ * HTTP (moflex_set_open_hook -> bt_open_media). */
+static void bt_draw_top(int i);
+static const BtItem *s_bt_items = NULL; static int s_bt_n = 0;
+static BtCfg s_bt_cfg;
+
+/* "192.168.1.20" / "192.168.1.20:32500" / "http://..." -> a full base URL */
+static void bt_norm_url(const char *in, char *out, int cap) {
+    while (*in == ' ') in++;
+    char host[120]; snprintf(host, sizeof host, "%s", strncmp(in, "http://", 7) ? in : in + 7);
+    size_t L = strlen(host); while (L && (host[L - 1] == '/' || host[L - 1] == ' ')) host[--L] = 0;
+    snprintf(out, (size_t)cap, strchr(host, ':') ? "http://%s" : "http://%s:32500", host);
+}
+
+static void bt_setup(void) {
+    for (;;) {
+        BtCfg c; int have = bt_cfg_load(&c);
+        char sub[120];
+        snprintf(sub, sizeof sub, "%s", have ? (c.name[0] ? c.name : c.url) : "No server chosen yet");
+        const char *rows[4] = { "FIND SERVERS ON THIS WI-FI", "ENTER ADDRESS", have ? "FORGET THIS SERVER" : "DONE", "DONE" };
+        int k = ui_menu("BIG TOP SERVER", sub, rows, have ? 4 : 3);
+        if (k < 0 || (!have && k == 2) || k == 3) return;
+        if (k == 0) {
+            msg_screen_nowait("BIG TOP SERVER", "Looking for Big Top on this Wi-Fi...");
+            BtServer sv[8]; int n = bt_discover(sv, 8, 2500);
+            if (n <= 0) {
+                msg_screen("BIG TOP SERVER", "No Big Top server answered.\n\nIs Big Top running on the computer,\nand allowed through its firewall?\n\n"
+                                             "Or choose ENTER ADDRESS and type\nthe address its setup page shows.");
+                continue;
+            }
+            int pick = 0;
+            if (n > 1) {
+                char names[8][64];
+                for (int i = 0; i < n; i++) snprintf(names[i], 64, "%s", sv[i].name[0] ? sv[i].name : sv[i].url);
+                pick = catalog_pick("CHOOSE A SERVER", NULL, names, n, 0, NULL);
+                if (pick < 0) continue;
+            }
+            snprintf(c.url, sizeof c.url, "%s", sv[pick].url); snprintf(c.name, sizeof c.name, "%s", sv[pick].name);
+            snprintf(c.id, sizeof c.id, "%s", sv[pick].id);
+            bt_cfg_save(&c);
+            char m[200]; snprintf(m, sizeof m, "Using %s\n%s", c.name, c.url);
+            msg_screen("BIG TOP SERVER", m);
+            return;
+        }
+        if (k == 1) {
+            char in[96] = "";
+            if (!kbd_text("Big Top address, e.g. 192.168.1.20", in, sizeof in)) continue;
+            char url[128]; bt_norm_url(in, url, sizeof url);
+            msg_screen_nowait("BIG TOP SERVER", "Connecting...");
+            BtServer info;
+            if (!bt_ping(url, &info)) { char m[260]; snprintf(m, sizeof m, "No Big Top at %s\n\n%s", url, bt_error()); msg_screen("BIG TOP SERVER", m); continue; }
+            snprintf(c.url, sizeof c.url, "%s", url); snprintf(c.name, sizeof c.name, "%s", info.name);
+            snprintf(c.id, sizeof c.id, "%s", info.id);
+            bt_cfg_save(&c);
+            char m[200]; snprintf(m, sizeof m, "Using %s\n%s", c.name, c.url);
+            msg_screen("BIG TOP SERVER", m);
+            return;
+        }
+        if (k == 2 && have) { c.url[0] = c.name[0] = c.id[0] = 0; bt_cfg_save(&c); }
+    }
+}
+
+/* Play one video: the server's resume point is offered (it knows where this console -- or this
+ * console before a reinstall -- stopped), then progress goes back to it. 1 = the app is closing. */
+static int bt_play(const BtCfg *c, const BtItem *it, const char *title) {
+    static char path[300];
+    bt_media_path(c, it, title, path, sizeof path);
+    BtItem fresh;                                         /* the list may be minutes old */
+    long long pos_ms = bt_item(c, it->id, &fresh) ? fresh.pos : it->pos;
+    if (pos_ms > 10000) moflex_resume_save(path, pos_ms * 1000);
+    else moflex_resume_clear(path);
+    MoflexResult r = play_movie(path);
+    long long at = moflex_resume_get(path);               /* where the engine stopped (0 = the end) */
+    long long dur = (long long)it->runtime * 60000;
+    if (r == MOFLEX_EOF) { bt_progress(c, it->id, dur, dur, "stopped"); bt_watched(c, it->id, 1); }
+    else if (r != MOFLEX_QUIT_EXIT || at > 0) bt_progress(c, it->id, at / 1000, dur, "stopped");
+    return r == MOFLEX_QUIT_EXIT;
+}
+
+static void bt_row(const BtItem *e, char *out) {
+    const char *mark = e->watched ? "* " : "";
+    if (!strcmp(e->type, "lib")) snprintf(out, 64, "%s", e->title);
+    else if (!strcmp(e->type, "episode")) snprintf(out, 64, "%s%d. %s", mark, e->episode, e->title);
+    else if (!strcmp(e->type, "season")) snprintf(out, 64, "%s  (%d/%d)", e->title, e->seen, e->episodes);
+    else if (!strcmp(e->type, "show")) snprintf(out, 64, "%s%s%.0d%s", e->title, e->year ? " (" : "", e->year, e->year ? ")" : "");
+    else if (e->year) snprintf(out, 64, "%s%s (%d)", mark, e->title, e->year);
+    else snprintf(out, 64, "%s%s", mark, e->title);
+}
+
+/* the top screen for the highlighted row: the same info view as the library and Plex */
+static void bt_draw_top(int i) {
+    if (!s_bt_items || i < 0 || i >= s_bt_n) return;
+    const BtItem *e = &s_bt_items[i];
+    CatEntry m; memset(&m, 0, sizeof m);
+    if (!strcmp(e->type, "lib")) {
+        snprintf(m.name, sizeof m.name, "%s", e->title);
+        snprintf(m.desc, sizeof m.desc, "%d movies, %d shows", e->episodes, e->seen);
+        snprintf(m.category, sizeof m.category, "Big Top");
+        draw_info_top(&m, NULL);
+        return;
+    }
+    if (!strcmp(e->type, "episode")) snprintf(m.name, sizeof m.name, "S%02dE%02d %s", e->season, e->episode, e->title);
+    else if (e->year) snprintf(m.name, sizeof m.name, "%s (%d)", e->title, e->year);
+    else snprintf(m.name, sizeof m.name, "%s", e->title);
+    snprintf(m.title, sizeof m.title, "%s", e->title);
+    snprintf(m.genres, sizeof m.genres, "%s", e->genres);
+    snprintf(m.desc, sizeof m.desc, "%s", e->summary);
+    if (!m.desc[0] && e->episodes) snprintf(m.desc, sizeof m.desc, "%d episodes, %d watched", e->episodes, e->seen);
+    snprintf(m.category, sizeof m.category, "Big Top");
+    m.year = e->year; m.runtime = e->runtime; m.is3d = e->is3d;
+    static u16 art[POSTER_W * POSTER_H];
+    int have = 0;
+    if (e->poster) {
+        char key[96];
+        snprintf(key, sizeof key, "bigtop_%s_%s", s_bt_cfg.id, e->id);
+        for (char *q = key; *q; q++) if (*q == '/') *q = '_';
+        have = poster_cached(key, art, POSTER_W, POSTER_H);
+        if (!have && !s_pf_busy && strcmp(key, s_pf_key)) {   /* fetched in the background (see Plex) */
+            bt_poster_url(&s_bt_cfg, e, POSTER_W, POSTER_H, s_pf_url, sizeof s_pf_url);
+            snprintf(s_pf_key, sizeof s_pf_key, "%s", key);
+            s_pf_busy = 1;
+            if (!threadCreate(plex_poster_thread, NULL, 128 * 1024, 0x3F, -2, true)) s_pf_busy = 0;
+        }
+    }
+    draw_info_top(&m, have ? art : NULL);
+}
+
+/* OPEN VIDEO -> BIG TOP: libraries -> movies and shows -> seasons -> episodes. 1 = exit app. */
+static int bt_browse(void) {
+    BtCfg c;
+    if (!bt_cfg_load(&c)) {
+        if (prompt2("BIG TOP", "No Big Top server is set up yet.\n\nBig Top streams the moflex files on\nyour computer to this 3DS.",
+                    "SET UP", "BACK") != 0) return 0;
+        bt_setup();
+        if (!bt_cfg_load(&c)) return 0;
+    }
+    s_bt_cfg = c;
+    static char path[6][128], ttl[6][96], filt[6][64];
+    int depth = 0, presel[6] = { 0 };
+    BtItem *lst[6] = { 0 }; int lstn[6] = { 0 };
+    for (int d = 0; d < 6; d++) filt[d][0] = 0;
+    #define BT_DONE(rv) do { for (int d_ = 0; d_ < 6; d_++) free(lst[d_]); return (rv); } while (0)
+    #define BT_UP() do { free(lst[depth]); lst[depth] = NULL; if (depth == 0) BT_DONE(0); depth--; } while (0)
+    snprintf(ttl[0], sizeof ttl[0], "%s", c.name[0] ? c.name : "BIG TOP");
+    path[0][0] = 0;                                       /* level 0: the libraries */
+    for (;;) {
+        if (!lst[depth]) {
+            msg_screen_nowait(ttl[depth], "Loading...");
+            BtItem *got = NULL;
+            int k = depth == 0 ? bt_libraries(&c, &got) : bt_list(&c, path[depth], &got);
+            if (k < 0) {
+                free(got);
+                if (depth == 0 && prompt2("BIG TOP", bt_error(), "CHANGE SERVER", "BACK") == 0) {
+                    bt_setup(); if (!bt_cfg_load(&c)) BT_DONE(0);
+                    s_bt_cfg = c; snprintf(ttl[0], sizeof ttl[0], "%s", c.name[0] ? c.name : "BIG TOP");
+                    continue;
+                }
+                if (depth > 0) msg_screen("BIG TOP", bt_error());
+                BT_UP(); continue;
+            }
+            if (k == 0) {
+                free(got);
+                msg_screen(ttl[depth], depth == 0 ? "This server has no libraries yet.\n\nAdd your moflex folders in Big Top's\nsetup page on the computer."
+                                                  : "Nothing here.");
+                BT_UP(); continue;
+            }
+            /* a library with one movie list and no shows still goes through this level */
+            lst[depth] = got; lstn[depth] = k;
+        }
+        BtItem *it = lst[depth]; int n = lstn[depth];
+        char (*names)[64] = (char (*)[64])malloc((size_t)n * 64);
+        int *map = (int *)malloc((size_t)n * sizeof(int));
+        if (!names || !map) { free(names); free(map); BT_DONE(0); }
+        int shown = 0;
+        for (int i = 0; i < n; i++) {
+            if (filt[depth][0] && !ci_contains(it[i].title, filt[depth])) continue;
+            map[shown] = i; bt_row(&it[i], names[shown]); shown++;
+        }
+        if (filt[depth][0] && shown == 0) {
+            free(names); free(map);
+            char m[120]; snprintf(m, sizeof m, "Nothing here matches\n\"%s\".", filt[depth]);
+            msg_screen(ttl[depth], m); filt[depth][0] = 0; continue;
+        }
+        s_pick_init = 0;
+        for (int r = 0; r < shown; r++) if (map[r] == presel[depth]) { s_pick_init = r; break; }
+        char sub[80] = "";
+        if (filt[depth][0]) snprintf(sub, sizeof sub, "Search: %s  (B clears)", filt[depth]);
+        BtItem *view = it;
+        if (filt[depth][0]) {
+            view = (BtItem *)malloc((size_t)shown * sizeof(BtItem));
+            if (view) for (int r = 0; r < shown; r++) view[r] = it[map[r]]; else view = it;
+        }
+        s_bt_items = view; s_bt_n = view == it ? n : shown;
+        s_pick_top = bt_draw_top;
+        gfxSet3D(false);
+        int sel = catalog_pick(ttl[depth], sub[0] ? sub : NULL, names, shown, 0, NULL);
+        s_bt_items = NULL; s_bt_n = 0;
+        if (view != it) free(view);
+        branding_show();
+        free(names);
+        if (sel == -4) {                                  /* X: search this list */
+            free(map);
+            char q[64]; snprintf(q, sizeof q, "%s", filt[depth]);
+            if (kbd_text("Search", q, sizeof q)) snprintf(filt[depth], sizeof filt[depth], "%s", q);
+            continue;
+        }
+        if (sel < 0 || sel >= shown) {
+            free(map);
+            if (filt[depth][0]) { filt[depth][0] = 0; continue; }
+            BT_UP(); continue;
+        }
+        sel = map[sel]; free(map);
+        presel[depth] = sel;
+        BtItem pick = it[sel];
+        if (!strcmp(pick.type, "movie") || !strcmp(pick.type, "episode")) {
+            char title[128];
+            if (!strcmp(pick.type, "episode") && depth >= 2)       /* "Show S01E02 Title": unique per video */
+                snprintf(title, sizeof title, "%s S%02dE%02d %s", ttl[depth - 1], pick.season, pick.episode, pick.title);
+            else snprintf(title, sizeof title, "%s", pick.title);
+            if (bt_play(&c, &pick, title)) BT_DONE(1);
+            free(lst[depth]); lst[depth] = NULL;                   /* reload: watched marks, resume points */
+        } else if (depth < 5) {
+            depth++; presel[depth] = 0; filt[depth][0] = 0;
+            free(lst[depth]); lst[depth] = NULL;
+            if (!strcmp(pick.type, "lib")) snprintf(path[depth], sizeof path[depth], "/api/libraries/%s", pick.id);
+            else if (!strcmp(pick.type, "show")) snprintf(path[depth], sizeof path[depth], "/api/shows/%s", pick.id);
+            else if (!strcmp(pick.type, "season")) {               /* id is "<show>/<n>" */
+                char sid[40]; snprintf(sid, sizeof sid, "%s", pick.id);
+                char *sl = strchr(sid, '/'); if (sl) *sl = 0;
+                snprintf(path[depth], sizeof path[depth], "/api/shows/%s/seasons/%d", sid, pick.season);
+            }
+            snprintf(ttl[depth], sizeof ttl[depth], "%s", pick.title);
+            /* a show with a single season: straight to its episodes */
+            if (!strcmp(pick.type, "show")) {
+                BtItem *ss = NULL; int ns = bt_list(&c, path[depth], &ss);
+                if (ns == 1) {
+                    snprintf(path[depth], sizeof path[depth], "/api/shows/%s/seasons/%d", pick.id, ss[0].season);
+                    free(ss);
+                } else if (ns > 1) { lst[depth] = ss; lstn[depth] = ns; }
+                else free(ss);
+            }
+        }
+    }
+    #undef BT_UP
+    #undef BT_DONE
+}
+
 static int open_pick(void) {
     int sel = 0, redraw = 1;
     while (aptMainLoop()) {
         hidScanInput();
         u32 k = hidKeysDown();
         if (k & KEY_B) return -1;
-        if (k & (KEY_DOWN | KEY_RIGHT)) { if (sel < 4) sel++; redraw = 1; }
-        if (k & (KEY_UP | KEY_LEFT))    { if (sel > 0) sel--; redraw = 1; }
+        /* five rows; the last is PLEX | BIG TOP side by side (sel 4 / 5) */
+        if (k & KEY_DOWN)  { if (sel < 4) sel++; redraw = 1; }
+        if (k & KEY_UP)    { if (sel == 5) sel = 3; else if (sel > 0) sel--; redraw = 1; }
+        if (k & KEY_RIGHT) { if (sel == 4) sel = 5; else if (sel < 4) sel++; redraw = 1; }
+        if (k & KEY_LEFT)  { if (sel == 5) sel = 4; else if (sel > 0) sel--; redraw = 1; }
         if (k & KEY_A) return sel;
-        /* five rows: PLEX joined LIBRARY / FILESYSTEM / RECENTLY PLAYED / WALK THE AISLE */
         if (k & KEY_TOUCH) { touchPosition tp; hidTouchRead(&tp);
-            for (int i = 0; i < 5; i++) if (tp.py >= 40 + i * 39 && tp.py < 40 + i * 39 + 34) return i; }
+            for (int i = 0; i < 5; i++) if (tp.py >= 40 + i * 39 && tp.py < 40 + i * 39 + 34)
+                return i == 4 && tp.px >= UI_W / 2 ? 5 : i; }
         if (redraw) {
             ui_begin(GFX_BOTTOM);
             ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
@@ -6494,7 +6753,8 @@ static int open_pick(void) {
             ui_button(34,  79, UI_W - 68, 34, "FILESYSTEM",      sel == 1, UI_NEONP);
             ui_button(34, 118, UI_W - 68, 34, "RECENTLY PLAYED", sel == 2, UI_NEONC);
             ui_button(34, 157, UI_W - 68, 34, "WALK THE AISLE",  sel == 3, UI_NEON);
-            ui_button(34, 196, UI_W - 68, 34, "PLEX",            sel == 4, UI_NEONP);
+            ui_button(34, 196, (UI_W - 68) / 2 - 4, 34, "PLEX",  sel == 4, UI_NEONP);
+            ui_button(UI_W / 2 + 4, 196, (UI_W - 68) / 2 - 4, 34, "BIG TOP", sel == 5, UI_NEONC);
             ui_present(); redraw = 0;
         }
         gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
@@ -6564,6 +6824,7 @@ static int open_video(char *out, size_t cap) {
                                            "This Old 3DS can still play\nmoflex files from LIBRARY.");
             else if (plex_browse()) return 1;
         }
+        else if (pick == 5) { if (bt_browse()) return 1; }
         else if (pick == 3) { int r = store_pick(out, cap);
                               if (r < 0) return 1;
                               if (r == 1) { s_pick_origin = PLAY_FROM_STORE; return 2; } }
@@ -6660,6 +6921,7 @@ int main(void) {
     osSetSpeedupEnable(true);   /* unlock New 3DS 804MHz clock (no-op on old 3DS) */
     gfxInitDefault();
     romfsInit();                /* files shipped inside the app (the store's song) */
+    moflex_set_open_hook(bt_open_media);   /* "bigtop:" videos stream from a Big Top server */
     ndspInit();
     theme_load();               /* restore the saved theme before anything draws */
 

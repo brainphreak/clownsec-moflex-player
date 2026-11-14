@@ -68,6 +68,14 @@ static void vol_save(void) {
     if (f) { fprintf(f, "%.2f\n", g_vol); fclose(f); }
 }
 
+/* ---- where a video's bytes come from: the SD card, or (via the app's hook) a server ---- */
+static FILE *(*g_open_hook)(const char *path) = NULL;
+void moflex_set_open_hook(FILE *(*fn)(const char *path)) { g_open_hook = fn; }
+static FILE *media_fopen(const char *path) {
+    if (g_open_hook) { FILE *f = g_open_hook(path); if (f) return f; }
+    return fopen(path, "rb");
+}
+
 /* ---- per-movie resume position, persisted to sdmc ---- */
 /* sanitized basename + CIA embed suffix. off>=0 forces a specific embedded video;
  * off<0 uses the active selection (empty for a plain moflex). */
@@ -1104,7 +1112,7 @@ static int g_trsub_sel = 0;
 #define EMB_SRT "sdmc:/moflex_player/.embedded.srt"
 static int trsub_stash(const char *path, int k) {
     if (k < 0 || k >= g_tra.sub_n) return 0;
-    FILE *sf = fopen(path, "rb");
+    FILE *sf = media_fopen(path);
     if (!sf) return 0;
     /* in chunks: a raw fansub track can run to megabytes, and the heap is needed for video */
     static char buf[32 * 1024];
@@ -2893,7 +2901,7 @@ static volatile int64_t g_aud_start = -1;/* audio timeline anchor (astart) -> vi
 static volatile int64_t g_vid_us;        /* content timestamp the video has reached (main thread) */
 static void audio_worker(void *arg) {
     const char *path = (const char *)arg;
-    FILE *af = fopen(path, "rb");
+    FILE *af = media_fopen(path);
     if (!af) return;
     MfxDemux am;
     if (mfx_open_auto(&am, af, path) != 0) { fclose(af); return; }
@@ -2953,7 +2961,7 @@ static void audio_worker(void *arg) {
 
 static MoflexResult moflex_play_gpu(const char *path) {
     vol_load();
-    FILE *f = fopen(path, "rb");
+    FILE *f = media_fopen(path);
     if (!f) return MOFLEX_ERROR;
     MfxDemux m;
     if (mfx_open_auto(&m, f, path) != 0) { fclose(f); return MOFLEX_ERROR; }
@@ -4132,7 +4140,7 @@ static void embsub_scan(MfxDemux *m) {
 
 static MoflexResult moflex_play_ring(const char *path) {
     vol_load();
-    FILE *f = fopen(path, "rb");
+    FILE *f = media_fopen(path);
     if (!f) return MOFLEX_ERROR;
     trailer_probe(f);
     MfxDemux m;
@@ -4377,7 +4385,7 @@ static MoflexResult moflex_play_ring(const char *path) {
     s.aidx = ai;
     s.trf = NULL; s.tr_cur = 0; s.tr_active = 0;
     if (use_trailer_audio) {
-        s.trf = fopen(path, "rb");
+        s.trf = media_fopen(path);
         if (s.trf) { s.tr_active = 1; s.aidx = -2; }   /* -2: no in-band stream feeds the DSP */
     }
     g_panel_cheap = !r3_isnew;   /* lighten the software panel on Old-3DS to free decode CPU */
@@ -4585,7 +4593,7 @@ static MoflexResult moflex_play_ring(const char *path) {
                         { nrate = (int)g_tra.aud_rate; nchn = (int)g_tra.aud_chn; }
                     else ok = 0;
                     if (ok && !s.trf) {               /* first crossing needs its private handle */
-                        s.trf = fopen(path, "rb");
+                        s.trf = media_fopen(path);
                         if (!s.trf) ok = 0;
                     }
                 } else if (newsi < m.nb_streams) {
@@ -5044,7 +5052,7 @@ static MoflexResult moflex_play_classic(const char *path) {
     vol_load();
     g_hq_avail = 0;   /* the HQ (color-depth) toggle is a ring-only feature; classic is always 24-bit */
 
-    FILE *f = fopen(path, "rb");
+    FILE *f = media_fopen(path);
     if (!f) { printf("\x1b[2J\x1b[Hfopen failed\npress A\n"); mp_wait_key(); return MOFLEX_ERROR; }
 
     mobi_opt = 14;   /* prefetch + idct-skip + DC-only: bit-exact, ~6-8% faster decode (esp. Old 3DS) */
@@ -5439,7 +5447,7 @@ static void sr_wrap(AVFrame *f, uint8_t *b, int W, int H) {      /* view over a 
 
 static MoflexResult moflex_play_soft(const char *path) {
     init_luts(); vol_load();
-    FILE *f = fopen(path, "rb");
+    FILE *f = media_fopen(path);
     if (!f) return MOFLEX_ERROR;
     MfxDemux m;
     if (mfx_open_auto(&m, f, path) != 0) { fclose(f); return MOFLEX_ERROR; }
@@ -5720,7 +5728,7 @@ static MoflexResult moflex_play_soft(const char *path) {
 #define USE_RING_3D 1
 MoflexResult moflex_play(const char *path) {
     int is3d = 0;
-    FILE *f = fopen(path, "rb");
+    FILE *f = media_fopen(path);
     if (f) {
         MfxDemux *m = (MfxDemux *)malloc(sizeof *m);
         if (m) {
