@@ -17,4 +17,9 @@ FILE *httpfile_open(const char *url, long long size, size_t ring_bytes);
 int  httpfile_gave_up(void);
 void httpfile_reset(void);
 
+/* Called while a read waits for data (poll=1: it may check the buttons) and before each read
+ * (poll=0). Returning non-zero makes the read fail at once -- the player uses it to drop a seek
+ * the viewer has already moved on from. */
+void httpfile_set_wait_hook(int (*fn)(int poll));
+
 #endif

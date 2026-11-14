@@ -26,6 +26,10 @@
 
 /* why the last network read gave up: 0 = it didn't, 1 = the viewer held B, 2 = the server went quiet */
 static volatile int g_hf_gave_up;
+/* the player's say while a read waits: poll=1 may look at the buttons; non-zero = stop this read
+ * now (a new seek target, B). Only the player knows when that's safe and what it means. */
+static int (*g_hf_hook)(int poll) = NULL;
+void httpfile_set_wait_hook(int (*fn)(int poll)) { g_hf_hook = fn; }
 static int g_hf_open;               /* files open now: only the first gets the big cache */
 int  httpfile_gave_up(void) { return g_hf_gave_up; }
 void httpfile_reset(void) { g_hf_gave_up = 0; }
@@ -180,6 +184,7 @@ static void worker(void *arg) {
 static ssize_t hf_read(void *c, char *buf, size_t n) {
     HFile *h = (HFile *)c;
     if (h->aborted) return -1;
+    if (g_hf_hook && g_hf_hook(0)) return -1;            /* a seek being dropped: every read fails fast */
     if (h->pos >= h->size) return 0;
     long long blk = h->pos / HB_SIZE;
     int off = (int)(h->pos % HB_SIZE), fails = 0;
@@ -213,15 +218,11 @@ static ssize_t hf_read(void *c, char *buf, size_t n) {
             g_hf_gave_up = 2; h->aborted = 1;
             return -1;
         }
-        /* a seek is a run of reads with the player's controls dead until it ends: holding B
-         * (or START) while we wait gives up, and playback closes like at the end of the file */
-        if (waited > 300 && (waited / 50) % 2 == 0) {
-            hidScanInput();
-            if (hidKeysHeld() & (KEY_B | KEY_START)) {
-                LightLock_Lock(&h->lk); h->want = -1; LightLock_Unlock(&h->lk);
-                g_hf_gave_up = 1; h->aborted = 1;
-                return -1;
-            }
+        /* a seek is a run of reads with the player's controls dead until it ends: the player may
+         * look at the buttons meanwhile and drop it (a new target, or B) */
+        if (g_hf_hook && waited > 100 && (waited / 30) % 2 == 0 && g_hf_hook(1)) {
+            LightLock_Lock(&h->lk); h->want = -1; LightLock_Unlock(&h->lk);
+            return -1;
         }
         svcSleepThread(2 * 1000 * 1000LL);
         LightLock_Lock(&h->lk);

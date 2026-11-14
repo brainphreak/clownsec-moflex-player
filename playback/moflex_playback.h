@@ -30,6 +30,8 @@ MoflexResult moflex_play(const char *path);
  * network stream; for anything else it returns NULL and the file is opened from the card. */
 #include <stdio.h>
 void moflex_set_open_hook(FILE *(*fn)(const char *path));
+/* For a slow source's wait loop (httpfile_set_wait_hook): drops a seek the viewer moved on from. */
+int  moflex_seek_wait_hook(int poll);
 
 /* Saved resume position (microseconds) for a movie, or 0 if none. */
 long long moflex_resume_get(const char *path);

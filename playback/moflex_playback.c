@@ -71,6 +71,21 @@ static void vol_save(void) {
 /* ---- where a video's bytes come from: the SD card, or (via the app's hook) a server ---- */
 static FILE *(*g_open_hook)(const char *path) = NULL;
 void moflex_set_open_hook(FILE *(*fn)(const char *path)) { g_open_hook = fn; }
+/* A seek over a slow source (a Big Top stream) can take a while, and it runs with the controls
+ * dead. While its reads wait, the source asks moflex_seek_wait_hook: a new seek target (a touch, a
+ * left/right step) or B drops the seek -- the press is then handled like any other, so the viewer
+ * goes straight to the place they meant instead of waiting out the one they didn't. */
+static volatile int g_seek_busy = 0, g_seek_cut = 0;
+static u32 g_seek_cut_kd = 0;
+int moflex_seek_wait_hook(int poll) {
+    if (!g_seek_busy) return 0;
+    if (g_seek_cut) return 1;
+    if (!poll) return 0;
+    hidScanInput();
+    u32 kd = hidKeysDown();
+    if (kd & (KEY_B | KEY_START | KEY_TOUCH | KEY_LEFT | KEY_RIGHT)) { g_seek_cut_kd |= kd; g_seek_cut = 1; return 1; }
+    return 0;
+}
 static FILE *media_fopen(const char *path) {
     if (g_open_hook) { FILE *f = g_open_hook(path); if (f) return f; }
     return fopen(path, "rb");
@@ -4425,9 +4440,11 @@ static MoflexResult moflex_play_ring(const char *path) {
         C3D_FrameEnd(0);
     }
 
+    u32 cut_kd = 0;                       /* the press that dropped a seek, handled this frame */
     while (aptMainLoop()) {
         hidScanInput();
-        u32 kd = hidKeysDown(), kh = hidKeysHeld();
+        u32 kd = hidKeysDown() | cut_kd, kh = hidKeysHeld();
+        cut_kd = 0;
         touchPosition tp; hidTouchRead(&tp);
         /* Lid watchdog: with sleep denied (background downloads) closing the lid doesn't sleep --
          * the movie keeps playing dark -- and reopening fires NO wake event, so a missed system
@@ -4620,8 +4637,9 @@ static MoflexResult moflex_play_ring(const char *path) {
                 seek_to_us = cur_us; want_seek = 1;
             }
         }
-        if (want_seek && !(kh & (KEY_LEFT | KEY_RIGHT))) {
+        if (want_seek && !scrubbing && !(kh & (KEY_LEFT | KEY_RIGHT))) {
             WORKER_LOCK();   /* blocks until the decode thread finishes its current pair and releases */
+            g_seek_busy = 1; g_seek_cut = 0;     /* a slow source may drop this seek if the viewer moves on */
             if (dur_us > 0) { if (seek_to_us < 0) seek_to_us = 0; if (seek_to_us > dur_us) seek_to_us = dur_us; }
             /* Land on the last KEYFRAME at/before the target. P-frames don't decode after a flush
              * (references freed), so the old forward hunt started 3-20s LATE on sparse-keyframe
@@ -4792,9 +4810,28 @@ static MoflexResult moflex_play_ring(const char *path) {
              * something re-opened the file (switching tracks and back "fixed" it). */
             if (s.tr_active && g_tra.aud_pktsamp && g_tra.aud_rate)
                 s.tr_cur = (u32)(cur_us * (s64)g_tra.aud_rate / 1000000 / g_tra.aud_pktsamp);
-            s.paused = 0;
-            WORKER_UNLOCK();   /* resume the decode thread from the new position */
-            want_seek = 0;
+            g_seek_busy = 0;
+            if (g_seek_cut) {
+                /* dropped mid-way: nothing it read counts. Empty the ring, hold the decoder, and
+                 * keep the seek pending at its target -- the press that dropped it is handled next
+                 * frame: a touch on the bar starts a new scrub (the seek waits for the release), a
+                 * step moves on from this target, B leaves; anything else just seeks here again. */
+                g_seek_cut = 0;
+                clearerr(m.f); m.eof = 0;
+                for (int i = 0; i < NB; i++) ready[i] = 0;
+                s.wr = 0; rd = 0; s.rd = 0; s.dpair = 0; s.done = 0; s.has_pending = 0; last_shown = -1;
+                r3_vq_clear();
+                if (have_audio) { r3_audio_flush(); ndspChnSetPaused(0, true); }
+                gated = 0; s.paused = 1;
+                WORKER_UNLOCK();
+                cut_kd = g_seek_cut_kd; g_seek_cut_kd = 0;
+                dirty = 1;
+            } else {
+                s.paused = 0;
+                WORKER_UNLOCK();   /* resume the decode thread from the new position */
+                LightEvent_Signal(&s.wake);   /* in case a dropped seek had left it parked */
+                want_seek = 0;
+            }
         }
 
         if (kd) dirty = 1;   /* any control input -> repaint the held frame / panel */
