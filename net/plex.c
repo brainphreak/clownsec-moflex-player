@@ -392,6 +392,20 @@ static int plex_decide(const PlexCfg *c, const char *q) {
             char t[96] = ""; jstr(mc, keys[i][1], t, sizeof t);
             plex_log("decision %s=%lld \"%s\"", keys[i][0], jnum(mc, keys[i][0]), t);
         }
+        /* which tracks the server will actually send (a picked audio track that doesn't show up
+         * here was ignored by the server) */
+        cJSON *md = cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(mc, "Metadata"), 0);
+        cJSON *me = md ? cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(md, "Media"), 0) : NULL;
+        cJSON *pt = me ? cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(me, "Part"), 0) : NULL;
+        cJSON *st; if (pt) cJSON_ArrayForEach(st, cJSON_GetObjectItemCaseSensitive(pt, "Stream")) {
+            int type = (int)jnum(st, "streamType");
+            if (type != 2 && type != 3) continue;
+            char lang[8] = "", codec[12] = "", dec[16] = "";
+            jstr(st, "languageCode", lang, sizeof lang); jstr(st, "codec", codec, sizeof codec);
+            jstr(st, "decision", dec, sizeof dec);
+            plex_log("decision %s track %lld (%s %s): %s", type == 2 ? "audio" : "subtitle",
+                     jnum(st, "id"), lang, codec, dec[0] ? dec : "-");
+        }
         for (int i = 0; i < 3 && ok; i++) {
             long long dc = jnum(mc, keys[i][0]);
             if (dc >= 2000) {
@@ -654,6 +668,23 @@ int plex_select_audio(const PlexCfg *c, long long part_id, long long audio_id) {
     long st = plex_req(c, url, &body, 0, 2);
     free(body);
     return st == 200;
+}
+/* for the log: which audio track the server now has selected for this item (0 = none / unknown) */
+long long plex_selected_audio(const PlexCfg *c, const char *rating_key) {
+    char url[256], *body = NULL; long long id = 0;
+    snprintf(url, sizeof url, "%s/library/metadata/%s", c->url, rating_key);
+    if (plex_get(c, url, &body, 1) == 200 && body) {
+        cJSON *r = cJSON_Parse(body);
+        cJSON *mc = r ? cJSON_GetObjectItemCaseSensitive(r, "MediaContainer") : NULL;
+        cJSON *md = mc ? cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(mc, "Metadata"), 0) : NULL;
+        cJSON *me = md ? cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(md, "Media"), 0) : NULL;
+        cJSON *pt = me ? cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(me, "Part"), 0) : NULL;
+        cJSON *st; if (pt) cJSON_ArrayForEach(st, cJSON_GetObjectItemCaseSensitive(pt, "Stream"))
+            if (jnum(st, "streamType") == 2 && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(st, "selected"))) id = jnum(st, "id");
+        cJSON_Delete(r);
+    }
+    free(body);
+    return id;
 }
 const char *plex_lang_name(const char *code) {
     static const char *const L[][2] = {

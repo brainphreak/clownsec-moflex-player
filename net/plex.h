@@ -129,6 +129,7 @@ int  plex_item_streams(const PlexCfg *c, const char *rating_key, PlexSub *subs, 
 /* make this the part's audio track: the transcoder plays the selected one. Like any Plex client,
  * the choice stays with the item for next time. */
 int  plex_select_audio(const PlexCfg *c, long long part_id, long long audio_id);
+long long plex_selected_audio(const PlexCfg *c, const char *rating_key);   /* for the log */
 int  plex_sub_is_text(const char *codec);   /* a text codec (srt, ass...), not a picture (pgs, vobsub) */
 /* An EMBEDDED text track, copied out by Plex while the video plays (the track must be the part's
  * selected subtitle until finish). take() hands over whole SRT blocks in movie time as they come;

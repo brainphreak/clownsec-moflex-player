@@ -5882,8 +5882,9 @@ static void plex_src_set_burn(void *ctx, int on) { ((PlexPlay *)ctx)->burn = on;
 static void plex_src_set_audio(void *ctx, int idx) {
     PlexPlay *p = (PlexPlay *)ctx;
     if (idx < 0 || idx >= p->naud) return;
-    plex_log("audio: switching to %s", p->aud[idx].title);
+    plex_log("audio: switching to track %lld, %s", p->aud[idx].id, p->aname[idx]);
     plex_select_audio(&p->c, p->part, p->aud[idx].id);       /* the next stream plays it */
+    plex_log("audio: the server now has track %lld selected", plex_selected_audio(&p->c, p->it.rating));
 }
 static int plex_src_subs_take(void *ctx, long long now_us, char *buf, int cap) {
     PlexPlay *p = (PlexPlay *)ctx;
