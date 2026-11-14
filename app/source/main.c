@@ -1635,7 +1635,7 @@ static int catalog_pick(const char *title, const char *subtitle, char items[][64
     int sel = 0, top = 0, redraw = 1, td = 0, tx0 = 0, ty0 = 0, tsc0 = 0, tmv = 0;
     if (s_pick_init > 0) sel = s_pick_init < total ? s_pick_init : (total ? total - 1 : 0);
     s_pick_init = 0;   /* one-shot (the follow logic below scrolls it into view) */
-    int hfu = 0, hfd = 0;
+    int hfu = 0, hfd = 0, hfl = 0, hfr = 0;
     const int VIS = 5, ry0 = 54, rh = 30, gap = 4;
     while (aptMainLoop()) {
         hidScanInput();
@@ -1645,8 +1645,9 @@ static int catalog_pick(const char *title, const char *subtitle, char items[][64
         /* same fast navigation as the movie lists: hold to repeat, left/right = page jump */
         if (nav_repeat(k, kh, NAV_DOWN, &hfd)) { if (sel < total - 1) sel++; redraw = 1; }
         if (nav_repeat(k, kh, NAV_UP, &hfu))   { if (sel > 0) sel--; redraw = 1; }
-        if (k & KEY_RIGHT) { sel += VIS; if (sel > total - 1) sel = total - 1; redraw = 1; }
-        if (k & KEY_LEFT)  { sel -= VIS; if (sel < 0) sel = 0; redraw = 1; }
+        /* page jumps repeat while held, speeding up -- a 5000-movie library is 1000 pages */
+        if (nav_repeat(k, kh, KEY_RIGHT, &hfr)) { sel += VIS; if (sel > total - 1) sel = total - 1; redraw = 1; }
+        if (nav_repeat(k, kh, KEY_LEFT, &hfl))  { sel -= VIS; if (sel < 0) sel = 0; redraw = 1; }
         int act = (k & KEY_A) ? sel : -1;
         touchPosition tp; hidTouchRead(&tp);
         if (k & KEY_TOUCH) { td = 1; tx0 = tp.px; ty0 = tp.py; tsc0 = top; tmv = 0; }
@@ -6113,6 +6114,8 @@ static int plex_browse(void) {
     int lib3d = 0;                            /* inside a library named "...3D..." */
     static char path[8][192], ttl[8][96];
     int depth = 0, presel[8] = { 0 };
+    static char filt[8][64];                  /* X: a search typed at each level ("" = none) */
+    for (int d = 0; d < 8; d++) filt[d][0] = 0;
     /* each level's list is kept while you're below it, so going back never downloads it again;
      * a whole library (stamp > 0) is also kept on the SD card for next time */
     PlexItem *lst[8] = { 0 }; int lstn[8] = { 0 }; long long stamp[8] = { 0 };
@@ -6135,27 +6138,61 @@ static int plex_browse(void) {
         }
         PlexItem *it = lst[depth]; int n = lstn[depth];
         char (*names)[64] = (char (*)[64])malloc((size_t)n * 64);
-        if (!names) PLEX_BROWSE_DONE(0);
+        int *map = (int *)malloc((size_t)n * sizeof(int));     /* shown row -> list index */
+        if (!names || !map) { free(names); free(map); PLEX_BROWSE_DONE(0); }
+        int shown = 0;
         for (int i = 0; i < n; i++) {
             const PlexItem *e = &it[i];
+            if (filt[depth][0] && !ci_contains(e->title, filt[depth])) continue;
+            map[shown] = i;
             const char *mark = (plex_playable(e) && e->viewed) ? "* " : "";
+            char *nm = names[shown++];
             if (!strcmp(e->type, "episode"))
-                snprintf(names[i], 64, "%s%d. %s", mark, e->index, e->title);
+                snprintf(nm, 64, "%s%d. %s", mark, e->index, e->title);
             else if (e->year && (!strcmp(e->type, "movie") || !strcmp(e->type, "show")))
-                snprintf(names[i], 64, "%s%s (%d)%s%s%s", mark, e->title, e->year,
+                snprintf(nm, 64, "%s%s (%d)%s%s%s", mark, e->title, e->year,
                          e->edition[0] ? " [" : "", e->edition, e->edition[0] ? "]" : "");
-            else snprintf(names[i], 64, "%s%s%s%s%s", mark, e->title,
+            else snprintf(nm, 64, "%s%s%s%s%s", mark, e->title,
                           e->edition[0] ? " [" : "", e->edition, e->edition[0] ? "]" : "");
         }
-        s_pick_init = presel[depth];
-        s_plex_items = it; s_plex_n = n; s_plex_cfg = c;
+        if (filt[depth][0] && shown == 0) {
+            free(names); free(map);
+            char m[120]; snprintf(m, sizeof m, "Nothing here matches\n\"%s\".", filt[depth]);
+            msg_screen(ttl[depth], m);
+            filt[depth][0] = 0; continue;
+        }
+        /* the highlighted row survives a search: find the same item among the rows shown */
+        s_pick_init = 0;
+        for (int r = 0; r < shown; r++) if (map[r] == presel[depth]) { s_pick_init = r; break; }
+        char sub[80] = "";
+        if (filt[depth][0]) snprintf(sub, sizeof sub, "Search: %s  (B clears)", filt[depth]);
+        /* the info view reads the rows it is shown: hand it the filtered items */
+        PlexItem *view = it;
+        if (filt[depth][0]) {
+            view = (PlexItem *)malloc((size_t)shown * sizeof(PlexItem));
+            if (view) for (int r = 0; r < shown; r++) view[r] = it[map[r]];
+            else view = it;
+        }
+        s_plex_items = view; s_plex_n = view == it ? n : shown; s_plex_cfg = c;
         s_pick_top = plex_draw_top;           /* poster + info for the highlighted row */
         gfxSet3D(false);                      /* the info view is 2D: the 3D logo must not stay in the right eye */
-        int sel = catalog_pick(ttl[depth], NULL, names, n, 0, NULL);
+        int sel = catalog_pick(ttl[depth], sub[0] ? sub : NULL, names, shown, 0, NULL);
         s_plex_items = NULL; s_plex_n = 0;
+        if (view != it) free(view);
         branding_show();                      /* the logo back while the next list loads */
         free(names);
-        if (sel < 0 || sel >= n) { PLEX_UP(); if (depth == 0) lib3d = 0; continue; }
+        if (sel == -4) {                      /* X: search this list (B clears it) */
+            free(map);
+            char q[64]; snprintf(q, sizeof q, "%s", filt[depth]);
+            if (kbd_text("Search", q, sizeof q)) snprintf(filt[depth], sizeof filt[depth], "%s", q);
+            continue;
+        }
+        if (sel < 0 || sel >= shown) {
+            free(map);
+            if (filt[depth][0]) { filt[depth][0] = 0; continue; }   /* B: drop the search first */
+            PLEX_UP(); if (depth == 0) lib3d = 0; continue;
+        }
+        sel = map[sel]; free(map);
         presel[depth] = sel;
         PlexItem pick = it[sel];
         if (plex_playable(&pick)) {
@@ -6175,7 +6212,7 @@ static int plex_browse(void) {
             }
         } else if (depth < 7 && pick.key[0]) {
             if (depth == 0) lib3d = ci_contains(pick.title, "3d");
-            depth++; presel[depth] = 0;
+            depth++; presel[depth] = 0; filt[depth][0] = 0;
             free(lst[depth]); lst[depth] = NULL;
             stamp[depth] = depth == 1 ? pick.stamp : 0;     /* a whole library: cache it */
             snprintf(path[depth], sizeof path[depth], "%s", pick.key);
