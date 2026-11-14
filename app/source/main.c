@@ -5912,12 +5912,12 @@ static int plex_sub_apply(PlexPlay *p, int idx, char *path, int cap) {
     if (s->key[0] && text) {              /* an external text file: drawn by the player */
         snprintf(path, (size_t)cap, "sdmc:/moflex_player/.plexsub.%s", strcmp(s->codec, "srt") ? s->codec : "srt");
         if (plex_download(&p->c, s->key, path)) fl = STREAM_SUB_FILE; else path[0] = 0;
-    } else if (text) {                    /* embedded text: drawn by the player too (both eyes in 3D) */
+    } else if (plex_sub_fetchable(s->codec)) {   /* embedded SRT-type text: drawn by the player (both eyes in 3D) */
         char cp[96]; plex_sub_cache_path(&p->c, s->id, cp, sizeof cp);
         FILE *cf = fopen(cp, "rb");
         if (cf) { fclose(cf); snprintf(path, (size_t)cap, "%s", cp); fl = STREAM_SUB_FILE; }   /* fetched before */
         else { p->fetch_id = s->id; p->fetch_select = s->id == p->plex_sel ? 0 : s->id; fl = STREAM_SUB_ARRIVE; }
-    } else if (!p->is3d) {                /* a picture track: Plex burns the selected one in */
+    } else if (!p->is3d) {                /* a picture track, or embedded ASS (Plex won't copy that out): burned in */
         if (s->id == p->plex_sel || plex_select_sub(&p->c, p->part, s->id)) {
             p->plex_sel = s->id; p->burn = 1; fl = STREAM_SUB_BURN;
         }
@@ -6024,8 +6024,20 @@ static MoflexResult plex_play(const PlexCfg *c, const PlexItem *it, int lib3d, l
                 }
     }
     for (int i = 0; i < p.naud; i++) {
-        snprintf(p.alang[i], sizeof p.alang[i], "%s", p.aud[i].lang);
-        snprintf(p.aname[i], sizeof p.aname[i], "%s", p.aud[i].title[0] ? p.aud[i].title : p.aud[i].lang);
+        /* Plex names a track in its language's own script ("日本語 (Opus Stereo)"), which the
+         * player's font can't draw: name it from the language code instead */
+        const PlexAudio *a = &p.aud[i];
+        const char *ln = plex_lang_name(a->lang);
+        char par[32]; plex_paren(a->title, par, sizeof par);
+        char base[40]; snprintf(base, sizeof base, "%s", ln[0] ? ln : a->lang[0] ? a->lang : "Track");
+        if (!ln[0] && !a->lang[0] && a->title[0] && (unsigned char)a->title[0] < 0x80)
+            snprintf(base, sizeof base, "%.39s", a->title);              /* no language: Plex's name, if readable */
+        if (a->name[0] && !ci_contains(base, a->name))
+            snprintf(p.aname[i], sizeof p.aname[i], "%.16s - %.14s%s%.12s%s", base, a->name,
+                     par[0] ? " (" : "", par, par[0] ? ")" : "");
+        else
+            snprintf(p.aname[i], sizeof p.aname[i], "%.30s%s%.14s%s", base, par[0] ? " (" : "", par, par[0] ? ")" : "");
+        snprintf(p.alang[i], sizeof p.alang[i], "%s", a->lang);
     }
     if (p.naud > 0) snprintf(alang, sizeof alang, "%s", p.aud[asel].lang);
     if (ns < 0 && part == 0) {
@@ -6044,7 +6056,9 @@ static MoflexResult plex_play(const PlexCfg *c, const PlexItem *it, int lib3d, l
             if (subs[i].selected) { sel = i; p.orig_sel = p.plex_sel = subs[i].id; }
             char cu[12]; snprintf(cu, sizeof cu, "%s", subs[i].codec);
             for (char *q = cu; *q; q++) if (*q >= 'a' && *q <= 'z') *q -= 32;
-            const char *t = subs[i].title[0] ? subs[i].title : subs[i].lang[0] ? subs[i].lang : "Track";
+            const char *ln = plex_lang_name(subs[i].lang);   /* Plex's own title may be in a script we can't draw */
+            const char *t = ln[0] ? ln : subs[i].lang[0] ? subs[i].lang
+                          : (subs[i].title[0] && (unsigned char)subs[i].title[0] < 0x80) ? subs[i].title : "Track";
             /* the file's own track name says what Plex's title hides: two "English" tracks are
              * often the full one and a forced-only one */
             const char *nm = subs[i].name;

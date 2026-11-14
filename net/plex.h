@@ -111,9 +111,16 @@ typedef struct {
 typedef struct {
     long long id;
     char lang[8];        /* "eng" */
-    char title[48];      /* Plex's own name: "English (AC3 5.1)" */
+    char title[48];      /* Plex's own name: "English (AC3 5.1)" -- in the language's OWN script ("日本語") */
+    char name[32];       /* the file's track name ("Commentary"), often empty */
     int  selected;
 } PlexAudio;
+/* "Japanese" for "jpn"/"ja": readable in the player's font, unlike Plex's own names */
+const char *plex_lang_name(const char *code);
+/* "Opus Stereo" out of "日本語 (Opus Stereo)" -> out ("" if none) */
+void plex_paren(const char *display, char *out, int cap);
+/* an embedded track Plex will copy out as text (SRT and kin). Not ASS: Plex only burns that. */
+int  plex_sub_fetchable(const char *codec);
 /* The item's subtitle tracks, its part id, its selected audio language and (aud != NULL) every
  * audio track. Returns the subtitle count, -1. */
 int  plex_item_streams(const PlexCfg *c, const char *rating_key, PlexSub *subs, int max,

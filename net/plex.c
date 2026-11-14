@@ -620,6 +620,7 @@ int plex_item_streams(const PlexCfg *c, const char *rating_key, PlexSub *subs, i
                 a->id = jnum(st, "id");
                 jstr(st, "languageCode", a->lang, sizeof a->lang);
                 jstr(st, "displayTitle", a->title, sizeof a->title);
+                jstr(st, "title", a->name, sizeof a->name);
                 a->selected = sel;
             }
             if (type != 3 || n >= max) continue;
@@ -653,6 +654,34 @@ int plex_select_audio(const PlexCfg *c, long long part_id, long long audio_id) {
     long st = plex_req(c, url, &body, 0, 2);
     free(body);
     return st == 200;
+}
+const char *plex_lang_name(const char *code) {
+    static const char *const L[][2] = {
+        { "eng", "English" }, { "en", "English" }, { "jpn", "Japanese" }, { "ja", "Japanese" },
+        { "spa", "Spanish" }, { "es", "Spanish" }, { "fra", "French" }, { "fre", "French" }, { "fr", "French" },
+        { "deu", "German" }, { "ger", "German" }, { "de", "German" }, { "ita", "Italian" }, { "it", "Italian" },
+        { "por", "Portuguese" }, { "pt", "Portuguese" }, { "rus", "Russian" }, { "ru", "Russian" },
+        { "kor", "Korean" }, { "ko", "Korean" }, { "zho", "Chinese" }, { "chi", "Chinese" }, { "zh", "Chinese" },
+        { "nld", "Dutch" }, { "dut", "Dutch" }, { "swe", "Swedish" }, { "pol", "Polish" }, { "ara", "Arabic" },
+        { "hin", "Hindi" }, { "tha", "Thai" }, { "tur", "Turkish" }, { "dan", "Danish" }, { "fin", "Finnish" },
+        { "nor", "Norwegian" }, { "nob", "Norwegian" }, { "hun", "Hungarian" }, { "ces", "Czech" }, { "cze", "Czech" },
+        { "ell", "Greek" }, { "gre", "Greek" }, { "heb", "Hebrew" }, { "ind", "Indonesian" }, { "vie", "Vietnamese" },
+        { "ukr", "Ukrainian" }, { "ron", "Romanian" }, { "rum", "Romanian" }, { "msa", "Malay" }, { "may", "Malay" },
+        { "cat", "Catalan" }, { "fil", "Filipino" }, { "tgl", "Tagalog" }, { "und", "Unknown" }, { "zxx", "No language" },
+    };
+    if (!code || !code[0]) return "";
+    for (size_t i = 0; i < sizeof L / sizeof L[0]; i++) if (!strcasecmp(code, L[i][0])) return L[i][1];
+    return "";
+}
+void plex_paren(const char *display, char *out, int cap) {
+    out[0] = 0;
+    const char *o = strrchr(display, '('), *c = o ? strchr(o, ')') : NULL;
+    if (o && c && c > o + 1) snprintf(out, (size_t)cap, "%.*s", (int)(c - o - 1), o + 1);
+}
+int plex_sub_fetchable(const char *codec) {
+    static const char *const T[] = { "srt", "subrip", "mov_text", "webvtt", "vtt", "text" };
+    for (size_t i = 0; i < sizeof T / sizeof T[0]; i++) if (!strcmp(codec, T[i])) return 1;
+    return 0;
 }
 int plex_sub_is_text(const char *codec) {
     static const char *const T[] = { "srt", "subrip", "ass", "ssa", "mov_text", "webvtt", "vtt", "text", "smi" };
