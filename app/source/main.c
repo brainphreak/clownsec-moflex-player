@@ -6045,8 +6045,14 @@ static MoflexResult plex_play(const PlexCfg *c, const PlexItem *it, int lib3d, l
             char cu[12]; snprintf(cu, sizeof cu, "%s", subs[i].codec);
             for (char *q = cu; *q; q++) if (*q >= 'a' && *q <= 'z') *q -= 32;
             const char *t = subs[i].title[0] ? subs[i].title : subs[i].lang[0] ? subs[i].lang : "Track";
-            snprintf(p.sname[i], sizeof p.sname[i], "%.30s%s [%s]", t,
-                     subs[i].forced && !ci_contains(t, "forced") ? " Forced" : "", cu);
+            /* the file's own track name says what Plex's title hides: two "English" tracks are
+             * often the full one and a forced-only one */
+            const char *nm = subs[i].name;
+            if (nm[0] && !ci_contains(t, nm))
+                snprintf(p.sname[i], sizeof p.sname[i], "%.20s - %.14s [%s]", t, nm, cu);
+            else
+                snprintf(p.sname[i], sizeof p.sname[i], "%.30s%s [%s]", t,
+                         subs[i].forced && !ci_contains(t, "forced") ? " Forced" : "", cu);
         }
         /* the track to use whenever subtitles are on: Plex's own selection, else the preferred
          * language (not a forced-only track), else the first */

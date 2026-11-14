@@ -104,6 +104,7 @@ typedef struct {
     char codec[12];      /* "srt" "ass" "pgs" "vobsub" ... */
     char lang[8];        /* "eng" */
     char title[48];
+    char name[32];       /* the file's own track name ("forced", "SDH", "Signs"), often hidden by title */
     char key[96];        /* external file: "/library/streams/<id>"; "" = embedded */
     int  forced, selected;
 } PlexSub;

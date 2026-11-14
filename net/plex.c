@@ -628,8 +628,10 @@ int plex_item_streams(const PlexCfg *c, const char *rating_key, PlexSub *subs, i
             jstr(st, "codec", s->codec, sizeof s->codec);
             jstr(st, "languageCode", s->lang, sizeof s->lang);
             jstr(st, "displayTitle", s->title, sizeof s->title);
+            jstr(st, "title", s->name, sizeof s->name);
             jstr(st, "key", s->key, sizeof s->key);
             s->forced = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(st, "forced")) || jnum(st, "forced") == 1;
+            if (!s->forced && s->name[0] && strstr(s->name, "orced")) s->forced = 1;   /* named "forced"/"Forced" */
             s->selected = sel;
         }
     }
