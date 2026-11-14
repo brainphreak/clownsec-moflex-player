@@ -992,13 +992,16 @@ MoflexResult stream_play(const StreamSrc *src) {
     moflex_subs_autoload(src->key);       /* per-item settings (zoom etc.) */
     if (src->subfile && src->subfile[0]) moflex_subs_load_file(src->subfile);   /* the server's text track */
     else if (src->subs_take) moflex_subs_stream_begin();                        /* ...or one on its way */
-    int subs_any = src->burnable || src->subs_take || (src->subfile && src->subfile[0]);
+    int burnable = src->burnable;         /* changes when another track is picked */
+    int subs_any = burnable || src->subs_take || (src->subfile && src->subfile[0]);
     if (subs_any) moflex_subs_set(src->subs_on);
-    kit_set_subs_any(src->burnable || src->subs_take);   /* the CC menu's on/off works before any cue is here */
+    kit_set_subs_any(burnable || src->subs_take);   /* the CC menu's on/off works before any cue is here */
     int last_subs = moflex_subs_on();     /* burnable: Y / CC on-off re-requests the stream */
     kit_film_begin(is3d);
     if (src->n_audio > 1 && src->audio_lang && src->audio_name)
         kit_set_audio_tracks(src->n_audio, src->audio_lang, src->audio_name, src->audio_sel);
+    if (src->n_subs > 1 && src->sub_name && src->set_sub)
+        kit_set_sub_tracks(src->n_subs, src->sub_name, src->sub_sel);
     kit_fmt_set(fmt);
     kit_saves_baseline();
     aptHook(&g_mp4_apt_cookie, mp4_apt_hook, NULL);
@@ -1177,7 +1180,23 @@ MoflexResult stream_play(const StreamSrc *src) {
         /* Burned-in subtitles are part of the picture, so the player's switch (Y, or the CC menu's
          * on/off) can only take effect by asking the server for the stream again, with or
          * without them, from here -- the same short restart as switching 2D/3D. */
-        if (src->burnable && moflex_subs_on() != last_subs) {
+        /* another subtitle track: a file, cues on their way, or the server burning it in */
+        {   int ssel;
+            if (kit_take_sub_change(&ssel) && src->set_sub) {
+                static char spath[160]; spath[0] = 0;
+                int fl = src->set_sub(src->ctx, ssel, cur_us, spath, sizeof spath);
+                if ((fl & STREAM_SUB_FILE) && spath[0]) moflex_subs_load_file(spath);
+                else moflex_subs_stream_begin();          /* nothing drawn until cues arrive (or burned) */
+                burnable = (fl & STREAM_SUB_BURN) ? 1 : 0;
+                moflex_subs_set(1);
+                last_subs = 1;
+                kit_set_subs_any(burnable || src->subs_take);
+                if ((fl & STREAM_SUB_RESTART) && !want_seek) { seek_to = cur_us; want_seek = 1; }
+                subs_next = 0;
+                dirty = 1;
+            }
+        }
+        if (burnable && moflex_subs_on() != last_subs) {
             last_subs = moflex_subs_on();
             src->set_burn(src->ctx, last_subs);
             if (!want_seek) { seek_to = cur_us; want_seek = 1; }

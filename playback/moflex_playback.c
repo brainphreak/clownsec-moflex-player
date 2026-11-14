@@ -141,6 +141,9 @@ static int g_kit_defer = 0, g_kit_pq_pending = 0, g_kit_sub_pending = 0;
  * subtitle text is loaded, so the CC menu's on/off row must work without g_nsubs. Never set by
  * the moflex engines. */
 static int g_kit_subs_any = 0;
+/* a stream's subtitle tracks (the server's): the CC menu's Track row; the stream code acts on a pick */
+#define KSTRK_MAX 16
+static char g_kstrk_name[KSTRK_MAX][40]; static int g_kstrk_n = 0, g_kstrk_sel = 0, g_kstrk_apply = 0;
 static void pq_save(void) {
     if (g_kit_defer) { g_kit_pq_pending = 1; return; }
     mkdir("sdmc:/moflex_player", 0777);
@@ -2417,6 +2420,7 @@ static int submenu_actions(int is3d, int *act) {
      * track the row was hidden, so loading an external .srt was a one-way trip: nothing on
      * screen could put the built-in subtitles back. */
     if (g_tra.sub_n > 0) act[n++] = 8;   /* built-in subtitle track */
+    if (g_kstrk_n > 1) act[n++] = 13;    /* a stream's tracks (the server's list) */
     if (is3d) act[n++] = 4;
     act[n++] = 5;
     return n;
@@ -2439,6 +2443,7 @@ static void submenu_label(int a, char *r, int cap) {
         case 12: snprintf(r, cap, "Link top & bottom:  %s", g_sub_link ? "ON" : "OFF"); break;
         case 4: snprintf(r, cap, "Depth (3D):  %+d", g_sub_depth); break;
         case 7: snprintf(r, cap, "Audio:  Track %d / %d", g_atrk_sel + 1, g_atrk_n); break;
+        case 13: snprintf(r, cap, "Track:  %.24s (%d/%d)", g_kstrk_name[g_kstrk_sel], g_kstrk_sel + 1, g_kstrk_n); break;
         case 8: snprintf(r, cap, "Built-in:  %s (%d/%d)%s",
                          g_trsub_sel < g_tra.sub_n && g_tra.sub_lang[g_trsub_sel][0]
                              ? g_tra.sub_lang[g_trsub_sel] : "---",
@@ -2449,7 +2454,7 @@ static void submenu_label(int a, char *r, int cap) {
     }
 }
 static void submenu_render(int is3d) {
-    int act[12]; int n = submenu_actions(is3d, act);
+    int act[16]; int n = submenu_actions(is3d, act);
     int top, step, bh; submenu_layout(n, &top, &step, &bh);
     ui_begin(GFX_BOTTOM);
     ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
@@ -2810,7 +2815,7 @@ static int submenu_input(u32 kd, u32 kh, touchPosition tp, int is3d, const char 
         }
         return 0;
     }
-    int act[12]; int n = submenu_actions(is3d, act);
+    int act[16]; int n = submenu_actions(is3d, act);
     if (g_sub_sel >= n) g_sub_sel = n - 1;
     if (g_sub_sel < 0)  g_sub_sel = 0;
     if (kd & KEY_B) { subcfg_save(moviepath); g_submenu = 0; return 1; }
@@ -2856,6 +2861,11 @@ static int submenu_input(u32 kd, u32 kh, touchPosition tp, int is3d, const char 
         case 10: if (rep) sub_nudge(0, rep * sub_ramp(g_sub_rep)); break;   /* left/down lower, right/up higher */
         case 11: if (rep) sub_nudge(1, rep * sub_ramp(g_sub_rep)); break;   /* left/right: closer/further from the top edge */
         case 12: if (press) sub_link_toggle(); break;
+        case 13: if (press && g_kstrk_n > 1) {
+                    g_kstrk_sel = (g_kstrk_sel + g_kstrk_n + (press < 0 ? -1 : 1)) % g_kstrk_n;
+                    g_kstrk_apply = 1;  /* the stream loop fetches it (or restarts to burn it) */
+                    g_sub_on = 1;       /* picking a track implies wanting it shown */
+                } break;
         case 8: if (press && g_tra.sub_n > 0) {
                     /* A on this row means "show the built-in subtitles". Only advance the
                      * language when they are ALREADY what is showing -- otherwise the first
@@ -2948,7 +2958,7 @@ static MoflexResult moflex_play_gpu(const char *path) {
     MfxDemux m;
     if (mfx_open_auto(&m, f, path) != 0) { fclose(f); return MOFLEX_ERROR; }
     int vi = -1, ai = -1;
-    memset(g_atrk_name, 0, sizeof g_atrk_name);
+    memset(g_atrk_name, 0, sizeof g_atrk_name); g_kstrk_n = 0;
     g_atrk_n = 0; g_atrk_sel = 0;   /* re-filled per file; subcfg_load below restores a saved choice */
     for (int i = 0; i < m.nb_streams; i++) {
         if (m.streams[i].media_type == MFX_TYPE_VIDEO && vi < 0) vi = i;
@@ -4130,7 +4140,7 @@ static MoflexResult moflex_play_ring(const char *path) {
                            : mfx_open_auto(&m, f, path);
     if (mo != 0) { fclose(f); return MOFLEX_ERROR; }
     int vi = -1, ai = -1;
-    memset(g_atrk_name, 0, sizeof g_atrk_name);
+    memset(g_atrk_name, 0, sizeof g_atrk_name); g_kstrk_n = 0;
     g_atrk_n = 0; g_atrk_sel = 0;   /* re-filled per file; subcfg_load below restores a saved choice */
     for (int i = 0; i < m.nb_streams; i++) {
         if (m.streams[i].media_type == MFX_TYPE_VIDEO && vi < 0) vi = i;
@@ -5434,7 +5444,7 @@ static MoflexResult moflex_play_soft(const char *path) {
     MfxDemux m;
     if (mfx_open_auto(&m, f, path) != 0) { fclose(f); return MOFLEX_ERROR; }
     int vi = -1, ai = -1;
-    memset(g_atrk_name, 0, sizeof g_atrk_name);
+    memset(g_atrk_name, 0, sizeof g_atrk_name); g_kstrk_n = 0;
     g_atrk_n = 0; g_atrk_sel = 0;   /* re-filled per file; subcfg_load below restores a saved choice */
     for (int i = 0; i < m.nb_streams; i++) {
         if (m.streams[i].media_type == MFX_TYPE_VIDEO && vi < 0) vi = i;
@@ -5918,6 +5928,7 @@ void kit_film_begin(int is3d) {
     g_view_is3d = is3d;
     g_atrk_n = 1; g_atrk_sel = 0; g_atrk_apply = 0;   /* one track: SOUND shows auto level only */
     memset(g_atrk_name, 0, sizeof g_atrk_name);
+    g_kstrk_n = 0; g_kstrk_sel = 0; g_kstrk_apply = 0;
     lb_reset(); al_reset();
     g_kit_redraw = 0;
     g_kit_fmt_row = 1; g_kit_fmt_changed = 0;
@@ -5980,6 +5991,18 @@ void kit_fmt_save(const char *movie, int fmt) {
     fprintf(f, "%d\n", fmt); fclose(f);
 }
 void kit_set_subs_any(int on) { g_kit_subs_any = on; }
+void kit_set_sub_tracks(int n, const char name[][48], int sel) {
+    if (n > KSTRK_MAX) n = KSTRK_MAX;
+    if (n < 0) n = 0;
+    for (int i = 0; i < n; i++) snprintf(g_kstrk_name[i], sizeof g_kstrk_name[i], "%s", name[i]);
+    g_kstrk_n = n; g_kstrk_sel = sel >= 0 && sel < n ? sel : 0; g_kstrk_apply = 0;
+    g_kit_menu_dirty = 1;
+}
+int kit_take_sub_change(int *sel) {
+    if (!g_kstrk_apply) return 0;
+    g_kstrk_apply = 0; *sel = g_kstrk_sel;
+    return 1;
+}
 void kit_set_audio_tracks(int n, const char lang[][8], const char name[][48], int sel) {
     if (n > ATRK_MAX) n = ATRK_MAX;
     if (n < 1) { g_atrk_n = 1; g_atrk_sel = 0; return; }

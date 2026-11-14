@@ -5874,6 +5874,9 @@ typedef struct {
     char alang[8][8], aname[8][48];
     /* an embedded text track Plex copies out while the video plays (started once subtitles are on) */
     long long fetch_id, fetch_select; PlexSubFetch *fetch; int fetch_tried;
+    /* the subtitle tracks (CC menu's Track row) and Plex's selection: put back as found */
+    PlexSub subs[16]; int nsub, cur; char sname[16][48];
+    long long orig_sel, plex_sel; int is3d;
 } PlexPlay;
 static void plex_src_set_burn(void *ctx, int on) { ((PlexPlay *)ctx)->burn = on; }
 static void plex_src_set_audio(void *ctx, int idx) {
@@ -5884,11 +5887,49 @@ static void plex_src_set_audio(void *ctx, int idx) {
 }
 static int plex_src_subs_take(void *ctx, long long now_us, char *buf, int cap) {
     PlexPlay *p = (PlexPlay *)ctx;
-    if (!p->fetch && !p->fetch_tried && moflex_subs_on()) {
+    if (!p->fetch && !p->fetch_tried && p->fetch_id && moflex_subs_on()) {
         p->fetch_tried = 1;
         p->fetch = plex_subs_fetch_start(&p->c, p->it.rating, now_us / 1000000, p->part, p->fetch_select);
+        if (p->fetch && p->fetch_select) p->plex_sel = p->fetch_select;
     }
     return p->fetch ? plex_subs_fetch_take(p->fetch, buf, cap) : 0;
+}
+/* Make track idx the one shown: a text file (external, or a saved copy of an embedded one) loads
+ * as a file; an embedded text track without a copy streams in; a picture track is burned in by
+ * the server (2D only). Returns STREAM_SUB_* flags; path gets a file to load. */
+static int plex_sub_apply(PlexPlay *p, int idx, char *path, int cap) {
+    path[0] = 0;
+    if (idx < 0 || idx >= p->nsub) return 0;
+    if (p->fetch) {                       /* the previous track's fetch: keep it if it finished */
+        char cp[96]; plex_sub_cache_path(&p->c, p->fetch_id, cp, sizeof cp);
+        plex_subs_fetch_finish(p->fetch, cp); p->fetch = NULL;
+    }
+    p->fetch_id = 0; p->fetch_select = 0; p->fetch_tried = 0;
+    int was_burn = p->burn, fl = 0; p->burn = 0;
+    const PlexSub *s = &p->subs[idx]; p->cur = idx;
+    int text = plex_sub_is_text(s->codec);
+    if (s->key[0] && text) {              /* an external text file: drawn by the player */
+        snprintf(path, (size_t)cap, "sdmc:/moflex_player/.plexsub.%s", strcmp(s->codec, "srt") ? s->codec : "srt");
+        if (plex_download(&p->c, s->key, path)) fl = STREAM_SUB_FILE; else path[0] = 0;
+    } else if (text) {                    /* embedded text: drawn by the player too (both eyes in 3D) */
+        char cp[96]; plex_sub_cache_path(&p->c, s->id, cp, sizeof cp);
+        FILE *cf = fopen(cp, "rb");
+        if (cf) { fclose(cf); snprintf(path, (size_t)cap, "%s", cp); fl = STREAM_SUB_FILE; }   /* fetched before */
+        else { p->fetch_id = s->id; p->fetch_select = s->id == p->plex_sel ? 0 : s->id; fl = STREAM_SUB_ARRIVE; }
+    } else if (!p->is3d) {                /* a picture track: Plex burns the selected one in */
+        if (s->id == p->plex_sel || plex_select_sub(&p->c, p->part, s->id)) {
+            p->plex_sel = s->id; p->burn = 1; fl = STREAM_SUB_BURN;
+        }
+    }
+    plex_log("subtitles: track %lld (%s%s) -> %s", s->id, s->codec, s->key[0] ? ", external" : "",
+             fl & STREAM_SUB_FILE ? "file" : fl & STREAM_SUB_ARRIVE ? "fetched while playing" :
+             fl & STREAM_SUB_BURN ? "burned in" : "not shown");
+    if (was_burn != p->burn) fl |= STREAM_SUB_RESTART;
+    return fl;
+}
+static int plex_src_set_sub(void *ctx, int idx, long long now_us, char *path, int cap) {
+    (void)now_us;                         /* the fetch starts from where playback is, via subs_take */
+    return plex_sub_apply((PlexPlay *)ctx, idx, path, cap);
 }
 static HttpStream *plex_src_open(void *ctx, long long at_us, int fmt) {
     PlexPlay *p = (PlexPlay *)ctx;
@@ -5920,17 +5961,21 @@ static void plex_src_report(void *ctx, const char *state, long long pos_us) {
 }
 static const char *plex_src_error(void *ctx) { (void)ctx; return plex_error(); }
 
-/* 3D layout of a Plex item: the edition says it ("3D Half SBS" / "3D Full SBS"); untagged, a
- * double-wide frame is full SBS and anything else in a "3D" library is half SBS. */
+/* 3D layout of a Plex item, from the item alone (a "3D" library can hold 2D copies too): the
+ * edition says it ("2D" / "3D Half SBS" / "3D Full SBS"); else "3D"/"SBS" in the edition or the
+ * title, laid out full SBS when the frame is double-wide and half SBS otherwise; else a
+ * double-wide frame is full SBS; else 2D. */
 static int plex_fmt(const PlexItem *it, int lib3d) {
+    (void)lib3d;
     if (ci_contains(it->edition, "full sbs") || ci_contains(it->edition, "fsbs")) return 1;
     if (ci_contains(it->edition, "half sbs") || ci_contains(it->edition, "hsbs") ||
         ci_contains(it->edition, "half-sbs")) return 2;
-    if (ci_contains(it->edition, "sbs") || ci_contains(it->edition, "3d") || lib3d) {
-        if (it->width && it->height && it->width * 10 > it->height * 27) return 1;
-        return 2;
-    }
-    return 0;
+    int wide = it->width && it->height && it->width * 10 > it->height * 27;
+    if (ci_contains(it->edition, "2d")) return 0;
+    if (ci_contains(it->edition, "sbs") || ci_contains(it->edition, "3d") ||
+        ci_contains(it->title, " 3d") || ci_contains(it->title, "sbs"))
+        return wide ? 1 : 2;
+    return wide ? 1 : 0;
 }
 /* returns the player's result (MOFLEX_QUIT_EXIT = the app is closing). from_us >= 0: start there
  * without asking (RESUME on the home card); < 0: offer Plex's resume point. */
@@ -5938,6 +5983,7 @@ static MoflexResult plex_play(const PlexCfg *c, const PlexItem *it, int lib3d, l
     static PlexPlay p;
     p.c = *c; p.it = *it; p.session[0] = 0; p.burn = 0;
     p.part = 0; p.naud = 0; p.fetch_id = 0; p.fetch_select = 0; p.fetch = NULL; p.fetch_tried = 0;
+    p.nsub = 0; p.cur = 0; p.orig_sel = 0; p.plex_sel = 0; p.is3d = 0;
     long long start = from_us > 0 ? from_us : 0;
     if (from_us < 0 && it->offset_ms > 10000 && (it->duration_ms <= 0 || it->offset_ms < it->duration_ms - 30000)) {
         long t = (long)(it->offset_ms / 1000);
@@ -5954,7 +6000,7 @@ static MoflexResult plex_play(const PlexCfg *c, const PlexItem *it, int lib3d, l
     /* ---- subtitles: which track (Playback Defaults), and how (drawn by us / burned by Plex) ---- */
     int fmt = plex_fmt(it, lib3d);
     static char subfile[96]; subfile[0] = 0;
-    PlexSub subs[16]; long long part = 0, orig_sel = 0, burn_id = 0; char alang[8] = "";
+    PlexSub *subs = p.subs; long long part = 0; char alang[8] = "";
     /* the steps before the playback screen say what they're doing: the playback screen stays
      * dark until the first frame, so a slow or refusing server must be visible HERE */
     {   char lw[200]; snprintf(lw, sizeof lw, "Playing \"%s\" (item %s) from %s, start %llds, 3D fmt %d",
@@ -5986,35 +6032,29 @@ static MoflexResult plex_play(const PlexCfg *c, const PlexItem *it, int lib3d, l
     }
     {   int saved = moflex_fmt_load_key(key); if (saved >= 0) fmt = saved; }   /* the Format row's choice */
     int burnable = 0, subs_on = moflex_subs_wanted(key, alang);   /* the PLAYER's switch decides */
+    int pick = -1;
+    p.is3d = fmt != 0;
     if (ns > 0) {
         MoflexDefaults d; moflex_defaults_get(&d);
-        int pick = -1, sel = -1;
-        for (int i = 0; i < ns; i++) if (subs[i].selected) { sel = i; orig_sel = subs[i].id; }
+        int sel = -1;
+        p.nsub = ns;
+        for (int i = 0; i < ns; i++) {
+            if (subs[i].selected) { sel = i; p.orig_sel = p.plex_sel = subs[i].id; }
+            char cu[12]; snprintf(cu, sizeof cu, "%s", subs[i].codec);
+            for (char *q = cu; *q; q++) if (*q >= 'a' && *q <= 'z') *q -= 32;
+            const char *t = subs[i].title[0] ? subs[i].title : subs[i].lang[0] ? subs[i].lang : "Track";
+            snprintf(p.sname[i], sizeof p.sname[i], "%.30s%s [%s]", t,
+                     subs[i].forced && !ci_contains(t, "forced") ? " Forced" : "", cu);
+        }
         /* the track to use whenever subtitles are on: Plex's own selection, else the preferred
          * language (not a forced-only track), else the first */
         const char *want = d.slang > 0 ? moflex_lang_code(d.slang) : "ENG";
         pick = sel;
         for (int i = 0; i < ns && pick < 0; i++) if (!subs[i].forced && !strcasecmp(subs[i].lang, want)) pick = i;
         if (pick < 0) pick = 0;
-        if (pick >= 0) {
-            const PlexSub *s = &subs[pick];
-            int text = plex_sub_is_text(s->codec);
-            if (s->key[0] && text) {              /* an external text file: drawn by the player */
-                msg_screen_nowait(it->title, "Getting subtitles...");
-                snprintf(subfile, sizeof subfile, "sdmc:/moflex_player/.plexsub.%s", strcmp(s->codec, "srt") ? s->codec : "srt");
-                if (!plex_download(c, s->key, subfile)) subfile[0] = 0;
-            } else if (text) {                    /* embedded text: drawn by the player too (both eyes in 3D) */
-                char cp[96]; plex_sub_cache_path(c, s->id, cp, sizeof cp);
-                FILE *cf = fopen(cp, "rb");
-                if (cf) { fclose(cf); snprintf(subfile, sizeof subfile, "%s", cp); }   /* fetched before */
-                else { p.fetch_id = s->id; p.fetch_select = s->id == orig_sel ? 0 : s->id; }
-                plex_log("subtitles: embedded %s track %lld, %s", s->codec, s->id, cf ? "saved copy" : "fetched while playing");
-            } else if (fmt == 0) {                /* a picture track: Plex burns the selected one in */
-                if (s->id == orig_sel || plex_select_sub(c, part, s->id)) {
-                    burnable = 1; burn_id = s->id; p.burn = subs_on;
-                }
-            }
-        }
+        msg_screen_nowait(it->title, "Getting subtitles...");
+        int fl = plex_sub_apply(&p, pick, subfile, sizeof subfile);
+        if (fl & STREAM_SUB_BURN) { burnable = 1; p.burn = subs_on; }
     }
 
     /* will the server make the stream? (it answers why not -- shown here, not on a dark screen) */
@@ -6023,7 +6063,7 @@ static MoflexResult plex_play(const PlexCfg *c, const PlexItem *it, int lib3d, l
         if (!plex_stream_check(c, it->rating, start, sfmt != 0, p.burn && sfmt == 0)) {
             char m[260]; snprintf(m, sizeof m, "The server can't stream this.\n\n%s\n\nDetails: moflex_player/plex_log.txt", plex_error());
             plex_log_end(); msg_screen("PLEX", m);
-            if (burn_id && burn_id != orig_sel) plex_select_sub(c, part, orig_sel);
+            if (p.plex_sel != p.orig_sel) plex_select_sub(c, part, p.orig_sel);
             return MOFLEX_QUIT_BACK;
         }
         msg_screen_nowait(it->title, "Starting the video...\n(the screen stays dark until it\narrives -- up to 30 seconds)");
@@ -6038,15 +6078,15 @@ static MoflexResult plex_play(const PlexCfg *c, const PlexItem *it, int lib3d, l
                     plex_src_open, plex_src_close, plex_src_report, plex_src_error, subfile,
                     burnable, subs_on, plex_src_set_burn,
                     p.naud, asel, (const char (*)[8])p.alang, (const char (*)[48])p.aname, plex_src_set_audio,
-                    p.fetch_id ? plex_src_subs_take : NULL };
+                    p.nsub > 0 ? plex_src_subs_take : NULL,
+                    p.nsub, pick, (const char (*)[48])p.sname, plex_src_set_sub };
     MoflexResult r = stream_play(&s);
-    if (p.fetch) {                        /* keep a whole track for next time; put Plex's choice back */
+    if (p.fetch) {                        /* keep a whole track for next time */
         char cp[96]; plex_sub_cache_path(c, p.fetch_id, cp, sizeof cp);
         plex_subs_fetch_finish(p.fetch, cp); p.fetch = NULL;
-        if (p.fetch_select) plex_select_sub(c, part, orig_sel);
     }
+    if (p.plex_sel != p.orig_sel) plex_select_sub(c, part, p.orig_sel);   /* leave Plex's choice as it was */
     plex_log_end();
-    if (burn_id && burn_id != orig_sel) plex_select_sub(c, part, orig_sel);   /* leave Plex's choice as it was */
     consoleInit(GFX_BOTTOM, NULL);
     gfxSetDoubleBuffering(GFX_BOTTOM, false);
     branding_show();

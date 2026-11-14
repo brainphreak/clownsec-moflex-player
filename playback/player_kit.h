@@ -68,6 +68,9 @@ void kit_set_subs_any(int on);        /* subtitles exist though none are loaded 
  * Picking one there is reported by kit_take_audio_change -- the caller restarts the stream on it. */
 void kit_set_audio_tracks(int n, const char lang[][8], const char name[][48], int sel);
 int  kit_take_audio_change(int *sel);
+/* ...and its subtitle tracks for the CC menu's Track row (picking one also turns subtitles on) */
+void kit_set_sub_tracks(int n, const char name[][48], int sel);
+int  kit_take_sub_change(int *sel);
 
 /* A touch-DOWN on the panel. Menu buttons and the moon are handled inside; transport actions
  * come back for the caller. */
