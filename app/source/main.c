@@ -616,9 +616,17 @@ static void upload_screen(void) {
                 }
             } else {
                 ui_text_center(UI_W / 2, 62, 1, UI_INK, "Server ON. On the same Wi-Fi, open:");
-                ui_text_center_fit(UI_W / 2, 84, 2, UI_NEONC, httpd_url(), UI_W - 16);
-                ui_text_center(UI_W / 2, 118, 1, UI_DIM, "Upload any files from the page.");
-                ui_text_center(UI_W / 2, 134, 1, UI_DIM, "Browse folders + delete there too.");
+                if (httpd_url_name()[0]) {   /* the short name, with the address as a fallback */
+                    ui_text_center_fit(UI_W / 2, 80, 2, UI_NEONC, httpd_url_name(), UI_W - 16);
+                    ui_text_center(UI_W / 2, 100, 1, UI_DIM, "or");
+                    ui_text_center_fit(UI_W / 2, 112, 1, UI_NEONC, httpd_url(), UI_W - 16);
+                    ui_text_center(UI_W / 2, 136, 1, UI_DIM, "Upload any files from the page.");
+                    ui_text_center(UI_W / 2, 152, 1, UI_DIM, "Browse folders + delete there too.");
+                } else {
+                    ui_text_center_fit(UI_W / 2, 84, 2, UI_NEONC, httpd_url(), UI_W - 16);
+                    ui_text_center(UI_W / 2, 118, 1, UI_DIM, "Upload any files from the page.");
+                    ui_text_center(UI_W / 2, 134, 1, UI_DIM, "Browse folders + delete there too.");
+                }
             }
             ui_present();
             redraw = 0;

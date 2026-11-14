@@ -12,6 +12,8 @@ bool httpd_start(void);
 void httpd_stop(void);
 /* Human-readable "http://x.x.x.x:8080" (or "wifi off" if no IP). */
 const char *httpd_url(void);
+/* "http://clownsec.local" (mDNS name, port 80) or "" when the name couldn't be set up */
+const char *httpd_url_name(void);
 
 /* If an upload is currently being received, fills done/total (bytes) + the filename and
  * returns 1; otherwise returns 0. Lets the on-device UI show a progress bar. */
