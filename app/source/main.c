@@ -1624,6 +1624,8 @@ static const signed char *s_pick_status = NULL;         /* optional per-item bad
  * screen, so a list used to leave whatever was already up there -- which is why every episode of
  * a show showed the SHOW's info. Set this to draw the highlighted item instead. */
 static void (*s_pick_top)(int item) = NULL;
+/* set (from any thread) when the top screen's art just arrived: the picker repaints its row */
+static volatile int s_pick_top_refresh = 0;
 static int s_pick_init = 0;   /* initial highlight ROW for the NEXT catalog_pick (one-shot):
                                * callers set it when re-showing a list so B-back lands where you were */
 static int catalog_pick(const char *title, const char *subtitle, char items[][64], int n, int show_all, const char *extra) {
@@ -1682,6 +1684,8 @@ static int catalog_pick(const char *title, const char *subtitle, char items[][64
                 else if (ptop_first || ++ptop_settle >= 5) {
                     ptop(item); ptop_drawn = item; ptop_settle = 0; ptop_first = 0;
                 }
+            } else if (s_pick_top_refresh && !(kh & (NAV_UP | NAV_DOWN | KEY_LEFT | KEY_RIGHT))) {
+                s_pick_top_refresh = 0; ptop(item);     /* its poster came in the background */
             }
         }
         if (redraw) {
@@ -6057,6 +6061,15 @@ static int plex_playable(const PlexItem *it) {
  * resizes it; cached on the card like catalog art), title, year, genres, rating, runtime, summary. */
 static const PlexItem *s_plex_items = NULL; static int s_plex_n = 0;
 static PlexCfg s_plex_cfg;
+/* one poster download at a time, off the UI thread; the picker repaints when it lands */
+static volatile int s_pf_busy = 0;
+static char s_pf_url[640], s_pf_key[200];                /* the last one asked for (never twice) */
+static void plex_poster_thread(void *a) {
+    (void)a;
+    static u16 buf[POSTER_W * POSTER_H];
+    poster_get(s_pf_url, s_pf_key, buf, POSTER_W, POSTER_H);   /* lands in the card's art cache */
+    s_pf_busy = 0; s_pick_top_refresh = 1;
+}
 static void plex_draw_top(int i) {
     if (!s_plex_items || i < 0 || i >= s_plex_n) return;
     const PlexItem *e = &s_plex_items[i];
@@ -6077,9 +6090,16 @@ static void plex_draw_top(int i) {
     static u16 art[POSTER_W * POSTER_H];
     int have = 0;
     if (e->poster[0] && strncmp(e->poster, "/:/resources", 12)) {   /* skip Plex's stock section icons */
-        char url[640]; plex_art_url(&s_plex_cfg, e->poster, POSTER_W, POSTER_H, url, sizeof url);
         char key[200]; snprintf(key, sizeof key, "plex%s", e->poster);   /* the thumb path is versioned */
-        have = poster_get(url, key, art, POSTER_W, POSTER_H);
+        have = poster_cached(key, art, POSTER_W, POSTER_H);
+        /* not on the card yet: fetch it in the background so the list keeps moving (it used to
+         * download right here, holding the buttons for a second per row over a slow link) */
+        if (!have && !s_pf_busy && strcmp(key, s_pf_key)) {
+            plex_art_url(&s_plex_cfg, e->poster, POSTER_W, POSTER_H, s_pf_url, sizeof s_pf_url);
+            snprintf(s_pf_key, sizeof s_pf_key, "%s", key);
+            s_pf_busy = 1;
+            if (!threadCreate(plex_poster_thread, NULL, 128 * 1024, 0x3F, -2, true)) s_pf_busy = 0;
+        }
     }
     draw_info_top(&m, have ? art : NULL);
 }

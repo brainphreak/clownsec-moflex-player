@@ -7,6 +7,8 @@
  * and write it row-major RGB565 into out (pw*ph u16s). cache_key is sanitized to a
  * filename so repeat views are instant. Returns 1 on success, 0 on no-art/failure. */
 int poster_get(const char *art_url, const char *cache_key, u16 *out, int pw, int ph);
+/* the cached copy only (no network): 1 = out filled */
+int poster_cached(const char *cache_key, u16 *out, int pw, int ph);
 
 /* Write a metadata sidecar next to a cached catalog poster, as "<sanitized key>.nfo" in the
  * art directory, in the same "key: value" shape movieinfo uses. The poster cache is otherwise

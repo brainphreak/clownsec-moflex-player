@@ -767,7 +767,27 @@ static long sf_get(PlexSubFetch *f, const char *url, int stream, int *rc_out, in
     curl_easy_setopt(e, CURLOPT_XFERINFODATA, f);
     curl_easy_setopt(e, CURLOPT_WRITEFUNCTION, stream ? sf_write : on_mem);
     curl_easy_setopt(e, CURLOPT_WRITEDATA, stream ? (void *)f : (void *)&m);
-    CURLcode rc = curl_easy_perform(e);
+    /* Never wait inside the network stack. Every thread's socket calls go through the one
+     * session the app holds with the console's socket service, and this transfer is mostly
+     * silence (a cue every few seconds): a blocking wait here parked the video stream and the
+     * timeline reports behind it until they timed out. So: non-blocking steps, sleep between. */
+    CURLcode rc = CURLE_OK;
+    CURLM *mh = curl_multi_init();
+    if (!mh) rc = CURLE_OUT_OF_MEMORY;
+    else {
+        curl_multi_add_handle(mh, e);
+        int running = 1;
+        while (running) {
+            if (curl_multi_perform(mh, &running) != CURLM_OK) { rc = CURLE_RECV_ERROR; break; }
+            if (!running) break;
+            if (f->quit && !f->noabort) { rc = CURLE_ABORTED_BY_CALLBACK; break; }
+            svcSleepThread(50 * 1000000LL);
+        }
+        CURLMsg *msg; int left;
+        while ((msg = curl_multi_info_read(mh, &left)))
+            if (msg->msg == CURLMSG_DONE && msg->easy_handle == e) rc = msg->data.result;
+        curl_multi_remove_handle(mh, e); curl_multi_cleanup(mh);
+    }
     long code = 0; curl_easy_getinfo(e, CURLINFO_RESPONSE_CODE, &code);
     curl_slist_free_all(hl); curl_easy_cleanup(e); free(m.p);
     if (rc_out) *rc_out = (int)rc;
@@ -820,6 +840,9 @@ PlexSubFetch *plex_subs_fetch_start(const PlexCfg *c, const char *rating_key, lo
     PlexSubFetch *f = (PlexSubFetch *)calloc(1, sizeof *f); if (!f) return NULL;
     f->c = *c; snprintf(f->rating, sizeof f->rating, "%s", rating_key);
     f->part_id = part_id; f->sub_id = select_sub_id;
+    /* its own device id: Plex ends a device's running stream when that device starts another
+     * session, so under the console's own id this would cut the video off */
+    snprintf(f->c.client, sizeof f->c.client, "%.34s-subs", c->client);
     f->start_s = start_s < 0 ? 0 : start_s;
     LightLock_Init(&f->lk);
     /* off the video's core (2) where possible; lowest priority -- it only waits on the network */
