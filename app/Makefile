@@ -22,6 +22,7 @@ BUILD_TAG ?= $(shell ./buildnum.sh)
 export BUILD_TAG
 CFLAGS  := -w -Wreturn-type -O3 -mword-relocations -ffunction-sections -D__3DS__ -D_GNU_SOURCE \
 	-DBUILD_TAG=\"$(BUILD_TAG)\" \
+	-DMOBI_OPT_CONST=0x08bbda5e \
 	-Wno-error=implicit-function-declaration $(ARCH) $(INCLUDE)
 # Test builds only: UPDATE_TEST_URL=https://.../latest.txt points the update check (and the
 # self-updater's download, which sits beside it) somewhere other than the public release.

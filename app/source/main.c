@@ -5039,6 +5039,7 @@ static int extplay_launch(const char *path) {
     return 1;
 }
 
+static int g_play_to_browser = 0;   /* set by a browser (Big Top, Plex) that redraws its own top screen */
 static MoflexResult play_movie(const char *path) {
     /* a Big Top video streams from the server: none of the card checks below apply to it */
     int remote = !strncmp(path, "bigtop:", 7);
@@ -5147,7 +5148,9 @@ static MoflexResult play_movie(const char *path) {
     cia_clear_selection();
     consoleInit(GFX_BOTTOM, NULL);
     gfxSetDoubleBuffering(GFX_BOTTOM, false);
-    branding_show();               /* restore the 3D logo on the top screen */
+    /* back to a browser: it draws the movie's info on top itself, so no logo in between */
+    if (!g_play_to_browser) branding_show();   /* restore the 3D logo on the top screen */
+    g_play_to_browser = 0;
     return r;
 }
 
@@ -6289,7 +6292,7 @@ static int plex_browse(void) {
         int sel = catalog_pick(ttl[depth], sub[0] ? sub : NULL, names, shown, 0, NULL);
         s_plex_items = NULL; s_plex_n = 0;
         if (view != it) free(view);
-        branding_show();                      /* the logo back while the next list loads */
+        /* the top keeps the last info until the next list draws its own (no logo flash) */
         free(names);
         if (sel == -4) {                      /* X: search this list (B clears it) */
             free(map);
@@ -6420,8 +6423,72 @@ static void home_draw(int bsel, long long rpos) {
     }
 }
 
+/* ---- WHAT'S NEW: shown once per release note (not per build). Bump WHATSNEW_ID with new notes. ---- */
+#define WHATSNEW_ID   "engine2"
+#define WHATSNEW_SEEN "sdmc:/moflex_player/whatsnew_seen.txt"
+static const char *const k_whatsnew[] = {
+    "2D and 3D moflex are now fully supported on Old 3DS, both local files and streaming from the CLOWNSEC Big Top streaming app.",
+    "A new playback engine on every 3DS: smoother video and steady frame pacing, even in heavy action scenes.",
+    "Found a bug? Report it to bugs@clownsec.com",
+};
+#define WN_CW    37          /* characters per line (8 px font, 12 px margins) */
+#define WN_LINES 13          /* visible body lines between the rule and the button */
+static void whatsnew_maybe_show(void) {
+    char seen[40] = "";
+    FILE *f = fopen(WHATSNEW_SEEN, "r");
+    if (f) { if (!fgets(seen, sizeof seen, f)) seen[0] = 0; fclose(f); }
+    seen[strcspn(seen, "\r\n")] = 0;
+    if (!strcmp(seen, WHATSNEW_ID)) return;
+    const int np = (int)(sizeof k_whatsnew / sizeof k_whatsnew[0]);
+    int plines[8], total = 0;
+    for (int i = 0; i < np; i++) {
+        int y = 0; plines[i] = ui_text_wrap_from(0, &y, 1, UI_INK, k_whatsnew[i], WN_CW, 0, 0);
+        total += plines[i] + (i + 1 < np ? 1 : 0);   /* a blank line between paragraphs */
+    }
+    int scroll = 0, maxscroll = total > WN_LINES ? total - WN_LINES : 0;
+    int redraw = 1, tdown = 0, tx0 = 0, ty0 = 0;
+    while (aptMainLoop()) {
+        hidScanInput();
+        u32 k = hidKeysDown(), ku = hidKeysUp();
+        if (k & (KEY_A | KEY_B)) break;
+        if ((k & KEY_DOWN) && scroll < maxscroll) { scroll++; redraw = 1; }
+        if ((k & KEY_UP) && scroll > 0) { scroll--; redraw = 1; }
+        touchPosition tp; hidTouchRead(&tp);
+        if (k & KEY_TOUCH) { tdown = 1; tx0 = tp.px; ty0 = tp.py; }
+        else if ((ku & KEY_TOUCH) && tdown) { tdown = 0; if (ty0 >= 206 && ty0 < 234 && tx0 >= 110 && tx0 < 210) break; }
+        if (redraw) {
+            ui_begin(GFX_BOTTOM);
+            ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
+            ui_text_center_fit(UI_W / 2, 14, 2, UI_NEON, "WHAT'S NEW", UI_W - 16);
+            ui_glow_round(28, 42, UI_W - 56, 2, 1, UI_NEON, 3, 30);
+            ui_fill_round(28, 42, UI_W - 56, 2, 1, UI_NEON);
+            int y = 56, line = 0, room = WN_LINES;            /* line = index into the whole text */
+            for (int i = 0; i < np && room > 0; i++) {
+                int skip = scroll > line ? scroll - line : 0;  /* lines of this paragraph above the window */
+                if (skip < plines[i]) {
+                    int y0 = y;
+                    ui_text_wrap_from(12, &y, 1, UI_INK, k_whatsnew[i], WN_CW, room, skip);
+                    room -= (y - y0) / 10;
+                }
+                line += plines[i];
+                if (i + 1 < np) { if (line >= scroll && room > 0) { y += 10; room--; } line++; }   /* paragraph gap */
+            }
+            if (scroll < maxscroll) ui_text(12, 194, 1, UI_NEON, "v more");
+            if (scroll > 0) ui_text(UI_W - 12 - 8 * 6, 194, 1, UI_NEON, "^ back");
+            ui_button(110, 206, 100, 28, "OKAY", 0, UI_NEONP);
+            ui_present(); redraw = 0;
+        }
+        gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
+    }
+    mkdir("sdmc:/moflex_player", 0777);
+    f = fopen(WHATSNEW_SEEN, "w");
+    if (f) { fputs(WHATSNEW_ID "\n", f); fclose(f); }
+}
+
 static int home_gui(void) {
     static int bsel = 0;   /* remember the highlighted button across screens (B back keeps it) */
+    static int s_whatsnew_done = 0;
+    if (!s_whatsnew_done) { s_whatsnew_done = 1; whatsnew_maybe_show(); }
     int redraw = 1;
     if (startup_detect_poll()) redraw = 1;   /* background new-video check landed while we were away */
     /* read the resume position ONCE (not every frame -- that hammered the SD card) */
@@ -6744,6 +6811,7 @@ static int bt_play(const BtCfg *c, const BtItem *it, const char *title) {
     /* the first seconds are the player reading the start (and end) of the file over Wi-Fi */
     msg_screen_nowait(title, "Connecting to Big Top...");
     httpfile_reset();
+    g_play_to_browser = 1;
     MoflexResult r = play_movie(path);
     httpfile_drop_cache();                                /* the video's kept blocks: memory back */
     long long at = moflex_resume_get(path);               /* where the engine stopped (0 = the end) */
@@ -6878,7 +6946,8 @@ static int bt_browse(void) {
         int sel = catalog_pick(ttl[depth], sub[0] ? sub : NULL, names, shown, 0, NULL);
         s_bt_items = NULL; s_bt_n = 0;
         if (view != it) free(view);
-        branding_show();
+        /* no logo here: the top keeps the last info until the next list draws its own (the logo
+         * flashed between every list and after every movie) */
         free(names);
         if (sel == -4) {                                  /* X: search this list */
             free(map);
