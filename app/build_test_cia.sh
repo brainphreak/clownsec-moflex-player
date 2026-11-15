@@ -10,7 +10,7 @@ unset UPDATE_TEST_URL
 export BUILD_TAG=${BUILD_TAG:-$(./buildnum.sh)}
 make clean BUILD_TAG=$BUILD_TAG >/dev/null
 make TEST_CHANNEL=1 BUILD_TAG=$BUILD_TAG
-"$BIN/bannertool" makesmdh -s "CLOWNSEC VIDEO TEST" -l "MOFLEX VIDEO PLAYER (engine test)" -p "brAinphreAk" \
+"$BIN/bannertool" makesmdh -s "CLOWNSEC VIDEO (BETA)" -l "CLOWNSEC VIDEO (BETA)" -p "brAinphreAk" \
     -i icon.png -o clownsec_player_test.smdh
 "$DEVKITPRO/tools/bin/3dsxtool" clownsec_player.elf clownsec_player_test.3dsx --smdh=clownsec_player_test.smdh
 "$BIN/bannertool" makebanner -i banner.png -a banner_audio.wav -o banner.bin
