@@ -1128,6 +1128,12 @@ static int entry_super(const CatEntry *e, char *audio, int acap, char *subs, int
  * Reset whenever the highlight moves -- scrolling belongs to the thing you are looking at. */
 static int g_desc_scroll = 0, g_desc_over = 0, g_desc_total = 0;
 #define DESC_LINES 12
+/* How many description lines the panel shows. It is NOT a constant: the description starts lower
+ * when there are Audio/Subs/genre lines above it (a SUPER MOFLEX has all three), and a fixed 12
+ * then ran over the "more..." hint and off the bottom of the screen. Set by draw_info_top() from
+ * where the text actually starts; the scroll handlers use it for the last scroll position. */
+static int g_desc_lines = DESC_LINES;
+#define DESC_HINT_Y 228                 /* the "more... ZL/ZR" hint row */
 static void draw_info_top(const CatEntry *e, const u16 *poster) {
     ui_begin(GFX_TOP);
     ui_clear(UI_BG);
@@ -1168,17 +1174,26 @@ static void draw_info_top(const CatEntry *e, const u16 *poster) {
     }
     if (e->genres[0]) { ui_text_wrap(tx, &ty, 1, UI_GRAY, e->genres, 30, 3); ty += 4; }
     if (e->desc[0]) {
-        int total = ui_text_wrap_from(tx, &ty, 1, UI_INK, e->desc, 30, DESC_LINES, g_desc_scroll);
-        g_desc_over = (total > DESC_LINES); g_desc_total = total;
+        /* lines are 10 px (8 px glyphs + 2): fit to the screen edge when it all fits, otherwise
+         * stop above the hint row so the two never overlap */
+        int dummy = ty;
+        int total = ui_text_wrap_from(tx, &dummy, 1, UI_INK, e->desc, 30, 0, 0);   /* count only */
+        int fit_all  = (240 - 2 - 8 - ty) / 10 + 1;
+        int fit_hint = (DESC_HINT_Y - 2 - 8 - ty) / 10 + 1;
+        g_desc_lines = (total <= fit_all) ? fit_all : fit_hint;
+        if (g_desc_lines < 1) g_desc_lines = 1;
+        if (g_desc_scroll > total - g_desc_lines) g_desc_scroll = total - g_desc_lines > 0 ? total - g_desc_lines : 0;
+        ui_text_wrap_from(tx, &ty, 1, UI_INK, e->desc, 30, g_desc_lines, g_desc_scroll);
+        g_desc_over = (total > g_desc_lines); g_desc_total = total;
         if (g_desc_over) {
             /* Say that there is more, and which buttons reach it. A New 3DS has ZL/ZR; every
              * console has L with up and down, so neither is left without a way down the page. */
             char hint[40];
-            int shown = total - g_desc_scroll; if (shown > DESC_LINES) shown = DESC_LINES;
+            int shown = total - g_desc_scroll; if (shown > g_desc_lines) shown = g_desc_lines;
             snprintf(hint, sizeof hint, "%s ZL/ZR or L+%s",
                      g_desc_scroll + shown < total ? "more..." : "end.",
                      g_desc_scroll > 0 ? "up/down" : "down");
-            ui_text(tx, 228, 1, UI_DIM, hint);
+            ui_text(tx, DESC_HINT_Y, 1, UI_DIM, hint);
         }
     } else { g_desc_over = 0; g_desc_total = 0; }
     ui_present();
@@ -1987,7 +2002,7 @@ cb_rebuild:;   /* X-search inside the list jumps back here with filt_search set 
             if ((kh & KEY_L) && (k & KEY_UP))   sd = -1;
             if (sd) {
                 g_desc_scroll += sd * 4;
-                int last = g_desc_total - DESC_LINES;      /* never past the final line */
+                int last = g_desc_total - g_desc_lines;      /* never past the final line */
                 if (g_desc_scroll > last) g_desc_scroll = last;
                 if (g_desc_scroll < 0)    g_desc_scroll = 0;
                 redraw = 1;
@@ -3235,7 +3250,7 @@ ll_rebuild:;   /* X-search inside the list jumps back here with s_lib_search set
             if ((kh & KEY_L) && (k & KEY_UP))   sd = -1;
             if (sd) {
                 g_desc_scroll += sd * 4;
-                int last = g_desc_total - DESC_LINES;      /* never past the final line */
+                int last = g_desc_total - g_desc_lines;      /* never past the final line */
                 if (g_desc_scroll > last) g_desc_scroll = last;
                 if (g_desc_scroll < 0)    g_desc_scroll = 0;
                 redraw = 1;
