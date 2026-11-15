@@ -32,6 +32,7 @@ typedef struct {
 } MfxPacket;
 
 #define MFX_RBUF (64 * 1024)
+extern int mfx_rbuf_size;      /* bytes per SD read; defaults to MFX_RBUF (lab can raise it before mfx_open) */
 
 typedef struct {
     FILE   *f;

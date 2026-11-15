@@ -5,12 +5,14 @@
 #include <string.h>
 #include <limits.h>
 
+int mfx_rbuf_size = MFX_RBUF;
+
 /* ---- buffered byte reader (mirrors avio_* used by moflex.c) ---- */
 static void io_fill(MfxDemux *m) {
     m->rbase = (int64_t)ftello(m->f) - m->base;      /* logical pos within [base, base+file_size) */
-    int toread = MFX_RBUF;
+    int toread = mfx_rbuf_size;
     int64_t remain = m->file_size - m->rbase;         /* never read past the window (CIA-embedded moflex) */
-    if (remain < MFX_RBUF) toread = remain > 0 ? (int)remain : 0;
+    if (remain < mfx_rbuf_size) toread = remain > 0 ? (int)remain : 0;
     size_t got = toread ? fread(m->rbuf, 1, (size_t)toread, m->f) : 0;
     m->rn = (int)got;
     m->rp = 0;
@@ -187,7 +189,7 @@ int mfx_open_window(MfxDemux *m, FILE *f, int64_t base, int64_t size) {
     memset(m, 0, sizeof(*m));
     m->f = f;
     m->base = base;
-    m->rbuf = (uint8_t *)malloc(MFX_RBUF);
+    m->rbuf = (uint8_t *)malloc(mfx_rbuf_size);
     if (!m->rbuf) return -1;
 
     /* window size (whole file, or the embedded region) + duration probe over the window's tail */

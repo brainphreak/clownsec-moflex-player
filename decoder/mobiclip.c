@@ -54,6 +54,11 @@ uint64_t mobi_recon_ticks;
  * Findings: 1 SWAR hurt, 2 idct-skip ~2%, 4 DC-only noise, 8 prefetch helps pure-decode ~5% but
  * REGRESSES in-player (fights Y2R for the memory bus), 16 UHADD8 bit-exact but 0 gain (memory-bound). */
 int mobi_opt = 0;
+#ifdef MOBI_OPT_CONST
+/* build-time decoder config: every mobi_opt test folds to a constant, so unused variants and their
+ * branches are compiled out (smaller hot code). The runtime variable above is then ignored. */
+#define mobi_opt (MOBI_OPT_CONST)
+#endif
 #define PF(p) do { if (mobi_opt & 8) __builtin_prefetch((p), 0, 1); } while (0)
 
 /* SWAR (SIMD-within-a-register): process 4 packed bytes per 32-bit op. The >>1 + mask
@@ -377,6 +382,7 @@ typedef struct BlockXY {
     int size;
     uint8_t *block;
     int linesize;
+    int interior;      /* every pixel pget can touch is inside the frame: no clamping needed */
 } BlockXY;
 
 typedef struct MotionXY {
@@ -388,6 +394,12 @@ typedef struct MotionXY {
  * order (bit-exact single-thread) or splits them across two cores. The intricate bitstream parsing
  * stays inline and unchanged -- only the final pixel-write becomes a recorded job. ---- */
 enum { RECON_INLINE = 0, RECON_RECORD = 1 };   /* recon_mode: 0 = original (parse+reconstruct fused) */
+/* With a build-time config the record/replay machinery folds away entirely unless MOBI_RECON2 is in it. */
+#ifdef MOBI_OPT_CONST
+#define RECON_IS_RECORD(s) (((MOBI_OPT_CONST) & 0x10000000) && (s)->recon_mode == RECON_RECORD)
+#else
+#define RECON_IS_RECORD(s) ((s)->recon_mode == RECON_RECORD)
+#endif
 enum { RJ_MC = 0, RJ_IDCT = 1, RJ_INTRA = 2 };
 typedef struct ReconJob {
     uint8_t  type, plane, size, param;   /* param = MC method / intra pmode */
@@ -779,7 +791,8 @@ static int add_coefficients_impl(AVCodecContext *avctx, AVFrame *frame,
 {
     MobiClipContext *s = avctx->priv_data;
     GetBitContext *gb = &s->gb;
-    dctcoef mat[64] = { 0 };
+    dctcoef mat[64];
+    memset(mat, 0, (size_t)size * size * sizeof(dctcoef));   /* a 4x4 block only uses 16 entries */
     const uint8_t *ztab = size == 8 ? ff_zigzag_direct : zigzag4x4_tab;
     const int *qtab = s->qtab[size == 8];
     uint8_t *dst = frame->data[plane] + by * frame->linesize[plane] + bx;
@@ -788,6 +801,49 @@ static int add_coefficients_impl(AVCodecContext *avctx, AVFrame *frame,
     if ((mobi_opt & 32) && !g_clamp_ready) clamp_init();
     uint64_t _te = PROF_NOW();
 
+    if (mobi_opt & 0x200000) {
+        /* Fast coefficient loop, structured like the official decoder: one 32-bit window per coefficient,
+         * one 12-bit table lookup for run/level/last, and the sign bit read from the same window (no
+         * separate get_bits1). Escape codes (level 0 in the table) take the original path. Bit-exact. */
+        const VLCElem *tab = rl_vlc[s->dct_tab_idx];
+        const uint8_t *buf = gb->buffer;
+        unsigned idx = gb->index;
+        const int end = gb->size_in_bits, n2 = size * size;
+        for (int pos = 0; (int)(end - (int)idx) > 0; pos++) {
+            uint32_t c = AV_RB32(buf + (idx >> 3)) << (idx & 7);
+            const VLCElem e = tab[c >> (32 - MOBI_RL_VLC_BITS)];
+            int n = e.sym, len = e.len;
+            int last = (n >> 11) == 1, run = (n >> 5) & 0x3F, level = n & 0x1F;
+            if (level) {
+                if ((c << len) & 0x80000000u) level = -level;
+                idx += len + 1;
+            } else {
+                gb->index = idx + len;
+                if (!get_bits1(gb)) {
+                    read_run_encoding(gb, s->dct_tab_idx, &last, &run, &level);
+                    level += run_residue[s->dct_tab_idx][(last ? 64 : 0) + run];
+                    if (get_bits1(gb)) level = -level;
+                } else if (!get_bits1(gb)) {
+                    read_run_encoding(gb, s->dct_tab_idx, &last, &run, &level);
+                    run += run_residue[s->dct_tab_idx][128 + (last ? 64 : 0) + level];
+                    if (get_bits1(gb)) level = -level;
+                } else {
+                    last  = get_bits1(gb);
+                    run   = get_bits(gb, 6);
+                    level = get_sbits(gb, 12);
+                }
+                idx = gb->index;
+            }
+            pos += run;
+            if (pos >= n2) { gb->index = idx; return AVERROR_INVALIDDATA; }
+            int zp = ztab[pos];
+            mat[zp] = qtab[pos] * (unsigned)level;
+            rowmask |= 1u << (zp >> (size == 8 ? 3 : 2));   /* size is 4 or 8: shift, not a software divide */
+            ac += (zp != 0);
+            if (last) break;
+        }
+        gb->index = idx;
+    } else
     for (int pos = 0; get_bits_left(gb) > 0; pos++) {
         int qval, last, run, level;
 
@@ -818,7 +874,7 @@ static int add_coefficients_impl(AVCodecContext *avctx, AVFrame *frame,
         qval = qtab[pos];
         int zp = ztab[pos];
         mat[zp] = qval * (unsigned)level;
-        rowmask |= 1u << (zp / size);
+        rowmask |= 1u << (zp >> (size == 8 ? 3 : 2));   /* size is 4 or 8: shift, not a software divide */
         if (zp) ac++;                         /* count AC (non-DC) coefficients */
 
         if (last)
@@ -829,7 +885,7 @@ static int add_coefficients_impl(AVCodecContext *avctx, AVFrame *frame,
     uint64_t _tt = PROF_NOW();
 
     mat[0] += 32;
-    if (s->recon_mode == RECON_RECORD) {      /* defer the IDCT + write-back to the reconstruct pass */
+    if (RECON_IS_RECORD(s)) {      /* defer the IDCT + write-back to the reconstruct pass */
         ReconJob *j = rj_new(s, s->rec_intra ? 2 : 0);   /* inter residual -> list 0, right after its MC (stays cache-hot) */
         int off = rmat_put(s, mat, size * size);
         if (!j || off < 0) return AVERROR(ENOMEM);
@@ -888,7 +944,7 @@ static int adjust(int x, int size)
 /* Intra prediction sample fetch. Refactored to take the block descriptor by CONST POINTER plus the
  * (already-transformed) coordinates px,py in registers -- the old code passed the whole 36-byte
  * BlockXY struct BY VALUE per pixel through a function pointer. Bit-identical; just leaner calls. */
-static uint8_t pget(const BlockXY *b, int px, int py)
+static av_always_inline uint8_t pget(const BlockXY *b, int px, int py)
 {
     int rx, ry;
 
@@ -898,43 +954,45 @@ static uint8_t pget(const BlockXY *b, int px, int py)
     else if (px == -2 && py == -1)      { rx = -1; ry =  0; }
     else                                { rx = px; ry = py; }   /* fall-through kept ret = b */
 
+    if (b->interior)                    /* proven in-frame: same pixel as the clamped path */
+        return b->block[(b->ay + ry) * b->linesize + b->ax + rx];
     int y = av_clip(b->ay + ry, 0, b->h - 1);
     int x = av_clip(b->ax + rx, 0, b->w - 1);
 
     return b->block[y * b->linesize + x];
 }
 
-static uint8_t half(int a, int b)
+static av_always_inline uint8_t half(int a, int b)
 {
     return ((a + b) + 1) / 2;
 }
 
-static uint8_t half3(int a, int b, int c)
+static av_always_inline uint8_t half3(int a, int b, int c)
 {
     return ((a + b + b + c) * 2 / 4 + 1) / 2;
 }
 
-static uint8_t pick_above(const BlockXY *b, int x, int y) { return pget(b, x, y - 1); }
-static uint8_t pick_left (const BlockXY *b, int x, int y) { return pget(b, x - 1, y); }
+static av_always_inline uint8_t pick_above(const BlockXY *b, int x, int y) { return pget(b, x, y - 1); }
+static av_always_inline uint8_t pick_left (const BlockXY *b, int x, int y) { return pget(b, x - 1, y); }
 
-static uint8_t half_horz(const BlockXY *b, int x, int y)
+static av_always_inline uint8_t half_horz(const BlockXY *b, int x, int y)
 {
     return half3(pget(b, x - 1, y), pget(b, x, y), pget(b, x + 1, y));
 }
 
-static uint8_t half_vert(const BlockXY *b, int x, int y)
+static av_always_inline uint8_t half_vert(const BlockXY *b, int x, int y)
 {
     return half3(pget(b, x, y - 1), pget(b, x, y), pget(b, x, y + 1));
 }
 
-static uint8_t pick_4(const BlockXY *b, int x, int y)
+static av_always_inline uint8_t pick_4(const BlockXY *b, int x, int y)
 {
     if ((x % 2) == 0)
         return half(pget(b, -1, y + x / 2), pget(b, -1, y + x / 2 + 1));
     return half_vert(b, -1, y + x / 2 + 1);
 }
 
-static uint8_t pick_5(const BlockXY *b, int x, int y)
+static av_always_inline uint8_t pick_5(const BlockXY *b, int x, int y)
 {
     if (x == 0)      return half(pget(b, -1, y - 1), pget(b, -1, y));
     else if (y == 0) return half_horz(b, x - 2, y - 1);
@@ -942,7 +1000,7 @@ static uint8_t pick_5(const BlockXY *b, int x, int y)
     else             return pget(b, x - 2, y - 1);
 }
 
-static uint8_t pick_6(const BlockXY *b, int x, int y)
+static av_always_inline uint8_t pick_6(const BlockXY *b, int x, int y)
 {
     if (y == 0)      return half(pget(b, x - 1, -1), pget(b, x, -1));
     else if (x == 0) return half_vert(b, x - 1, y - 2);
@@ -950,7 +1008,7 @@ static uint8_t pick_6(const BlockXY *b, int x, int y)
     else             return pget(b, x - 1, y - 2);
 }
 
-static uint8_t pick_7(const BlockXY *b, int x, int y)
+static av_always_inline uint8_t pick_7(const BlockXY *b, int x, int y)
 {
     int clr = pget(b, x - 1, y - 1);
     if (x && y)
@@ -962,7 +1020,7 @@ static uint8_t pick_7(const BlockXY *b, int x, int y)
     return half3(acc1, clr, acc2);
 }
 
-static uint8_t pick_8(const BlockXY *b, int x, int y)
+static av_always_inline uint8_t pick_8(const BlockXY *b, int x, int y)
 {
     if (y == 0)                return half(pget(b, x, -1), pget(b, x + 1, -1));
     else if (y == 1)           return half_horz(b, x + 1, y - 2);
@@ -980,7 +1038,7 @@ static void block_fill_simple(uint8_t *block, int size, int linesize, int fill)
     }
 }
 
-static void block_fill(uint8_t *block, int size, int linesize,
+static av_always_inline void block_fill(uint8_t *block, int size, int linesize,
                        int w, int h, int ax, int ay,
                        uint8_t (*pick)(const BlockXY *, int, int))
 {
@@ -993,6 +1051,8 @@ static void block_fill(uint8_t *block, int size, int linesize,
     bxy.h = h;
     bxy.ay = ay;
     bxy.ax = ax;
+    /* pget reads x in [ax-2, ax+2*size] and y in [ay-2, ay+size] at most */
+    bxy.interior = ax >= 2 && ay >= 2 && ax + 2 * size < w && ay + size < h;
 
     for (int y = 0; y < size; y++)
         for (int x = 0; x < size; x++)
@@ -1073,13 +1133,13 @@ static int intra_predict_fill(uint8_t *pdata, int linesize, int w, int h,
                 int top  = block_sum(pdata + (ay - 1) * linesize + ax,
                                      size, 1, linesize);
 
-                fill = ((left + top) * 2 / (2 * size) + 1) / 2;
+                fill = ((((left + top) * 2) >> __builtin_ctz(2 * size)) + 1) >> 1;   /* sums >= 0, size = 2^k */
             } else if (ax >= 1) {
-                fill = (block_sum(pdata + ay * linesize + ax - 1,
-                                  1, size, linesize) * 2 / size + 1) / 2;
+                fill = ((block_sum(pdata + ay * linesize + ax - 1,
+                                  1, size, linesize) * 2 >> __builtin_ctz(size)) + 1) >> 1;
             } else if (ay >= 1) {
-                fill = (block_sum(pdata + (ay - 1) * linesize + ax,
-                                  size, 1, linesize) * 2 / size + 1) / 2;
+                fill = ((block_sum(pdata + (ay - 1) * linesize + ax,
+                                  size, 1, linesize) * 2 >> __builtin_ctz(size)) + 1) >> 1;
             } else {
                 return -1;
             }
@@ -1117,7 +1177,7 @@ static int predict_intra(AVCodecContext *avctx, AVFrame *frame, int ax, int ay,
     uint64_t _pt = PROF_NOW();
 
     int golomb = (pmode == 2) ? get_se_golomb(gb) : 0;   /* mode 2 reads one value (serial) */
-    if (s->recon_mode == RECON_RECORD) {
+    if (RECON_IS_RECORD(s)) {
         ReconJob *j = rj_new(s, 2); if (!j) return AVERROR(ENOMEM);
         j->type = RJ_INTRA; j->dst = frame->data[plane]; j->dst_ls = frame->linesize[plane];
         j->w = w; j->h = h; j->ax = ax; j->ay = ay; j->param = (uint8_t)pmode;
@@ -1288,6 +1348,7 @@ static int get_index(int x)
 static void mc_copy(uint8_t *dst, const uint8_t *src, int width, int height,
                     int dst_linesize, int src_linesize, int method)
 {
+
             if (mobi_opt & 0x100) {                      /* hand-written ARM assembly half-pel */
             int al = (((uintptr_t)src & 3) == 0) && ((width & 3) == 0);
             switch (method) {
@@ -1586,7 +1647,7 @@ static int predict_motion_impl(AVCodecContext *avctx,
 
             src = s->pic[sidx]->data[i] + offsetx + (mv.x >> 1) +
                            (offsety + (mv.y >> 1)) * src_linesize;
-          if (s->recon_mode == RECON_RECORD) {   /* defer the copy to the reconstruct pass */
+          if (RECON_IS_RECORD(s)) {   /* defer the copy to the reconstruct pass */
             ReconJob *j = rj_new(s, 0); if (!j) return AVERROR(ENOMEM);
             j->type = RJ_MC; j->dst = dst; j->src = src; j->w = width; j->h = height;
             j->dst_ls = dst_linesize; j->src_ls = src_linesize; j->param = (uint8_t)method;
@@ -1775,7 +1836,7 @@ static int mobiclip_decode(AVCodecContext *avctx, AVFrame *rframe,
     int ret;
 
     s->recon_mode = (mobi_opt & MOBI_RECON2) ? RECON_RECORD : RECON_INLINE;
-    int pipe = (mobi_opt & MOBI_PIPE) && s->recon_mode == RECON_RECORD;
+    int pipe = (mobi_opt & MOBI_PIPE) && RECON_IS_RECORD(s);
 
     /* flush (empty packet): drain the one frame still pending in the pipeline */
     if (!pkt->data || pkt->size == 0) {
@@ -1811,7 +1872,7 @@ static int mobiclip_decode(AVCodecContext *avctx, AVFrame *rframe,
     if (ret < 0)
         return ret;
 
-    if (s->recon_mode == RECON_RECORD) {
+    if (RECON_IS_RECORD(s)) {
         rs->rjob_n[0] = rs->rjob_n[1] = rs->rjob_n[2] = 0; rs->rmat_n = 0; rs->out = frame;
     }
 
@@ -1893,7 +1954,7 @@ static int mobiclip_decode(AVCodecContext *avctx, AVFrame *rframe,
         }
     }
 
-    if (s->recon_mode == RECON_RECORD) {
+    if (RECON_IS_RECORD(s)) {
         if (pipe) {
             if (pend) recon_pipe_wait();      /* N-1 reconstruct finished (overlapped the parse above) */
             rs->valid = 1;                    /* this frame becomes next call's pending reconstruct */
