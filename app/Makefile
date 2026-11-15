@@ -26,6 +26,10 @@ CFLAGS  := -w -Wreturn-type -O3 -mword-relocations -ffunction-sections -D__3DS__
 	-Wno-error=implicit-function-declaration $(ARCH) $(INCLUDE)
 # Test builds only: UPDATE_TEST_URL=https://.../latest.txt points the update check (and the
 # self-updater's download, which sits beside it) somewhere other than the public release.
+# Engine test channel: TEST_CHANNEL=1 builds update only from the engine-test release (see RELEASING.md)
+ifneq ($(TEST_CHANNEL),)
+CFLAGS  += -DTEST_CHANNEL
+endif
 ifneq ($(UPDATE_TEST_URL),)
 CFLAGS  += -DUPDATE_TEST_URL=\"$(UPDATE_TEST_URL)\"
 endif

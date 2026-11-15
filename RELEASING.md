@@ -30,8 +30,9 @@ it, checks its MD5, installs it over itself and relaunches. Every release has to
    | stable  | `v1.0`       | `clownsec_player.cia`, `clownsec_player.3dsx`, `latest.txt` |
    | beta    | `v1.1.0-beta`| `clownsec_player_beta.cia`, `clownsec_player_beta.3dsx`, `latest.txt` |
    | mp4     | `mp4-beta`   | `clownsec_player_mp4.cia`, `clownsec_player_mp4.3dsx`, `latest.txt` |
+   | engine test | `engine-test` | `clownsec_player_test.cia`, `clownsec_player_test.3dsx`, `latest.txt` |
 
-4. **Never change a channel's UniqueID** in `cia*.rsf` (0xf8a2c / 0xf8a2d / 0xf8a2e), and keep
+4. **Never change a channel's UniqueID** in `cia*.rsf` (0xf8a2c / 0xf8a2d / 0xf8a2e / 0xf8a2f), and keep
    `am:net` in its ServiceAccessControl. A new UniqueID installs as a separate app instead of
    upgrading; without `am:net` the install fails.
 5. **The build tag must go up.** The check compares `MAJOR.MINOR` numerically (`61024.4` >
@@ -71,3 +72,20 @@ put the newer one at `/var/www/html/clownsec/test/clownsec_player.cia` (+ `.3dsx
 test files afterwards.
 
 Users on builds older than 61024.4 have no self-updater and need one last QR install.
+
+## Engine test channel (`engine-test`, UniqueID 0xf8a2f)
+
+Installs BESIDE the official app ("CLOWNSEC VIDEO TEST" on the HOME menu) and updates only from
+its own release: builds are made with `TEST_CHANNEL=1`, which pins the update check and the
+download to `engine-test` (GitHub, then the clownsec.com mirror) for the CIA and the .3dsx alike.
+
+```sh
+cd app && ./build_test_cia.sh                       # clean build, pinned tag -> latest_test.txt
+strings clownsec_player_test.3dsx | grep -c releases/download/engine-test   # must be 1
+rsync clownsec_player_test.cia clownsec_player_test.3dsx brainphreak:/var/www/html/clownsec/player/engine-test/
+gh release upload engine-test clownsec_player_test.cia clownsec_player_test.3dsx --clobber
+cp latest_test.txt latest.txt
+rsync latest.txt brainphreak:/var/www/html/clownsec/player/engine-test/
+gh release upload engine-test latest.txt --clobber                          # last
+```
+Never upload a TEST_CHANNEL build to a stable/beta/mp4 release.

@@ -4234,12 +4234,16 @@ static int startup_detect_poll(void);
 #define LATEST_URL_STABLE "https://github.com/brainphreak/clownsec-moflex-player/releases/download/v1.0/latest.txt"
 #define LATEST_URL_BETA   "https://github.com/brainphreak/clownsec-moflex-player/releases/download/v1.1.0-beta/latest.txt"
 #define LATEST_URL_MP4    "https://github.com/brainphreak/clownsec-moflex-player/releases/download/mp4-beta/latest.txt"
+/* engine test channel (UniqueID 0xf8a2f, builds made with TEST_CHANNEL=1): installs beside the
+ * official app and only ever updates from its own release */
+#define LATEST_URL_TEST   "https://github.com/brainphreak/clownsec-moflex-player/releases/download/engine-test/latest.txt"
 /* The same files are mirrored on clownsec.com in GitHub's layout (<release tag>/latest.txt with the
  * channel's .cia/.3dsx beside it): when GitHub's release downloads fail (they 504'd for hours on
  * 2026-11-08 and every player silently saw "no update"), the check and the download fall back. */
 #define LATEST_URL_STABLE_M "https://www.clownsec.com/player/v1.0/latest.txt"
 #define LATEST_URL_BETA_M   "https://www.clownsec.com/player/v1.1.0-beta/latest.txt"
 #define LATEST_URL_MP4_M    "https://www.clownsec.com/player/mp4-beta/latest.txt"
+#define LATEST_URL_TEST_M   "https://www.clownsec.com/player/engine-test/latest.txt"
 #define UPD_SOURCES 2                 /* 0 = GitHub, 1 = clownsec.com mirror */
 static int s_upd_src = 0;             /* the source whose latest.txt answered: download from it first */
 static const char *latest_url_n(int src) {
@@ -4247,9 +4251,13 @@ static const char *latest_url_n(int src) {
     (void)src;
     return UPDATE_TEST_URL;
 #endif
+#ifdef TEST_CHANNEL
+    return src ? LATEST_URL_TEST_M : LATEST_URL_TEST;   /* the .3dsx too: HBL has no TitleID to tell */
+#endif
     u64 tid = 0;
     APT_GetProgramID(&tid);
     u32 uid = (u32)((tid >> 8) & 0xFFFFF);
+    if (uid == 0xf8a2f) return src ? LATEST_URL_TEST_M : LATEST_URL_TEST;
     if (uid == 0xf8a2d) return src ? LATEST_URL_BETA_M : LATEST_URL_BETA;
     if (uid == 0xf8a2e) return src ? LATEST_URL_MP4_M : LATEST_URL_MP4;
     return src ? LATEST_URL_STABLE_M : LATEST_URL_STABLE;
@@ -4370,6 +4378,11 @@ static void upd_asset_url(char *out, size_t n, const char *ext, int src) {
     u64 tid = 0; APT_GetProgramID(&tid);
     u32 uid = (u32)((tid >> 8) & 0xFFFFF);
     const char *nm = uid == 0xf8a2d ? "clownsec_player_beta" : uid == 0xf8a2e ? "clownsec_player_mp4" : "clownsec_player";
+#ifdef TEST_CHANNEL
+    nm = "clownsec_player_test";
+#else
+    if (uid == 0xf8a2f) nm = "clownsec_player_test";
+#endif
     snprintf(out, n, "%.*s%s%s", base, lu, nm, ext);
 }
 static void upd_screen(const char *title, const char *line, int pct) {
