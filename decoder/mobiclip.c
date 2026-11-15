@@ -1345,9 +1345,80 @@ static int get_index(int x)
 
 /* the RECONSTRUCT half of motion comp: the extracted per-block copy (all opt paths), so inline and
  * replay are byte-identical. Pure pixel work: reads src (ref frame), writes dst. */
+/* ---- motion compensation, official-decoder style (opt 0x800000) ----
+ * Only ALIGNED word loads: the words covering a source row are loaded once and the misaligned
+ * (and +1-shifted, for half-pel) pixels are built by shifting in registers -- ARM11 penalizes
+ * unaligned loads, which the ld4() path issued 2-4x per output word. Half-pel averaging is 4 pixels
+ * per op with the exact truncating rule (a>>1)+(b>>1). Vertical/diagonal cases compute each source
+ * row once and reuse it for the next output row. Specialized per block width (nw = width/4). */
+#define MC_M 0x7F7F7F7Fu
+typedef uint32_t __attribute__((may_alias)) mc_u32;   /* frame bytes accessed as words */
+static av_always_inline uint32_t mc_avg(uint32_t a, uint32_t b) { return ((a >> 1) & MC_M) + ((b >> 1) & MC_M); }
+static av_always_inline void mc_words(const uint8_t *src, int nw, int need1, uint32_t *w0, uint32_t *w1)
+{
+    unsigned o = (uintptr_t)src & 3;
+    const mc_u32 *A = (const mc_u32 *)(src - o);
+    uint32_t a[5];
+    for (int i = 0; i <= nw; i++) a[i] = A[i];
+    unsigned k = 8 * o;
+    for (int i = 0; i < nw; i++) w0[i] = k ? (a[i] >> k) | (a[i + 1] << (32 - k)) : a[i];
+    if (need1) {
+        unsigned k1 = 8 * (o + 1);
+        for (int i = 0; i < nw; i++) w1[i] = (k1 == 32) ? a[i + 1] : (a[i] >> k1) | (a[i + 1] << (32 - k1));
+    }
+}
+static av_always_inline void mc_fast_t(uint8_t *dst, const uint8_t *src, int nw, int height,
+                                       int dls, int sls, int method)
+{
+    uint32_t w0[4], w1[4], prev[4], cur[4];
+    switch (method) {
+    case 0:
+        for (int y = 0; y < height; y++, dst += dls, src += sls) {
+            PF(src + 2 * sls);
+            mc_words(src, nw, 0, w0, w1);
+            for (int i = 0; i < nw; i++) ((mc_u32 *)dst)[i] = w0[i];
+        }
+        break;
+    case 1:
+        for (int y = 0; y < height; y++, dst += dls, src += sls) {
+            PF(src + 2 * sls);
+            mc_words(src, nw, 1, w0, w1);
+            for (int i = 0; i < nw; i++) ((mc_u32 *)dst)[i] = mc_avg(w0[i], w1[i]);
+        }
+        break;
+    case 2:
+        mc_words(src, nw, 0, prev, w1);
+        for (int y = 0; y < height; y++, dst += dls) {
+            src += sls; PF(src + 2 * sls); mc_words(src, nw, 0, cur, w1);
+            for (int i = 0; i < nw; i++) { ((mc_u32 *)dst)[i] = mc_avg(prev[i], cur[i]); prev[i] = cur[i]; }
+        }
+        break;
+    default:
+        mc_words(src, nw, 1, w0, w1);
+        for (int i = 0; i < nw; i++) prev[i] = mc_avg(w0[i], w1[i]);
+        for (int y = 0; y < height; y++, dst += dls) {
+            src += sls; PF(src + 2 * sls); mc_words(src, nw, 1, w0, w1);
+            for (int i = 0; i < nw; i++) { cur[i] = mc_avg(w0[i], w1[i]); ((mc_u32 *)dst)[i] = mc_avg(prev[i], cur[i]); prev[i] = cur[i]; }
+        }
+        break;
+    }
+}
+/* returns 0 if this block shape isn't handled (caller falls back) */
+static int mc_fast(uint8_t *dst, const uint8_t *src, int width, int height, int dls, int sls, int method)
+{
+    if (((uintptr_t)dst & 3) || (dls & 3) || (sls & 3)) return 0;
+    switch (width) {
+    case 16: mc_fast_t(dst, src, 4, height, dls, sls, method); return 1;
+    case 8:  mc_fast_t(dst, src, 2, height, dls, sls, method); return 1;
+    case 4:  mc_fast_t(dst, src, 1, height, dls, sls, method); return 1;
+    }
+    return 0;
+}
+
 static void mc_copy(uint8_t *dst, const uint8_t *src, int width, int height,
                     int dst_linesize, int src_linesize, int method)
 {
+    if ((mobi_opt & 0x800000) && mc_fast(dst, src, width, height, dst_linesize, src_linesize, method)) return;
 
             if (mobi_opt & 0x100) {                      /* hand-written ARM assembly half-pel */
             int al = (((uintptr_t)src & 3) == 0) && ((width & 3) == 0);
