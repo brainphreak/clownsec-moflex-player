@@ -6825,6 +6825,7 @@ static int bt_play(const BtCfg *c, const BtItem *it, const char *title) {
     msg_screen_nowait(title, "Connecting to Big Top...");
     httpfile_reset();
     g_play_to_browser = 1;
+    moflex_watched_set(path, 0);      /* the engine sets it again when this playback finishes */
     MoflexResult r = play_movie(path);
     httpfile_drop_cache();                                /* the video's kept blocks: memory back */
     long long at = moflex_resume_get(path);               /* where the engine stopped (0 = the end) */
@@ -6835,7 +6836,12 @@ static int bt_play(const BtCfg *c, const BtItem *it, const char *title) {
          * place it was is the last one the server heard (it may have been mid-seek) */
         moflex_resume_save(path, pos_ms * 1000);
         if (gave_up == 2) msg_screen("BIG TOP", "Lost the connection to Big Top.\n\nIs the computer still on and on\nthis Wi-Fi?");
-    } else if (r == MOFLEX_EOF) { bt_progress(c, it->id, dur, dur, "stopped"); bt_watched(c, it->id, 1); }
+    } else if (r == MOFLEX_EOF || moflex_watched(path)) {
+        /* played to the end. With no next episode on the SD card the engine parks on the last
+         * frame and B returns QUIT_BACK, with the resume point cleared -- that used to report
+         * "stopped at 0" and Big Top never marked the episode watched */
+        bt_progress(c, it->id, dur, dur, "stopped"); bt_watched(c, it->id, 1);
+    }
     else if (r != MOFLEX_QUIT_EXIT || at > 0) bt_progress(c, it->id, at / 1000, dur, "stopped");
     return r == MOFLEX_QUIT_EXIT;
 }
