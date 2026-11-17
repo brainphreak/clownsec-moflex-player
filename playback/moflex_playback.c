@@ -4712,7 +4712,9 @@ static MoflexResult moflex_play_ring(const char *path) {
     ctx.width = W; ctx.height = H; ctx.priv_data = calloc(1, mobi_ctx_size());
     g_yq_cap = 0; g_yq_h = g_yq_n = 0;
     {   bool isn = false; APT_CheckNew3DS(&isn);
-        if (!isn) {   /* Old 3DS: a frame queue in free heap, as deep as fits with room to spare */
+        /* A/B TEST: queue off for Big Top streams (Killer Klowns fails on Old 3DS only, curl 27 + a
+         * citro2d overflow; New 3DS -- no queue -- plays it). Local files keep the queue. */
+        if (!isn && strncmp(path, "bigtop:", 7)) {   /* Old 3DS: a frame queue in free heap, as deep as fits with room to spare */
             int fpp = is3d ? 2 : 1, cap = is3d ? 24 : 48;
             size_t fb = (size_t)W * H * 3 / 2 + 3 * 1024;
             /* a Big Top stream also needs heap for curl's requests: with 6 MB spare, curl failed with
