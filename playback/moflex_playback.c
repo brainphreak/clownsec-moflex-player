@@ -4779,6 +4779,7 @@ static MoflexResult moflex_play_ring(const char *path) {
     /* seek sync log (sdmc:/moflex_player/seek_debug.txt): per seek, the landing and the A/V error
      * measured ~3 s into playback -- to find a sync offset after seeks */
     int64_t sd_lts = 0, sd_T = 0; u64 sd_at = 0; int sd_pend = 0, sd_kind = 0;
+    u64 sd_land_t = 0; long sd_shown0 = 0; int sd_stuck_logged = 0;   /* "no new frame 2 s after a landing" */
     int vol_drag = 0;                           /* touch-drag on the volume slider (applies live) */
     int resume_exact = 0;                       /* resume only: decode forward to the EXACT saved second */
     g_submenu = 0; g_sub_sel = 0;               /* subtitle menu starts closed */
@@ -5142,6 +5143,7 @@ static MoflexResult moflex_play_ring(const char *path) {
                 cur_us = lts; s.cur_us = lts; s.paused = 0;
                 WORKER_UNLOCK();
                 sd_lts = lts; sd_T = s.land_T; sd_at = 0; sd_pend = 1; sd_kind = 1;
+                sd_land_t = osGetTime(); sd_shown0 = st_shown; sd_stuck_logged = 0;
             } else {                             /* couldn't prime there: the UI-thread seek takes over */
                 WORKER_UNLOCK();
                 seek_to_us = s.land_T; want_seek = 1;
@@ -5378,12 +5380,25 @@ static MoflexResult moflex_play_ring(const char *path) {
         if (!threaded && playing && !s.done && (s.wr - rd) < NB - 1) { r3_produce(&s); inline_produced = 1; }
 
         /* pre-roll: unpause audio once enough pairs are banked, or the worker's audio bank filled first */
-        /* sound starts WITH the picture: once PRIME pairs are banked. The audio bank filling first only
-         * starts it early when video can't progress without it (in-band audio: the reader holds a full
-         * bank's packet and the video backlog has run dry) -- else the sound led the picture after seeks */
-        if (have_audio && !gated && playing && ((s.wr - rd) >= PRIME || (s.audio_pre_full && r3_vqc < 2 && (s.wr - rd) >= 1) || s.done)) {
-            gated = 1; ndspChnSetPaused(0, false); r3_apos = 0; }
+        if (have_audio && !gated && playing && (s.wr >= PRIME || s.audio_pre_full)) { gated = 1; ndspChnSetPaused(0, false); r3_apos = 0; }
 
+        if (sd_land_t && !sd_stuck_logged && osGetTime() - sd_land_t > 2000) {
+            if (st_shown - sd_shown0 < 5) {      /* 2 s after a landing and the picture hasn't moved */
+                int q = 0, pl = 0, dn = 0;
+                for (int i = 0; i < r3_nawb; i++) { if (r3_wb[i].status == NDSP_WBUF_QUEUED) q++;
+                    else if (r3_wb[i].status == NDSP_WBUF_PLAYING) pl++; else if (r3_wb[i].status == NDSP_WBUF_DONE) dn++; }
+                FILE *df = fopen("sdmc:/moflex_player/seek_debug.txt", "a");
+                if (df) {
+                    fprintf(df, "%s STUCK land=%lld | wr=%d rd=%d ready=%d vqc=%d done=%d paused=%d pv=%d | gated=%d playing=%d apos=%lld aplayed=%lld pre_full=%d wbuf q=%d play=%d done=%d chn_playing=%d chn_paused=%d t0=%lld av_ready=%d vl_on=%d shown+%ld tr=%d\n",
+                            BUILD_TAG, (long long)sd_lts / 1000, s.wr, rd, ready[rd % NB], r3_vqc, s.done, s.paused, s.pv_mode,
+                            gated, playing, (long long)r3_apos / 1000, (long long)r3_aplayed, s.audio_pre_full, q, pl, dn,
+                            ndspChnIsPlaying(0), ndspChnIsPaused(0), (long long)r3_audio_t0 / 1000, r3_av_ready, vl_on,
+                            st_shown - sd_shown0, s.tr_active);
+                    fclose(df);
+                }
+            }
+            sd_stuck_logged = 1;
+        }
         int wr = s.wr; __sync_synchronize();   /* snapshot the write index, then see the frame data behind it */
         int64_t apos;
         if (have_audio) apos = r3_apos;
