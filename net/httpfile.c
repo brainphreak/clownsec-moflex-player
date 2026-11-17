@@ -62,6 +62,7 @@ typedef struct {
     CURL *e; Slot *fills[HB_BATCH]; int nfill, fill_i;
     /* for the log */
     u64 t_open, wait_ms, wait_max, fetch_ms; int waits, fetches, failed; long long bytes;
+    int f_rc, f_code, f_got, f_want;   /* the first failed request: curl code, HTTP status, bytes got/asked */
 } HFile;
 
 /* ---- the file's size: one HEAD (cached for the last few URLs; a file is opened several times) ---- */
@@ -106,6 +107,16 @@ static size_t on_block(char *p, size_t sz, size_t nm, void *u) {
 }
 static int on_abort(void *u, curl_off_t a, curl_off_t b, curl_off_t c, curl_off_t d) {
     (void)a; (void)b; (void)c; (void)d; return ((HFile *)u)->stop;
+}
+/* largest block malloc can still give (KB, probed in 256 KB steps up to 16 MB): a failed request can be
+ * curl running out of memory */
+static unsigned long hf_heap_free_kb(void) {
+    unsigned long lo = 0, hi = 16 * 1024;
+    while (hi - lo > 256) {
+        unsigned long mid = (lo + hi) / 2; void *p = malloc(mid * 1024);
+        if (p) { free(p); lo = mid; } else hi = mid;
+    }
+    return lo;
 }
 static int slot_of(HFile *h, long long blk) {
     for (int i = 0; i < h->nslots; i++)
@@ -194,7 +205,10 @@ static void worker(void *arg) {
         LightLock_Lock(&h->lk);
         for (int j = 0; j < n; j++) h->fills[j]->state = ok ? SL_READY : SL_FAILED;
         h->fetches++; h->fetch_ms += osGetTime() - t; h->bytes += got;
-        if (!ok && !h->stop) h->failed++;      /* a request cut off by closing the file isn't a failure */
+        if (!ok && !h->stop) {                  /* a request cut off by closing the file isn't a failure */
+            if (!h->failed) { h->f_rc = (int)rc; h->f_code = (int)code; h->f_got = got; h->f_want = (int)(b - a + 1); }
+            h->failed++;
+        }
         LightLock_Unlock(&h->lk);
         if (!ok && !h->stop) svcSleepThread(200 * 1000 * 1000LL);   /* don't hammer a failing server */
     }
@@ -275,12 +289,14 @@ static int hf_close(void *c) {
         if (lf) {
             const char *nm = strrchr(h->url, '/');
             fprintf(lf, "%llus open, %lld KB in %d requests (%d failed), %llu ms/request avg, "
-                        "%.0f KB/s while fetching; reads waited %d times, %llu ms total, longest %llu ms%s  [%s]\n",
+                        "%.0f KB/s while fetching; reads waited %d times, %llu ms total, longest %llu ms%s"
+                        " | first fail: curl %d http %d got %d/%d | heap free %lu KB  [%s]\n",
                     secs, h->bytes / 1024, h->fetches, h->failed,
                     h->fetches ? h->fetch_ms / (u64)h->fetches : 0ULL,
                     h->fetch_ms ? (double)h->bytes / 1024.0 / ((double)h->fetch_ms / 1000.0) : 0.0,
                     h->waits, h->wait_ms, h->wait_max,
                     h->aborted ? (g_hf_gave_up == 1 ? ", stopped with B" : ", gave up (no data)") : "",
+                    h->f_rc, h->f_code, h->f_got, h->f_want, hf_heap_free_kb(),
                     nm ? nm : h->url);
             fclose(lf);
         }
