@@ -2391,14 +2391,32 @@ static int ui_tex_init(void) {
 static void ui_tex_free(void) { if (g_uitex_ok) { C3D_TexDelete(&g_uitex); g_uitex_ok = 0; } }
 
 /* copy the offscreen UI buffer into the texture (the CPU-heavy 76800-pixel tiled copy) */
+/* Walked one 8x8 texture tile at a time, 8 source columns at once: the source is column-major
+ * (rotated framebuffer), so the old row-by-row walk missed the cache on nearly every one of the
+ * 76800 reads -- long enough on Old 3DS to push the next film frame a refresh late, once a second. */
+static u64 g_upl_max;   /* slowest panel/menu upload this playback (ticks), for ring_stats */
 static void ui_tex_upload(void) {
+    u64 t0 = svcGetSystemTick();
     ui_capture(0);
     const u16 *src = ui_pixels();                /* pixel (x,y) at [x*UI_H + (UI_H-1-y)] (rotated fb) */
     u16 *dst = (u16 *)g_uitex.data;
-    for (int y = 0; y < UI_H; y++)
-        for (int x = 0; x < UI_W; x++)
-            dst[r3_tile_off(x, y)] = src[x * UI_H + (UI_H - 1 - y)];
+    static u8 mort[64]; static int mort_ok;
+    if (!mort_ok) {
+        for (u32 y = 0; y < 8; y++) for (u32 x = 0; x < 8; x++)
+            mort[y * 8 + x] = (u8)((x & 1) | ((y & 1) << 1) | ((x & 2) << 1) | ((y & 2) << 2) | ((x & 4) << 2) | ((y & 4) << 3));
+        mort_ok = 1;
+    }
+    for (int tx = 0; tx < UI_W; tx += 8)
+        for (int ty = 0; ty < UI_H; ty += 8) {
+            u16 *t = dst + ((ty >> 3) * (GT_W >> 3) + (tx >> 3)) * 64;
+            for (int dx = 0; dx < 8; dx++) {
+                const u16 *col = src + (tx + dx) * UI_H + (UI_H - 1 - ty);   /* y = ty.. walks down this column */
+                const u8 *mo = mort + dx;
+                for (int dy = 0; dy < 8; dy++) t[mo[dy * 8]] = col[-dy];
+            }
+        }
     C3D_TexFlush(&g_uitex);
+    u64 dt = svcGetSystemTick() - t0; if (dt > g_upl_max) g_upl_max = dt;
 }
 /* blit the (already-uploaded) UI texture onto the bottom screen -- cheap GPU only */
 static void ui_tex_blit(C3D_RenderTarget *bot) {
@@ -2416,6 +2434,7 @@ static void ui_tex_present(C3D_RenderTarget *bot) { ui_tex_upload(); ui_tex_blit
 static int g_sub_redraw = 1;   /* the CC menu must re-render into the shared UI texture */
 static int g_panel_force = 1;   /* force a re-render next time (first frame, wake from dark, submenu exit) */
 static int g_panel_age = 0;   /* presents since the panel was last brought up to date */
+static u64 g_panel_max;       /* slowest panel redraw (draw + upload) this playback, ticks */
 static void g_panel_prep(const char *title, int64_t cur, int64_t dur, int playing);
 static void g_panel_sw(C3D_RenderTarget *bot, const char *title, int64_t cur, int64_t dur, int playing) {
     if (!ui_tex_init()) return;
@@ -2435,9 +2454,11 @@ static void g_panel_prep(const char *title, int64_t cur, int64_t dur, int playin
     int vol = (int)(g_vol * 100 + 0.5f);
     if (g_panel_force || sec != l_sec || bar != l_bar || playing != l_play || vol != l_vol || g_batt_pct != l_batt || vw != l_zm) {
         g_panel_force = 0; l_sec = sec; l_bar = bar; l_play = playing; l_vol = vol; l_batt = g_batt_pct; l_zm = vw;
+        u64 pt0 = svcGetSystemTick();
         ui_capture(1);
         panel_draw(title, cur, dur, playing);   /* fills g_buf; ui_present() is a no-op under capture */
         ui_tex_upload();
+        { u64 dt = svcGetSystemTick() - pt0; if (dt > g_panel_max) g_panel_max = dt; }
         g_sub_redraw = 1;                       /* the shared UI texture no longer holds the menu */
     }
 }
@@ -4517,6 +4538,7 @@ static MoflexResult moflex_play_ring(const char *path) {
     if (have_audio) r3_set_aspeed(vl_speed);        /* once, before any sound: no rate change mid-play */
     int vl_on = 0; u32 vl_base_vb = 0; int64_t vl_base_n = 0; double vl_err = 0; int vl_cnt = 0;
     int vl_prevhold = 0; long st_slip = 0;
+    g_panel_max = 0; g_upl_max = 0;
     /* session totals, written to sdmc:/moflex_player/ring_stats.txt when playback ends */
     long st_v2 = 0, st_v3 = 0, st_vx = 0, st_stut = 0, st_shown = 0, st_decn = 0; long long st_dec = 0, st_dmax = 0;
     u64 st_maxgap = 0, st_t0 = osGetTime();
@@ -5238,10 +5260,10 @@ static MoflexResult moflex_play_ring(const char *path) {
         if (sf) {
             st_v2 += cad_v2; st_v3 += cad_v3; st_vx += cad_vx; st_dec += s.wk_dec; st_decn += s.wk_n;
             struct mallinfo mi = mallinfo();
-            fprintf(sf, "%s | %s %s | %.0fs (playing %.0fs, %.1f fps) shown=%ld stutters=%ld maxgap=%llums cadence v2=%ld v3=%ld bad=%ld slips=%ld lock=%.2f@%.4f | decode %.2f ms/pair max %.1f | NB=%d heap peak %lu KB, linear free %lu KB | %s\n",
+            fprintf(sf, "%s | %s %s | %.0fs (playing %.0fs, %.1f fps) shown=%ld stutters=%ld maxgap=%llums cadence v2=%ld v3=%ld bad=%ld slips=%ld lock=%.2f@%.4f panel=%.1fms upl=%.1fms | decode %.2f ms/pair max %.1f | NB=%d heap peak %lu KB, linear free %lu KB | %s\n",
                     BUILD_TAG, r3_isnew ? "new3ds" : "old3ds", is3d ? "3D" : "2D", (osGetTime() - st_t0) / 1000.0,
                     st_play_ms / 1000.0, st_play_ms ? st_shown * 1000.0 / st_play_ms : 0.0,
-                    st_shown, st_stut, (unsigned long long)st_maxgap, st_v2, st_v3, st_vx, st_slip, vl_vk, (double)vl_speed,
+                    st_shown, st_stut, (unsigned long long)st_maxgap, st_v2, st_v3, st_vx, st_slip, vl_vk, (double)vl_speed, PF_MS(g_panel_max), PF_MS(g_upl_max),
                     st_decn ? PF_MS(st_dec) / st_decn : 0.0, PF_MS(st_dmax), NB,
                     (unsigned long)(mi.arena / 1024), (unsigned long)(linearSpaceFree() / 1024), title);
             fclose(sf);
