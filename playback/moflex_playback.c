@@ -4621,6 +4621,11 @@ static MoflexResult moflex_play_ring(const char *path) {
     int64_t cur_us = 0, dur_us = m.duration_us, seek_to_us = 0; int want_seek = 0, shold = 0;
     int scrubbing = 0; int64_t scrub_us = 0;   /* touch-drag on the bar: preview while held, seek on release */
     int tseek = 0, tseek_hold = 0;             /* touch rewind (-1) / fast-forward (+1) held */
+    /* SEEK PREVIEW (the official player's feel): from the moment a seek control is touched until it is
+     * let go nothing plays -- the decoder, reader and audio are held once, and the top screen shows a
+     * still of the nearest keyframe to the target, refreshed as the target moves. The UI never waits
+     * on a seek; the real seek runs once, on release, with the threads already held. */
+    int pv_hold = 0; u64 pv_t = 0; int64_t pv_tgt = -1, pv_mark = -1;
     int vol_drag = 0;                           /* touch-drag on the volume slider (applies live) */
     int resume_exact = 0;                       /* resume only: decode forward to the EXACT saved second */
     g_submenu = 0; g_sub_sel = 0;               /* subtitle menu starts closed */
@@ -4939,8 +4944,53 @@ static MoflexResult moflex_play_ring(const char *path) {
                 seek_to_us = cur_us; want_seek = 1;
             }
         }
+        {   int seek_ui = scrubbing || tseek || (want_seek && (kh & (KEY_LEFT | KEY_RIGHT)));
+            if (seek_ui && !pv_hold) {          /* hold everything once: no playing while seeking */
+                WORKER_LOCK();
+                for (int i = 0; i < NB; i++) ready[i] = 0;
+                s.wr = 0; rd = 0; s.rd = 0; s.dpair = 0; s.has_pending = 0;
+                r3_vq_clear();
+                if (have_audio) { r3_audio_flush(); ndspChnSetPaused(0, true); }
+                gated = 0; s.paused = 1;
+                pv_hold = 1; pv_t = 0; pv_tgt = -1; pv_mark = -1;
+            }
+            if (seek_ui && pv_hold) {
+                int64_t T = scrubbing ? scrub_us : seek_to_us;
+                if (T < 0) T = 0;
+                if (dur_us > 0 && T > dur_us - 1000000) T = dur_us - 1000000 > 0 ? dur_us - 1000000 : 0;
+                if (T != pv_tgt && osGetTime() - pv_t >= 60) {   /* rate-limited: input stays live */
+                    pv_t = osGetTime(); pv_tgt = T;
+                    do_seek(&m, &ctx, T);
+                    if (m.ts != pv_mark) {               /* a different landing: decode its keyframe */
+                        int64_t mark = m.ts;
+                        MfxPacket pk; int vseen = 0, got = 0;
+                        for (int g = 0; g < 600 && !got; g++) {   /* ~a few seconds of packets at most */
+                            if (mfx_next_packet(&m, &pk) != 1) break;
+                            if (m.streams[pk.stream_index].media_type != MFX_TYPE_VIDEO) continue;
+                            vseen++;
+                            if (is3d && !(vseen & 1)) continue;   /* a pair starts on the landing's eye phase */
+                            if (!pk.keyframe) continue;
+                            AVPacket ap; ap.data = pk.data; ap.size = pk.size; int gL = 0;
+                            if (!(mobi_decode(&ctx, fL, &gL, &ap) >= 0 && gL)) continue;
+                            if (is3d) {
+                                MfxPacket pr; int haveR = 0, gR = 0;
+                                for (int g2 = 0; g2 < 8; g2++) { if (mfx_next_packet(&m, &pr) != 1) break;
+                                    if (m.streams[pr.stream_index].media_type == MFX_TYPE_VIDEO) { haveR = 1; break; } }
+                                if (!haveR || !(mobi_decode(&ctx, fR, &gR, &(AVPacket){ .data = pr.data, .size = pr.size }) >= 0 && gR)) break;
+                                g_y2r_start(fL, &r3_texL[0], W, H); g_y2r_wait(&r3_texL[0]);
+                                g_y2r_start(fR, &r3_texR[0], W, H); g_y2r_wait(&r3_texR[0]);
+                            } else { g_y2r_start(fL, &r3_texL[0], W, H); g_y2r_wait(&r3_texL[0]); }
+                            got = 1;
+                        }
+                        clearerr(m.f); m.eof = 0;
+                        if (got) { pv_mark = mark; last_shown = 0; last_bts = T; dirty = 1; }
+                    }
+                }
+            }
+        }
         if (want_seek && !scrubbing && !tseek && !(kh & (KEY_LEFT | KEY_RIGHT))) {
-            WORKER_LOCK();   /* blocks until the decode thread finishes its current pair and releases */
+            if (!pv_hold) WORKER_LOCK();   /* blocks until the decode thread finishes its current pair and releases */
+            pv_hold = 0;                   /* held since the preview: the unlock below releases it */
             g_seek_busy = 1; g_seek_cut = 0;     /* a slow source may drop this seek if the viewer moves on */
             if (dur_us > 0) { if (seek_to_us < 0) seek_to_us = 0; if (seek_to_us > dur_us) seek_to_us = dur_us; }
             /* Land on the last KEYFRAME at/before the target. P-frames don't decode after a flush
@@ -5379,6 +5429,7 @@ static MoflexResult moflex_play_ring(const char *path) {
         }
     }
     if (!aptMainLoop() && result == MOFLEX_QUIT_BACK) result = MOFLEX_QUIT_EXIT;
+    if (pv_hold) { WORKER_UNLOCK(); pv_hold = 0; }   /* left while seeking: the threads must be free to stop */
     aptUnhook(&g_ring_apt_cookie);
     /* Leaving: a network read the reader is blocked in must fail NOW (not after the 20 s stall limit,
      * which also reported a false "lost the connection"). The seek hook's cut makes every pending
