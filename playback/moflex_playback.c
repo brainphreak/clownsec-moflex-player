@@ -5378,7 +5378,11 @@ static MoflexResult moflex_play_ring(const char *path) {
         if (!threaded && playing && !s.done && (s.wr - rd) < NB - 1) { r3_produce(&s); inline_produced = 1; }
 
         /* pre-roll: unpause audio once enough pairs are banked, or the worker's audio bank filled first */
-        if (have_audio && !gated && playing && (s.wr >= PRIME || s.audio_pre_full)) { gated = 1; ndspChnSetPaused(0, false); r3_apos = 0; }
+        /* sound starts WITH the picture: once PRIME pairs are banked. The audio bank filling first only
+         * starts it early when video can't progress without it (in-band audio: the reader holds a full
+         * bank's packet and the video backlog has run dry) -- else the sound led the picture after seeks */
+        if (have_audio && !gated && playing && ((s.wr - rd) >= PRIME || (s.audio_pre_full && r3_vqc < 2 && (s.wr - rd) >= 1) || s.done)) {
+            gated = 1; ndspChnSetPaused(0, false); r3_apos = 0; }
 
         int wr = s.wr; __sync_synchronize();   /* snapshot the write index, then see the frame data behind it */
         int64_t apos;
@@ -5426,7 +5430,13 @@ static MoflexResult moflex_play_ring(const char *path) {
                 #define VL_N(i) ((rts[(i) % NB] + pair_dur / 2) / pair_dur)
                 #define VL_DUE(n) (vl_base_vb + (u32)(int64_t)floor((double)((n) - vl_base_n) * vl_vk + 0.5))
                 if (!vl_on) {
-                    vl_on = 1; vl_base_vb = vb; vl_base_n = VL_N(rd); vl_err = 0; vl_cnt = 0;
+                    /* anchor to the AUDIO: this frame is due on the refresh when the audio reaches its
+                     * time (earlier frames are then dropped, later ones wait). Anchoring on "now" froze
+                     * whatever lag the first frame had -- after a seek the audio starts while the decoder
+                     * is still catching up, and the picture stayed that far behind the sound. */
+                    vl_on = 1; vl_base_n = VL_N(rd); vl_err = 0; vl_cnt = 0;
+                    double dv = (double)(rts[rd % NB] - ae) * VL_HZ / 1e6;   /* refreshes until it is due */
+                    vl_base_vb = vb + (u32)(s32)floor(dv + 0.5);
                     if (r3_aspeed != vl_speed) r3_set_aspeed(vl_speed);
                 }
                 while ((wr - rd) > 1 && ready[(rd + 1) % NB] && (s32)(vb - VL_DUE(VL_N(rd + 1))) >= 0) { ready[rd % NB] = 0; rd++; }
@@ -5435,7 +5445,7 @@ static MoflexResult moflex_play_ring(const char *path) {
                     /* sync: video content time vs the audio clock, smoothed; steer the audio speed */
                     double e = (double)(rts[show] - ae);
                     vl_err += (e - vl_err) / 32.0;
-                    if (vl_err > 250000.0 || vl_err < -250000.0) {   /* lost (stall, odd stamps): re-anchor */
+                    if (vl_err > 60000.0 || vl_err < -60000.0) {     /* off by > 60 ms: re-anchor on the audio */
                         vl_on = 0; r3_set_aspeed(vl_speed);
                     } else if (++vl_cnt >= 24) {
                         /* Rate changes are RARE: each one can tick in the audio (it was set every second
