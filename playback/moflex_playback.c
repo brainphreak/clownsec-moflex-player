@@ -4958,7 +4958,12 @@ static MoflexResult moflex_play_ring(const char *path) {
                 int64_t T = scrubbing ? scrub_us : seek_to_us;
                 if (T < 0) T = 0;
                 if (dur_us > 0 && T > dur_us - 1000000) T = dur_us - 1000000 > 0 ? dur_us - 1000000 : 0;
-                if (T != pv_tgt && osGetTime() - pv_t >= 60) {   /* rate-limited: input stays live */
+                /* the slider comes first: decode a still only once the finger slows (target unchanged
+                 * for two refreshes) or every 250 ms while it keeps moving -- a 3D keyframe pair is
+                 * ~50-100 ms on Old 3DS, and doing it on every move left the knob trailing the finger */
+                static int64_t pv_prevT = -1; static int pv_still = 0;
+                if (T == pv_prevT) pv_still++; else { pv_still = 0; pv_prevT = T; }
+                if (T != pv_tgt && (pv_still >= 2 || osGetTime() - pv_t >= 250)) {
                     pv_t = osGetTime(); pv_tgt = T;
                     do_seek(&m, &ctx, T);
                     if (m.ts != pv_mark) {               /* a different landing: decode its keyframe */
@@ -5352,7 +5357,8 @@ static MoflexResult moflex_play_ring(const char *path) {
                 if (playing && g_submenu_stale() && g_sub_last != -1) ui_tex_blit(bot);
                 else g_submenu_sw(bot, is3d);
                 g_panel_force = 1; }
-            else { if (dirty) g_panel_force = 1;                          /* UI changed -> re-render the panel */
+            else { if (dirty && !pv_hold) g_panel_force = 1;              /* UI changed -> re-render the panel;
+                                                                            * seeking: only the bar/time strips move */
                    /* a film frame: reuse the panel texture (kept current between frames, below) so
                     * the present is never late; refresh it here only on a UI change, or when no
                     * spare refresh has come for ~2 s (60 fps material has none) */
