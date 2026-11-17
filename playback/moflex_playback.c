@@ -4513,9 +4513,14 @@ static void r3_dec_thread(void *arg) {
         if (s->pv_mode) {                                        /* seeking: stills, not playback */
             LightLock_Lock(&s->lock);
             int land = s->pv_mode && s->land_handled != s->land_seq;
-            int todo = land || (s->pv_mode && s->pv_handled != s->pv_req_seq);
+            int landed = s->land_done_seq == s->land_seq && s->land_seq != 0 && !s->land_cancel;   /* waiting for main */
+            int todo = land || (s->pv_mode && !landed && s->pv_handled != s->pv_req_seq);
             if (land) {
                 int seq = s->land_seq; s->land_handled = seq;
+                /* previews still queued from before the release are void: one running after the
+                 * landing moved the demuxer back to the drag target (the sound then started there,
+                 * seconds from the picture) and clobbered the decoder's references */
+                s->pv_handled = s->pv_req_seq;
                 int slot, ok; int64_t lts;
                 if (s->lastop_ok && s->lastop_T == s->land_T) {      /* released on the still: already landed */
                     slot = s->lastop_slot; lts = s->lastop_lts; ok = 1;
@@ -4528,6 +4533,7 @@ static void r3_dec_thread(void *arg) {
                     s->lastop_ok = 0;
                 }
                 s->land_ok = ok && !s->land_cancel; s->land_slot = slot; s->land_lts = lts;
+                s->pv_handled = s->pv_req_seq;
                 __sync_synchronize(); s->land_done_seq = seq;
             } else if (todo) r3_preview_one(s);
             LightLock_Unlock(&s->lock);
@@ -4796,6 +4802,7 @@ static MoflexResult moflex_play_ring(const char *path) {
      * on a seek; the real seek runs once, on release, with the threads already held. */
     int pv_hold = 0, pv_seen = 0, landing = 0, pv_had_still = 0; int64_t pv_tgt = -1;
     int64_t pv_disp = 0;   /* where the seek is going: the panel shows this from first touch to playback */
+    int pv_wait = 0;       /* landed, waiting for sound + picture to start: still show pv_disp */
     /* seek sync log (sdmc:/moflex_player/seek_debug.txt): per seek, the landing and the A/V error
      * measured ~3 s into playback -- to find a sync offset after seeks */
     int64_t sd_lts = 0, sd_T = 0; u64 sd_at = 0; int sd_pend = 0, sd_kind = 0;
@@ -5119,6 +5126,7 @@ static MoflexResult moflex_play_ring(const char *path) {
             }
         }
         {   int seek_ui = scrubbing || tseek || (want_seek && (kh & (KEY_LEFT | KEY_RIGHT)));
+            if (seek_ui) pv_wait = 0;
             if (seek_ui && !pv_hold) {          /* stop playing once: the worker switches to stills */
                 WORKER_LOCK();
                 for (int i = 0; i < NB; i++) ready[i] = 0;
@@ -5171,6 +5179,7 @@ static MoflexResult moflex_play_ring(const char *path) {
                 WORKER_UNLOCK();
                 seek_to_us = s.land_T; want_seek = 1;
             }
+            pv_wait = 1;
             dirty = 1;
         }
         if (want_seek && pv_hold && !landing && !scrubbing && !tseek && !(kh & (KEY_LEFT | KEY_RIGHT))) {
@@ -5516,7 +5525,8 @@ static MoflexResult moflex_play_ring(const char *path) {
         } else if (!playing && vl_on) vl_on = 0;   /* paused: re-anchor on resume */
 
         /* ---- draw: video pair (or held frame) + subtitle overlay + bottom panel, one GPU frame ---- */
-        int64_t disp_us = (show >= 0) ? bts[show] : pv_hold ? pv_disp : (last_shown >= 0 ? last_bts : cur_us);
+        if (pv_wait && show >= 0 && apos >= 0) pv_wait = 0;   /* playing: the real position takes over */
+        int64_t disp_us = (show >= 0 && !pv_wait) ? bts[show] : (pv_hold || pv_wait) ? pv_disp : (last_shown >= 0 ? last_bts : cur_us);
         if (want_seek && ((kh & (KEY_LEFT | KEY_RIGHT)) || tseek)) { disp_us = seek_to_us < 0 ? 0 : seek_to_us; dirty = 1; }  /* preview the accumulating seek target */
         if (scrubbing) { disp_us = scrub_us; dirty = 1; }   /* preview the dragged position while the finger is down */
         (void)pf_str;
@@ -5654,7 +5664,7 @@ static MoflexResult moflex_play_ring(const char *path) {
             /* a spare refresh, and the GPU is done with the last frame: update the panel texture now,
              * for the frame that shows next, so presents only blit it */
             if (playing && !g_screen_off && !g_submenu) {
-                int64_t nx = pv_hold ? pv_disp : ((s.wr - rd) > 0 && ready[rd % NB]) ? bts[rd % NB] : cur_us;
+                int64_t nx = (pv_hold || pv_wait) ? pv_disp : ((s.wr - rd) > 0 && ready[rd % NB]) ? bts[rd % NB] : cur_us;
                 g_panel_prep(title, nx, dur_us, playing);
             } else if (playing && !g_screen_off && g_submenu && g_submenu_stale()) {
                 g_submenu_prep(is3d); dirty = 1;   /* shown by the next pass */
