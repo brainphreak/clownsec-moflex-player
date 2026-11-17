@@ -4368,14 +4368,17 @@ static void r3_reader_thread(void *arg) {
 }
 
 static void r3_preview_one(R3S *s) {
-    int seq = s->pv_req_seq; int64_t T = s->pv_req;
+    int seq = s->pv_req_seq; int64_t T = s->pv_req;   /* the newest target right now */
     s->pv_handled = seq;
     do_seek(s->m, s->ctx, T);
     int64_t mark = s->m->ts;
     if (mark == s->pv_mark) return;                       /* same landing as the still on screen */
     int slot = (s->pv_slot + 1) % 3;                      /* never the slot being shown */
     MfxPacket pk; int vseen = 0, got = 0;
-    for (int g = 0; g < 600 && !got && s->pv_req_seq == seq && !g_wl_req; g++) {   /* newer target or release: drop it */
+    /* finish this still even if the target moved on (a finger "held" on the bar still jitters a few
+     * pixels, and dropping on every move meant no still ever appeared); the next pass takes the
+     * newest target. Only a release (the seek waiting for the lock) cuts it short. */
+    for (int g = 0; g < 600 && !got && !g_wl_req; g++) {
         if (mfx_next_packet(s->m, &pk) != 1) break;
         if (s->m->streams[pk.stream_index].media_type != MFX_TYPE_VIDEO) continue;
         vseen++;
@@ -5067,7 +5070,7 @@ static MoflexResult moflex_play_ring(const char *path) {
              * the landing's eye exactly (validated 50/50 landings, 0 wrong, on movie.moflex).
              * Peek forward counting blocks, then re-seek to the landing for the real prime. */
             s.eye_swap = 0;
-            if (is3d) {
+            if (is3d && !g_seek_cut) {
                 /* A landing that starts on a RIGHT eye would pair R(t) with L(t+1) -- eyes from
                  * ADJACENT pairs, a visible 33ms offset between the eyes (reported: "left 34L with
                  * right 35R"). Instead: detect R-first and STEP THE SEEK BACK one block (~1s) to an
@@ -5083,6 +5086,7 @@ static MoflexResult moflex_play_ring(const char *path) {
                     int okc = 1, decided = 0;
                     rfirst = 0;
                     for (long g = 0; g < 1500 && nb < 4 && !decided && okc; g++) {
+                        if ((g & 31) == 31 && moflex_seek_wait_hook(1)) break;   /* a new press drops this seek */
                         if (mfx_next_packet(&m, &pk) != 1) break;
                         if (m.streams[pk.stream_index].media_type != MFX_TYPE_VIDEO) continue;
                         if (m.ts != bt) {
@@ -5099,7 +5103,7 @@ static MoflexResult moflex_play_ring(const char *path) {
                         }
                         cnt++;
                     }
-                    if (!rfirst || attempt >= 3) break;
+                    if (!rfirst || attempt >= 3 || g_seek_cut) break;
                     tgt = land_ts - 1; if (tgt < 0) tgt = 0;      /* previous marker boundary */
                     do_seek(&m, &ctx, tgt);
                 }
@@ -5109,9 +5113,10 @@ static MoflexResult moflex_play_ring(const char *path) {
             /* FAST PRIME: decode the landing keyframe pair straight into slot 0 (bounded keyframe scan;
              * else take the next decodable frame) so the picture appears at once and audio resyncs.
              * Eye routing honors s.eye_swap (first frame -> R when the landing starts on a right eye). */
-            {
+            if (!g_seek_cut) {
                 MfxPacket pk; int64_t lts = seek_to_us; int vseen = 0;
                 for (int guard = 0; guard < 4000; guard++) {
+                    if ((guard & 15) == 15 && moflex_seek_wait_hook(1)) break;   /* a new press drops this seek */
                     if (mfx_next_packet(&m, &pk) != 1) break;
                     if (m.streams[pk.stream_index].media_type != MFX_TYPE_VIDEO) continue;
                     vseen++;
