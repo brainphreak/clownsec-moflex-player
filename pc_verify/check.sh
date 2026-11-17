@@ -4,7 +4,7 @@ set -e
 HERE="$(cd "$(dirname "$0")" && pwd)"; ROOT="$(cd "$HERE/.." && pwd)"
 DEC="$ROOT/decoder"; FSUP="$ROOT/ffmpeg_support"; OUT="$HERE/out_chk"; mkdir -p "$OUT"
 INC="-I $DEC -I $FSUP/include -I $FSUP/include/libavcodec"
-CF="-std=c11 -O2 -w -DMOBI_OPT_CONST=${OPT:-0x08bbda5e}"
+CF="-std=c11 -O2 -w -DMOBI_OPT_CONST=${OPT:-0x08bbda5e} ${EXTRA:-}"
 for f in "$DEC/mobiclip.c" "$DEC/mobicompat.c" "$DEC/moflex_demux.c" "$FSUP/vlc.c" "$FSUP/golomb.c" "$FSUP/mathtables.c" "$FSUP/reverse.c" "$HERE/test_decode.c"; do
   cc -c $CF $INC "$f" -o "$OUT/$(basename "${f%.c}").o"; done
 cc -O2 "$OUT"/*.o -o "$OUT/test_decode"

@@ -1450,6 +1450,9 @@ static int mc_fast(uint8_t *dst, const uint8_t *src, int width, int height, int 
         return 1;
     }
 #endif
+#if defined(__3DS__) && !defined(MC_ASM_CHECK)
+    return 0;   /* the asm took every shape it can; the C kernels stay out of the I-cache */
+#endif
     switch (width) {
     case 16: mc_fast_t(dst, src, 4, height, dls, sls, method); return 1;
     case 8:  mc_fast_t(dst, src, 2, height, dls, sls, method); return 1;
