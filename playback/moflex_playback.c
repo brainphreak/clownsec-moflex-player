@@ -3439,6 +3439,14 @@ gdone:
 #define R3_ABUF 2048          /* max samples/ch per audio packet (real ~2k) */
 static ndspWaveBuf r3_wb[R3_AWB]; static int16_t *r3_ab[R3_AWB];
 static int16_t *r3_raw;            /* R3_AWB x R3_ABUF x channels unscaled samples, or NULL */
+/* AUDIO TRIM after a seek: the reader rewinds to the landing block, whose audio starts before the
+ * picture's first frame (up to ~1 s). That gap was past the A/V skew bound, so the offset was taken
+ * as 0 and the sound ran that far ahead. Instead the samples before the picture are cut, exactly:
+ * the reader gives each in-band packet's content start (block ts + the packets before it in the
+ * block), and the first packets are trimmed to r3_trim_from. The audio origin is then exact. */
+static int64_t r3_trim_from = -1;  /* drop audio before this content time (us); -1 = none */
+static int64_t r3_pkt_start = -1;  /* content start of the packet being fed (us), -1 = unknown */
+static int     r3_last_fr = 0;     /* frames the last fed packet decoded to (before any trim) */
 static float r3_bal[R3_AWB];       /* the levelling factor each buffer was baked with */
 static int r3_awi, r3_nawb, r3_arate, r3_achn, r3_aok, r3_acnt[R3_AWB];
 static long long r3_aplayed; static int64_t r3_apos;   /* elapsed audible us, -1 = not started */
@@ -3594,7 +3602,19 @@ static int r3_audio_feed_raw(const uint8_t *data, int size) {
     if (w->status == NDSP_WBUF_DONE && !r3_acnt[r3_awi] && w->nsamples > 0) { r3_aplayed += w->nsamples; r3_acnt[r3_awi] = 1; }
     LightLock_Unlock(&g_alk);
     int fr = adpcm_moflex_decode(data, size, r3_achn, r3_ab[r3_awi]);
-    if (fr <= 0 || fr > R3_ABUF) return 1;                                       /* bad -> drop */
+    if (fr <= 0 || fr > R3_ABUF) { r3_last_fr = 0; return 1; }                   /* bad -> drop */
+    r3_last_fr = fr;
+    if (r3_trim_from >= 0 && r3_pkt_start >= 0) {
+        int64_t st = r3_pkt_start, en = st + (int64_t)fr * 1000000 / r3_arate;
+        if (en <= r3_trim_from) return 1;                    /* wholly before the picture: consumed, not queued */
+        if (st < r3_trim_from) {                             /* straddles it: cut the head */
+            int n = (int)((r3_trim_from - st) * r3_arate / 1000000);
+            if (n > 0 && n < fr) { memmove(r3_ab[r3_awi], r3_ab[r3_awi] + n * r3_achn, (size_t)(fr - n) * r3_achn * 2); fr -= n; }
+            st = r3_trim_from;
+        }
+        r3_trim_from = -1;
+        if (r3_audio_t0 < 0) r3_audio_t0 = st;               /* the exact origin */
+    }
     { int16_t *s = r3_ab[r3_awi]; int ns = fr * r3_achn;
       float al = (g_autolvl > 0 && g_autolvl <= 2) ? al_update(s, ns) : 1.0f;
       LightLock_Lock(&g_alk);
@@ -3615,6 +3635,7 @@ static void r3_audio_flush(void) {   /* on seek: drop everything queued, clock o
     for (int i = 0; i < r3_nawb; i++) { r3_wb[i].status = NDSP_WBUF_DONE; r3_acnt[i] = 1; }
     r3_awi = 0; r3_aplayed = 0; r3_apos = -1; r3_last = 0;
     r3_audio_t0 = -1; r3_av_skew = 0; r3_av_ready = 0;   /* re-anchor A/V on the next lock */
+    r3_trim_from = -1;
     ndspChnSetPaused(0, true);
 }
 static void r3_audio_close(void) {   /* safe to call in ANY state: frees partial allocations too */
@@ -4195,6 +4216,7 @@ typedef struct {
     volatile int land_active;            /* a landing (not a preview) is running: land_cancel applies */
     volatile int vskip;                  /* reader: drop this many video packets (already decoded by the prime) */
     int lastop_ok, lastop_slot; long long lastop_T, lastop_lts;   /* the worker's last r3_land: reusable on release */
+    long long a_blk, a_acc;              /* reader: current block ts, content start of its next audio packet */
 } R3S;
 
 /* Y2R OVERLAP: the last conversion of a pair is started but not waited for; it runs while the next
@@ -4244,7 +4266,10 @@ static int r3_read_some(R3S *s, int maxpk) {
             s->has_pending = 0;   /* a NON-selected audio track (dual audio): skip it entirely --
                                    * feeding every audio stream to one DSP channel garbles both */
         } else if (mt == MFX_TYPE_AUDIO && s->have_audio) {
+            if (s->m->ts != s->a_blk) { s->a_blk = s->m->ts; s->a_acc = s->m->ts; }
+            r3_pkt_start = s->a_acc;
             if (r3_audio_feed(&s->pending)) {
+                if (r3_last_fr > 0 && r3_arate > 0) s->a_acc += (int64_t)r3_last_fr * 1000000 / r3_arate;
                 if (r3_audio_t0 < 0) { int64_t at = s->m->ts; r3_audio_t0 = at < 0 ? 0 : at; }  /* audio origin */
                 s->has_pending = 0;
             }
@@ -4439,21 +4464,27 @@ static int r3_land(R3S *s, int64_t T, int slot, int64_t *lts_out) {
         do_seek(m, ctx, tgt);
         prime_from = tgt;
     }
-    /* prime: the landing keyframe pair into `slot` */
+    /* prime: the landing keyframe pair into `slot`. Its time is exact: the block ts plus the video
+     * packets before it in the block (a keyframe mid-block was stamped with the block start, and the
+     * sound -- trimmed to this time -- would then start early) */
     MfxPacket pk; int64_t lts = T; int vseen = 0;
+    int64_t vb_ts = -1; int vb_cnt = 0, eyes = s->is3d ? 2 : 1;
     for (int guard = 0; guard < 4000 && !LAND_CUT; guard++) {
         if (mfx_next_packet(m, &pk) != 1) break;
         if (m->streams[pk.stream_index].media_type != MFX_TYPE_VIDEO) continue;
+        if (m->ts != vb_ts) { vb_ts = m->ts; vb_cnt = 0; }
+        int in_blk = vb_cnt++;
         vseen++;
         if (s->is3d && !(vseen & 1)) continue;
         if (!pk.keyframe && vseen < 30) continue;
-        lts = m->ts;
+        lts = m->ts + (int64_t)(in_blk / eyes) * s->pair_dur;
         AVPacket ap; ap.data = pk.data; ap.size = pk.size; int gL = 0;
         if (!(mobi_decode(ctx, s->fL, &gL, &ap) >= 0 && gL)) continue;
         if (s->is3d) {
             int haveR = 0; MfxPacket pr;
             for (int g2 = 0; g2 < 8; g2++) { if (mfx_next_packet(m, &pr) != 1) break;
-                if (m->streams[pr.stream_index].media_type == MFX_TYPE_VIDEO) { haveR = 1; vseen++; break; } }
+                if (m->streams[pr.stream_index].media_type == MFX_TYPE_VIDEO) { haveR = 1; vseen++;
+                    if (m->ts != vb_ts) { vb_ts = m->ts; vb_cnt = 0; } vb_cnt++; break; } }
             int gR = 0;
             if (!haveR || !(mobi_decode(ctx, s->fR, &gR, &(AVPacket){ .data = pr.data, .size = pr.size }) >= 0 && gR)) continue;
             C3D_Tex *tA = s->eye_swap ? &r3_texR[slot] : &r3_texL[slot];
@@ -5167,7 +5198,8 @@ static MoflexResult moflex_play_ring(const char *path) {
                                                      * else the preview still stays up until sound+picture start */
                 r3_vq_clear();
                 if (have_audio) r3_audio_flush();
-                s.lastop_ok = 0;
+                s.lastop_ok = 0; s.a_blk = -1;
+                r3_trim_from = s.tr_active ? -1 : lts;
                 if (s.tr_active && g_tra.aud_pktsamp && g_tra.aud_rate)
                     s.tr_cur = (u32)(lts * (s64)g_tra.aud_rate / 1000000 / g_tra.aud_pktsamp);
                 gated = 0; s.audio_pre_full = 0; playing = 1; r3_wallset = 0;
@@ -5315,7 +5347,8 @@ static MoflexResult moflex_play_ring(const char *path) {
                         g_y2r_start(fR, tB, W, H); g_y2r_wait(tB);
                     } else { g_y2r_start(fL, &r3_texL[0], W, H); g_y2r_wait(&r3_texL[0]); }
                     rts[0] = 0; bts[0] = lts; ready[0] = 1; s.wr = 1; s.dpair = 1; cur_us = lts; s.cur_us = lts;
-                    if (!resume_exact) { mfx_seek_time(&m, prime_from); s.vskip = vseen; }   /* keep the block's audio */
+                    if (!resume_exact) { mfx_seek_time(&m, prime_from); s.vskip = vseen;   /* keep the block's audio */
+                                         s.a_blk = -1; r3_trim_from = s.tr_active ? -1 : lts; }
                     sd_lts = lts; sd_T = seek_to_us; sd_at = 0; sd_pend = 1; sd_kind = 0;
                     break;
                 }
@@ -5459,7 +5492,7 @@ static MoflexResult moflex_play_ring(const char *path) {
              * constant thereafter and ignored if implausibly large (bad/absent timestamps). */
             if (have_audio && !r3_av_ready && apos >= 0 && r3_audio_t0 >= 0) {
                 int64_t sk = r3_audio_t0 - (bts[rd % NB] - rts[rd % NB]);
-                r3_av_skew = (sk < -300000 || sk > 300000) ? 0 : sk;
+                r3_av_skew = (sk < -1000000 || sk > 1000000) ? 0 : sk;
                 r3_av_ready = 1;
             }
             int64_t ae = (have_audio && apos >= 0) ? apos + r3_av_skew : apos;
