@@ -4776,6 +4776,9 @@ static MoflexResult moflex_play_ring(const char *path) {
      * on a seek; the real seek runs once, on release, with the threads already held. */
     int pv_hold = 0, pv_seen = 0, landing = 0; int64_t pv_tgt = -1;
     int64_t pv_disp = 0;   /* where the seek is going: the panel shows this from first touch to playback */
+    /* seek sync log (sdmc:/moflex_player/seek_debug.txt): per seek, the landing and the A/V error
+     * measured ~3 s into playback -- to find a sync offset after seeks */
+    int64_t sd_lts = 0, sd_T = 0; u64 sd_at = 0; int sd_pend = 0, sd_kind = 0;
     int vol_drag = 0;                           /* touch-drag on the volume slider (applies live) */
     int resume_exact = 0;                       /* resume only: decode forward to the EXACT saved second */
     g_submenu = 0; g_sub_sel = 0;               /* subtitle menu starts closed */
@@ -5138,6 +5141,7 @@ static MoflexResult moflex_play_ring(const char *path) {
                 gated = 0; s.audio_pre_full = 0; playing = 1; r3_wallset = 0;
                 cur_us = lts; s.cur_us = lts; s.paused = 0;
                 WORKER_UNLOCK();
+                sd_lts = lts; sd_T = s.land_T; sd_at = 0; sd_pend = 1; sd_kind = 1;
             } else {                             /* couldn't prime there: the UI-thread seek takes over */
                 WORKER_UNLOCK();
                 seek_to_us = s.land_T; want_seek = 1;
@@ -5275,6 +5279,7 @@ static MoflexResult moflex_play_ring(const char *path) {
                         g_y2r_start(fR, tB, W, H); g_y2r_wait(tB);
                     } else { g_y2r_start(fL, &r3_texL[0], W, H); g_y2r_wait(&r3_texL[0]); }
                     rts[0] = 0; bts[0] = lts; ready[0] = 1; s.wr = 1; s.dpair = 1; cur_us = lts; s.cur_us = lts;
+                    sd_lts = lts; sd_T = seek_to_us; sd_at = 0; sd_pend = 1; sd_kind = 0;
                     break;
                 }
             }
@@ -5399,6 +5404,22 @@ static MoflexResult moflex_play_ring(const char *path) {
                 r3_av_ready = 1;
             }
             int64_t ae = (have_audio && apos >= 0) ? apos + r3_av_skew : apos;
+            if (sd_pend && have_audio && r3_av_ready && apos >= 0) {
+                if (!sd_at) sd_at = osGetTime();
+                else if (osGetTime() - sd_at > 3000) {
+                    sd_pend = 0;
+                    FILE *df = fopen("sdmc:/moflex_player/seek_debug.txt", "a");
+                    if (df) {
+                        int64_t vpos = bts[rd % NB], arel = apos + r3_audio_t0;   /* content times */
+                        fprintf(df, "%s %s target=%lld land=%lld audio_t0=%lld skew=%lld | 3s: video=%lld audio=%lld diff=%lldms vl_err=%.0fms lock=%d speed=%.4f tr=%d\n",
+                                BUILD_TAG, sd_kind ? "worker" : "ui", (long long)sd_T / 1000, (long long)sd_lts / 1000,
+                                (long long)r3_audio_t0 / 1000, (long long)r3_av_skew / 1000,
+                                (long long)vpos / 1000, (long long)arel / 1000, (long long)(vpos - arel) / 1000,
+                                vl_err / 1000.0, vl_on, (double)r3_aspeed, s.tr_active);
+                        fclose(df);
+                    }
+                }
+            }
             if (have_audio && apos >= 0 && r3_av_ready) {
                 /* display lock: frame n shows on refresh base + round((n - n0) * vk) */
                 u32 vb = C3D_FrameCounter(0);
