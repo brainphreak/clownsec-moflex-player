@@ -2502,14 +2502,14 @@ static void g_panel_prep(const char *title, int64_t cur, int64_t dur, int playin
     if (!ui_tex_init()) return;
     g_panel_age = 0;
     static int64_t l_sec = -1; static int l_bar = -1, l_play = -1, l_vol = -1, l_batt = -2, l_chg = -1, l_zm = -1;
-    static const char *l_title; static int l_lock = -1;
+    static const char *l_title; static int l_lock = -1, l_toast = -1;
     int vw = g_zoom * 1000 + (g_conv + CONV_MAX) * 32 + g_ghost + (g_autolvl ? 1 << 20 : 0);   /* any VIEW change repaints */
     int sec = (int)(cur / 1000000);
     int bar = dur > 0 ? (int)((double)BAR_W * (double)cur / (double)dur) : 0;
     int vol = (int)(g_vol * 100 + 0.5f);
     batt_refresh();                             /* throttled inside; the partial path below skips panel_draw */
     int full = g_panel_force || !g_panel_buf_ok || playing != l_play || g_batt_pct != l_batt
-               || g_batt_chg != l_chg || vw != l_zm || title != l_title || g_lock_toast > 0 || g_touch_locked != l_lock;
+               || g_batt_chg != l_chg || vw != l_zm || title != l_title || (g_lock_toast > 0) != l_toast || g_touch_locked != l_lock;
     if (!full && sec == l_sec && bar == l_bar && vol == l_vol) return;
     u64 pt0 = svcGetSystemTick();
     ui_capture(1);
@@ -2539,7 +2539,7 @@ static void g_panel_prep(const char *title, int64_t cur, int64_t dur, int playin
         ui_capture(0);   /* as ui_tex_upload does: left on, the app's ui_present() stays a no-op after
                           * playback and its screens never appear (looked like a hang on exit) */
     }
-    g_panel_force = 0; l_sec = sec; l_bar = bar; l_play = playing; l_vol = vol; l_batt = g_batt_pct; l_chg = g_batt_chg; l_zm = vw; l_title = title; l_lock = g_touch_locked;
+    g_panel_force = 0; l_sec = sec; l_bar = bar; l_play = playing; l_vol = vol; l_batt = g_batt_pct; l_chg = g_batt_chg; l_zm = vw; l_title = title; l_lock = g_touch_locked; l_toast = g_lock_toast > 0;
     { u64 dt = svcGetSystemTick() - pt0; if (dt > g_panel_max) g_panel_max = dt; }
     g_sub_redraw = 1;                           /* the shared UI texture no longer holds the menu */
 }
@@ -2902,10 +2902,11 @@ static int snd_input(u32 kd, u32 kh, touchPosition tp) {
  * to redo all of that every frame while open -- on Old 3DS that runs on the decode core above the
  * decoder and starved it: the film went choppy with the CC menu open, and the drained ring kept it
  * choppy for a while after closing. */
-static int g_submenu_stale(void) { return g_sub_redraw || g_submenu != g_sub_last || g_lock_toast > 0; }
+static int g_sub_toast = -1;
+static int g_submenu_stale(void) { return g_sub_redraw || g_submenu != g_sub_last || (g_lock_toast > 0) != g_sub_toast; }
 static void g_submenu_prep(int is3d) {
     if (!ui_tex_init() || !g_submenu_stale()) return;
-    g_sub_redraw = 0; g_sub_last = g_submenu; g_panel_buf_ok = 0;
+    g_sub_redraw = 0; g_sub_last = g_submenu; g_panel_buf_ok = 0; g_sub_toast = g_lock_toast > 0;
     ui_capture(1);
     if (g_submenu == 4) snd_render(); else if (g_submenu == 3) view_render(); else if (g_submenu == 2) srtpicker_render(); else submenu_render(is3d);
     ui_tex_upload();
@@ -5047,7 +5048,7 @@ static MoflexResult moflex_play_ring(const char *path) {
             g_touch_locked = !g_touch_locked; g_lock_toast = 0; dirty = 1; kd = 0; kh = 0;
         }
         if (g_touch_locked) {
-            if (kd) { g_lock_toast = 90; dirty = 1; }   /* any attempt -> flash WHY nothing responds */
+            if (kd) { if (g_lock_toast == 0) dirty = 1; g_lock_toast = 90; }   /* any attempt -> flash WHY nothing responds */
             kd = 0; kh = 0;                             /* fully inert (dark screen stays dark too) */
         }
 
@@ -5061,7 +5062,7 @@ static MoflexResult moflex_play_ring(const char *path) {
             kd &= ~KEY_TOUCH; kh &= ~KEY_TOUCH;          /* touch on a dark screen drives no control */
         }
 
-        if (g_lock_toast > 0) { g_lock_toast--; dirty = 1; }
+        if (g_lock_toast > 0 && --g_lock_toast == 0) dirty = 1;   /* repaint when it goes, not every frame */
 
         /* reconcile the physical backlight: on unless the user darkened it -- and even then, briefly on
          * to show the touch-locked toast so they can read why touch isn't waking it. */
@@ -5076,7 +5077,7 @@ static MoflexResult moflex_play_ring(const char *path) {
             submenu_input(kd, kh, tp, is3d, path);
             /* repaint on input only (held arrows repeat, a finger may drag); the menu texture is
              * reused otherwise, and new film frames still present on their own */
-            if (kd || (kh & (KEY_LEFT | KEY_RIGHT | KEY_UP | KEY_DOWN | KEY_TOUCH)) || g_submenu != sm_was || g_lock_toast > 0) {
+            if (kd || (kh & (KEY_LEFT | KEY_RIGHT | KEY_UP | KEY_DOWN | KEY_TOUCH)) || g_submenu != sm_was) {
                 dirty = 1; g_sub_redraw = 1;
             }
             if (g_hq_req) {
@@ -5232,6 +5233,8 @@ static MoflexResult moflex_play_ring(const char *path) {
                 if (have_audio) { r3_audio_flush(); ndspChnSetPaused(0, true); }
                 gated = 0; s.paused = 1;
                 s.pv_mark = -1; s.pv_mode = 1; pv_seen = s.pv_done_seq; s.lastop_ok = 0; s.vskip = 0;
+                s.land_cancel = 1;   /* the previous landing is spent: stills may run again (it held
+                                      * "landed" true forever after the first seek -> no stills) */
                 WORKER_UNLOCK();                 /* the reader idles (paused); the worker serves stills */
                 pv_hold = 1; pv_tgt = -1; pv_had_still = 0;
             }
@@ -5711,7 +5714,7 @@ static MoflexResult moflex_play_ring(const char *path) {
                    /* a film frame: reuse the panel texture (kept current between frames, below) so
                     * the present is never late; refresh it here only on a UI change, or when no
                     * spare refresh has come for ~2 s (60 fps material has none) */
-                   if (show >= 0 && !dirty && !g_panel_force && g_lock_toast <= 0 && ++g_panel_age < 48) ui_tex_blit(bot);
+                   if (show >= 0 && !dirty && !g_panel_force && ++g_panel_age < 48) ui_tex_blit(bot);
                    else g_panel_sw(bot, title, disp_us, dur_us, playing); }   /* panel (lock toast on top) */
             u64 _tg = svcGetSystemTick(); C3D_FrameEnd(0); pf_gpu += svcGetSystemTick() - _tg;
             dirty2 = dirty; dirty = 0;   /* second pass fills the other buffer (see above) */
