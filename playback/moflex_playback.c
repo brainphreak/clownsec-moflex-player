@@ -4187,6 +4187,11 @@ typedef struct {
     volatile int pv_mode, pv_req_seq, pv_done_seq, pv_done_slot;
     volatile long long pv_req, pv_done_T;
     int pv_handled, pv_slot; long long pv_mark;
+    /* LANDING (on release): the worker runs the real seek too -- keyframe landing, 3D eye parity,
+     * prime pair -- so the UI never waits on it; a new touch cancels it (land_cancel). */
+    volatile int land_seq, land_done_seq, land_ok, land_slot, land_cancel;
+    volatile long long land_T, land_lts;
+    int land_handled;
 } R3S;
 
 /* Y2R OVERLAP: the last conversion of a pair is started but not waited for; it runs while the next
@@ -4402,14 +4407,109 @@ static void r3_preview_one(R3S *s) {
         __sync_synchronize(); s->pv_done_seq++;
     }
 }
+#define LAND_CUT (s->land_cancel || g_wl_req)
+static int r3_land(R3S *s, int64_t T, int slot, int64_t *lts_out) {
+    MfxDemux *m = s->m; AVCodecContext *ctx = s->ctx;
+    int64_t land_tgt = T;
+    do_seek(m, ctx, T);
+    {   MfxPacket pk; int direct_kf = 0;
+        for (int g = 0; g < 200 && !LAND_CUT; g++) {
+            if (mfx_next_packet(m, &pk) != 1) break;
+            if (m->streams[pk.stream_index].media_type != MFX_TYPE_VIDEO) continue;
+            direct_kf = pk.keyframe; break;
+        }
+        if (!direct_kf && !LAND_CUT) {             /* sparse keyframes: last keyframe within 20 s before T */
+            int64_t back = T - 20000000; if (back < 0) back = 0;
+            do_seek(m, ctx, back);
+            int64_t kf_marker = -1, cur_marker = m->ts;
+            for (long g = 0; g < 60000 && !LAND_CUT; g++) {
+                if (mfx_next_packet(m, &pk) != 1) break;
+                if (m->ts != cur_marker) { if (m->ts > T) break; cur_marker = m->ts; }
+                if (m->streams[pk.stream_index].media_type != MFX_TYPE_VIDEO) continue;
+                if (pk.keyframe) kf_marker = cur_marker;
+            }
+            if (kf_marker >= 0) land_tgt = kf_marker;
+        }
+    }
+    if (LAND_CUT) return 0;
+    do_seek(m, ctx, land_tgt);
+    s->eye_swap = 0;
+    if (s->is3d) {                                  /* 3D eye parity: see the UI-thread seek */
+        int64_t tgt = land_tgt; int rfirst = 0;
+        double eye = (double)s->pair_dur * 0.5;
+        for (int attempt = 0; ; attempt++) {
+            int64_t land_ts = m->ts;
+            MfxPacket pk; int64_t bt = m->ts; long cnt = 0; int nb = 0;
+            int okc = 1, decided = 0;
+            rfirst = 0;
+            for (long g = 0; g < 1500 && nb < 4 && !decided && okc && !LAND_CUT; g++) {
+                if (mfx_next_packet(m, &pk) != 1) break;
+                if (m->streams[pk.stream_index].media_type != MFX_TYPE_VIDEO) continue;
+                if (m->ts != bt) {
+                    double fx = (double)(m->ts - bt) / eye;
+                    long F = (long)(fx + 0.5);
+                    double d = fx - (double)F; if (d < 0) d = -d;
+                    if (d > 0.02) okc = 0;
+                    else {
+                        int step = (int)(cnt - F);
+                        if (step == 1 || step == -1) { if (step == -1) rfirst = 1; decided = 1; }
+                        else if (step != 0) okc = 0;
+                    }
+                    nb++; bt = m->ts; cnt = 0;
+                }
+                cnt++;
+            }
+            if (!rfirst || attempt >= 3 || LAND_CUT) break;
+            tgt = land_ts - 1; if (tgt < 0) tgt = 0;
+            do_seek(m, ctx, tgt);
+        }
+        if (LAND_CUT) return 0;
+        s->eye_swap = rfirst;
+        do_seek(m, ctx, tgt);
+    }
+    /* prime: the landing keyframe pair into `slot` */
+    MfxPacket pk; int64_t lts = T; int vseen = 0;
+    for (int guard = 0; guard < 4000 && !LAND_CUT; guard++) {
+        if (mfx_next_packet(m, &pk) != 1) break;
+        if (m->streams[pk.stream_index].media_type != MFX_TYPE_VIDEO) continue;
+        vseen++;
+        if (s->is3d && !(vseen & 1)) continue;
+        if (!pk.keyframe && vseen < 30) continue;
+        lts = m->ts;
+        AVPacket ap; ap.data = pk.data; ap.size = pk.size; int gL = 0;
+        if (!(mobi_decode(ctx, s->fL, &gL, &ap) >= 0 && gL)) continue;
+        if (s->is3d) {
+            int haveR = 0; MfxPacket pr;
+            for (int g2 = 0; g2 < 8; g2++) { if (mfx_next_packet(m, &pr) != 1) break;
+                if (m->streams[pr.stream_index].media_type == MFX_TYPE_VIDEO) { haveR = 1; vseen++; break; } }
+            int gR = 0;
+            if (!haveR || !(mobi_decode(ctx, s->fR, &gR, &(AVPacket){ .data = pr.data, .size = pr.size }) >= 0 && gR)) continue;
+            C3D_Tex *tA = s->eye_swap ? &r3_texR[slot] : &r3_texL[slot];
+            C3D_Tex *tB = s->eye_swap ? &r3_texL[slot] : &r3_texR[slot];
+            g_y2r_start(s->fL, tA, s->W, s->H); g_y2r_wait(tA);
+            g_y2r_start(s->fR, tB, s->W, s->H); g_y2r_wait(tB);
+        } else { g_y2r_start(s->fL, &r3_texL[slot], s->W, s->H); g_y2r_wait(&r3_texL[slot]); }
+        *lts_out = lts;
+        return 1;
+    }
+    return 0;
+}
 static void r3_dec_thread(void *arg) {
     R3S *s = (R3S *)arg;
     while (s->run) {
         if (g_wl_req) { svcSleepThread(1000000LL); continue; }   /* a seek is waiting for the lock */
         if (s->pv_mode) {                                        /* seeking: stills, not playback */
             LightLock_Lock(&s->lock);
-            int todo = s->pv_mode && s->pv_handled != s->pv_req_seq;
-            if (todo) r3_preview_one(s);
+            int land = s->pv_mode && s->land_handled != s->land_seq;
+            int todo = land || (s->pv_mode && s->pv_handled != s->pv_req_seq);
+            if (land) {
+                int seq = s->land_seq; s->land_handled = seq;
+                int slot = (s->pv_slot + 1) % 3; int64_t lts = s->land_T;
+                int ok = r3_land(s, s->land_T, slot, &lts);
+                clearerr(s->m->f); s->m->eof = 0;
+                s->land_ok = ok && !s->land_cancel; s->land_slot = slot; s->land_lts = lts;
+                __sync_synchronize(); s->land_done_seq = seq;
+            } else if (todo) r3_preview_one(s);
             LightLock_Unlock(&s->lock);
             if (!todo) LightEvent_Wait(&s->wake);
             continue;
@@ -4674,7 +4774,7 @@ static MoflexResult moflex_play_ring(const char *path) {
      * let go nothing plays -- the decoder, reader and audio are held once, and the top screen shows a
      * still of the nearest keyframe to the target, refreshed as the target moves. The UI never waits
      * on a seek; the real seek runs once, on release, with the threads already held. */
-    int pv_hold = 0, pv_seen = 0; int64_t pv_tgt = -1;
+    int pv_hold = 0, pv_seen = 0, landing = 0; int64_t pv_tgt = -1;
     int vol_drag = 0;                           /* touch-drag on the volume slider (applies live) */
     int resume_exact = 0;                       /* resume only: decode forward to the EXACT saved second */
     g_submenu = 0; g_sub_sel = 0;               /* subtitle menu starts closed */
@@ -5005,6 +5105,7 @@ static MoflexResult moflex_play_ring(const char *path) {
                 WORKER_UNLOCK();                 /* the reader idles (paused); the worker serves stills */
                 pv_hold = 1; pv_tgt = -1;
             }
+            if (seek_ui && pv_hold && landing) { s.land_cancel = 1; landing = 0; pv_tgt = -1; }   /* moved again */
             if (seek_ui && pv_hold) {
                 int64_t T = scrubbing ? scrub_us : seek_to_us;
                 if (T < 0) T = 0;
@@ -5019,7 +5120,37 @@ static MoflexResult moflex_play_ring(const char *path) {
                 last_shown = s.pv_done_slot; last_bts = s.pv_done_T; dirty = 1;
             }
         }
-        if (want_seek && !scrubbing && !tseek && !(kh & (KEY_LEFT | KEY_RIGHT))) {
+        if (pv_hold && landing && s.land_done_seq == s.land_seq) {   /* the worker has landed */
+            landing = 0;
+            WORKER_LOCK();                       /* the worker is idle: take the ring back */
+            s.pv_mode = 0; pv_hold = 0;
+            if (s.land_ok) {
+                int sl = s.land_slot; int64_t lts = s.land_lts;
+                for (int i = 0; i < NB; i++) ready[i] = 0;
+                rd = sl; s.rd = sl; s.wr = sl + 1; ready[sl] = 1; rts[sl] = 0; bts[sl] = lts; s.dpair = 1;
+                s.skipping = 0; s.done = 0; s.has_pending = 0; last_shown = -1;
+                r3_vq_clear();
+                if (have_audio) r3_audio_flush();
+                if (s.tr_active && g_tra.aud_pktsamp && g_tra.aud_rate)
+                    s.tr_cur = (u32)(lts * (s64)g_tra.aud_rate / 1000000 / g_tra.aud_pktsamp);
+                gated = 0; s.audio_pre_full = 0; playing = 1; r3_wallset = 0;
+                cur_us = lts; s.cur_us = lts; s.paused = 0;
+                WORKER_UNLOCK();
+            } else {                             /* couldn't prime there: the UI-thread seek takes over */
+                WORKER_UNLOCK();
+                seek_to_us = s.land_T; want_seek = 1;
+            }
+            dirty = 1;
+        }
+        if (want_seek && pv_hold && !landing && !scrubbing && !tseek && !(kh & (KEY_LEFT | KEY_RIGHT))) {
+            /* released while previewing: the worker lands (keyframe, eye parity, prime) while the UI
+             * keeps the still up and stays live -- a new touch cancels it */
+            int64_t T = seek_to_us; if (T < 0) T = 0; if (dur_us > 0 && T > dur_us) T = dur_us;
+            s.land_cancel = 0; s.land_T = T; __sync_synchronize(); s.land_seq++;
+            LightEvent_Signal(&s.wake);
+            landing = 1; want_seek = 0;
+        }
+        if (want_seek && !pv_hold && !scrubbing && !tseek && !(kh & (KEY_LEFT | KEY_RIGHT))) {
             WORKER_LOCK();   /* blocks until the decode thread finishes its current pair (or still) and releases */
             s.pv_mode = 0; pv_hold = 0;    /* stills over: the seek below lands and playback resumes */
             g_seek_busy = 1; g_seek_cut = 0;     /* a slow source may drop this seek if the viewer moves on */
@@ -5463,7 +5594,7 @@ static MoflexResult moflex_play_ring(const char *path) {
         }
     }
     if (!aptMainLoop() && result == MOFLEX_QUIT_BACK) result = MOFLEX_QUIT_EXIT;
-    if (pv_hold) { s.pv_mode = 0; pv_hold = 0; }      /* left while seeking: back to normal so the threads stop */
+    if (pv_hold) { s.land_cancel = 1; s.pv_mode = 0; pv_hold = 0; }   /* left while seeking: stop a landing, back to normal */
     aptUnhook(&g_ring_apt_cookie);
     /* Leaving: a network read the reader is blocked in must fail NOW (not after the 20 s stall limit,
      * which also reported a false "lost the connection"). The seek hook's cut makes every pending
