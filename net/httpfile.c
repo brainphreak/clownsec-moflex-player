@@ -63,6 +63,7 @@ typedef struct {
     /* for the log */
     u64 t_open, wait_ms, wait_max, fetch_ms; int waits, fetches, failed; long long bytes;
     int f_rc, f_code, f_got, f_want;   /* the first failed request: curl code, HTTP status, bytes got/asked */
+    unsigned long f_heap;              /* largest free heap block when it failed (KB) */
 } HFile;
 
 /* ---- the file's size: one HEAD (cached for the last few URLs; a file is opened several times) ---- */
@@ -206,7 +207,8 @@ static void worker(void *arg) {
         for (int j = 0; j < n; j++) h->fills[j]->state = ok ? SL_READY : SL_FAILED;
         h->fetches++; h->fetch_ms += osGetTime() - t; h->bytes += got;
         if (!ok && !h->stop) {                  /* a request cut off by closing the file isn't a failure */
-            if (!h->failed) { h->f_rc = (int)rc; h->f_code = (int)code; h->f_got = got; h->f_want = (int)(b - a + 1); }
+            if (!h->failed) { h->f_rc = (int)rc; h->f_code = (int)code; h->f_got = got; h->f_want = (int)(b - a + 1);
+                              h->f_heap = hf_heap_free_kb(); }   /* free heap AT the failure */
             h->failed++;
         }
         LightLock_Unlock(&h->lk);
@@ -290,13 +292,13 @@ static int hf_close(void *c) {
             const char *nm = strrchr(h->url, '/');
             fprintf(lf, "%llus open, %lld KB in %d requests (%d failed), %llu ms/request avg, "
                         "%.0f KB/s while fetching; reads waited %d times, %llu ms total, longest %llu ms%s"
-                        " | first fail: curl %d http %d got %d/%d | heap free %lu KB  [%s]\n",
+                        " | first fail: curl %d http %d got %d/%d heap %lu KB | heap free at close %lu KB  [%s]\n",
                     secs, h->bytes / 1024, h->fetches, h->failed,
                     h->fetches ? h->fetch_ms / (u64)h->fetches : 0ULL,
                     h->fetch_ms ? (double)h->bytes / 1024.0 / ((double)h->fetch_ms / 1000.0) : 0.0,
                     h->waits, h->wait_ms, h->wait_max,
                     h->aborted ? (g_hf_gave_up == 1 ? ", stopped with B" : ", gave up (no data)") : "",
-                    h->f_rc, h->f_code, h->f_got, h->f_want, hf_heap_free_kb(),
+                    h->f_rc, h->f_code, h->f_got, h->f_want, h->f_heap, hf_heap_free_kb(),
                     nm ? nm : h->url);
             fclose(lf);
         }

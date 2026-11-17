@@ -4712,11 +4712,14 @@ static MoflexResult moflex_play_ring(const char *path) {
     ctx.width = W; ctx.height = H; ctx.priv_data = calloc(1, mobi_ctx_size());
     g_yq_cap = 0; g_yq_h = g_yq_n = 0;
     {   bool isn = false; APT_CheckNew3DS(&isn);
-        if (!isn) {   /* Old 3DS: a frame queue in free heap, as deep as fits with 6 MB to spare */
+        if (!isn) {   /* Old 3DS: a frame queue in free heap, as deep as fits with room to spare */
             int fpp = is3d ? 2 : 1, cap = is3d ? 24 : 48;
             size_t fb = (size_t)W * H * 3 / 2 + 3 * 1024;
+            /* a Big Top stream also needs heap for curl's requests: with 6 MB spare, curl failed with
+             * CURLE_OUT_OF_MEMORY (bigtop_log) and playback starved -- streams keep 12 MB */
+            size_t spare = (size_t)(strncmp(path, "bigtop:", 7) ? 6 : 12) * 1024 * 1024;
             while (cap >= 8) {
-                void *probe = malloc((size_t)fpp * (cap + 2) * fb + 6u * 1024 * 1024);
+                void *probe = malloc((size_t)fpp * (cap + 2) * fb + spare);
                 if (probe) { free(probe); break; }
                 cap /= 2;
             }
