@@ -2413,6 +2413,7 @@ static void ui_tex_present(C3D_RenderTarget *bot) { ui_tex_upload(); ui_tex_blit
  * changed -- second tick, bar pixel, play state, volume, battery, or a forced event. The blit runs
  * every frame so the panel stays on screen with no flicker. This keeps the panel off the decode
  * critical path on Old-3DS (it was re-rendering + re-uploading every frame). */
+static int g_sub_redraw = 1;   /* the CC menu must re-render into the shared UI texture */
 static int g_panel_force = 1;   /* force a re-render next time (first frame, wake from dark, submenu exit) */
 static void g_panel_sw(C3D_RenderTarget *bot, const char *title, int64_t cur, int64_t dur, int playing) {
     if (!ui_tex_init()) return;
@@ -2789,7 +2790,6 @@ static int snd_input(u32 kd, u32 kh, touchPosition tp) {
  * to redo all of that every frame while open -- on Old 3DS that runs on the decode core above the
  * decoder and starved it: the film went choppy with the CC menu open, and the drained ring kept it
  * choppy for a while after closing. */
-static int g_sub_redraw = 1;
 static void g_submenu_sw(C3D_RenderTarget *bot, int is3d) {
     if (!ui_tex_init()) return;
     static int last = -1;
