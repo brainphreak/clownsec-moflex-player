@@ -2415,8 +2415,19 @@ static void ui_tex_present(C3D_RenderTarget *bot) { ui_tex_upload(); ui_tex_blit
  * critical path on Old-3DS (it was re-rendering + re-uploading every frame). */
 static int g_sub_redraw = 1;   /* the CC menu must re-render into the shared UI texture */
 static int g_panel_force = 1;   /* force a re-render next time (first frame, wake from dark, submenu exit) */
+static int g_panel_age = 0;   /* presents since the panel was last brought up to date */
+static void g_panel_prep(const char *title, int64_t cur, int64_t dur, int playing);
 static void g_panel_sw(C3D_RenderTarget *bot, const char *title, int64_t cur, int64_t dur, int playing) {
     if (!ui_tex_init()) return;
+    g_panel_prep(title, cur, dur, playing);
+    ui_tex_blit(bot);
+}
+/* Bring the panel texture up to date (software draw + tiled upload) when a visible element changed.
+ * The ring engine calls this in the spare refreshes BETWEEN film frames: done inside a present it
+ * pushed that frame a refresh late on Old 3DS -- a small hitch every second, when the clock ticked. */
+static void g_panel_prep(const char *title, int64_t cur, int64_t dur, int playing) {
+    if (!ui_tex_init()) return;
+    g_panel_age = 0;
     static int64_t l_sec = -1; static int l_bar = -1, l_play = -1, l_vol = -1, l_batt = -2, l_zm = -1;
     int vw = g_zoom * 1000 + (g_conv + CONV_MAX) * 32 + g_ghost + (g_autolvl ? 1 << 20 : 0);   /* any VIEW change repaints */
     int sec = (int)(cur / 1000000);
@@ -2429,7 +2440,6 @@ static void g_panel_sw(C3D_RenderTarget *bot, const char *title, int64_t cur, in
         ui_tex_upload();
         g_sub_redraw = 1;                       /* the shared UI texture no longer holds the menu */
     }
-    ui_tex_blit(bot);
 }
 
 /* ==================== NON-BLOCKING SUBTITLE MENU (ring engine, live preview) ====================
@@ -4504,6 +4514,7 @@ static MoflexResult moflex_play_ring(const char *path) {
     {   double h = floor(vl_k * 2.0 + 0.5) / 2.0;
         if (h >= 1.0 && fabs(vl_k / h - 1.0) < 0.006) vl_vk = h; }
     const float vl_speed = (float)(vl_k / vl_vk);   /* audio speed that matches the locked video rate */
+    if (have_audio) r3_set_aspeed(vl_speed);        /* once, before any sound: no rate change mid-play */
     int vl_on = 0; u32 vl_base_vb = 0; int64_t vl_base_n = 0; double vl_err = 0; int vl_cnt = 0;
     int vl_prevhold = 0; long st_slip = 0;
     /* session totals, written to sdmc:/moflex_player/ring_stats.txt when playback ends */
@@ -4769,7 +4780,7 @@ static MoflexResult moflex_play_ring(const char *path) {
                 s.aidx = to_tr ? -2 : newsi;          /* -2 deliberately matches no in-band stream */
                 s.audio_pre_full = 0;                 /* the old track's gate must not stick */
                 if (nrate != r3_arate || nchn != r3_achn) {
-                    r3_audio_close(); r3_audio_setup(nrate, nchn);
+                    r3_audio_close(); r3_audio_setup(nrate, nchn); r3_set_aspeed(vl_speed);
                 } else r3_audio_flush();              /* same format: just drop the old track */
                 WORKER_UNLOCK();
                 if (!r3_aok) have_audio = 0;          /* re-alloc failed: fall back to the wall clock */
@@ -5031,16 +5042,21 @@ static MoflexResult moflex_play_ring(const char *path) {
                     if (vl_err > 250000.0 || vl_err < -250000.0) {   /* lost (stall, odd stamps): re-anchor */
                         vl_on = 0; r3_set_aspeed(vl_speed);
                     } else if (++vl_cnt >= 24) {
+                        /* Rate changes are RARE: each one can tick in the audio (it was set every second
+                         * and testers heard a 1 s hitch, louder with the volume up). The trim is set once
+                         * at lock; only a drift past 30 ms engages a 0.2% catch-up, released at 5 ms. */
                         vl_cnt = 0;
-                        double adj = vl_err * 6e-8;                  /* 50 ms ahead -> audio 0.3% faster */
-                        if (adj > 0.004) adj = 0.004; else if (adj < -0.004) adj = -0.004;
-                        r3_set_aspeed(vl_speed * (float)(1.0 + adj));
+                        float want = r3_aspeed;
+                        if (vl_err > 30000.0)       want = vl_speed * 1.002f;
+                        else if (vl_err < -30000.0) want = vl_speed * 0.998f;
+                        else if ((r3_aspeed > vl_speed && vl_err < 5000.0) || (r3_aspeed < vl_speed && vl_err > -5000.0)) want = vl_speed;
+                        if (want != r3_aspeed) r3_set_aspeed(want);
                     }
                 }
                 #undef VL_DUE
                 #undef VL_N
             } else {
-                if (vl_on) { vl_on = 0; if (have_audio && r3_aspeed != 1.0f) r3_set_aspeed(1.0f); }
+                if (vl_on) { vl_on = 0; if (have_audio && r3_aspeed != vl_speed) r3_set_aspeed(vl_speed); }
                 while ((wr - rd) > 1 && ready[(rd + 1) % NB] && rts[(rd + 1) % NB] <= ae + VS_HALF) { ready[rd % NB] = 0; rd++; }
                 if (apos < 0) { if (last_shown < 0) show = rd % NB; }             /* pre-roll: show the landing pair */
                 else if (ae + VS_HALF >= rts[rd % NB]) show = rd % NB;
@@ -5124,7 +5140,11 @@ static MoflexResult moflex_play_ring(const char *path) {
             if (g_screen_off) { g_dark_sw(bot); g_panel_force = 1; }      /* dark: panel stale -> force on wake */
             else if (g_submenu) { g_submenu_sw(bot, is3d); g_panel_force = 1; }  /* submenu: panel stale on exit */
             else { if (dirty) g_panel_force = 1;                          /* UI changed -> re-render the panel */
-                   g_panel_sw(bot, title, disp_us, dur_us, playing); }   /* panel (lock toast on top) */
+                   /* a film frame: reuse the panel texture (kept current between frames, below) so
+                    * the present is never late; refresh it here only on a UI change, or when no
+                    * spare refresh has come for ~2 s (60 fps material has none) */
+                   if (show >= 0 && !dirty && !g_panel_force && g_lock_toast <= 0 && ++g_panel_age < 48) ui_tex_blit(bot);
+                   else g_panel_sw(bot, title, disp_us, dur_us, playing); }   /* panel (lock toast on top) */
             u64 _tg = svcGetSystemTick(); C3D_FrameEnd(0); pf_gpu += svcGetSystemTick() - _tg;
             dirty2 = dirty; dirty = 0;   /* second pass fills the other buffer (see above) */
             if (show >= 0) {
@@ -5172,7 +5192,13 @@ static MoflexResult moflex_play_ring(const char *path) {
         /* Sleep to the refresh on EVERY pass that drew nothing. (It used to also skip while `dirty`, but
          * before the first pair exists dirty can't be drawn or cleared -- and on Old-3DS the producer
          * runs BELOW this thread on the same core, so the spin starved it: blank screen on "restart".) */
-        if (!drew && !inline_produced) { u64 _ti = svcGetSystemTick(); gspWaitForVBlank(); pf_idle += svcGetSystemTick() - _ti; pf_n++; }
+        if (!drew && !inline_produced) { u64 _ti = svcGetSystemTick(); gspWaitForVBlank(); pf_idle += svcGetSystemTick() - _ti; pf_n++;
+            /* a spare refresh, and the GPU is done with the last frame: update the panel texture now,
+             * for the frame that shows next, so presents only blit it */
+            if (playing && !g_screen_off && !g_submenu) {
+                int64_t nx = ((s.wr - rd) > 0 && ready[rd % NB]) ? bts[rd % NB] : cur_us;
+                g_panel_prep(title, nx, dur_us, playing);
+            } }
 
         /* Roll the HUD every ~24 presented frames. CADENCE is the judder meter: v2/v3 = frames held 2/3
          * refreshes (good), bad = held 1 or 4+ (judder). d/D = worker decode avg/max ms; i = main idle. */
