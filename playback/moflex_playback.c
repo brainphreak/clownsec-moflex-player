@@ -1669,11 +1669,11 @@ static void panel_lock_toast(void) {
 
 static int g_panel_cheap = 0;   /* Old-3DS: skip the CPU-heavy full-screen gradient + glow blurs in the
                                  * software-rendered panel -- they steal decode time on the single core. */
-static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing) {
-    ui_begin(GFX_BOTTOM);
-    if (g_panel_cheap) ui_fill_round(0, 0, UI_W, UI_H, 0, UI_BG);          /* flat bg (cheap) */
-    else               ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
-
+/* The parts of the panel that change while a film plays, each drawn into its own strip so the
+ * once-a-second update can redraw just those strips (panel_update_partial) -- a full redraw takes
+ * ~35 ms on Old 3DS, two refreshes, and pushed a film frame late every second. */
+static int panel_title_scrolls(const char *title) { return ui_text_w(1, title) > VOL_X - 12 - 10; }
+static void panel_title_row(const char *title) {
     {   /* title: marquee-scroll when it overflows so the episode name is readable */
         int tw = ui_text_w(1, title), avail = VOL_X - 12 - 10;
         if (tw <= avail) ui_text(10, 8, 1, UI_NEON, title);
@@ -1686,12 +1686,41 @@ static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing)
             ui_text_clipped(10 - off, 8, 1, UI_NEON, title, 10, VOL_X - 12);
         }
     }
-
+}
+static void panel_time_row(int64_t cur, int64_t dur) {
     char tc[16], td[16], line[40];
     fmt_time(cur, tc, sizeof(tc));
     fmt_time(dur, td, sizeof(td));
     snprintf(line, sizeof(line), "%s / %s", tc, td);
     ui_text(10, 26, 1, UI_NEONC, line);
+}
+static void panel_bar(int64_t cur, int64_t dur) {
+    /* progress bar: rounded track + neon fill + glowing knob */
+    double frac = dur > 0 ? (double)cur / (double)dur : 0.0;
+    if (frac > 1) frac = 1;
+    ui_fill_round(BAR_X, BAR_Y, BAR_W, BAR_H, BAR_H / 2, TH_TRACK);
+    int fw = (int)(BAR_W * frac);
+    if (fw > 0) ui_fill_round(BAR_X, BAR_Y, fw, BAR_H, BAR_H / 2, UI_NEON);
+    int kx = BAR_X + fw, ky = BAR_Y + BAR_H / 2, kr = 8;
+    if (!g_panel_cheap) ui_glow_round(kx - kr, ky - kr, 2 * kr, 2 * kr, kr, UI_NEON, 4, 26);
+    ui_fill_round(kx - kr, ky - kr, 2 * kr, 2 * kr, kr, UI_WHITE);
+}
+/* strips (x0,y0)-(x1,y1), 8-aligned so they upload as whole texture tiles. Nothing else is drawn
+ * inside them: the time row ends well left of the battery (x >= 256), the bar's knob stays in y 57-73. */
+#define PT_TITLE_Y0 0
+#define PT_TITLE_Y1 24
+#define PT_TIME_X1 200
+#define PT_TIME_Y0 24
+#define PT_TIME_Y1 40
+#define PT_BAR_Y0 56
+#define PT_BAR_Y1 80
+static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing) {
+    ui_begin(GFX_BOTTOM);
+    if (g_panel_cheap) ui_fill_round(0, 0, UI_W, UI_H, 0, UI_BG);          /* flat bg (cheap) */
+    else               ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
+
+    panel_title_row(title);
+    panel_time_row(cur, dur);
 
     /* battery: small icon + % at the far right of the time row (cyan while charging) */
     batt_refresh();
@@ -1714,15 +1743,7 @@ static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing)
     } else if (g_old3d_warn)   /* Old 3DS can't keep up with 3D's doubled frame rate */
         ui_text(10, 42, 1, UI_RED, "3D Has Performance Issues on Old3DS");
 
-    /* progress bar: rounded track + neon fill + glowing knob */
-    double frac = dur > 0 ? (double)cur / (double)dur : 0.0;
-    if (frac > 1) frac = 1;
-    ui_fill_round(BAR_X, BAR_Y, BAR_W, BAR_H, BAR_H / 2, TH_TRACK);
-    int fw = (int)(BAR_W * frac);
-    if (fw > 0) ui_fill_round(BAR_X, BAR_Y, fw, BAR_H, BAR_H / 2, UI_NEON);
-    int kx = BAR_X + fw, ky = BAR_Y + BAR_H / 2, kr = 8;
-    if (!g_panel_cheap) ui_glow_round(kx - kr, ky - kr, 2 * kr, 2 * kr, kr, UI_NEON, 4, 26);
-    ui_fill_round(kx - kr, ky - kr, 2 * kr, 2 * kr, kr, UI_WHITE);
+    panel_bar(cur, dur);
 
     /* transport: RW (<<)   glowing play/pause   FF (>>) */
     ui_play_l(RW_CX - 5, PLAY_CY, 14, UI_NEONC); ui_play_l(RW_CX + 6, PLAY_CY, 14, UI_NEONC);
@@ -2395,6 +2416,18 @@ static void ui_tex_free(void) { if (g_uitex_ok) { C3D_TexDelete(&g_uitex); g_uit
  * (rotated framebuffer), so the old row-by-row walk missed the cache on nearly every one of the
  * 76800 reads -- long enough on Old 3DS to push the next film frame a refresh late, once a second. */
 static u64 g_upl_max;   /* slowest panel/menu upload this playback (ticks), for ring_stats */
+static int g_panel_buf_ok = 0;   /* the UI buffer holds a complete panel (the menu/dark screen draw into it too) */
+static void ui_tiles(const u16 *src, u16 *dst, const u8 *mort, int x0, int y0, int x1, int y1) {
+    for (int tx = x0; tx < x1; tx += 8)
+        for (int ty = y0; ty < y1; ty += 8) {
+            u16 *t = dst + ((ty >> 3) * (GT_W >> 3) + (tx >> 3)) * 64;
+            for (int dx = 0; dx < 8; dx++) {
+                const u16 *col = src + (tx + dx) * UI_H + (UI_H - 1 - ty);   /* y = ty.. walks down this column */
+                const u8 *mo = mort + dx;
+                for (int dy = 0; dy < 8; dy++) t[mo[dy * 8]] = col[-dy];
+            }
+        }
+}
 static void ui_tex_upload(void) {
     u64 t0 = svcGetSystemTick();
     ui_capture(0);
@@ -2406,17 +2439,19 @@ static void ui_tex_upload(void) {
             mort[y * 8 + x] = (u8)((x & 1) | ((y & 1) << 1) | ((x & 2) << 1) | ((y & 2) << 2) | ((x & 4) << 2) | ((y & 4) << 3));
         mort_ok = 1;
     }
-    for (int tx = 0; tx < UI_W; tx += 8)
-        for (int ty = 0; ty < UI_H; ty += 8) {
-            u16 *t = dst + ((ty >> 3) * (GT_W >> 3) + (tx >> 3)) * 64;
-            for (int dx = 0; dx < 8; dx++) {
-                const u16 *col = src + (tx + dx) * UI_H + (UI_H - 1 - ty);   /* y = ty.. walks down this column */
-                const u8 *mo = mort + dx;
-                for (int dy = 0; dy < 8; dy++) t[mo[dy * 8]] = col[-dy];
-            }
-        }
+    ui_tiles(src, dst, mort, 0, 0, UI_W, UI_H);
     C3D_TexFlush(&g_uitex);
     u64 dt = svcGetSystemTick() - t0; if (dt > g_upl_max) g_upl_max = dt;
+}
+/* the tiles covering (x0,y0)-(x1,y1) only; the caller flushes the texture */
+static void ui_tex_upload_rect(int x0, int y0, int x1, int y1) {
+    static u8 mort[64]; static int mort_ok;
+    if (!mort_ok) {
+        for (u32 y = 0; y < 8; y++) for (u32 x = 0; x < 8; x++)
+            mort[y * 8 + x] = (u8)((x & 1) | ((y & 1) << 1) | ((x & 2) << 1) | ((y & 2) << 2) | ((x & 4) << 2) | ((y & 4) << 3));
+        mort_ok = 1;
+    }
+    ui_tiles(ui_pixels(), (u16 *)g_uitex.data, mort, x0 & ~7, y0 & ~7, x1, y1);
 }
 /* blit the (already-uploaded) UI texture onto the bottom screen -- cheap GPU only */
 static void ui_tex_blit(C3D_RenderTarget *bot) {
@@ -2447,20 +2482,38 @@ static void g_panel_sw(C3D_RenderTarget *bot, const char *title, int64_t cur, in
 static void g_panel_prep(const char *title, int64_t cur, int64_t dur, int playing) {
     if (!ui_tex_init()) return;
     g_panel_age = 0;
-    static int64_t l_sec = -1; static int l_bar = -1, l_play = -1, l_vol = -1, l_batt = -2, l_zm = -1;
+    static int64_t l_sec = -1; static int l_bar = -1, l_play = -1, l_vol = -1, l_batt = -2, l_chg = -1, l_zm = -1;
+    static const char *l_title; static int l_lock = -1;
     int vw = g_zoom * 1000 + (g_conv + CONV_MAX) * 32 + g_ghost + (g_autolvl ? 1 << 20 : 0);   /* any VIEW change repaints */
     int sec = (int)(cur / 1000000);
     int bar = dur > 0 ? (int)((double)BAR_W * (double)cur / (double)dur) : 0;
     int vol = (int)(g_vol * 100 + 0.5f);
-    if (g_panel_force || sec != l_sec || bar != l_bar || playing != l_play || vol != l_vol || g_batt_pct != l_batt || vw != l_zm) {
-        g_panel_force = 0; l_sec = sec; l_bar = bar; l_play = playing; l_vol = vol; l_batt = g_batt_pct; l_zm = vw;
-        u64 pt0 = svcGetSystemTick();
-        ui_capture(1);
+    batt_refresh();                             /* throttled inside; the partial path below skips panel_draw */
+    int full = g_panel_force || !g_panel_buf_ok || playing != l_play || vol != l_vol || g_batt_pct != l_batt
+               || g_batt_chg != l_chg || vw != l_zm || title != l_title || g_lock_toast > 0 || g_touch_locked != l_lock;
+    if (!full && sec == l_sec && bar == l_bar) return;
+    u64 pt0 = svcGetSystemTick();
+    ui_capture(1);
+    if (full || !g_panel_cheap) {               /* the gradient background (New 3DS) can't be patched by a flat fill */
         panel_draw(title, cur, dur, playing);   /* fills g_buf; ui_present() is a no-op under capture */
         ui_tex_upload();
-        { u64 dt = svcGetSystemTick() - pt0; if (dt > g_panel_max) g_panel_max = dt; }
-        g_sub_redraw = 1;                       /* the shared UI texture no longer holds the menu */
+        g_panel_buf_ok = 1;
+    } else {
+        /* only the clock/bar moved: redraw those strips (and a scrolling title) and upload their tiles */
+        ui_begin(GFX_BOTTOM);
+        ui_fill(8, PT_TIME_Y0, PT_TIME_X1 - 8, 12, UI_BG);   panel_time_row(cur, dur);
+        ui_fill(0, PT_BAR_Y0, UI_W, 20, UI_BG);              panel_bar(cur, dur);   /* y 56-75: the volume label starts at 76 */
+        ui_tex_upload_rect(0, PT_TIME_Y0, PT_TIME_X1, PT_TIME_Y1);
+        ui_tex_upload_rect(0, PT_BAR_Y0, UI_W, PT_BAR_Y1);
+        if (panel_title_scrolls(title)) {
+            ui_fill(8, 6, VOL_X - 12 - 8 + 2, 12, UI_BG);   panel_title_row(title);
+            ui_tex_upload_rect(0, PT_TITLE_Y0, VOL_X - 8, PT_TITLE_Y1);
+        }
+        C3D_TexFlush(&g_uitex);
     }
+    g_panel_force = 0; l_sec = sec; l_bar = bar; l_play = playing; l_vol = vol; l_batt = g_batt_pct; l_chg = g_batt_chg; l_zm = vw; l_title = title; l_lock = g_touch_locked;
+    { u64 dt = svcGetSystemTick() - pt0; if (dt > g_panel_max) g_panel_max = dt; }
+    g_sub_redraw = 1;                           /* the shared UI texture no longer holds the menu */
 }
 
 /* ==================== NON-BLOCKING SUBTITLE MENU (ring engine, live preview) ====================
@@ -2825,7 +2878,7 @@ static void g_submenu_sw(C3D_RenderTarget *bot, int is3d) {
     if (!ui_tex_init()) return;
     static int last = -1;
     if (g_sub_redraw || g_submenu != last || g_lock_toast > 0) {
-        g_sub_redraw = 0; last = g_submenu;
+        g_sub_redraw = 0; last = g_submenu; g_panel_buf_ok = 0;
         ui_capture(1);
         if (g_submenu == 4) snd_render(); else if (g_submenu == 3) view_render(); else if (g_submenu == 2) srtpicker_render(); else submenu_render(is3d);
         ui_tex_upload();
@@ -2835,7 +2888,7 @@ static void g_submenu_sw(C3D_RenderTarget *bot, int is3d) {
 /* dark bottom screen: pure black -- with ONLY the lock toast when it flashes on (never the panel) */
 static void g_dark_sw(C3D_RenderTarget *bot) {
     if (!ui_tex_init()) return;
-    ui_capture(1);
+    ui_capture(1); g_panel_buf_ok = 0;
     ui_begin(GFX_BOTTOM);
     ui_clear(0);          /* black */
     panel_lock_toast();
@@ -6220,7 +6273,7 @@ int moflex_defaults_preview(const MoflexDefaults *d,
         u32 kd = hidKeysDown(), kh = hidKeysHeld(), ku = hidKeysUp();
         touchPosition tp; hidTouchRead(&tp);
         int drew = 0;
-        ui_capture(1);                    /* the app's ui_present() becomes a no-op: we texture it */
+        ui_capture(1); g_panel_buf_ok = 0; /* the app's ui_present() becomes a no-op: we texture it */
         code = frame(ctx, kd, kh, ku, tp.px, tp.py, &drew);
         if (code) { closing = 0; ui_capture(0); break; }   /* ui_present() must draw again */
         g_sub_size = d->size; g_sub_pos = d->pos; g_sub_font = d->font; g_sub_depth = d->depth;
