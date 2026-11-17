@@ -62,6 +62,14 @@ typedef struct {
     int      audio_only;    /* if set, mfx_next_packet skips (seeks past) non-audio chunks */
 
     unsigned br_last, br_pos;  /* bit reader */
+
+    /* seek memory: block (offset, ts) pairs found by earlier seeks, sorted by offset, so a later seek
+     * brackets its target at once; and the last target's answer, so the same time lands identically */
+#define MFX_KN 64
+    int64_t  kofs[MFX_KN], kts[MFX_KN];
+    int      kn;
+    int      ls_valid;
+    int64_t  ls_t, ls_off;
 } MfxDemux;
 
 /* Returns 0 on success. Parses the first sync so stream table is known. */

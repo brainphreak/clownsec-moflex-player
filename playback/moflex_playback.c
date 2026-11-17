@@ -19,6 +19,7 @@
 #include <citro2d.h>   /* Old-3DS GPU playback path (no CPU transpose) */
 
 extern int    mobi_init(AVCodecContext *);
+extern int    mobi_npic;              /* decoder frame-pool size, read at init (the Old-3DS frame queue) */
 extern int    mobi_decode(AVCodecContext *, AVFrame *, int *, AVPacket *);
 extern void   mobi_recon_par_exit(void);   /* join the New-3DS decode-pipeline worker thread */
 extern void   mobi_flush(AVCodecContext *);
@@ -3684,7 +3685,17 @@ static uint8_t *r3_vq_pop(int *n, int64_t *ts, int *kf) {
     LightLock_Unlock(&g_vqlk);
     return p;
 }
+/* DECODED-FRAME QUEUE (Old 3DS). The texture ring holds only ~1 s (26 pairs) of finished textures in
+ * scarce linear memory; heavy stretches longer than that drained it into stutters. Decoded pairs now
+ * wait as YUV in the decoder's own (enlarged) frame pool -- no copy -- and are converted into the
+ * ring as it frees: the cushion becomes ring + queue (~2 s more) using ordinary heap. */
+#define YQ_MAX 64
+typedef struct { AVFrame L, R; int64_t rts, bts; int swap; } R3YQ;
+static R3YQ g_yq[YQ_MAX];
+static volatile int g_yq_h, g_yq_n;
+static int g_yq_cap;                     /* 0 = off (New 3DS, or not enough memory) */
 static void r3_vq_clear(void) { int n, kf; int64_t ts; while (r3_vqc > 0) free(r3_vq_pop(&n, &ts, &kf));
+    g_yq_h = g_yq_n = 0;                 /* the queued frames go with any seek / reset */
     LightLock_Lock(&g_vqlk);
     r3_vqh = r3_vqt = r3_vqc = 0; r3_kfph = r3_kfpt = r3_kfpc = 0; r3_pushv = 0;
     LightLock_Unlock(&g_vqlk); }
@@ -4237,6 +4248,34 @@ static inline int r3_inflight(void) { return r3_pend >= 0; }
 static R3S *g_ring_s;                    /* the live ring state, for the suspend hook */
 static void r3_retire_any(void) { if (g_ring_s) r3_retire(g_ring_s); }
 
+static void r3_yq_push(R3S *s, const AVFrame *L, const AVFrame *R, int64_t rts, int64_t bts) {
+    R3YQ *e = &g_yq[(g_yq_h + g_yq_n) % YQ_MAX];
+    e->L = *L; if (R) e->R = *R;
+    for (int i = 0; i < 4; i++) { e->L._own[i] = 0; e->R._own[i] = 0; }   /* the decoder owns the buffers */
+    e->rts = rts; e->bts = bts; e->swap = s->eye_swap;
+    __sync_synchronize(); g_yq_n = g_yq_n + 1;
+}
+/* the oldest queued pair -> the next ring slot (the second eye's conversion is left in flight) */
+static void r3_yq_convert(R3S *s) {
+    R3YQ *e = &g_yq[g_yq_h];
+    if (s->old3ds && r3_apos >= 0) {   /* already behind the audio: present would discard it unseen */
+        int stale = (e->rts + s->pair_dur < r3_apos);
+        int starving = ((u32)osGetTime() - g_r3_last_present) >= 100;
+        if (stale && !starving) { g_yq_h = (g_yq_h + 1) % YQ_MAX; g_yq_n = g_yq_n - 1; return; }
+    }
+    r3_retire(s);
+    int slot = s->wr % s->NB;
+    if (!s->is3d) {
+        g_y2r_start(&e->L, &r3_texL[slot], s->W, s->H); r3_pend_tex = &r3_texL[slot];
+    } else {
+        C3D_Tex *tA = e->swap ? &r3_texR[slot] : &r3_texL[slot], *tB = e->swap ? &r3_texL[slot] : &r3_texR[slot];
+        g_y2r_start(&e->L, tA, s->W, s->H); g_y2r_wait(tA);
+        g_y2r_start(&e->R, tB, s->W, s->H); r3_pend_tex = tB;
+    }
+    r3_pend = slot; r3_pend_rts = e->rts; r3_pend_bts = e->bts;
+    g_yq_h = (g_yq_h + 1) % YQ_MAX; g_yq_n = g_yq_n - 1;
+}
+
 /* Decode+bank ONE pair into ring slot wr%NB (or drop a pair while catching up). Runs under s->lock. */
 /* PHASE 0 + 1: trailer audio, then fill the video backlog and feed the DSP bank. Runs on the reader
  * thread (core 1) when it exists, else at the top of r3_produce. maxpk bounds one call so a seek never
@@ -4287,6 +4326,10 @@ static int r3_read_some(R3S *s, int maxpk) {
 
 static volatile int g_reader_on;          /* the core-1 reader thread is running */
 static void r3_produce(R3S *s) {
+    if (g_yq_cap > 0) {                           /* the ring takes a queued pair as soon as it has room */
+        if (g_yq_n > 0 && (s->wr + r3_inflight() - s->rd) < s->NB - 1) { r3_yq_convert(s); return; }
+        if (g_yq_n >= g_yq_cap) return;           /* ring and queue both full */
+    }
     if (!g_reader_on) r3_read_some(s, 1 << 30);   /* no reader thread: read inline, as before */
     if (r3_vqc < 2) return;   /* not enough for a pair yet */
 
@@ -4330,7 +4373,7 @@ static void r3_produce(R3S *s) {
          * that corrupts the whole GOP and the blockiness bleeds into the following calm scenes. The
          * cost is a brief freeze on the last clean frame, resolved the instant a keyframe lands. */
         if (r3_vqc == 0) { s->dpair = dpair + 1; return; }                 /* nothing buffered yet -> hold */
-        if (r3_vq_head_is_kf()) { s->skipping = 0; mobi_flush(s->ctx); }   /* FLUSH on resync (avtest mode 2,
+        if (r3_vq_head_is_kf()) { s->skipping = 0; r3_retire(s); g_yq_h = g_yq_n = 0; mobi_flush(s->ctx); }   /* FLUSH on resync (avtest mode 2,
                              * "looked best": clean picture + rare freezes, vs no-flush's persistent ghosting on
                              * this keyframe-sparse content). Matches the avtest degradation the user prefers. */
         else {
@@ -4360,7 +4403,14 @@ static void r3_produce(R3S *s) {
     /* keep measuring all through the film: a scope feature can open on a 16:9 logo card, and
      * since bars only ever shrink, a wider shot arriving later corrects an early guess */
     { static int lbn = 0; if (okL && ++lbn >= 12) { lbn = 0; lb_sample(s->fL, s->W, s->H); } }
-    if (!s->is3d) {
+    if (g_yq_cap > 0) {                           /* queue mode: decode the pair, convert later */
+        if (!s->is3d) { if (okL && !elide) r3_yq_push(s, s->fL, NULL, dpair * s->pair_dur, vts); }
+        else if (r3_vqc > 0) {
+            int64_t vts2; p = r3_vq_pop(&n, &vts2, &kf); ap.data = p; ap.size = n;
+            int gotR = 0; int okR = (mobi_decode(s->ctx, s->fR, &gotR, &ap) >= 0 && gotR); free(p);
+            if (okL && okR && !elide) r3_yq_push(s, s->fL, s->fR, dpair * s->pair_dur, vts);
+        }
+    } else if (!s->is3d) {
         if (okL && !elide) { r3_retire(s); slot = s->wr % s->NB;
                    g_y2r_start(s->fL, &r3_texL[slot], s->W, s->H);
                    r3_pend = slot; r3_pend_tex = &r3_texL[slot]; r3_pend_rts = dpair * s->pair_dur; r3_pend_bts = vts; }
@@ -4572,8 +4622,11 @@ static void r3_dec_thread(void *arg) {
             continue;
         }
         LightLock_Lock(&s->lock);
-        int wait = s->paused || g_ring_susp || (s->wr + r3_inflight() - s->rd >= s->NB - 1) || (s->done && r3_vqc == 0);
-        int starved = !wait && g_reader_on && r3_vqc < 2;    /* waiting on the reader, not on the ring */
+        int ring_full = (s->wr + r3_inflight() - s->rd >= s->NB - 1);
+        int wait = s->paused || g_ring_susp || (ring_full && (g_yq_cap == 0 || g_yq_n >= g_yq_cap))
+                   || (s->done && r3_vqc == 0 && (g_yq_n == 0 || ring_full));
+        int conv = g_yq_n > 0 && !ring_full;                 /* a queued pair can go into the ring */
+        int starved = !wait && !conv && g_reader_on && r3_vqc < 2;    /* waiting on the reader, not on the ring */
         if (!wait && !starved) r3_produce(s);
         else r3_retire(s);                     /* going idle: publish the in-flight frame first */
         LightLock_Unlock(&s->lock);
@@ -4646,7 +4699,20 @@ static MoflexResult moflex_play_ring(const char *path) {
 
     AVCodecContext ctx; memset(&ctx, 0, sizeof ctx);
     ctx.width = W; ctx.height = H; ctx.priv_data = calloc(1, mobi_ctx_size());
-    if (!ctx.priv_data || mobi_init(&ctx) != 0) { free(ctx.priv_data); mfx_close(&m); fclose(f); return MOFLEX_ERROR; }
+    g_yq_cap = 0; g_yq_h = g_yq_n = 0;
+    {   bool isn = false; APT_CheckNew3DS(&isn);
+        if (!isn) {   /* Old 3DS: a frame queue in free heap, as deep as fits with 6 MB to spare */
+            int fpp = is3d ? 2 : 1, cap = is3d ? 24 : 48;
+            size_t fb = (size_t)W * H * 3 / 2 + 3 * 1024;
+            while (cap >= 8) {
+                void *probe = malloc((size_t)fpp * (cap + 2) * fb + 6u * 1024 * 1024);
+                if (probe) { free(probe); break; }
+                cap /= 2;
+            }
+            if (cap >= 8) { g_yq_cap = cap; mobi_npic = 6 + fpp * (cap + 2); }
+        } }
+    if (!ctx.priv_data || mobi_init(&ctx) != 0) { mobi_npic = 6; g_yq_cap = 0; free(ctx.priv_data); mfx_close(&m); fclose(f); return MOFLEX_ERROR; }
+    mobi_npic = 6;                       /* read at init only; other engines keep the plain pool */
     mobi_opt = 0x1BDA5E | 0x08000000;   /* shipped fast path + missing-ref tolerance + SIMD residual (0x40) + FUSED
                              * transpose-free IDCT (0x08000000, bit-exact, ~3% faster decode -- binary-guided). NOTE: no pipeline --
                             * the decode THREAD gives the headroom the New-3DS pipeline used to, and the
@@ -5022,7 +5088,7 @@ static MoflexResult moflex_play_ring(const char *path) {
         } else {
         if (kd & KEY_B) { result = MOFLEX_QUIT_BACK; break; }
         if (kd & KEY_A) {
-            if (s.done && (s.wr - rd) == 0) { seek_to_us = 0; want_seek = 1; }   /* at the end: replay */
+            if (s.done && (s.wr - rd) == 0 && g_yq_n == 0) { seek_to_us = 0; want_seek = 1; }   /* at the end: replay */
             else { playing = !playing; if (have_audio) ndspChnSetPaused(0, !playing);
                    if (!playing) pause_wall = osGetTime();
                    else { r3_last = 0; if (r3_wallset) r3_wall0 += osGetTime() - pause_wall; }
@@ -5597,7 +5663,8 @@ static MoflexResult moflex_play_ring(const char *path) {
             /* GATE ON !playing, not on "no frame due": show < 0 is also true on a UI repaint
              * between presents, and firing there converted the worker's LATEST frame into an
              * already-queued ring slot -- wrong frame, wrong slot, visible as a glitch. */
-            if (g_pq_redo && !playing && s.paused && show < 0 && b >= 0) {
+            if (g_pq_redo && !playing && s.paused && show < 0 && b >= 0 && !g_yq_cap) {   /* queue mode: the
+                * latest decode is ~2 s ahead of the screen; the change shows from the next converted frame */
                 g_pq_redo = 0;
                 WORKER_LOCK();
                 if (g_pq_dirty) { g_pq_dirty = 0; pq_apply(); }
@@ -5679,7 +5746,7 @@ static MoflexResult moflex_play_ring(const char *path) {
 
         /* movie finished: STOP in the player (last frame held, bar parked at the end) instead of
          * exiting as if B was pressed. A replays from the start; B leaves as usual. */
-        if (s.done && (s.wr - rd) == 0 && playing) {
+        if (s.done && (s.wr - rd) == 0 && g_yq_n == 0 && playing) {
             playing = 0; s.paused = 1;
             if (have_audio) ndspChnSetPaused(0, true);
             resume_clear(path); moflex_watched_set(path, 1);   /* finished -> watched */
@@ -5742,11 +5809,11 @@ static MoflexResult moflex_play_ring(const char *path) {
         if (sf) {
             st_v2 += cad_v2; st_v3 += cad_v3; st_vx += cad_vx; st_dec += s.wk_dec; st_decn += s.wk_n;
             struct mallinfo mi = mallinfo();
-            fprintf(sf, "%s | %s %s | %.0fs (playing %.0fs, %.1f fps) shown=%ld stutters=%ld maxgap=%llums cadence v2=%ld v3=%ld bad=%ld slips=%ld lock=%.2f@%.4f panel=%.1fms upl=%.1fms | decode %.2f ms/pair max %.1f | NB=%d heap peak %lu KB, linear free %lu KB | %s\n",
+            fprintf(sf, "%s | %s %s | %.0fs (playing %.0fs, %.1f fps) shown=%ld stutters=%ld maxgap=%llums cadence v2=%ld v3=%ld bad=%ld slips=%ld lock=%.2f@%.4f panel=%.1fms upl=%.1fms | decode %.2f ms/pair max %.1f | NB=%d+q%d heap peak %lu KB, linear free %lu KB | %s\n",
                     BUILD_TAG, r3_isnew ? "new3ds" : "old3ds", is3d ? "3D" : "2D", (osGetTime() - st_t0) / 1000.0,
                     st_play_ms / 1000.0, st_play_ms ? st_shown * 1000.0 / st_play_ms : 0.0,
                     st_shown, st_stut, (unsigned long long)st_maxgap, st_v2, st_v3, st_vx, st_slip, vl_vk, (double)vl_speed, PF_MS(g_panel_max), PF_MS(g_upl_max),
-                    st_decn ? PF_MS(st_dec) / st_decn : 0.0, PF_MS(st_dmax), NB,
+                    st_decn ? PF_MS(st_dec) / st_decn : 0.0, PF_MS(st_dmax), NB, g_yq_cap,
                     (unsigned long)(mi.arena / 1024), (unsigned long)(linearSpaceFree() / 1024), title);
             fclose(sf);
         }

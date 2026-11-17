@@ -421,8 +421,13 @@ typedef struct ReconSet {
     int       valid;                         /* has pending replay work */
 } ReconSet;
 
+#ifndef MOBI_NPIC_MAX
+#define MOBI_NPIC_MAX 128
+#endif
 typedef struct MobiClipContext {
-    AVFrame *pic[6];
+    AVFrame *pic[MOBI_NPIC_MAX];
+    int       npic;                      /* frames in the pool: 6 = the references; more lets decoded
+                                          * frames wait in place (the player's frame queue) */
 
     int current_pic;
     int moflex;
@@ -448,6 +453,13 @@ typedef struct MobiClipContext {
     int       parse_slot;                /* which set the current parse records into */
 } MobiClipContext;
 
+/* Decoded frames live in a ring of pool buffers and are references for up to 5 frames back. A player
+ * that queues decoded frames before converting them sets mobi_npic (before init) so they are not
+ * overwritten while they wait; references are found the same way, so the output is unchanged. */
+#ifndef MOBI_NPIC_INIT
+#define MOBI_NPIC_INIT 6
+#endif
+int mobi_npic = MOBI_NPIC_INIT;
 static const VLCElem *rl_vlc[2];
 static const VLCElem *mv_vlc[2][16];
 /* The coefficient tables again, 16 bits an entry: (len << 12) | (last << 11 | run << 5 | level). As
@@ -498,7 +510,8 @@ static av_cold int mobiclip_init(AVCodecContext *avctx)
         return AVERROR(ENOMEM);
     s->motion_size = (avctx->width / 16 + 3) * sizeof(MotionXY);
 
-    for (int i = 0; i < 6; i++) {
+    s->npic = mobi_npic < 6 ? 6 : mobi_npic > MOBI_NPIC_MAX ? MOBI_NPIC_MAX : mobi_npic;
+    for (int i = 0; i < s->npic; i++) {     /* buffers themselves are allocated on first use */
         s->pic[i] = av_frame_alloc();
         if (!s->pic[i])
             return AVERROR(ENOMEM);
@@ -1718,7 +1731,7 @@ static int predict_motion_impl(AVCodecContext *avctx,
         MotionXY mv = s->motion[0];
 
         if (sidx < 0)
-            sidx += 6;
+            sidx += s->npic;
 
         if (index > 0) {
             mv.x = mv.x + (unsigned)get_se_golomb(gb);
@@ -2083,7 +2096,7 @@ static int mobiclip_decode(AVCodecContext *avctx, AVFrame *rframe,
     if (!s->moflex)
         avctx->colorspace = AVCOL_SPC_YCGCO;
 
-    s->current_pic = (s->current_pic + 1) % 6;
+    s->current_pic = (s->current_pic + 1) % s->npic;
 
     if (pipe) {
         if (pend) { if ((ret = av_frame_ref(rframe, pend->out)) < 0) return ret; pend->valid = 0; *got_frame = 1; }
@@ -2100,7 +2113,7 @@ static void mobiclip_flush(AVCodecContext *avctx)
 {
     MobiClipContext *s = avctx->priv_data;
 
-    for (int i = 0; i < 6; i++)
+    for (int i = 0; i < s->npic; i++)
         av_frame_unref(s->pic[i]);
     /* drop any pending pipeline frame so a seek doesn't reconstruct against a stale reference */
     s->rset[0].valid = s->rset[1].valid = 0;
@@ -2121,7 +2134,7 @@ static av_cold int mobiclip_close(AVCodecContext *avctx)
         av_freep(&rs->rmat); rs->rmat_cap = rs->rmat_n = 0;
     }
 
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < s->npic; i++) {
         av_frame_free(&s->pic[i]);
     }
 

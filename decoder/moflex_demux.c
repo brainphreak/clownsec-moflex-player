@@ -230,11 +230,25 @@ int mfx_open_window(MfxDemux *m, FILE *f, int64_t base, int64_t size) {
 
 int mfx_open(MfxDemux *m, FILE *f) { return mfx_open_window(m, f, 0, -1); }
 
+static int seek_off(MfxDemux *m, int64_t off, int64_t *landed_off);
 int mfx_seek_frac(MfxDemux *m, double frac) {
     if (m->file_size <= 0) return -1;
     if (frac < 0) frac = 0;
     if (frac > 0.999) frac = 0.999;
-    io_seek(m, (int64_t)(frac * m->file_size), SEEK_SET);
+    return seek_off(m, (int64_t)(frac * m->file_size), NULL);
+}
+/* go to byte offset `off` (window-relative) and realign to the next real sync marker; *landed_off =
+ * where that block starts */
+#ifdef MFX_COUNT
+long g_seek_probes;
+#endif
+static int seek_off(MfxDemux *m, int64_t off, int64_t *landed_off) {
+#ifdef MFX_COUNT
+    g_seek_probes++;
+#endif
+    if (m->file_size <= 0) return -1;
+    if (off < 0) off = 0;
+    io_seek(m, off, SEEK_SET);
     m->eof = 0;
     /* realign to the next REAL sync marker: 0x4C32 whose timestamp is in range
      * (filters false 0x4C32 matches inside packet data, which caused hangs). */
@@ -250,7 +264,8 @@ int mfx_seek_frac(MfxDemux *m, double frac) {
             int ok;
             if (m->duration_us > 0) ok = (ts >= 0 && ts <= m->duration_us + 2000000);
             else                    ok = (ts >= 0 && ts < 100LL * 3600 * 1000000);
-            if (ok) { m->ts = ts; io_seek(m, after - 2, SEEK_SET); found = 1; break; }  /* real sync */
+            if (ok) { m->ts = ts; io_seek(m, after - 2, SEEK_SET); found = 1;
+                      if (landed_off) *landed_off = after - 2; break; }  /* real sync */
             io_seek(m, after, SEEK_SET);             /* false match; keep scanning */
             prev = -1;
             continue;
@@ -264,20 +279,47 @@ int mfx_seek_frac(MfxDemux *m, double frac) {
 
 /* Seek to a target TIMESTAMP (microseconds). Binary-searches byte offsets so it
  * lands near the target regardless of the nonlinear byte<->time mapping. */
+static void seek_learn(MfxDemux *m, int64_t off, int64_t ts) {
+    int i = 0;
+    while (i < m->kn && m->kofs[i] < off) i++;
+    if (i < m->kn && m->kofs[i] == off) return;
+    if (m->kn >= MFX_KN) return;
+    for (int j = m->kn; j > i; j--) { m->kofs[j] = m->kofs[j - 1]; m->kts[j] = m->kts[j - 1]; }
+    m->kofs[i] = off; m->kts[i] = ts; m->kn++;
+}
+/* Seek to a target TIMESTAMP (microseconds): lands on the last block at/before it.
+ * Interpolates between the closest known blocks (every probe is remembered), so a first seek takes a
+ * few probes and later ones -- preview stills while dragging, the landing -- usually one; stops once
+ * the bracket is under 64 KB (a fraction of a second). The previous version halved the whole file 12
+ * times per seek, each probe a resync scan, and landed up to ~0.5 MB early. */
 int mfx_seek_time(MfxDemux *m, int64_t target_us) {
     if (m->duration_us <= 0 || m->file_size <= 0) return mfx_seek_frac(m, 0);
-    if (target_us <= 0) return mfx_seek_frac(m, 0);   /* seek-to-start: no binary search needed */
+    if (target_us <= 0) return mfx_seek_frac(m, 0);   /* seek-to-start: no search needed */
     if (target_us > m->duration_us) target_us = m->duration_us;
+    if (m->ls_valid && m->ls_t == target_us) return seek_off(m, m->ls_off, NULL);   /* same answer again */
 
-    double lo = 0.0, hi = 0.999, best = 0.0;
-    for (int it = 0; it < 12; it++) {
-        double mid = (lo + hi) * 0.5;
-        if (mfx_seek_frac(m, mid) != 0) { hi = mid; continue; }
-        int64_t landed = m->ts;                 /* set by mfx_seek_frac */
-        if (landed <= target_us) { lo = mid; best = mid; }
-        else                     { hi = mid; }
+    int64_t ao = 0, at = 0, bo = m->file_size, bt = m->duration_us;
+    for (int i = 0; i < m->kn; i++) {
+        if (m->kts[i] <= target_us) { if (m->kofs[i] > ao) { ao = m->kofs[i]; at = m->kts[i]; } }
+        else if (m->kofs[i] < bo) { bo = m->kofs[i]; bt = m->kts[i]; }
     }
-    return mfx_seek_frac(m, best);              /* land at/just before target */
+    int have_a = (ao > 0);
+    for (int it = 0; it < 12 && bo - ao > 65536; it++) {
+        int64_t span = bo - ao, g;
+        if (bt > at) g = ao + (int64_t)((double)(target_us - at) / (double)(bt - at) * (double)span);
+        else g = ao + span / 2;
+        int64_t lo = ao + span / 16, hi = bo - span / 16;        /* always shrink the bracket */
+        if (g < lo) g = lo; if (g > hi) g = hi;
+        int64_t lofs = -1;
+        if (seek_off(m, g, &lofs) != 0 || lofs < 0) { bo = g; continue; }
+        seek_learn(m, lofs, m->ts);
+        if (m->ts <= target_us) { if (lofs > ao) { ao = lofs; at = m->ts; have_a = 1; } else { bo = g; } }
+        else { bo = g; bt = m->ts; }
+    }
+    int64_t lofs = -1;
+    int r = have_a ? seek_off(m, ao, &lofs) : mfx_seek_frac(m, 0);
+    if (r == 0) { m->ls_valid = 1; m->ls_t = target_us; m->ls_off = have_a ? ao : 0; }
+    return r;
 }
 
 /* Detect frame-interleaved 3D vs 2D: a 3D moflex delivers ~2x the timebase frame rate (an L and an R
