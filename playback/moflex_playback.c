@@ -3323,6 +3323,11 @@ static int64_t r3_audio_t0 = -1;   /* content ts of the first audio sample after
 static int64_t r3_av_skew = 0;     /* constant apos offset = audio_origin - video_origin */
 static int     r3_av_ready = 0;    /* r3_av_skew has been captured for this segment */
 static u64 r3_last;   /* last poll tick, for the phase-locked clock */
+/* DISPLAY LOCK: the audio's playback speed (1.0 = as recorded). The present loop trims it a hair
+ * (23.976 fps on the 59.83 Hz LCD: 0.18% slower) so frames land on an exact 3,2,3,2 refresh pattern,
+ * and nudges it to hold A/V sync; the smoothed clock below advances at this speed. */
+static float r3_aspeed = 1.0f;
+static void r3_set_aspeed(float sp) { r3_aspeed = sp; ndspChnSetRate(0, (float)r3_arate * sp); }
 /* READER ON CORE 1: file reading + audio feeding run on their own thread, so the decode core never
  * waits on the SD card / network. These locks guard what both sides touch. */
 static LightLock g_vqlk;     /* compressed-video backlog + keyframe list */
@@ -3334,7 +3339,7 @@ __attribute__((constructor)) static void r3_locks_ctor(void) { r3_locks_init(); 
 static void r3_audio_close(void);   /* used by the setup failure path below */
 static void r3_audio_setup(int arate, int chn) {
     r3_arate = arate; r3_achn = chn; r3_awi = 0; r3_aplayed = 0; r3_apos = -1; r3_last = 0;
-    r3_audio_t0 = -1; r3_av_skew = 0; r3_av_ready = 0;
+    r3_audio_t0 = -1; r3_av_skew = 0; r3_av_ready = 0; r3_aspeed = 1.0f;
     ndspChnReset(0); ndspChnSetInterp(0, NDSP_INTERP_POLYPHASE); ndspChnSetRate(0, (float)arate);
     ndspChnSetFormat(0, chn == 2 ? NDSP_FORMAT_STEREO_PCM16 : NDSP_FORMAT_MONO_PCM16);
     float mix[12]; memset(mix, 0, sizeof mix); mix[0] = mix[1] = 1.0f; ndspChnSetMix(0, mix);
@@ -3370,7 +3375,7 @@ static void r3_audio_poll(void) {
     if (r3_last == 0) r3_last = now;
     int64_t dt = (int64_t)((now - r3_last) * 1000000LL / SYSCLOCK_ARM11);
     r3_last = now;
-    r3_apos += dt;                                                  /* smooth free-run */
+    r3_apos += (int64_t)(dt * r3_aspeed);                           /* smooth free-run, at the audio's speed */
     int64_t audio = (int64_t)(r3_aplayed * 1000000LL / r3_arate);
     if (r3_apos < audio)                 r3_apos += (audio - r3_apos) / 8;               /* fell behind -> ease up */
     else if (r3_apos > audio + 100000)   r3_apos -= (r3_apos - audio - 100000) / 8;      /* too far ahead -> ease back */
@@ -4474,6 +4479,20 @@ static MoflexResult moflex_play_ring(const char *path) {
     u64 pf_dec = 0, pf_y2r = 0, pf_gpu = 0, pf_idle = 0, pf_rd = 0, pf_dmax = 0, pf_rdmax = 0; int pf_n = 0; char pf_str[80] = "";
     #define PF_MS(t) ((double)(t) * 1000.0 / SYSCLOCK_ARM11)
     u64 cad_last = 0; int cad_v2 = 0, cad_v3 = 0, cad_vx = 0;
+    /* DISPLAY LOCK. Frames are scheduled by counting LCD refreshes (C3D_FrameCounter), not by
+     * comparing a clock to their timestamps: the clock read wobbles by the draw time (worse on Old
+     * 3DS), and the LCD runs at 59.83 Hz, so 23.976 fps is 2.4954 refreshes a frame, not 2.5 -- the
+     * 3,2 pattern slipped every ~9 s. Both showed as a hitch in long smooth pans. When the frame rate
+     * is within 0.6% of a whole or half number of refreshes, that number is used and the audio speed
+     * is trimmed to match; otherwise (25 fps) the true ratio, spread as evenly as refreshes allow.
+     * A/V sync is held by nudging the audio speed (at most +-0.4%, inaudible). */
+    const double VL_HZ = 59.8261;
+    double vl_k = VL_HZ * (double)pair_dur / 1e6, vl_vk = vl_k;
+    {   double h = floor(vl_k * 2.0 + 0.5) / 2.0;
+        if (h >= 1.0 && fabs(vl_k / h - 1.0) < 0.006) vl_vk = h; }
+    const float vl_speed = (float)(vl_k / vl_vk);   /* audio speed that matches the locked video rate */
+    int vl_on = 0; u32 vl_base_vb = 0; int64_t vl_base_n = 0; double vl_err = 0; int vl_cnt = 0;
+    int vl_prevhold = 0; long st_slip = 0;
     /* session totals, written to sdmc:/moflex_player/ring_stats.txt when playback ends */
     long st_v2 = 0, st_v3 = 0, st_vx = 0, st_stut = 0, st_shown = 0, st_decn = 0; long long st_dec = 0, st_dmax = 0;
     u64 st_maxgap = 0, st_t0 = osGetTime();
@@ -4976,10 +4995,39 @@ static MoflexResult moflex_play_ring(const char *path) {
                 r3_av_ready = 1;
             }
             int64_t ae = (have_audio && apos >= 0) ? apos + r3_av_skew : apos;
-            while ((wr - rd) > 1 && ready[(rd + 1) % NB] && rts[(rd + 1) % NB] <= ae + VS_HALF) { ready[rd % NB] = 0; rd++; }
-            if (apos < 0) { if (last_shown < 0) show = rd % NB; }             /* pre-roll: show the landing pair */
-            else if (ae + VS_HALF >= rts[rd % NB]) show = rd % NB;
-        }
+            if (have_audio && apos >= 0 && r3_av_ready) {
+                /* display lock: frame n shows on refresh base + round((n - n0) * vk) */
+                u32 vb = C3D_FrameCounter(0);
+                #define VL_N(i) ((rts[(i) % NB] + pair_dur / 2) / pair_dur)
+                #define VL_DUE(n) (vl_base_vb + (u32)(int64_t)floor((double)((n) - vl_base_n) * vl_vk + 0.5))
+                if (!vl_on) {
+                    vl_on = 1; vl_base_vb = vb; vl_base_n = VL_N(rd); vl_err = 0; vl_cnt = 0;
+                    if (r3_aspeed != vl_speed) r3_set_aspeed(vl_speed);
+                }
+                while ((wr - rd) > 1 && ready[(rd + 1) % NB] && (s32)(vb - VL_DUE(VL_N(rd + 1))) >= 0) { ready[rd % NB] = 0; rd++; }
+                if ((s32)(vb - VL_DUE(VL_N(rd))) >= 0) {
+                    show = rd % NB;
+                    /* sync: video content time vs the audio clock, smoothed; steer the audio speed */
+                    double e = (double)(rts[show] - ae);
+                    vl_err += (e - vl_err) / 32.0;
+                    if (vl_err > 250000.0 || vl_err < -250000.0) {   /* lost (stall, odd stamps): re-anchor */
+                        vl_on = 0; r3_set_aspeed(vl_speed);
+                    } else if (++vl_cnt >= 24) {
+                        vl_cnt = 0;
+                        double adj = vl_err * 6e-8;                  /* 50 ms ahead -> audio 0.3% faster */
+                        if (adj > 0.004) adj = 0.004; else if (adj < -0.004) adj = -0.004;
+                        r3_set_aspeed(vl_speed * (float)(1.0 + adj));
+                    }
+                }
+                #undef VL_DUE
+                #undef VL_N
+            } else {
+                if (vl_on) { vl_on = 0; if (have_audio && r3_aspeed != 1.0f) r3_set_aspeed(1.0f); }
+                while ((wr - rd) > 1 && ready[(rd + 1) % NB] && rts[(rd + 1) % NB] <= ae + VS_HALF) { ready[rd % NB] = 0; rd++; }
+                if (apos < 0) { if (last_shown < 0) show = rd % NB; }             /* pre-roll: show the landing pair */
+                else if (ae + VS_HALF >= rts[rd % NB]) show = rd % NB;
+            }
+        } else if (!playing && vl_on) vl_on = 0;   /* paused: re-anchor on resume */
 
         /* ---- draw: video pair (or held frame) + subtitle overlay + bottom panel, one GPU frame ---- */
         int64_t disp_us = (show >= 0) ? bts[show] : (last_shown >= 0 ? last_bts : cur_us);
@@ -5065,6 +5113,12 @@ static MoflexResult moflex_play_ring(const char *path) {
                 u64 nt = svcGetSystemTick();   /* cadence: refreshes this newly-shown frame replaced */
                 if (cad_last) { int v = (int)((double)(nt - cad_last) * 1000.0 / SYSCLOCK_ARM11 / VS_MS + 0.5);
                                 if (v == 2) cad_v2++; else if (v == 3) cad_v3++; else cad_vx++;
+                                /* pattern breaks: a half-refresh rate should alternate (3,2,3,2), a whole one repeat */
+                                if (playing && vl_prevhold) {
+                                    int half = (vl_vk - floor(vl_vk)) > 0.25;
+                                    if (half ? (v == vl_prevhold) : (v != (int)(vl_vk + 0.5))) st_slip++;
+                                }
+                                vl_prevhold = v;
                                 u64 gap = (nt - cad_last) / (SYSCLOCK_ARM11 / 1000);
                                 if (playing && gap > (u64)(2 * pair_dur / 1000)) st_stut++;   /* held > 2 frames */
                                 if (playing && gap > st_maxgap && gap < 5000) st_maxgap = gap; }
@@ -5140,10 +5194,10 @@ static MoflexResult moflex_play_ring(const char *path) {
         if (sf) {
             st_v2 += cad_v2; st_v3 += cad_v3; st_vx += cad_vx; st_dec += s.wk_dec; st_decn += s.wk_n;
             struct mallinfo mi = mallinfo();
-            fprintf(sf, "%s | %s %s | %.0fs (playing %.0fs, %.1f fps) shown=%ld stutters=%ld maxgap=%llums cadence v2=%ld v3=%ld bad=%ld | decode %.2f ms/pair max %.1f | NB=%d heap peak %lu KB, linear free %lu KB | %s\n",
+            fprintf(sf, "%s | %s %s | %.0fs (playing %.0fs, %.1f fps) shown=%ld stutters=%ld maxgap=%llums cadence v2=%ld v3=%ld bad=%ld slips=%ld lock=%.2f@%.4f | decode %.2f ms/pair max %.1f | NB=%d heap peak %lu KB, linear free %lu KB | %s\n",
                     BUILD_TAG, r3_isnew ? "new3ds" : "old3ds", is3d ? "3D" : "2D", (osGetTime() - st_t0) / 1000.0,
                     st_play_ms / 1000.0, st_play_ms ? st_shown * 1000.0 / st_play_ms : 0.0,
-                    st_shown, st_stut, (unsigned long long)st_maxgap, st_v2, st_v3, st_vx,
+                    st_shown, st_stut, (unsigned long long)st_maxgap, st_v2, st_v3, st_vx, st_slip, vl_vk, (double)vl_speed,
                     st_decn ? PF_MS(st_dec) / st_decn : 0.0, PF_MS(st_dmax), NB,
                     (unsigned long)(mi.arena / 1024), (unsigned long)(linearSpaceFree() / 1024), title);
             fclose(sf);
