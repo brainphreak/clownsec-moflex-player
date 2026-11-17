@@ -343,6 +343,7 @@ int mfx_detect_stereo(MfxDemux *m) {
     m->tb_is_eye = 0;
     if (t0 >= 0 && m->ts > t0 && vc > 4) {
         double dfps = (double)vc / ((double)(m->ts - t0) / 1e6);
+        m->meas_fps = dfps;
         /* Interleaved 3D shows up two ways depending on how the frame rate was declared:
          *  - our transcodes declare the DISPLAY rate (24-30) -> actual packet rate is ~2x it.
          *  - Nintendo's files declare the PACKET rate itself (~48-60 = L+R for 24-30fps) -> ratio ~1x,

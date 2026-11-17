@@ -60,6 +60,8 @@ typedef struct {
     int      tb_is_eye;     /* 3D: the declared timebase is the EYE-frame period (Nintendo files
                                declare ~48-60 = the L+R packet rate), so a display PAIR lasts 2x it */
     int      audio_only;    /* if set, mfx_next_packet skips (seeks past) non-audio chunks */
+    double   meas_fps;      /* video packets per second of container time, measured by mfx_detect_stereo
+                               (0 = unknown): the truth when a file's declared rate is wrong */
 
     unsigned br_last, br_pos;  /* bit reader */
 

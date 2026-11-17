@@ -4702,6 +4702,23 @@ static MoflexResult moflex_play_ring(const char *path) {
         if (pd >= 16000 && pd <= 100000) pair_dur = pd;
     }
     if (is3d && m.tb_is_eye) pair_dur *= 2;   /* Nintendo declares the EYE rate: a pair lasts 2x */
+    /* A declared rate can be wrong (seen: a 25 fps film declared 29.97 -- frames were scheduled at 30,
+     * ran ahead of the sound and kept waiting for it: ~5 long holds a second). The container's own
+     * timestamps give the real packet rate; when it is clearly a standard rate and the declaration is
+     * more than 4% off, pace by the real one. Correctly declared files are untouched. */
+    const double fps_decl = 1e6 / (double)pair_dur;
+    if (m.meas_fps > 0) {
+        static const double std_fps[] = { 23.976, 24.0, 25.0, 29.97, 30.0, 12.0, 15.0, 50.0, 59.94, 60.0 };
+        double R = m.meas_fps / (is3d ? 2.0 : 1.0), best = 0, be = 1;
+        for (unsigned i = 0; i < sizeof std_fps / sizeof std_fps[0]; i++) {
+            double e = fabs(R / std_fps[i] - 1.0);
+            if (e < be) { be = e; best = std_fps[i]; }
+        }
+        if (best > 0 && be < 0.03) {
+            int64_t pd = (int64_t)(1e6 / best + 0.5);
+            if (llabs(pd - pair_dur) * 100 > pair_dur * 4) pair_dur = pd;
+        }
+    }
 
     AVCodecContext ctx; memset(&ctx, 0, sizeof ctx);
     ctx.width = W; ctx.height = H; ctx.priv_data = calloc(1, mobi_ctx_size());
@@ -5822,12 +5839,13 @@ static MoflexResult moflex_play_ring(const char *path) {
         if (sf) {
             st_v2 += cad_v2; st_v3 += cad_v3; st_vx += cad_vx; st_dec += s.wk_dec; st_decn += s.wk_n;
             struct mallinfo mi = mallinfo();
-            fprintf(sf, "%s | %s %s | %.0fs (playing %.0fs, %.1f fps) shown=%ld stutters=%ld maxgap=%llums cadence v2=%ld v3=%ld bad=%ld slips=%ld lock=%.2f@%.4f panel=%.1fms upl=%.1fms | drop=%ld starve=%.1fs rdmax=%lums rdslow=%lu src=%s | decode %.2f ms/pair max %.1f | NB=%d+q%d heap peak %lu KB, linear free %lu KB | %s\n",
+            fprintf(sf, "%s | %s %s | %.0fs (playing %.0fs, %.1f fps) shown=%ld stutters=%ld maxgap=%llums cadence v2=%ld v3=%ld bad=%ld slips=%ld lock=%.2f@%.4f panel=%.1fms upl=%.1fms | drop=%ld starve=%.1fs rdmax=%lums rdslow=%lu src=%s fps decl=%.2f meas=%.2f used=%.2f | decode %.2f ms/pair max %.1f | NB=%d+q%d heap peak %lu KB, linear free %lu KB | %s\n",
                     BUILD_TAG, r3_isnew ? "new3ds" : "old3ds", is3d ? "3D" : "2D", (osGetTime() - st_t0) / 1000.0,
                     st_play_ms / 1000.0, st_play_ms ? st_shown * 1000.0 / st_play_ms : 0.0,
                     st_shown, st_stut, (unsigned long long)st_maxgap, st_v2, st_v3, st_vx, st_slip, vl_vk, (double)vl_speed, PF_MS(g_panel_max), PF_MS(g_upl_max),
                     st_drop, PF_MS(st_starve_ticks) / 1000.0, (unsigned long)g_st_rdmax, (unsigned long)g_st_rdslow,
                     strncmp(path, "bigtop:", 7) ? "sd" : "bigtop",
+                    fps_decl, m.meas_fps / (is3d ? 2.0 : 1.0), 1e6 / (double)pair_dur,
                     st_decn ? PF_MS(st_dec) / st_decn : 0.0, PF_MS(st_dmax), NB, g_yq_cap,
                     (unsigned long)(mi.arena / 1024), (unsigned long)(linearSpaceFree() / 1024), title);
             fclose(sf);
