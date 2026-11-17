@@ -4472,19 +4472,37 @@ static int r3_land(R3S *s, int64_t T, int slot, int64_t *lts_out) {
     }
     return 0;
 }
-/* a preview still IS a landing: the same keyframe + eye-parity logic, so the still shown is exactly
- * where playback will start, and a release on it reuses it without a second seek */
+/* a preview still: the keyframe pair at the target's index landing -- fast (no keyframe hunt, no
+ * eye-parity peek: those read seconds of file and made stills appear only after a long hold) */
 static void r3_preview_one(R3S *s) {
     int seq = s->pv_req_seq; int64_t T = s->pv_req;   /* the newest target right now */
     s->pv_handled = seq;
+    do_seek(s->m, s->ctx, T);
+    int64_t mark = s->m->ts;
+    if (mark == s->pv_mark) return;                   /* same landing as the still on screen */
     int slot = (s->pv_slot + 1) % 3;                  /* never the slot being shown */
-    int64_t lts = T;
-    s->land_active = 0;
-    int ok = r3_land(s, T, slot, &lts);
+    MfxPacket pk; int vseen = 0, got = 0;
+    for (int g = 0; g < 600 && !got && !g_wl_req; g++) {
+        if (mfx_next_packet(s->m, &pk) != 1) break;
+        if (s->m->streams[pk.stream_index].media_type != MFX_TYPE_VIDEO) continue;
+        vseen++;
+        if (s->is3d && !(vseen & 1)) continue;
+        if (!pk.keyframe) continue;
+        AVPacket ap; ap.data = pk.data; ap.size = pk.size; int gL = 0;
+        if (!(mobi_decode(s->ctx, s->fL, &gL, &ap) >= 0 && gL)) continue;
+        if (s->is3d) {
+            MfxPacket pr; int haveR = 0, gR = 0;
+            for (int g2 = 0; g2 < 8; g2++) { if (mfx_next_packet(s->m, &pr) != 1) break;
+                if (s->m->streams[pr.stream_index].media_type == MFX_TYPE_VIDEO) { haveR = 1; break; } }
+            if (!haveR || !(mobi_decode(s->ctx, s->fR, &gR, &(AVPacket){ .data = pr.data, .size = pr.size }) >= 0 && gR)) break;
+            g_y2r_start(s->fL, &r3_texL[slot], s->W, s->H); g_y2r_wait(&r3_texL[slot]);
+            g_y2r_start(s->fR, &r3_texR[slot], s->W, s->H); g_y2r_wait(&r3_texR[slot]);
+        } else { g_y2r_start(s->fL, &r3_texL[slot], s->W, s->H); g_y2r_wait(&r3_texL[slot]); }
+        got = 1;
+    }
     clearerr(s->m->f); s->m->eof = 0;
-    s->lastop_ok = ok; s->lastop_T = T; s->lastop_slot = slot; s->lastop_lts = lts;
-    if (ok) {
-        s->pv_slot = slot; s->pv_done_slot = slot; s->pv_done_T = lts;
+    if (got) {
+        s->pv_mark = mark; s->pv_slot = slot; s->pv_done_slot = slot; s->pv_done_T = T;
         __sync_synchronize(); s->pv_done_seq++;
     }
 }
@@ -4502,7 +4520,7 @@ static void r3_dec_thread(void *arg) {
                 if (s->lastop_ok && s->lastop_T == s->land_T) {      /* released on the still: already landed */
                     slot = s->lastop_slot; lts = s->lastop_lts; ok = 1;
                 } else {
-                    slot = (s->pv_slot + 1) % 3; lts = s->land_T;
+                    slot = (s->pv_slot + 1) % s->NB; lts = s->land_T;   /* the still (pv_slot) stays behind rd */
                     s->land_active = 1;
                     ok = r3_land(s, s->land_T, slot, &lts);
                     s->land_active = 0;
@@ -4776,7 +4794,7 @@ static MoflexResult moflex_play_ring(const char *path) {
      * let go nothing plays -- the decoder, reader and audio are held once, and the top screen shows a
      * still of the nearest keyframe to the target, refreshed as the target moves. The UI never waits
      * on a seek; the real seek runs once, on release, with the threads already held. */
-    int pv_hold = 0, pv_seen = 0, landing = 0; int64_t pv_tgt = -1;
+    int pv_hold = 0, pv_seen = 0, landing = 0, pv_had_still = 0; int64_t pv_tgt = -1;
     int64_t pv_disp = 0;   /* where the seek is going: the panel shows this from first touch to playback */
     /* seek sync log (sdmc:/moflex_player/seek_debug.txt): per seek, the landing and the A/V error
      * measured ~3 s into playback -- to find a sync offset after seeks */
@@ -5110,7 +5128,7 @@ static MoflexResult moflex_play_ring(const char *path) {
                 gated = 0; s.paused = 1;
                 s.pv_mark = -1; s.pv_mode = 1; pv_seen = s.pv_done_seq; s.lastop_ok = 0; s.vskip = 0;
                 WORKER_UNLOCK();                 /* the reader idles (paused); the worker serves stills */
-                pv_hold = 1; pv_tgt = -1;
+                pv_hold = 1; pv_tgt = -1; pv_had_still = 0;
             }
             if (seek_ui && pv_hold && landing) { s.land_cancel = 1; landing = 0; pv_tgt = -1; }   /* moved again */
             if (seek_ui && pv_hold) {
@@ -5125,7 +5143,7 @@ static MoflexResult moflex_play_ring(const char *path) {
             }
             if (pv_hold && s.pv_done_seq != pv_seen) {   /* a new still is ready: show it */
                 pv_seen = s.pv_done_seq; __sync_synchronize();
-                last_shown = s.pv_done_slot; last_bts = s.pv_done_T; dirty = 1;
+                last_shown = s.pv_done_slot; last_bts = s.pv_done_T; dirty = 1; pv_had_still = 1;
             }
         }
         if (pv_hold && landing && s.land_done_seq == s.land_seq) {   /* the worker has landed */
@@ -5136,7 +5154,9 @@ static MoflexResult moflex_play_ring(const char *path) {
                 int sl = s.land_slot; int64_t lts = s.land_lts;
                 for (int i = 0; i < NB; i++) ready[i] = 0;
                 rd = sl; s.rd = sl; s.wr = sl + 1; ready[sl] = 1; rts[sl] = 0; bts[sl] = lts; s.dpair = 1;
-                s.skipping = 0; s.done = 0; s.has_pending = 0; last_shown = -1;
+                s.skipping = 0; s.done = 0; s.has_pending = 0;
+                if (!pv_had_still) last_shown = -1;   /* no still shown: the landing pair stands in until play;
+                                                     * else the preview still stays up until sound+picture start */
                 r3_vq_clear();
                 if (have_audio) r3_audio_flush();
                 s.lastop_ok = 0;
@@ -5386,7 +5406,12 @@ static MoflexResult moflex_play_ring(const char *path) {
         if (!threaded && playing && !s.done && (s.wr - rd) < NB - 1) { r3_produce(&s); inline_produced = 1; }
 
         /* pre-roll: unpause audio once enough pairs are banked, or the worker's audio bank filled first */
-        if (have_audio && !gated && playing && (s.wr >= PRIME || s.audio_pre_full)) { gated = 1; ndspChnSetPaused(0, false); r3_apos = 0; }
+        /* sound and picture start together: once PRIME pairs are banked. A full audio bank starts it
+         * early only when video can't progress (the reader holds a packet for the full bank and the
+         * video backlog is dry) -- starting on the full bank alone began the sound with 1-2 pairs ready,
+         * the catch-up then dropped video to the next keyframe: stills, then a jump. */
+        if (have_audio && !gated && playing && ((s.wr - rd) >= PRIME || (s.audio_pre_full && r3_vqc < 2) || s.done)) {
+            gated = 1; ndspChnSetPaused(0, false); r3_apos = 0; }
 
         if (sd_land_t && !sd_stuck_logged && osGetTime() - sd_land_t > 2000) {
             if (st_shown - sd_shown0 < 5) {      /* 2 s after a landing and the picture hasn't moved */
