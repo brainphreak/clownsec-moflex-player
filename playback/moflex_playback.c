@@ -4775,6 +4775,7 @@ static MoflexResult moflex_play_ring(const char *path) {
      * still of the nearest keyframe to the target, refreshed as the target moves. The UI never waits
      * on a seek; the real seek runs once, on release, with the threads already held. */
     int pv_hold = 0, pv_seen = 0, landing = 0; int64_t pv_tgt = -1;
+    int64_t pv_disp = 0;   /* where the seek is going: the panel shows this from first touch to playback */
     int vol_drag = 0;                           /* touch-drag on the volume slider (applies live) */
     int resume_exact = 0;                       /* resume only: decode forward to the EXACT saved second */
     g_submenu = 0; g_sub_sel = 0;               /* subtitle menu starts closed */
@@ -5110,6 +5111,7 @@ static MoflexResult moflex_play_ring(const char *path) {
                 int64_t T = scrubbing ? scrub_us : seek_to_us;
                 if (T < 0) T = 0;
                 if (dur_us > 0 && T > dur_us - 1000000) T = dur_us - 1000000 > 0 ? dur_us - 1000000 : 0;
+                pv_disp = T;
                 if (T != pv_tgt) {               /* post the newest target; the worker skips stale ones */
                     pv_tgt = T; s.pv_req = T; __sync_synchronize(); s.pv_req_seq++;
                     LightEvent_Signal(&s.wake);
@@ -5147,6 +5149,7 @@ static MoflexResult moflex_play_ring(const char *path) {
              * keeps the still up and stays live -- a new touch cancels it */
             int64_t T = seek_to_us; if (T < 0) T = 0; if (dur_us > 0 && T > dur_us) T = dur_us;
             s.land_cancel = 0; s.land_T = T; __sync_synchronize(); s.land_seq++;
+            pv_disp = T; cur_us = T;             /* the knob stays where it was let go */
             LightEvent_Signal(&s.wake);
             landing = 1; want_seek = 0;
         }
@@ -5436,7 +5439,7 @@ static MoflexResult moflex_play_ring(const char *path) {
         } else if (!playing && vl_on) vl_on = 0;   /* paused: re-anchor on resume */
 
         /* ---- draw: video pair (or held frame) + subtitle overlay + bottom panel, one GPU frame ---- */
-        int64_t disp_us = (show >= 0) ? bts[show] : (last_shown >= 0 ? last_bts : cur_us);
+        int64_t disp_us = (show >= 0) ? bts[show] : pv_hold ? pv_disp : (last_shown >= 0 ? last_bts : cur_us);
         if (want_seek && ((kh & (KEY_LEFT | KEY_RIGHT)) || tseek)) { disp_us = seek_to_us < 0 ? 0 : seek_to_us; dirty = 1; }  /* preview the accumulating seek target */
         if (scrubbing) { disp_us = scrub_us; dirty = 1; }   /* preview the dragged position while the finger is down */
         (void)pf_str;
@@ -5574,7 +5577,7 @@ static MoflexResult moflex_play_ring(const char *path) {
             /* a spare refresh, and the GPU is done with the last frame: update the panel texture now,
              * for the frame that shows next, so presents only blit it */
             if (playing && !g_screen_off && !g_submenu) {
-                int64_t nx = ((s.wr - rd) > 0 && ready[rd % NB]) ? bts[rd % NB] : cur_us;
+                int64_t nx = pv_hold ? pv_disp : ((s.wr - rd) > 0 && ready[rd % NB]) ? bts[rd % NB] : cur_us;
                 g_panel_prep(title, nx, dur_us, playing);
             } else if (playing && !g_screen_off && g_submenu && g_submenu_stale()) {
                 g_submenu_prep(is3d); dirty = 1;   /* shown by the next pass */
