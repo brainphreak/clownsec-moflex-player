@@ -1714,6 +1714,22 @@ static void panel_bar(int64_t cur, int64_t dur) {
 #define PT_TIME_Y1 40
 #define PT_BAR_Y0 56
 #define PT_BAR_Y1 80
+static void panel_vol(void) {
+    /* volume slider (vertical, right) */
+    ui_fill_round(VOL_X, VOL_Y, 12, VOL_H, 6, TH_TRACK);
+    int vf = (int)(VOL_H * (g_vol / 4.0f));
+    if (vf > 0) ui_fill_round(VOL_X, VOL_Y + VOL_H - vf, 12, vf, 6, UI_NEON);
+    char vs[8]; snprintf(vs, sizeof(vs), "%d%%", (int)(g_vol * 100 + 0.5f));
+    ui_text(VOL_X - 16, VOL_Y - 12, 1, UI_INK, vs);   /* label above the slider (frees the button row) */
+}
+/* volume strips: the % label (x 280-320, y 76-85; the bar's knob ends at 73) and the slider
+ * (x 296-320, y 88-195; the CC/moon/AUTO buttons end at x 292) */
+#define PT_VLBL_X0 280
+#define PT_VLBL_Y0 76
+#define PT_VLBL_Y1 86
+#define PT_VSL_X0 296
+#define PT_VSL_Y0 88
+#define PT_VSL_Y1 196
 static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing) {
     ui_begin(GFX_BOTTOM);
     if (g_panel_cheap) ui_fill_round(0, 0, UI_W, UI_H, 0, UI_BG);          /* flat bg (cheap) */
@@ -1756,12 +1772,7 @@ static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing)
     if (playing) ui_pause(PLAY_CX, PLAY_CY, 22, UI_NEON);
     else         ui_play(PLAY_CX + 2, PLAY_CY, 22, UI_NEON);
 
-    /* volume slider (vertical, right) */
-    ui_fill_round(VOL_X, VOL_Y, 12, VOL_H, 6, TH_TRACK);
-    int vf = (int)(VOL_H * (g_vol / 4.0f));
-    if (vf > 0) ui_fill_round(VOL_X, VOL_Y + VOL_H - vf, 12, vf, 6, UI_NEON);
-    char vs[8]; snprintf(vs, sizeof(vs), "%d%%", (int)(g_vol * 100 + 0.5f));
-    ui_text(VOL_X - 16, VOL_Y - 12, 1, UI_INK, vs);   /* label above the slider (frees the button row) */
+    panel_vol();
 
     /* action buttons: SAME row as the home screen (OPEN VIDEO / MANAGE / ADD VIDEO) */
     ui_text(6, 190, 1, UI_INK, "Y=SUBS X=DARK A=PLAY L+R=LOCK");   /* key map (B=back is universal) */
@@ -2496,9 +2507,9 @@ static void g_panel_prep(const char *title, int64_t cur, int64_t dur, int playin
     int bar = dur > 0 ? (int)((double)BAR_W * (double)cur / (double)dur) : 0;
     int vol = (int)(g_vol * 100 + 0.5f);
     batt_refresh();                             /* throttled inside; the partial path below skips panel_draw */
-    int full = g_panel_force || !g_panel_buf_ok || playing != l_play || vol != l_vol || g_batt_pct != l_batt
+    int full = g_panel_force || !g_panel_buf_ok || playing != l_play || g_batt_pct != l_batt
                || g_batt_chg != l_chg || vw != l_zm || title != l_title || g_lock_toast > 0 || g_touch_locked != l_lock;
-    if (!full && sec == l_sec && bar == l_bar) return;
+    if (!full && sec == l_sec && bar == l_bar && vol == l_vol) return;
     u64 pt0 = svcGetSystemTick();
     ui_capture(1);
     if (full || !g_panel_cheap) {               /* the gradient background (New 3DS) can't be patched by a flat fill */
@@ -2512,6 +2523,13 @@ static void g_panel_prep(const char *title, int64_t cur, int64_t dur, int playin
         ui_fill(0, PT_BAR_Y0, UI_W, 20, UI_BG);              panel_bar(cur, dur);   /* y 56-75: the volume label starts at 76 */
         ui_tex_upload_rect(0, PT_TIME_Y0, PT_TIME_X1, PT_TIME_Y1);
         ui_tex_upload_rect(0, PT_BAR_Y0, UI_W, PT_BAR_Y1);
+        if (vol != l_vol) {   /* volume: its label + slider strips */
+            ui_fill(PT_VLBL_X0, PT_VLBL_Y0, UI_W - PT_VLBL_X0, PT_VLBL_Y1 - PT_VLBL_Y0, UI_BG);
+            ui_fill(PT_VSL_X0, PT_VSL_Y0, UI_W - PT_VSL_X0, PT_VSL_Y1 - PT_VSL_Y0, UI_BG);
+            panel_vol();
+            ui_tex_upload_rect(PT_VLBL_X0, 72, UI_W, PT_VLBL_Y1 + 2);
+            ui_tex_upload_rect(PT_VSL_X0, PT_VSL_Y0, UI_W, PT_VSL_Y1 + 4);
+        }
         if (panel_title_scrolls(title)) {
             ui_fill(8, 6, VOL_X - 12 - 8 + 2, 12, UI_BG);   panel_title_row(title);
             ui_tex_upload_rect(0, PT_TITLE_Y0, VOL_X - 8, PT_TITLE_Y1);
@@ -3420,6 +3438,8 @@ gdone:
 #define R3_AWB  48            /* wavebufs: deep audio read-ahead so audio rides through decode dips */
 #define R3_ABUF 2048          /* max samples/ch per audio packet (real ~2k) */
 static ndspWaveBuf r3_wb[R3_AWB]; static int16_t *r3_ab[R3_AWB];
+static int16_t *r3_raw;            /* R3_AWB x R3_ABUF x channels unscaled samples, or NULL */
+static float r3_bal[R3_AWB];       /* the levelling factor each buffer was baked with */
 static int r3_awi, r3_nawb, r3_arate, r3_achn, r3_aok, r3_acnt[R3_AWB];
 static long long r3_aplayed; static int64_t r3_apos;   /* elapsed audible us, -1 = not started */
 static volatile u32 g_r3_last_present;   /* osGetTime() of the last shown frame -- elision starving-guard */
@@ -3458,6 +3478,8 @@ static void r3_audio_setup(int arate, int chn) {
         r3_wb[r3_nawb].status = NDSP_WBUF_DONE;
     }
     if (r3_nawb < 8) { r3_audio_close(); return; }   /* leaking these bricked later C2D_Init -> dark screens */
+    free(r3_raw); r3_raw = (int16_t *)malloc((size_t)R3_AWB * R3_ABUF * chn * 2);   /* NULL: volume just lags */
+    for (int i = 0; i < R3_AWB; i++) r3_bal[i] = 1.0f;
     ndspChnSetPaused(0, true);   /* paused: bank audio during pre-roll, unpause aligned to content-0 */
     r3_aok = 1;
 }
@@ -3520,6 +3542,29 @@ static inline int al_soft(int v) {
     int y = AL_KNEE + (int)((float)span * d / (float)(d + span));
     return v < 0 ? -y : y;
 }
+/* VOLUME, applied the moment it changes. The gain is baked into the samples (so loud boosts bend
+ * softly through al_soft instead of clipping), but ~3 s of audio sits queued ahead -- a change used
+ * to be heard only once that had played. Each queued buffer keeps its unscaled samples (heap) and
+ * its levelling factor, and a volume change re-bakes every buffer still waiting to play. */
+static void r3_bake(int16_t *dst, const int16_t *src, int ns, float g) {
+    if (g == 1.0f) { if (dst != src) memcpy(dst, src, (size_t)ns * 2); return; }
+    for (int i = 0; i < ns; i++) {
+        int t = (int)(src[i] * g);
+        t = al_soft(t);                       /* bend the peaks rather than square them */
+        dst[i] = (int16_t)(t > 32767 ? 32767 : (t < -32768 ? -32768 : t));
+    }
+}
+static void r3_rebake(void) {
+    if (!r3_aok || !r3_raw) return;
+    LightLock_Lock(&g_alk);
+    for (int i = 0; i < r3_nawb; i++) {
+        if (r3_wb[i].status != NDSP_WBUF_QUEUED || r3_wb[i].nsamples == 0) continue;   /* playing/done: leave */
+        int ns = (int)r3_wb[i].nsamples * r3_achn;
+        r3_bake(r3_ab[i], r3_raw + (size_t)i * R3_ABUF * r3_achn, ns, g_vol * r3_bal[i]);
+        DSP_FlushDataCache(r3_ab[i], ns * 2);
+    }
+    LightLock_Unlock(&g_alk);
+}
 static float al_update(const int16_t *s, int ns) {
     double sq = 0.0;
     for (int i = 0; i < ns; i += 4) sq += (double)s[i] * s[i];   /* every 4th sample is plenty */
@@ -3546,18 +3591,16 @@ static int r3_audio_feed_raw(const uint8_t *data, int size) {
     int fr = adpcm_moflex_decode(data, size, r3_achn, r3_ab[r3_awi]);
     if (fr <= 0 || fr > R3_ABUF) return 1;                                       /* bad -> drop */
     { int16_t *s = r3_ab[r3_awi]; int ns = fr * r3_achn;
-      float g = g_vol;
-      if (g_autolvl > 0 && g_autolvl <= 2) g *= al_update(s, ns);
-      if (g != 1.0f) {
-          for (int i = 0; i < ns; i++) {
-              int t = (int)(s[i] * g);
-              t = al_soft(t);                       /* bend the peaks rather than square them */
-              s[i] = (int16_t)(t > 32767 ? 32767 : (t < -32768 ? -32768 : t));
-          }
-      } }
-    DSP_FlushDataCache(r3_ab[r3_awi], fr * r3_achn * 2);
-    memset(w, 0, sizeof *w); w->data_vaddr = r3_ab[r3_awi]; w->nsamples = fr;
-    ndspChnWaveBufAdd(0, w); r3_acnt[r3_awi] = 0; r3_awi = (r3_awi + 1) % r3_nawb;
+      float al = (g_autolvl > 0 && g_autolvl <= 2) ? al_update(s, ns) : 1.0f;
+      LightLock_Lock(&g_alk);
+      if (r3_raw) memcpy(r3_raw + (size_t)r3_awi * R3_ABUF * r3_achn, s, (size_t)ns * 2);
+      r3_bal[r3_awi] = al;
+      r3_bake(s, s, ns, g_vol * al);
+      DSP_FlushDataCache(r3_ab[r3_awi], fr * r3_achn * 2);
+      memset(w, 0, sizeof *w); w->data_vaddr = r3_ab[r3_awi]; w->nsamples = fr;
+      ndspChnWaveBufAdd(0, w); r3_acnt[r3_awi] = 0;
+      LightLock_Unlock(&g_alk); }
+    r3_awi = (r3_awi + 1) % r3_nawb;
     return 1;
 }
 static int r3_audio_feed(MfxPacket *pkt) { return r3_audio_feed_raw(pkt->data, pkt->size); }
@@ -3572,6 +3615,7 @@ static void r3_audio_flush(void) {   /* on seek: drop everything queued, clock o
 static void r3_audio_close(void) {   /* safe to call in ANY state: frees partial allocations too */
     ndspChnWaveBufClear(0); ndspChnReset(0);
     for (int i = 0; i < R3_AWB; i++) if (r3_ab[i]) { linearFree(r3_ab[i]); r3_ab[i] = NULL; }
+    free(r3_raw); r3_raw = NULL;
     r3_nawb = 0; r3_aok = 0;
 }
 
@@ -4577,6 +4621,7 @@ static MoflexResult moflex_play_ring(const char *path) {
     int64_t rpos = resume_load(path), last_save = 0;
     if (rpos > 3000000 && (dur_us <= 0 || rpos < dur_us - 10000000)) { seek_to_us = rpos; want_seek = 1; last_save = rpos; resume_exact = 1; }
     int vol_dirty = 0, save_pend = 0, save_delay = 0;
+    float vol_applied = g_vol; u64 vol_changed_at = 0;
     char last_ts[64] = "";
     u64 r3_wall0 = 0; int r3_wallset = 0;                 /* fallback real-time clock when no audio */
     u64 pause_wall = 0;                                   /* when the pause began (clock re-anchor on resume) */
@@ -5093,6 +5138,10 @@ static MoflexResult moflex_play_ring(const char *path) {
                     if (sl - last_sl > 0.004f || last_sl - sl > 0.004f) { last_sl = sl; dirty = 1; } }
 
         if (have_audio && playing) r3_audio_poll();   /* clock FROZEN while paused -> pause is instant */
+        if (g_vol != vol_applied) {   /* heard now: re-bake the queued audio; saved once it settles */
+            vol_applied = g_vol; vol_changed_at = osGetTime();
+            if (have_audio) r3_rebake();
+        }
 
         /* Old-3DS (not threaded): decode a pair INLINE here, once per iteration, when there's ring room.
          * (New-3DS does this on the decode thread instead.) */
@@ -5281,7 +5330,7 @@ static MoflexResult moflex_play_ring(const char *path) {
             if (vol_dirty) { vol_save(); vol_dirty = 0; }
             save_pend = 0;
         }
-        if (vol_dirty && !save_pend) { vol_save(); vol_dirty = 0; }
+        if (vol_dirty && !save_pend && osGetTime() - vol_changed_at > 1000) { vol_save(); vol_dirty = 0; }   /* after it settles */
 
         /* movie finished: STOP in the player (last frame held, bar parked at the end) instead of
          * exiting as if B was pressed. A replays from the start; B leaves as usual. */
