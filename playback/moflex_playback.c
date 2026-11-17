@@ -3461,6 +3461,11 @@ static void r3_set_aspeed(float sp) { r3_aspeed = sp; ndspChnSetRate(0, (float)r
 static LightLock g_vqlk;     /* compressed-video backlog + keyframe list */
 static LightLock g_alk;      /* audio wavebuf bookkeeping (feed on the reader, poll on the UI thread) */
 static LightLock g_rdlk;     /* held by the reader for each read; WORKER_LOCK takes it to pause reading for a seek */
+/* Set while the UI thread waits in WORKER_LOCK. The reader re-took g_rdlk the instant it let go, so
+ * after a seek -- while it refilled ~3 s of audio and the video backlog -- a second seek could not get
+ * the lock until the refill was done: scrubbing again (or rewinding) looked stuck until playback
+ * reached the first target. With this set, both threads step aside instead of re-locking. */
+static volatile int g_wl_req = 0;
 static int g_locks_init;
 static void r3_locks_init(void) { if (!g_locks_init) { LightLock_Init(&g_vqlk); LightLock_Init(&g_alk); LightLock_Init(&g_rdlk); g_locks_init = 1; } }
 __attribute__((constructor)) static void r3_locks_ctor(void) { r3_locks_init(); }   /* every engine uses the queue */
@@ -4348,6 +4353,7 @@ static void r3_reader_thread(void *arg) {
     R3S *s = (R3S *)arg;
     while (s->run) {
         if (s->paused || g_ring_susp || s->done) { svcSleepThread(5000000LL); continue; }
+        if (g_wl_req) { svcSleepThread(1000000LL); continue; }   /* a seek is waiting for the lock */
         LightLock_Lock(&g_rdlk);
         int got = s->run && !s->paused ? r3_read_some(s, 8) : 0;
         LightLock_Unlock(&g_rdlk);
@@ -4358,6 +4364,7 @@ static void r3_reader_thread(void *arg) {
 static void r3_dec_thread(void *arg) {
     R3S *s = (R3S *)arg;
     while (s->run) {
+        if (g_wl_req) { svcSleepThread(1000000LL); continue; }   /* a seek is waiting for the lock */
         LightLock_Lock(&s->lock);
         int wait = s->paused || g_ring_susp || (s->wr + r3_inflight() - s->rd >= s->NB - 1) || (s->done && r3_vqc == 0);
         int starved = !wait && g_reader_on && r3_vqc < 2;    /* waiting on the reader, not on the ring */
@@ -4699,7 +4706,7 @@ static MoflexResult moflex_play_ring(const char *path) {
     g_ring_lock = threaded ? &s.lock : NULL;   /* the suspend hook drains the worker through these */
     g_ring_s = &s;
     g_ring_wake = threaded ? &s.wake : NULL;
-    #define WORKER_LOCK()   do { if (threaded) LightLock_Lock(&s.lock); LightLock_Lock(&g_rdlk); r3_retire(&s); } while (0)   /* pause the worker + reader for a seek (and finish the in-flight conversion) */
+    #define WORKER_LOCK()   do { g_wl_req = 1; if (threaded) LightLock_Lock(&s.lock); LightLock_Lock(&g_rdlk); g_wl_req = 0; r3_retire(&s); } while (0)   /* pause the worker + reader for a seek (and finish the in-flight conversion) */
     #define WORKER_UNLOCK() do { LightLock_Unlock(&g_rdlk); if (threaded) { LightLock_Unlock(&s.lock); LightEvent_Signal(&s.wake); } } while (0)
 
     /* paint a clean loading screen NOW: the ring build + pre-roll take a few seconds on Old 3DS, and
