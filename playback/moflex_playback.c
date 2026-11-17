@@ -4760,8 +4760,15 @@ static MoflexResult moflex_play_ring(const char *path) {
                    s.paused = !playing; if (playing) LightEvent_Signal(&s.wake);
                    save_pend = !playing; save_delay = 30; }
         }
-        if (kd & KEY_UP)   { int s = (int)(g_vol / 0.25f + 0.0001f); g_vol = (s + 1) * 0.25f; if (g_vol > 4.0f) g_vol = 4.0f; vol_dirty = 1; }
-        if (kd & KEY_DOWN) { int s = (int)(g_vol / 0.25f + 0.9999f); g_vol = (s - 1) * 0.25f; if (g_vol < 0.25f) g_vol = 0.25f; vol_dirty = 1; }
+        {   /* volume: a press steps 25%, holding keeps stepping (d-pad repeat timing, a bit gentler) */
+            static int vhold = 0;
+            int vdir = (kh & KEY_UP) ? 1 : ((kh & KEY_DOWN) ? -1 : 0), vfire = 0;
+            if (!vdir) vhold = 0;
+            else if (kd & (KEY_UP | KEY_DOWN)) { vfire = 1; vhold = 0; }
+            else if (++vhold > 12 && vhold % 4 == 0) vfire = 1;
+            if (vfire && vdir > 0) { int s = (int)(g_vol / 0.25f + 0.0001f); g_vol = (s + 1) * 0.25f; if (g_vol > 4.0f) g_vol = 4.0f; vol_dirty = 1; }
+            if (vfire && vdir < 0) { int s = (int)(g_vol / 0.25f + 0.9999f); g_vol = (s - 1) * 0.25f; if (g_vol < 0.25f) g_vol = 0.25f; vol_dirty = 1; }
+        }
         if (kd & KEY_Y)      { g_sub_on = !g_sub_on; dirty = 1; }   /* Y: quick-toggle subtitles */
         if (kd & KEY_SELECT) { g_submenu = 1; g_sub_sel = 0; dirty = 1; }   /* SELECT: open subtitle options */
         if (kd & KEY_X && g_lcd_ok) { g_screen_off = !g_screen_off; dirty = 1; }   /* X: toggle dark screen */
