@@ -2426,6 +2426,7 @@ static void g_panel_sw(C3D_RenderTarget *bot, const char *title, int64_t cur, in
         ui_capture(1);
         panel_draw(title, cur, dur, playing);   /* fills g_buf; ui_present() is a no-op under capture */
         ui_tex_upload();
+        g_sub_redraw = 1;                       /* the shared UI texture no longer holds the menu */
     }
     ui_tex_blit(bot);
 }
@@ -2783,11 +2784,22 @@ static int snd_input(u32 kd, u32 kh, touchPosition tp) {
     }
     return 0;
 }
+/* The menu is re-rendered (software draw + the 76800-pixel tiled upload) only when it changed: input,
+ * a different screen, the lock toast, or the shared UI texture having been used by the panel. It used
+ * to redo all of that every frame while open -- on Old 3DS that runs on the decode core above the
+ * decoder and starved it: the film went choppy with the CC menu open, and the drained ring kept it
+ * choppy for a while after closing. */
+static int g_sub_redraw = 1;
 static void g_submenu_sw(C3D_RenderTarget *bot, int is3d) {
     if (!ui_tex_init()) return;
-    ui_capture(1);
-    if (g_submenu == 4) snd_render(); else if (g_submenu == 3) view_render(); else if (g_submenu == 2) srtpicker_render(); else submenu_render(is3d);
-    ui_tex_present(bot);
+    static int last = -1;
+    if (g_sub_redraw || g_submenu != last || g_lock_toast > 0) {
+        g_sub_redraw = 0; last = g_submenu;
+        ui_capture(1);
+        if (g_submenu == 4) snd_render(); else if (g_submenu == 3) view_render(); else if (g_submenu == 2) srtpicker_render(); else submenu_render(is3d);
+        ui_tex_upload();
+    }
+    ui_tex_blit(bot);
 }
 /* dark bottom screen: pure black -- with ONLY the lock toast when it flashes on (never the panel) */
 static void g_dark_sw(C3D_RenderTarget *bot) {
@@ -2797,6 +2809,7 @@ static void g_dark_sw(C3D_RenderTarget *bot) {
     ui_clear(0);          /* black */
     panel_lock_toast();
     ui_tex_present(bot);
+    g_sub_redraw = 1;
 }
 
 /* open the SRT picker: scan the movie folder + moviedata for .srt files */
@@ -4626,8 +4639,13 @@ static MoflexResult moflex_play_ring(const char *path) {
         }
 
         if (g_submenu) {                       /* subtitle menu owns input while open; movie plays on */
+            int sm_was = g_submenu;
             submenu_input(kd, kh, tp, is3d, path);
-            dirty = 1;
+            /* repaint on input only (held arrows repeat, a finger may drag); the menu texture is
+             * reused otherwise, and new film frames still present on their own */
+            if (kd || (kh & (KEY_LEFT | KEY_RIGHT | KEY_UP | KEY_DOWN | KEY_TOUCH)) || g_submenu != sm_was || g_lock_toast > 0) {
+                dirty = 1; g_sub_redraw = 1;
+            }
             if (g_hq_req) {
                 /* HQ row in VIEW: the ring's texture format is fixed at init, so the film has to
                  * be re-opened for a colour-depth change to take -- resume puts it back in place. */
@@ -6502,7 +6520,7 @@ void kit_draw(KitGpu *g, C2D_Image L, C2D_Image R, int is3d, const char *title,
     if (g_screen_off) { g_dark_sw(g->bot); g_panel_force = 1; g_kit_tex_menu = 0; }
     else if (g_submenu) {
         if (g_kit_menu_dirty || !g_kit_tex_menu || g_lock_toast > 0) {
-            g_submenu_sw(g->bot, is3d); g_kit_menu_dirty = 0; g_kit_tex_menu = 1;
+            g_sub_redraw = 1; g_submenu_sw(g->bot, is3d); g_kit_menu_dirty = 0; g_kit_tex_menu = 1;
         } else ui_tex_blit(g->bot);       /* unchanged menu: reuse its texture */
         g_panel_force = 1;
     }
