@@ -2510,6 +2510,8 @@ static void g_panel_prep(const char *title, int64_t cur, int64_t dur, int playin
             ui_tex_upload_rect(0, PT_TITLE_Y0, VOL_X - 8, PT_TITLE_Y1);
         }
         C3D_TexFlush(&g_uitex);
+        ui_capture(0);   /* as ui_tex_upload does: left on, the app's ui_present() stays a no-op after
+                          * playback and its screens never appear (looked like a hang on exit) */
     }
     g_panel_force = 0; l_sec = sec; l_bar = bar; l_play = playing; l_vol = vol; l_batt = g_batt_pct; l_chg = g_batt_chg; l_zm = vw; l_title = title; l_lock = g_touch_locked;
     { u64 dt = svcGetSystemTick() - pt0; if (dt > g_panel_max) g_panel_max = dt; }
@@ -5344,6 +5346,7 @@ static MoflexResult moflex_play_ring(const char *path) {
     for (int i = 0; i < NB; i++) { C3D_TexDelete(&r3_texL[i]); if (is3d) C3D_TexDelete(&r3_texR[i]); }
     subtex_free();
     ui_tex_free();   /* release the software-UI panel texture before C3D shuts down */
+    ui_capture(0);   /* the app draws to the real framebuffer again */
     gspWaitForVBlank(); gspWaitForVBlank();
     gpu_park_program(); C2D_Fini(); C3D_Fini(); g_y2r_exit();
     gfxSet3D(false);
