@@ -4441,13 +4441,18 @@ static void r3_produce(R3S *s) {
     s->dpair = dpair + 1;
 }
 
+static volatile u32 g_st_rdmax, g_st_rdslow;   /* reader: slowest read (ms), reads > 100 ms -- ring_stats */
 static void r3_reader_thread(void *arg) {
     R3S *s = (R3S *)arg;
     while (s->run) {
         if (s->paused || g_ring_susp || s->done) { svcSleepThread(5000000LL); continue; }
         if (g_wl_req) { svcSleepThread(1000000LL); continue; }   /* a seek is waiting for the lock */
         LightLock_Lock(&g_rdlk);
+        u64 _rt0 = svcGetSystemTick();
         int got = s->run && !s->paused ? r3_read_some(s, 8) : 0;
+        {   u32 ms = (u32)((svcGetSystemTick() - _rt0) / (SYSCLOCK_ARM11 / 1000));   /* a read stall (network) */
+            if (ms > g_st_rdmax) g_st_rdmax = ms;
+            if (ms > 100) g_st_rdslow++; }
         LightLock_Unlock(&g_rdlk);
         if (!got) svcSleepThread(2000000LL);   /* queue/bank full: let the decoder and DSP catch up */
     }
@@ -4939,6 +4944,7 @@ static MoflexResult moflex_play_ring(const char *path) {
     if (have_audio) r3_set_aspeed(vl_speed);        /* once, before any sound: no rate change mid-play */
     int vl_on = 0; u32 vl_base_vb = 0; int64_t vl_base_n = 0; double vl_err = 0; int vl_cnt = 0;
     int vl_prevhold = 0; long st_slip = 0;
+    long st_drop = 0; u64 st_starve_ticks = 0, st_starve_t0 = 0; g_st_rdmax = 0; g_st_rdslow = 0;
     g_panel_max = 0; g_upl_max = 0;
     /* session totals, written to sdmc:/moflex_player/ring_stats.txt when playback ends */
     long st_v2 = 0, st_v3 = 0, st_vx = 0, st_stut = 0, st_shown = 0, st_decn = 0; long long st_dec = 0, st_dmax = 0;
@@ -5542,6 +5548,10 @@ static MoflexResult moflex_play_ring(const char *path) {
             sd_stuck_logged = 1;
         }
         int wr = s.wr; __sync_synchronize();   /* snapshot the write index, then see the frame data behind it */
+        {   int dry = playing && gated && !pv_hold && !s.done && (wr - rd) == 0;   /* the buffer ran out */
+            u64 now_t = svcGetSystemTick();
+            if (dry) { if (!st_starve_t0) st_starve_t0 = now_t; }
+            else if (st_starve_t0) { st_starve_ticks += now_t - st_starve_t0; st_starve_t0 = 0; } }
         int64_t apos;
         if (have_audio) apos = r3_apos;
         else { if (!r3_wallset && wr >= PRIME) { r3_wall0 = osGetTime(); r3_wallset = 1; }
@@ -5596,7 +5606,7 @@ static MoflexResult moflex_play_ring(const char *path) {
                     vl_base_vb = vb + (u32)(s32)floor(dv + 0.5);
                     if (r3_aspeed != vl_speed) r3_set_aspeed(vl_speed);
                 }
-                while ((wr - rd) > 1 && ready[(rd + 1) % NB] && (s32)(vb - VL_DUE(VL_N(rd + 1))) >= 0) { ready[rd % NB] = 0; rd++; }
+                while ((wr - rd) > 1 && ready[(rd + 1) % NB] && (s32)(vb - VL_DUE(VL_N(rd + 1))) >= 0) { ready[rd % NB] = 0; rd++; st_drop++; }
                 if ((s32)(vb - VL_DUE(VL_N(rd))) >= 0) {
                     show = rd % NB;
                     /* sync: video content time vs the audio clock, smoothed; steer the audio speed */
@@ -5620,7 +5630,7 @@ static MoflexResult moflex_play_ring(const char *path) {
                 #undef VL_N
             } else {
                 if (vl_on) { vl_on = 0; if (have_audio && r3_aspeed != vl_speed) r3_set_aspeed(vl_speed); }
-                while ((wr - rd) > 1 && ready[(rd + 1) % NB] && rts[(rd + 1) % NB] <= ae + VS_HALF) { ready[rd % NB] = 0; rd++; }
+                while ((wr - rd) > 1 && ready[(rd + 1) % NB] && rts[(rd + 1) % NB] <= ae + VS_HALF) { ready[rd % NB] = 0; rd++; if (apos >= 0) st_drop++; }
                 if (apos < 0) { if (last_shown < 0) show = rd % NB; }             /* pre-roll: show the landing pair */
                 else if (ae + VS_HALF >= rts[rd % NB]) show = rd % NB;
             }
@@ -5812,10 +5822,12 @@ static MoflexResult moflex_play_ring(const char *path) {
         if (sf) {
             st_v2 += cad_v2; st_v3 += cad_v3; st_vx += cad_vx; st_dec += s.wk_dec; st_decn += s.wk_n;
             struct mallinfo mi = mallinfo();
-            fprintf(sf, "%s | %s %s | %.0fs (playing %.0fs, %.1f fps) shown=%ld stutters=%ld maxgap=%llums cadence v2=%ld v3=%ld bad=%ld slips=%ld lock=%.2f@%.4f panel=%.1fms upl=%.1fms | decode %.2f ms/pair max %.1f | NB=%d+q%d heap peak %lu KB, linear free %lu KB | %s\n",
+            fprintf(sf, "%s | %s %s | %.0fs (playing %.0fs, %.1f fps) shown=%ld stutters=%ld maxgap=%llums cadence v2=%ld v3=%ld bad=%ld slips=%ld lock=%.2f@%.4f panel=%.1fms upl=%.1fms | drop=%ld starve=%.1fs rdmax=%lums rdslow=%lu src=%s | decode %.2f ms/pair max %.1f | NB=%d+q%d heap peak %lu KB, linear free %lu KB | %s\n",
                     BUILD_TAG, r3_isnew ? "new3ds" : "old3ds", is3d ? "3D" : "2D", (osGetTime() - st_t0) / 1000.0,
                     st_play_ms / 1000.0, st_play_ms ? st_shown * 1000.0 / st_play_ms : 0.0,
                     st_shown, st_stut, (unsigned long long)st_maxgap, st_v2, st_v3, st_vx, st_slip, vl_vk, (double)vl_speed, PF_MS(g_panel_max), PF_MS(g_upl_max),
+                    st_drop, PF_MS(st_starve_ticks) / 1000.0, (unsigned long)g_st_rdmax, (unsigned long)g_st_rdslow,
+                    strncmp(path, "bigtop:", 7) ? "sd" : "bigtop",
                     st_decn ? PF_MS(st_dec) / st_decn : 0.0, PF_MS(st_dmax), NB, g_yq_cap,
                     (unsigned long)(mi.arena / 1024), (unsigned long)(linearSpaceFree() / 1024), title);
             fclose(sf);
