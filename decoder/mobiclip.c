@@ -450,6 +450,10 @@ typedef struct MobiClipContext {
 
 static const VLCElem *rl_vlc[2];
 static const VLCElem *mv_vlc[2][16];
+/* The coefficient tables again, 16 bits an entry: (len << 12) | (last << 11 | run << 5 | level). As
+ * VLCElem (4 bytes) each was 16 KB -- the whole Old-3DS L1 data cache, two of them -- and the lookup was
+ * the decoder's hottest stall. Every code is <= 12 bits (max_depth 1), so len fits in 4 bits. */
+static uint16_t rl_ctab[2][1 << MOBI_RL_VLC_BITS];
 
 static av_cold void mobiclip_init_static(void)
 {
@@ -470,6 +474,9 @@ static av_cold void mobiclip_init_static(void)
                                                 0, 0);
         }
     }
+    for (int i = 0; i < 2; i++)
+        for (int k = 0; k < (1 << MOBI_RL_VLC_BITS); k++)
+            rl_ctab[i][k] = (uint16_t)(((unsigned)rl_vlc[i][k].len & 15) << 12 | ((unsigned)rl_vlc[i][k].sym & 0xFFF));
 }
 
 static av_cold int mobiclip_init(AVCodecContext *avctx)
@@ -805,14 +812,14 @@ static int add_coefficients_impl(AVCodecContext *avctx, AVFrame *frame,
         /* Fast coefficient loop, structured like the official decoder: one 32-bit window per coefficient,
          * one 12-bit table lookup for run/level/last, and the sign bit read from the same window (no
          * separate get_bits1). Escape codes (level 0 in the table) take the original path. Bit-exact. */
-        const VLCElem *tab = rl_vlc[s->dct_tab_idx];
+        const uint16_t *tab = rl_ctab[s->dct_tab_idx];
         const uint8_t *buf = gb->buffer;
         unsigned idx = gb->index;
         const int end = gb->size_in_bits, n2 = size * size;
         for (int pos = 0; (int)(end - (int)idx) > 0; pos++) {
             uint32_t c = AV_RB32(buf + (idx >> 3)) << (idx & 7);
-            const VLCElem e = tab[c >> (32 - MOBI_RL_VLC_BITS)];
-            int n = e.sym, len = e.len;
+            const unsigned e = tab[c >> (32 - MOBI_RL_VLC_BITS)];
+            int n = e & 0xFFF, len = e >> 12;
             int last = (n >> 11) == 1, run = (n >> 5) & 0x3F, level = n & 0x1F;
             if (level) {
                 if ((c << len) & 0x80000000u) level = -level;
@@ -1403,10 +1410,46 @@ static av_always_inline void mc_fast_t(uint8_t *dst, const uint8_t *src, int nw,
         break;
     }
 }
+#if defined(__3DS__)
+/* ARMv6 kernels (mc_asm2.s): any source alignment, 4/8 px wide; 16 wide = two 8-wide halves */
+typedef void (*mc_kfn)(uint8_t *, const uint8_t *, int, int, int);
+extern void mc1_m0(uint8_t *, const uint8_t *, int, int, int), mc1_m1(uint8_t *, const uint8_t *, int, int, int),
+            mc1_m2(uint8_t *, const uint8_t *, int, int, int), mc1_m3(uint8_t *, const uint8_t *, int, int, int),
+            mc2_m0(uint8_t *, const uint8_t *, int, int, int), mc2_m1(uint8_t *, const uint8_t *, int, int, int),
+            mc2_m2(uint8_t *, const uint8_t *, int, int, int), mc2_m3(uint8_t *, const uint8_t *, int, int, int);
+static const mc_kfn mc_k1[4] = { mc1_m0, mc1_m1, mc1_m2, mc1_m3 };
+static const mc_kfn mc_k2[4] = { mc2_m0, mc2_m1, mc2_m2, mc2_m3 };
+#ifdef MC_ASM_CHECK
+unsigned mc_asm_calls, mc_asm_bad;   /* lab check build: asm vs C on every block */
+#endif
+#endif
 /* returns 0 if this block shape isn't handled (caller falls back) */
 static int mc_fast(uint8_t *dst, const uint8_t *src, int width, int height, int dls, int sls, int method)
 {
     if (((uintptr_t)dst & 3) || (dls & 3) || (sls & 3)) return 0;
+#if defined(__3DS__)
+    if (height > 0 && (width == 16 || width == 8 || width == 4)) {
+        int m = method & 3;
+#ifdef MC_ASM_CHECK
+        static uint8_t ref[16 * 16];
+        switch (width) { case 16: mc_fast_t(ref, src, 4, height, 16, sls, method); break;
+                         case 8:  mc_fast_t(ref, src, 2, height, 16, sls, method); break;
+                         default: mc_fast_t(ref, src, 1, height, 16, sls, method); }
+#endif
+        {   /* the whole reference block, up front: Old 3DS has no L2, every row is a ~100-cycle miss, and
+             * ARM11 overlaps outstanding line fills -- prefetching only 2 rows ahead serialized them */
+            const uint8_t *p = src; int rows = height + (m >= 2);
+            for (int y = 0; y < rows; y++, p += sls) { PF(p); PF(p + width); }
+        }
+        if (width == 4) mc_k1[m](dst, src, height, dls, sls);
+        else { mc_k2[m](dst, src, height, dls, sls); if (width == 16) mc_k2[m](dst + 8, src + 8, height, dls, sls); }
+#ifdef MC_ASM_CHECK
+        mc_asm_calls++;
+        for (int y = 0; y < height; y++) if (memcmp(dst + y * dls, ref + y * 16, width)) { mc_asm_bad++; break; }
+#endif
+        return 1;
+    }
+#endif
     switch (width) {
     case 16: mc_fast_t(dst, src, 4, height, dls, sls, method); return 1;
     case 8:  mc_fast_t(dst, src, 2, height, dls, sls, method); return 1;
