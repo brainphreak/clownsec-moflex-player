@@ -4192,6 +4192,9 @@ typedef struct {
     volatile int land_seq, land_done_seq, land_ok, land_slot, land_cancel;
     volatile long long land_T, land_lts;
     int land_handled;
+    volatile int land_active;            /* a landing (not a preview) is running: land_cancel applies */
+    volatile int vskip;                  /* reader: drop this many video packets (already decoded by the prime) */
+    int lastop_ok, lastop_slot; long long lastop_T, lastop_lts;   /* the worker's last r3_land: reusable on release */
 } R3S;
 
 /* Y2R OVERLAP: the last conversion of a pair is started but not waited for; it runs while the next
@@ -4246,6 +4249,8 @@ static int r3_read_some(R3S *s, int maxpk) {
                 s->has_pending = 0;
             }
             else { s->audio_pre_full = 1; break; }        /* bank full: hold packet, let main unpause audio */
+        } else if (mt == MFX_TYPE_VIDEO && s->vskip > 0) {
+            s->vskip--; s->has_pending = 0;        /* already decoded by the seek's prime */
         } else if (mt == MFX_TYPE_VIDEO) {
             int64_t vts = s->m->ts; if (vts < 0) vts = 0; if (s->dur_us > 0 && vts > s->dur_us) vts = s->dur_us;
             if (!r3_vq_push(s->pending.data, s->pending.size, vts, s->pending.keyframe)) break;
@@ -4372,42 +4377,7 @@ static void r3_reader_thread(void *arg) {
     }
 }
 
-static void r3_preview_one(R3S *s) {
-    int seq = s->pv_req_seq; int64_t T = s->pv_req;   /* the newest target right now */
-    s->pv_handled = seq;
-    do_seek(s->m, s->ctx, T);
-    int64_t mark = s->m->ts;
-    if (mark == s->pv_mark) return;                       /* same landing as the still on screen */
-    int slot = (s->pv_slot + 1) % 3;                      /* never the slot being shown */
-    MfxPacket pk; int vseen = 0, got = 0;
-    /* finish this still even if the target moved on (a finger "held" on the bar still jitters a few
-     * pixels, and dropping on every move meant no still ever appeared); the next pass takes the
-     * newest target. Only a release (the seek waiting for the lock) cuts it short. */
-    for (int g = 0; g < 600 && !got && !g_wl_req; g++) {
-        if (mfx_next_packet(s->m, &pk) != 1) break;
-        if (s->m->streams[pk.stream_index].media_type != MFX_TYPE_VIDEO) continue;
-        vseen++;
-        if (s->is3d && !(vseen & 1)) continue;            /* a pair starts on the landing's eye phase */
-        if (!pk.keyframe) continue;
-        AVPacket ap; ap.data = pk.data; ap.size = pk.size; int gL = 0;
-        if (!(mobi_decode(s->ctx, s->fL, &gL, &ap) >= 0 && gL)) continue;
-        if (s->is3d) {
-            MfxPacket pr; int haveR = 0, gR = 0;
-            for (int g2 = 0; g2 < 8; g2++) { if (mfx_next_packet(s->m, &pr) != 1) break;
-                if (s->m->streams[pr.stream_index].media_type == MFX_TYPE_VIDEO) { haveR = 1; break; } }
-            if (!haveR || !(mobi_decode(s->ctx, s->fR, &gR, &(AVPacket){ .data = pr.data, .size = pr.size }) >= 0 && gR)) break;
-            g_y2r_start(s->fL, &r3_texL[slot], s->W, s->H); g_y2r_wait(&r3_texL[slot]);
-            g_y2r_start(s->fR, &r3_texR[slot], s->W, s->H); g_y2r_wait(&r3_texR[slot]);
-        } else { g_y2r_start(s->fL, &r3_texL[slot], s->W, s->H); g_y2r_wait(&r3_texL[slot]); }
-        got = 1;
-    }
-    clearerr(s->m->f); s->m->eof = 0;
-    if (got) {
-        s->pv_mark = mark; s->pv_slot = slot; s->pv_done_slot = slot; s->pv_done_T = T;
-        __sync_synchronize(); s->pv_done_seq++;
-    }
-}
-#define LAND_CUT (s->land_cancel || g_wl_req)
+#define LAND_CUT ((s->land_active && s->land_cancel) || g_wl_req)
 static int r3_land(R3S *s, int64_t T, int slot, int64_t *lts_out) {
     MfxDemux *m = s->m; AVCodecContext *ctx = s->ctx;
     int64_t land_tgt = T;
@@ -4433,6 +4403,7 @@ static int r3_land(R3S *s, int64_t T, int slot, int64_t *lts_out) {
     }
     if (LAND_CUT) return 0;
     do_seek(m, ctx, land_tgt);
+    int64_t prime_from = land_tgt;
     s->eye_swap = 0;
     if (s->is3d) {                                  /* 3D eye parity: see the UI-thread seek */
         int64_t tgt = land_tgt; int rfirst = 0;
@@ -4466,6 +4437,7 @@ static int r3_land(R3S *s, int64_t T, int slot, int64_t *lts_out) {
         if (LAND_CUT) return 0;
         s->eye_swap = rfirst;
         do_seek(m, ctx, tgt);
+        prime_from = tgt;
     }
     /* prime: the landing keyframe pair into `slot` */
     MfxPacket pk; int64_t lts = T; int vseen = 0;
@@ -4490,9 +4462,31 @@ static int r3_land(R3S *s, int64_t T, int slot, int64_t *lts_out) {
             g_y2r_start(s->fR, tB, s->W, s->H); g_y2r_wait(tB);
         } else { g_y2r_start(s->fL, &r3_texL[slot], s->W, s->H); g_y2r_wait(&r3_texL[slot]); }
         *lts_out = lts;
+        /* the prime skipped this block's audio packets on its way to the pair: rewind the demuxer (no
+         * decoder flush -- its references are the pair just decoded) so the reader feeds the audio
+         * from here, and have it drop the video packets the prime already used. Without this the sound
+         * started up to a block (~1 s) after the picture. */
+        mfx_seek_time(m, prime_from);
+        s->vskip = vseen;
         return 1;
     }
     return 0;
+}
+/* a preview still IS a landing: the same keyframe + eye-parity logic, so the still shown is exactly
+ * where playback will start, and a release on it reuses it without a second seek */
+static void r3_preview_one(R3S *s) {
+    int seq = s->pv_req_seq; int64_t T = s->pv_req;   /* the newest target right now */
+    s->pv_handled = seq;
+    int slot = (s->pv_slot + 1) % 3;                  /* never the slot being shown */
+    int64_t lts = T;
+    s->land_active = 0;
+    int ok = r3_land(s, T, slot, &lts);
+    clearerr(s->m->f); s->m->eof = 0;
+    s->lastop_ok = ok; s->lastop_T = T; s->lastop_slot = slot; s->lastop_lts = lts;
+    if (ok) {
+        s->pv_slot = slot; s->pv_done_slot = slot; s->pv_done_T = lts;
+        __sync_synchronize(); s->pv_done_seq++;
+    }
 }
 static void r3_dec_thread(void *arg) {
     R3S *s = (R3S *)arg;
@@ -4504,9 +4498,17 @@ static void r3_dec_thread(void *arg) {
             int todo = land || (s->pv_mode && s->pv_handled != s->pv_req_seq);
             if (land) {
                 int seq = s->land_seq; s->land_handled = seq;
-                int slot = (s->pv_slot + 1) % 3; int64_t lts = s->land_T;
-                int ok = r3_land(s, s->land_T, slot, &lts);
-                clearerr(s->m->f); s->m->eof = 0;
+                int slot, ok; int64_t lts;
+                if (s->lastop_ok && s->lastop_T == s->land_T) {      /* released on the still: already landed */
+                    slot = s->lastop_slot; lts = s->lastop_lts; ok = 1;
+                } else {
+                    slot = (s->pv_slot + 1) % 3; lts = s->land_T;
+                    s->land_active = 1;
+                    ok = r3_land(s, s->land_T, slot, &lts);
+                    s->land_active = 0;
+                    clearerr(s->m->f); s->m->eof = 0;
+                    s->lastop_ok = 0;
+                }
                 s->land_ok = ok && !s->land_cancel; s->land_slot = slot; s->land_lts = lts;
                 __sync_synchronize(); s->land_done_seq = seq;
             } else if (todo) r3_preview_one(s);
@@ -5106,7 +5108,7 @@ static MoflexResult moflex_play_ring(const char *path) {
                 r3_vq_clear();
                 if (have_audio) { r3_audio_flush(); ndspChnSetPaused(0, true); }
                 gated = 0; s.paused = 1;
-                s.pv_mark = -1; s.pv_mode = 1; pv_seen = s.pv_done_seq;
+                s.pv_mark = -1; s.pv_mode = 1; pv_seen = s.pv_done_seq; s.lastop_ok = 0; s.vskip = 0;
                 WORKER_UNLOCK();                 /* the reader idles (paused); the worker serves stills */
                 pv_hold = 1; pv_tgt = -1;
             }
@@ -5137,6 +5139,7 @@ static MoflexResult moflex_play_ring(const char *path) {
                 s.skipping = 0; s.done = 0; s.has_pending = 0; last_shown = -1;
                 r3_vq_clear();
                 if (have_audio) r3_audio_flush();
+                s.lastop_ok = 0;
                 if (s.tr_active && g_tra.aud_pktsamp && g_tra.aud_rate)
                     s.tr_cur = (u32)(lts * (s64)g_tra.aud_rate / 1000000 / g_tra.aud_pktsamp);
                 gated = 0; s.audio_pre_full = 0; playing = 1; r3_wallset = 0;
@@ -5195,6 +5198,7 @@ static MoflexResult moflex_play_ring(const char *path) {
                 }
             }
             do_seek(&m, &ctx, land_tgt);
+            int64_t prime_from = land_tgt; s.vskip = 0;
             for (int i = rd; i < s.wr; i++) ready[i % NB] = 0;
             s.wr = 0; rd = 0; s.rd = 0; s.dpair = 0; s.skipping = 0; s.done = 0; s.has_pending = 0; last_shown = -1;
             r3_vq_clear();
@@ -5249,6 +5253,7 @@ static MoflexResult moflex_play_ring(const char *path) {
                 }
                 s.eye_swap = rfirst;                              /* only if stepping found no L-first */
                 do_seek(&m, &ctx, tgt);                           /* rewind to the (final) landing */
+                prime_from = tgt;
             }
             /* FAST PRIME: decode the landing keyframe pair straight into slot 0 (bounded keyframe scan;
              * else take the next decodable frame) so the picture appears at once and audio resyncs.
@@ -5281,6 +5286,7 @@ static MoflexResult moflex_play_ring(const char *path) {
                         g_y2r_start(fR, tB, W, H); g_y2r_wait(tB);
                     } else { g_y2r_start(fL, &r3_texL[0], W, H); g_y2r_wait(&r3_texL[0]); }
                     rts[0] = 0; bts[0] = lts; ready[0] = 1; s.wr = 1; s.dpair = 1; cur_us = lts; s.cur_us = lts;
+                    if (!resume_exact) { mfx_seek_time(&m, prime_from); s.vskip = vseen; }   /* keep the block's audio */
                     sd_lts = lts; sd_T = seek_to_us; sd_at = 0; sd_pend = 1; sd_kind = 0;
                     break;
                 }
@@ -5344,7 +5350,7 @@ static MoflexResult moflex_play_ring(const char *path) {
                  * keep the seek pending at its target -- the press that dropped it is handled next
                  * frame: a touch on the bar starts a new scrub (the seek waits for the release), a
                  * step moves on from this target, B leaves; anything else just seeks here again. */
-                g_seek_cut = 0;
+                g_seek_cut = 0; s.vskip = 0;
                 clearerr(m.f); m.eof = 0;
                 for (int i = 0; i < NB; i++) ready[i] = 0;
                 s.wr = 0; rd = 0; s.rd = 0; s.dpair = 0; s.done = 0; s.has_pending = 0; last_shown = -1;
