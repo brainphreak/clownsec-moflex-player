@@ -4247,6 +4247,10 @@ static void r3_retire(R3S *s) {
 static inline int r3_inflight(void) { return r3_pend >= 0; }
 
 static R3S *g_ring_s;                    /* the live ring state, for the suspend hook */
+/* ring_stats: frames the producer never delivered (they don't show as drops or starvation) and how busy
+ * the producer was -- decode + conversion ticks */
+static volatile u32 g_st_elide, g_st_yqstale, g_st_skipped;
+static volatile u64 g_st_busy;
 static void r3_retire_any(void) { if (g_ring_s) r3_retire(g_ring_s); }
 
 static void r3_yq_push(R3S *s, const AVFrame *L, const AVFrame *R, int64_t rts, int64_t bts) {
@@ -4262,7 +4266,7 @@ static void r3_yq_convert(R3S *s) {
     if (s->old3ds && r3_apos >= 0) {   /* already behind the audio: present would discard it unseen */
         int stale = (e->rts + s->pair_dur < r3_apos);
         int starving = ((u32)osGetTime() - g_r3_last_present) >= 100;
-        if (stale && !starving) { g_yq_h = (g_yq_h + 1) % YQ_MAX; g_yq_n = g_yq_n - 1; return; }
+        if (stale && !starving) { g_yq_h = (g_yq_h + 1) % YQ_MAX; g_yq_n = g_yq_n - 1; g_st_yqstale++; return; }
     }
     r3_retire(s);
     int slot = s->wr % s->NB;
@@ -4379,7 +4383,7 @@ static void r3_produce(R3S *s) {
                              * this keyframe-sparse content). Matches the avtest degradation the user prefers. */
         else {
             int n, kf; int64_t ts; free(r3_vq_pop(&n, &ts, &kf)); if (r3_vqc > 0) free(r3_vq_pop(&n, &ts, &kf));
-            s->dpair = dpair + 1;
+            s->dpair = dpair + 1; g_st_skipped++;
             return;
         }
     }
@@ -4400,6 +4404,7 @@ static void r3_produce(R3S *s) {
         int stale = (this_ts + s->pair_dur < r3_apos);
         int starving = ((u32)osGetTime() - g_r3_last_present) >= 100;
         elide = stale && !starving;
+        if (elide) g_st_elide++;
     }
     /* keep measuring all through the film: a scope feature can open on a 16:9 logo card, and
      * since bars only ever shrink, a wider shot arriving later corrects an early guess */
@@ -4633,7 +4638,7 @@ static void r3_dec_thread(void *arg) {
                    || (s->done && r3_vqc == 0 && (g_yq_n == 0 || ring_full));
         int conv = g_yq_n > 0 && !ring_full;                 /* a queued pair can go into the ring */
         int starved = !wait && !conv && g_reader_on && r3_vqc < 2;    /* waiting on the reader, not on the ring */
-        if (!wait && !starved) r3_produce(s);
+        if (!wait && !starved) { u64 _b0 = svcGetSystemTick(); r3_produce(s); if (!s->paused) g_st_busy += svcGetSystemTick() - _b0; }
         else r3_retire(s);                     /* going idle: publish the in-flight frame first */
         LightLock_Unlock(&s->lock);
         if (starved) { svcSleepThread(1000000LL); continue; }
@@ -4945,6 +4950,7 @@ static MoflexResult moflex_play_ring(const char *path) {
     int vl_on = 0; u32 vl_base_vb = 0; int64_t vl_base_n = 0; double vl_err = 0; int vl_cnt = 0;
     int vl_prevhold = 0; long st_slip = 0;
     long st_drop = 0; u64 st_starve_ticks = 0, st_starve_t0 = 0; g_st_rdmax = 0; g_st_rdslow = 0;
+    g_st_elide = g_st_yqstale = g_st_skipped = 0; g_st_busy = 0;
     g_panel_max = 0; g_upl_max = 0;
     /* session totals, written to sdmc:/moflex_player/ring_stats.txt when playback ends */
     long st_v2 = 0, st_v3 = 0, st_vx = 0, st_stut = 0, st_shown = 0, st_decn = 0; long long st_dec = 0, st_dmax = 0;
@@ -5822,12 +5828,14 @@ static MoflexResult moflex_play_ring(const char *path) {
         if (sf) {
             st_v2 += cad_v2; st_v3 += cad_v3; st_vx += cad_vx; st_dec += s.wk_dec; st_decn += s.wk_n;
             struct mallinfo mi = mallinfo();
-            fprintf(sf, "%s | %s %s | %.0fs (playing %.0fs, %.1f fps) shown=%ld stutters=%ld maxgap=%llums cadence v2=%ld v3=%ld bad=%ld slips=%ld lock=%.2f@%.4f panel=%.1fms upl=%.1fms | drop=%ld starve=%.1fs rdmax=%lums rdslow=%lu src=%s | decode %.2f ms/pair max %.1f | NB=%d+q%d heap peak %lu KB, linear free %lu KB | %s\n",
+            fprintf(sf, "%s | %s %s | %.0fs (playing %.0fs, %.1f fps) shown=%ld stutters=%ld maxgap=%llums cadence v2=%ld v3=%ld bad=%ld slips=%ld lock=%.2f@%.4f panel=%.1fms upl=%.1fms | drop=%ld starve=%.1fs rdmax=%lums rdslow=%lu src=%s | not-shown: elided=%lu stale=%lu skipped=%lu | busy=%.0f%% fps=%.2f | decode %.2f ms/pair max %.1f | NB=%d+q%d heap peak %lu KB, linear free %lu KB | %s\n",
                     BUILD_TAG, r3_isnew ? "new3ds" : "old3ds", is3d ? "3D" : "2D", (osGetTime() - st_t0) / 1000.0,
                     st_play_ms / 1000.0, st_play_ms ? st_shown * 1000.0 / st_play_ms : 0.0,
                     st_shown, st_stut, (unsigned long long)st_maxgap, st_v2, st_v3, st_vx, st_slip, vl_vk, (double)vl_speed, PF_MS(g_panel_max), PF_MS(g_upl_max),
                     st_drop, PF_MS(st_starve_ticks) / 1000.0, (unsigned long)g_st_rdmax, (unsigned long)g_st_rdslow,
                     strncmp(path, "bigtop:", 7) ? "sd" : "bigtop",
+                    (unsigned long)g_st_elide, (unsigned long)g_st_yqstale, (unsigned long)g_st_skipped,
+                    st_play_ms ? PF_MS(g_st_busy) * 100.0 / st_play_ms : 0.0, 1e6 / (double)pair_dur,
                     st_decn ? PF_MS(st_dec) / st_decn : 0.0, PF_MS(st_dmax), NB, g_yq_cap,
                     (unsigned long)(mi.arena / 1024), (unsigned long)(linearSpaceFree() / 1024), title);
             fclose(sf);
