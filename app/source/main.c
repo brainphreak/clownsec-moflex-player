@@ -4284,15 +4284,22 @@ static void update_check(void) {   /* worker thread; printf-free so it can't hit
         /* A server error still "downloads": GitHub's 504 is a 92-byte HTML page that parses as
          * version 0. Only a body that starts with a real "MAJOR.MINOR" counts as an answer;
          * anything else tries the mirror, then the next round. */
+        /* Ask EVERY source and keep the newest answer: GitHub's download link is cached for minutes
+         * after a release, so a stale-but-valid reply from it hid an update the mirror already had. */
+        int best_src = -1;
         for (src = 0; src < UPD_SOURCES && !s_dt_abort; src++) {
-            if (download_to_mem(latest_url_n(src), &buf, &len, 256) && buf) {
-                buf[len < 255 ? len : 255] = 0;
-                ver_parse(buf, &ld, &ln);
-                if (buf[0] >= '0' && buf[0] <= '9' && ld > 0) break;
+            char *b = NULL; size_t bl = 0; int d = 0, n = 0;
+            if (download_to_mem(latest_url_n(src), &b, &bl, 256) && b) {
+                b[bl < 255 ? bl : 255] = 0;
+                ver_parse(b, &d, &n);
+                if (b[0] >= '0' && b[0] <= '9' && d > 0 && (best_src < 0 || d > ld || (d == ld && n > ln))) {
+                    free(buf); buf = b; b = NULL; len = bl; ld = d; ln = n; best_src = src;
+                }
             }
-            free(buf); buf = NULL;
+            free(b);
         }
         if (!buf) continue;                       /* no source answered -> retry */
+        src = best_src;
         s_upd_src = src;
         ver_parse(BUILD_TAG, &cd, &cn);
         if (ld > cd || (ld == cd && ln > cn)) {   /* copy "MAJOR.MINOR" verbatim, no snprintf */

@@ -2467,8 +2467,15 @@ static void ui_tex_present(C3D_RenderTarget *bot) { ui_tex_upload(); ui_tex_blit
  * every frame so the panel stays on screen with no flicker. This keeps the panel off the decode
  * critical path on Old-3DS (it was re-rendering + re-uploading every frame). */
 static int g_sub_redraw = 1;   /* the CC menu must re-render into the shared UI texture */
+static int g_sub_last = -1;    /* the menu screen the UI texture holds (-1: it holds the panel) */
 static int g_panel_force = 1;   /* force a re-render next time (first frame, wake from dark, submenu exit) */
 static int g_panel_age = 0;   /* presents since the panel was last brought up to date */
+/* in-film menu background: the full-screen gradient is the costliest part of a menu redraw, and on
+ * Old 3DS each arrow press redraws the menu while the film plays -- flat there, like the panel */
+static void menu_bg(void) {
+    if (g_panel_cheap) ui_fill_round(0, 0, UI_W, UI_H, 0, UI_BG);
+    else               ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
+}
 static u64 g_panel_max;       /* slowest panel redraw (draw + upload) this playback, ticks */
 static void g_panel_prep(const char *title, int64_t cur, int64_t dur, int playing);
 static void g_panel_sw(C3D_RenderTarget *bot, const char *title, int64_t cur, int64_t dur, int playing) {
@@ -2497,7 +2504,7 @@ static void g_panel_prep(const char *title, int64_t cur, int64_t dur, int playin
     if (full || !g_panel_cheap) {               /* the gradient background (New 3DS) can't be patched by a flat fill */
         panel_draw(title, cur, dur, playing);   /* fills g_buf; ui_present() is a no-op under capture */
         ui_tex_upload();
-        g_panel_buf_ok = 1;
+        g_panel_buf_ok = 1; g_sub_last = -1;
     } else {
         /* only the clock/bar moved: redraw those strips (and a scrolling title) and upload their tiles */
         ui_begin(GFX_BOTTOM);
@@ -2575,7 +2582,7 @@ static void submenu_render(int is3d) {
     int act[16]; int n = submenu_actions(is3d, act);
     int top, step, bh; submenu_layout(n, &top, &step, &bh);
     ui_begin(GFX_BOTTOM);
-    ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
+    menu_bg();
     ui_text_center(UI_W / 2, 14, 2, UI_NEON, "SUBTITLES");
     for (int i = 0; i < n; i++) {
         char r[40]; submenu_label(act[i], r, sizeof r);
@@ -2586,7 +2593,7 @@ static void srtpicker_render(void) {
     int vis = g_srt_n < SRT_VIS ? g_srt_n : SRT_VIS;
     int top, step, bh; submenu_layout(vis > 0 ? vis : 1, &top, &step, &bh);
     ui_begin(GFX_BOTTOM);
-    ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
+    menu_bg();
     ui_text_center(UI_W / 2, 14, 2, UI_NEON, "LOAD SUBTITLES");
     if (g_srt_n == 0) {   /* same two-line message as the released sub_load_menu */
         ui_text_center(UI_W / 2, 100, 1, UI_INK, "No .srt/.ass files found in the");
@@ -2672,7 +2679,7 @@ static void view_reset_row(int row) {
 static void view_render(void) {
     int top, step, bh; submenu_layout(VIEW_ROWS, &top, &step, &bh);
     ui_begin(GFX_BOTTOM);
-    ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
+    menu_bg();
     ui_text_center(UI_W / 2, 14, 2, UI_NEON, "VIDEO");
     for (int i = 0; i < VIEW_ROWS; i++) {
         char r[44]; view_label(i, r, sizeof r);
@@ -2834,7 +2841,7 @@ static void snd_render(void) {
     int act[SND_ROWS_MAX]; int n = snd_rows(act);
     int top, step, bh; submenu_layout(n, &top, &step, &bh);
     ui_begin(GFX_BOTTOM);
-    ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
+    menu_bg();
     ui_text_center(UI_W / 2, 14, 2, UI_NEON, "SOUND");
     for (int i = 0; i < n; i++) {
         char r[44]; snd_label(act[i], r, sizeof r);
@@ -2876,21 +2883,23 @@ static int snd_input(u32 kd, u32 kh, touchPosition tp) {
  * to redo all of that every frame while open -- on Old 3DS that runs on the decode core above the
  * decoder and starved it: the film went choppy with the CC menu open, and the drained ring kept it
  * choppy for a while after closing. */
+static int g_submenu_stale(void) { return g_sub_redraw || g_submenu != g_sub_last || g_lock_toast > 0; }
+static void g_submenu_prep(int is3d) {
+    if (!ui_tex_init() || !g_submenu_stale()) return;
+    g_sub_redraw = 0; g_sub_last = g_submenu; g_panel_buf_ok = 0;
+    ui_capture(1);
+    if (g_submenu == 4) snd_render(); else if (g_submenu == 3) view_render(); else if (g_submenu == 2) srtpicker_render(); else submenu_render(is3d);
+    ui_tex_upload();
+}
 static void g_submenu_sw(C3D_RenderTarget *bot, int is3d) {
     if (!ui_tex_init()) return;
-    static int last = -1;
-    if (g_sub_redraw || g_submenu != last || g_lock_toast > 0) {
-        g_sub_redraw = 0; last = g_submenu; g_panel_buf_ok = 0;
-        ui_capture(1);
-        if (g_submenu == 4) snd_render(); else if (g_submenu == 3) view_render(); else if (g_submenu == 2) srtpicker_render(); else submenu_render(is3d);
-        ui_tex_upload();
-    }
+    g_submenu_prep(is3d);
     ui_tex_blit(bot);
 }
 /* dark bottom screen: pure black -- with ONLY the lock toast when it flashes on (never the panel) */
 static void g_dark_sw(C3D_RenderTarget *bot) {
     if (!ui_tex_init()) return;
-    ui_capture(1); g_panel_buf_ok = 0;
+    ui_capture(1); g_panel_buf_ok = 0; g_sub_last = -1;
     ui_begin(GFX_BOTTOM);
     ui_clear(0);          /* black */
     panel_lock_toast();
@@ -4560,6 +4569,7 @@ static MoflexResult moflex_play_ring(const char *path) {
     const int PRIME = (NB >= 16) ? 8 : (NB > 2 ? NB / 2 : 1);   /* pre-roll depth, clamped to a small ring */
     int64_t cur_us = 0, dur_us = m.duration_us, seek_to_us = 0; int want_seek = 0, shold = 0;
     int scrubbing = 0; int64_t scrub_us = 0;   /* touch-drag on the bar: preview while held, seek on release */
+    int tseek = 0, tseek_hold = 0;             /* touch rewind (-1) / fast-forward (+1) held */
     int vol_drag = 0;                           /* touch-drag on the volume slider (applies live) */
     int resume_exact = 0;                       /* resume only: decode forward to the EXACT saved second */
     g_submenu = 0; g_sub_sel = 0;               /* subtitle menu starts closed */
@@ -4781,9 +4791,11 @@ static MoflexResult moflex_play_ring(const char *path) {
                 else { r3_last = 0; if (r3_wallset) r3_wall0 += osGetTime() - pause_wall; }
                 s.paused = !playing; if (playing) LightEvent_Signal(&s.wake); save_pend = !playing; save_delay = 30;
             } else if (py >= PLAY_CY - 20 && py <= PLAY_CY + 20 && px >= RW_CX - 18 && px <= RW_CX + 18) {
-                seek_to_us = cur_us - 30000000; want_seek = 1;
+                tseek = -1; tseek_hold = 0;   /* held: steps like the d-pad, seeks on release */
+                seek_to_us = (want_seek ? seek_to_us : cur_us) - 30000000; want_seek = 1; dirty = 1;
             } else if (py >= PLAY_CY - 20 && py <= PLAY_CY + 20 && px >= FF_CX - 18 && px <= FF_CX + 18) {
-                seek_to_us = cur_us + 30000000; want_seek = 1;
+                tseek = 1; tseek_hold = 0;
+                seek_to_us = (want_seek ? seek_to_us : cur_us) + 30000000; want_seek = 1; dirty = 1;
             } else if (px >= AUD_X && px < AUD_X + AUD_W && py >= AUD_Y && py < AUD_Y + AUD_H) {
                 g_submenu = 4; g_snd_sel = 0; dirty = 1;    /* SOUND: track + levelling */
             } else if (px >= CC_X && px < CC_X + CC_W && py >= CC_Y && py < CC_Y + CC_H) {
@@ -4799,6 +4811,10 @@ static MoflexResult moflex_play_ring(const char *path) {
             }
         }
 
+        if (tseek) {   /* touch rewind/fast-forward held: repeat on the d-pad's timing */
+            if (!(kh & KEY_TOUCH)) tseek = 0;
+            else if (++tseek_hold > 8 && tseek_hold % 3 == 0) { seek_to_us += (int64_t)tseek * 30000000; dirty = 1; }
+        }
         /* ---- touch-drag the progress bar: while the finger is down, track its X into scrub_us and
          *      show it as a live preview (below); the actual seek fires once, on release. ---- */
         if (scrubbing) {
@@ -4864,7 +4880,7 @@ static MoflexResult moflex_play_ring(const char *path) {
                 seek_to_us = cur_us; want_seek = 1;
             }
         }
-        if (want_seek && !scrubbing && !(kh & (KEY_LEFT | KEY_RIGHT))) {
+        if (want_seek && !scrubbing && !tseek && !(kh & (KEY_LEFT | KEY_RIGHT))) {
             WORKER_LOCK();   /* blocks until the decode thread finishes its current pair and releases */
             g_seek_busy = 1; g_seek_cut = 0;     /* a slow source may drop this seek if the viewer moves on */
             if (dur_us > 0) { if (seek_to_us < 0) seek_to_us = 0; if (seek_to_us > dur_us) seek_to_us = dur_us; }
@@ -4879,15 +4895,17 @@ static MoflexResult moflex_play_ring(const char *path) {
             {
                 MfxPacket pk; int direct_kf = 0;
                 for (int g = 0; g < 200; g++) {
+                    if ((g & 31) == 31 && moflex_seek_wait_hook(1)) break;   /* a new press drops this seek */
                     if (mfx_next_packet(&m, &pk) != 1) break;
                     if (m.streams[pk.stream_index].media_type != MFX_TYPE_VIDEO) continue;
                     direct_kf = pk.keyframe; break;
                 }
-                if (!direct_kf) {
+                if (!direct_kf && !g_seek_cut) {
                     int64_t back = seek_to_us - 20000000; if (back < 0) back = 0;
                     do_seek(&m, &ctx, back);
                     int64_t kf_marker = -1, cur_marker = m.ts;
                     for (long g = 0; g < 60000; g++) {
+                        if ((g & 63) == 63 && moflex_seek_wait_hook(1)) break;   /* the 20 s keyframe hunt: cuttable */
                         if (mfx_next_packet(&m, &pk) != 1) break;
                         if (m.ts != cur_marker) { if (m.ts > seek_to_us) break; cur_marker = m.ts; }
                         if (m.streams[pk.stream_index].media_type != MFX_TYPE_VIDEO) continue;
@@ -5142,7 +5160,7 @@ static MoflexResult moflex_play_ring(const char *path) {
 
         /* ---- draw: video pair (or held frame) + subtitle overlay + bottom panel, one GPU frame ---- */
         int64_t disp_us = (show >= 0) ? bts[show] : (last_shown >= 0 ? last_bts : cur_us);
-        if (want_seek && (kh & (KEY_LEFT | KEY_RIGHT))) { disp_us = seek_to_us < 0 ? 0 : seek_to_us; dirty = 1; }  /* preview the accumulating seek target */
+        if (want_seek && ((kh & (KEY_LEFT | KEY_RIGHT)) || tseek)) { disp_us = seek_to_us < 0 ? 0 : seek_to_us; dirty = 1; }  /* preview the accumulating seek target */
         if (scrubbing) { disp_us = scrub_us; dirty = 1; }   /* preview the dragged position while the finger is down */
         (void)pf_str;
 
@@ -5215,7 +5233,12 @@ static MoflexResult moflex_play_ring(const char *path) {
             ring_sub_draw(&rst, stereo ? sdep : 0, subcol, subout);
             ring_sub_draw(&rsb, stereo ? sdep : 0, subcol, subout);
             if (g_screen_off) { g_dark_sw(bot); g_panel_force = 1; }      /* dark: panel stale -> force on wake */
-            else if (g_submenu) { g_submenu_sw(bot, is3d); g_panel_force = 1; }  /* submenu: panel stale on exit */
+            else if (g_submenu) {                                         /* submenu: panel stale on exit */
+                /* playing: redraw the menu in a spare refresh (below), not inside this frame's draw --
+                 * a menu redraw per arrow press here paused the film for a moment each time */
+                if (playing && g_submenu_stale() && g_sub_last != -1) ui_tex_blit(bot);
+                else g_submenu_sw(bot, is3d);
+                g_panel_force = 1; }
             else { if (dirty) g_panel_force = 1;                          /* UI changed -> re-render the panel */
                    /* a film frame: reuse the panel texture (kept current between frames, below) so
                     * the present is never late; refresh it here only on a UI change, or when no
@@ -5275,6 +5298,8 @@ static MoflexResult moflex_play_ring(const char *path) {
             if (playing && !g_screen_off && !g_submenu) {
                 int64_t nx = ((s.wr - rd) > 0 && ready[rd % NB]) ? bts[rd % NB] : cur_us;
                 g_panel_prep(title, nx, dur_us, playing);
+            } else if (playing && !g_screen_off && g_submenu && g_submenu_stale()) {
+                g_submenu_prep(is3d); dirty = 1;   /* shown by the next pass */
             } }
 
         /* Roll the HUD every ~24 presented frames. CADENCE is the judder meter: v2/v3 = frames held 2/3
