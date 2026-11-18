@@ -5135,7 +5135,12 @@ static MoflexResult moflex_play_ring(const char *path) {
                 if (sm_tx < 0 || abs(tp.px - sm_tx) > 1 || abs(tp.py - sm_ty) > 1) tmoved = 1;
                 sm_tx = tp.px; sm_ty = tp.py;
             } else sm_tx = sm_ty = -1;
-            if (kd || (kh & (KEY_LEFT | KEY_RIGHT | KEY_UP | KEY_DOWN)) || tmoved || g_submenu != sm_was) {
+            /* a held arrow repeats every 3rd frame (after a delay): repaint at that rhythm and once on
+             * release, not every frame -- each repaint is ~20 ms of an Old 3DS's decode thread */
+            static int arrow_n = 0; int arrow_due = 0;
+            if (kh & (KEY_LEFT | KEY_RIGHT | KEY_UP | KEY_DOWN)) { if (++arrow_n % 3 == 0) arrow_due = 1; }
+            else { if (arrow_n) arrow_due = 1; arrow_n = 0; }
+            if (kd || arrow_due || tmoved || g_submenu != sm_was) {
                 dirty = 1; g_sub_redraw = 1;
             }
             if (g_hq_req) {
@@ -5571,7 +5576,9 @@ static MoflexResult moflex_play_ring(const char *path) {
         /* The 3D slider is NOT a key. Without this the strength blend only tracked it while
          * frames were arriving -- move it on a paused frame and nothing redrew. */
         if (is3d) { static float last_sl = -1.0f; float sl = osGet3DSliderState();
-                    if (sl - last_sl > 0.004f || last_sl - sl > 0.004f) { last_sl = sl; dirty = 1; } }
+                    /* playing: every present reads the slider anyway -- a repaint per frame of slider
+                     * travel forced full panel repaints on the decode thread for nothing */
+                    if (sl - last_sl > 0.004f || last_sl - sl > 0.004f) { last_sl = sl; if (!playing) dirty = 1; } }
 
         if (have_audio && playing) r3_audio_poll();   /* clock FROZEN while paused -> pause is instant */
         if (g_vol != vol_applied) {   /* heard now: re-bake the queued audio; saved once it settles */
