@@ -190,6 +190,14 @@ int ui_width(void) { return g_w; }
 static int g_capture = 0;
 void ui_capture(int on) { g_capture = on; }
 const u16 *ui_pixels(void) { return g_buf; }
+/* columns are contiguous: (x, y) lives at [x*UI_H + (UI_H-1-y)], so rows y..y+h-1 of a column are
+ * one run starting at UI_H-1-(y+h-1) */
+void ui_rect_save(int x, int y, int w, int h, u16 *out) {
+    for (int c = 0; c < w; c++) memcpy(out + c * h, g_buf + (x + c) * UI_H + (UI_H - y - h), (size_t)h * 2);
+}
+void ui_rect_load(int x, int y, int w, int h, const u16 *in) {
+    for (int c = 0; c < w; c++) memcpy(g_buf + (x + c) * UI_H + (UI_H - y - h), in + c * h, (size_t)h * 2);
+}
 
 void ui_present(void) {
     if (g_capture) return;   /* caller lifts g_buf into a citro2d texture instead (no fb copy) */

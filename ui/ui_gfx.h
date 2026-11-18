@@ -62,6 +62,10 @@ void ui_present(void);                     /* copy offscreen -> that screen's fr
 void ui_capture(int on);                   /* when on, ui_present() is a no-op: the caller reads ui_pixels()
                                               itself (used to draw the UI as a citro2d texture instead of the
                                               framebuffer, which deadlocks against citro2d owning the GPU) */
+/* copy a bottom-screen rectangle of the offscreen buffer out / back in (w*h pixels) -- to put a
+ * popup on the panel and take it off again without redrawing the panel */
+void ui_rect_save(int x, int y, int w, int h, u16 *out);
+void ui_rect_load(int x, int y, int w, int h, const u16 *in);
 const u16 *ui_pixels(void);                /* offscreen buffer; pixel (x,y) is at [x*UI_H + (UI_H-1-y)] */
 int  ui_width(void);                       /* current target width (320 or 400) */
 void ui_clear(u16 c);

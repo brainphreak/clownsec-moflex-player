@@ -1659,9 +1659,13 @@ static void sub_overlay(int is3d, int64_t us) {
 static int g_dbg_fps = 0, g_dbg_dec10 = 0, g_dbg_blit10 = 0, g_dbg_aud10 = 0;
 
 /* "touch is locked" toast box; drawn last so it sits on top of everything */
+#define TOAST_W 184
+#define TOAST_H 42
+#define TOAST_X ((UI_W - TOAST_W) / 2)
+#define TOAST_Y ((UI_H - TOAST_H) / 2)
 static void panel_lock_toast(void) {
     if (g_lock_toast <= 0) return;
-    int bw = 184, bh = 42, bx = (UI_W - bw) / 2, by = (UI_H - bh) / 2;
+    int bw = TOAST_W, bh = TOAST_H, bx = TOAST_X, by = TOAST_Y;
     ui_fill_round(bx, by, bw, bh, 8, UI_BG2);
     ui_frame_round(bx, by, bw, bh, 8, UI_NEONC, 2);
     ui_text_center(UI_W / 2, by + 8, 1, UI_NEONC, "SCREEN IS LOCKED");
@@ -2508,13 +2512,24 @@ static void g_panel_prep(const char *title, int64_t cur, int64_t dur, int playin
     int bar = dur > 0 ? (int)((double)BAR_W * (double)cur / (double)dur) : 0;
     int vol = (int)(g_vol * 100 + 0.5f);
     batt_refresh();                             /* throttled inside; the partial path below skips panel_draw */
+    int toast = g_lock_toast > 0;
     int full = g_panel_force || !g_panel_buf_ok || playing != l_play || g_batt_pct != l_batt
-               || g_batt_chg != l_chg || vw != l_zm || title != l_title || (g_lock_toast > 0) != l_toast || g_touch_locked != l_lock;
-    if (!full && sec == l_sec && bar == l_bar && vol == l_vol) return;
+               || g_batt_chg != l_chg || vw != l_zm || title != l_title || g_touch_locked != l_lock;
+    /* the "screen is locked" popup is a patch: the panel under it is kept and put back, two small
+     * uploads -- it used to repaint the whole panel when it came AND when it went, ~20 ms each on an
+     * Old 3DS, so every tap on a locked screen dropped frames */
+    static u16 toast_under[TOAST_W * TOAST_H];
+    int toast_chg = toast != l_toast;
+    if (!full && !toast_chg && sec == l_sec && bar == l_bar && vol == l_vol) return;
     u64 pt0 = svcGetSystemTick();
     ui_capture(1);
     if (full || !g_panel_cheap) {               /* the gradient background (New 3DS) can't be patched by a flat fill */
+        int lt = g_lock_toast;
+        g_lock_toast = 0;                       /* the panel alone first: what goes back when the popup goes */
         panel_draw(title, cur, dur, playing);   /* fills g_buf; ui_present() is a no-op under capture */
+        g_lock_toast = lt;
+        ui_rect_save(TOAST_X, TOAST_Y, TOAST_W, TOAST_H, toast_under);
+        if (toast) panel_lock_toast();
         ui_tex_upload();
         g_panel_buf_ok = 1; g_sub_last = -1;
     } else {
@@ -2534,6 +2549,11 @@ static void g_panel_prep(const char *title, int64_t cur, int64_t dur, int playin
         if (panel_title_scrolls(title)) {
             ui_fill(8, 6, VOL_X - 12 - 8 + 2, 12, UI_BG);   panel_title_row(title);
             ui_tex_upload_rect(0, PT_TITLE_Y0, VOL_X - 8, PT_TITLE_Y1);
+        }
+        if (toast_chg) {                        /* the popup on / off: its box only */
+            if (toast) panel_lock_toast();
+            else ui_rect_load(TOAST_X, TOAST_Y, TOAST_W, TOAST_H, toast_under);
+            ui_tex_upload_rect(TOAST_X, TOAST_Y, TOAST_X + TOAST_W, TOAST_Y + TOAST_H);
         }
         C3D_TexFlush(&g_uitex);
         ui_capture(0);   /* as ui_tex_upload does: left on, the app's ui_present() stays a no-op after
