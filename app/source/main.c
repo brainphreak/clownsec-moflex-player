@@ -1880,14 +1880,28 @@ static int catalog_pick_group(const CatEntry *cat, int nc, const char *filt_cat,
     return 1;
 }
 
+/* B while a catalog is fetched: a slow or silent server used to leave "Fetching..." up with no
+ * way out (the transfer only gives up after its 20 s connect / 10 s stall timeouts, and retries) */
+static int s_fetch_cancelled;
+static int fetch_abort_b(void) {
+    hidScanInput();
+    if (hidKeysDown() & KEY_B) s_fetch_cancelled = 1;
+    return s_fetch_cancelled;
+}
 static void catalog_browse(const Source *src) {
     ui_begin(GFX_BOTTOM); ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
     ui_text_center(UI_W / 2, 100, 2, UI_NEON, "Fetching...");
-    ui_text_fit(UI_W / 2, 130, 1, UI_DIM, src->name, UI_W - 16); ui_present();
+    ui_text_fit(UI_W / 2, 130, 1, UI_DIM, src->name, UI_W - 16);
+    ui_text(8, 226, 1, UI_DIM, "B - cancel"); ui_present();
     gfxFlushBuffers(); gfxSwapBuffers();
 
     char *json = NULL; size_t len = 0;
-    if (!download_to_mem(src->url, &json, &len, 32 * 1024 * 1024)) {
+    s_fetch_cancelled = 0;
+    download_set_abort(fetch_abort_b);
+    int got = download_to_mem(src->url, &json, &len, 32 * 1024 * 1024);
+    download_set_abort(NULL);
+    if (s_fetch_cancelled) { free(json); return; }       /* back to the list, no message */
+    if (!got) {
         msg_screen("DOWNLOAD", "Fetch failed.\nIs Wi-Fi on? Is the URL right?"); return;
     }
     int cap = 4096;
@@ -6362,7 +6376,8 @@ static void settings_menu(void) {
     for (;;) {
         char r1[40]; const char *rows[6]; int act[6], n = 0;
         rows[n] = "PLAYBACK DEFAULTS"; act[n++] = 0;
-        rows[n] = "PLEX SERVER"; act[n++] = 2;
+        {   bool isnew = false; APT_CheckNew3DS(&isnew);   /* Plex needs a New 3DS (H.264) */
+            if (isnew) { rows[n] = "PLEX SERVER"; act[n++] = 2; } }
         rows[n] = "BIG TOP SERVER"; act[n++] = 3;
         if (g_extplay_ok) { snprintf(r1, sizeof r1, "OLD 3DS: PLAY MOVIES WITH..."); rows[n] = r1; act[n++] = 1; }
         rows[n] = "DONE"; act[n++] = -1;
@@ -7044,10 +7059,33 @@ static int bt_browse(void) {
 
 static int open_pick(void) {
     int sel = 0, redraw = 1;
+    /* Plex sends H.264, which only a New 3DS decodes: an Old 3DS gets BIG TOP across the last row */
+    bool isnew = false; APT_CheckNew3DS(&isnew);
     while (aptMainLoop()) {
         hidScanInput();
         u32 k = hidKeysDown();
         if (k & KEY_B) return -1;
+        if (!isnew) {
+            if (k & KEY_DOWN)  { if (sel < 4) sel++; redraw = 1; }
+            if (k & KEY_UP)    { if (sel > 0) sel--; redraw = 1; }
+            if (k & KEY_A) return sel == 4 ? 5 : sel;
+            if (k & KEY_TOUCH) { touchPosition tp; hidTouchRead(&tp);
+                for (int i = 0; i < 5; i++) if (tp.py >= 40 + i * 39 && tp.py < 40 + i * 39 + 34)
+                    return i == 4 ? 5 : i; }
+            if (redraw) {
+                ui_begin(GFX_BOTTOM);
+                ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
+                ui_text_center(UI_W / 2, 12, 2, UI_NEON, "OPEN VIDEO");
+                ui_button(34,  40, UI_W - 68, 34, "LIBRARY",         sel == 0, UI_NEON);
+                ui_button(34,  79, UI_W - 68, 34, "FILESYSTEM",      sel == 1, UI_NEONP);
+                ui_button(34, 118, UI_W - 68, 34, "RECENTLY PLAYED", sel == 2, UI_NEONC);
+                ui_button(34, 157, UI_W - 68, 34, "WALK THE AISLE",  sel == 3, UI_NEON);
+                ui_button(34, 196, UI_W - 68, 34, "BIG TOP",         sel == 4, UI_NEONC);
+                ui_present(); redraw = 0;
+            }
+            gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
+            continue;
+        }
         /* five rows; the last is PLEX | BIG TOP side by side (sel 4 / 5) */
         if (k & KEY_DOWN)  { if (sel < 4) sel++; redraw = 1; }
         if (k & KEY_UP)    { if (sel == 5) sel = 3; else if (sel > 0) sel--; redraw = 1; }
