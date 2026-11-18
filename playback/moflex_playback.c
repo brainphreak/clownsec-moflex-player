@@ -5182,6 +5182,7 @@ static MoflexResult moflex_play_ring(const char *path) {
         /* if (kd & KEY_SELECT) sub_menu(...);  // <- hangs under citro2d; do not call here */
         if (kd & KEY_TOUCH) {
             int px = tp.px, py = tp.py;
+            int thit = 1;   /* a touch that hits no control repaints nothing (see "if (kd ..." below) */
             if (py >= BAR_Y - 8 && py <= BAR_Y + BAR_H + 8 && px >= BAR_X && px <= BAR_X + BAR_W) {
                 scrubbing = 1;   /* begin drag; the seek fires on release (tracked in the scrub block below) */
             } else if (px >= VOL_X - 14 && px <= VOL_X + 26 && py >= VOL_Y - 8 && py <= VOL_Y + VOL_H + 8) {
@@ -5209,7 +5210,9 @@ static MoflexResult moflex_play_ring(const char *path) {
                 if      (px >= BKB_X && px < BKB_X + BKB_W) { result = MOFLEX_QUIT_OPEN; break; }   /* OPEN VIDEO */
                 else if (px >= OPB_X && px < OPB_X + OPB_W) { result = MOFLEX_QUIT_MANAGE; break; }   /* MANAGE VIDEOS */
                 else if (px >= EXB_X && px < EXB_X + EXB_W) { result = MOFLEX_QUIT_ADD; break; }   /* ADD VIDEO */
-            }
+                else thit = 0;
+            } else thit = 0;
+            if (thit) dirty = 1;
         }
 
         if (tseek) {   /* touch rewind/fast-forward held: repeat on the d-pad's timing */
@@ -5557,7 +5560,10 @@ static MoflexResult moflex_play_ring(const char *path) {
             }
         }
 
-        if (kd) dirty = 1;   /* any control input -> repaint the held frame / panel */
+        /* any button -> repaint the held frame / panel. A touch repaints only when it hit a control
+         * (above): every tap anywhere used to force a full panel repaint (~20 ms on an Old 3DS) plus
+         * two synced top-screen frames on the decode thread, so fast tapping starved playback. */
+        if (kd & ~KEY_TOUCH) dirty = 1;
         /* The 3D slider is NOT a key. Without this the strength blend only tracked it while
          * frames were arriving -- move it on a paused frame and nothing redrew. */
         if (is3d) { static float last_sl = -1.0f; float sl = osGet3DSliderState();
