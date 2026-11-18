@@ -5238,8 +5238,10 @@ static MoflexResult moflex_play_ring(const char *path) {
                 float f = 1.0f - (float)(tp.py - VOL_Y) / VOL_H; if (f < 0) f = 0; if (f > 1) f = 1;
                 int st = (int)(f * 4.0f / 0.25f + 0.5f); float nv = st * 0.25f;
                 if (nv < 0.25f) nv = 0.25f; if (nv > 4.0f) nv = 4.0f;
-                if (nv != g_vol) { g_vol = nv; vol_dirty = 1; }
-                dirty = 1;
+                /* playing: the spare-refresh panel update redraws just the volume strip -- marking
+                 * dirty here forced a FULL panel repaint (~20 ms on an Old 3DS) every frame the finger
+                 * stayed on the slider. Paused, nothing else repaints, so it still asks. */
+                if (nv != g_vol) { g_vol = nv; vol_dirty = 1; if (!playing) dirty = 1; }
             } else vol_drag = 0;
         }
         }   /* end transport input (skipped while the subtitle menu is open) */
@@ -5563,7 +5565,9 @@ static MoflexResult moflex_play_ring(const char *path) {
         /* any button -> repaint the held frame / panel. A touch repaints only when it hit a control
          * (above): every tap anywhere used to force a full panel repaint (~20 ms on an Old 3DS) plus
          * two synced top-screen frames on the decode thread, so fast tapping starved playback. */
-        if (kd & ~KEY_TOUCH) dirty = 1;
+        {   u32 rk = kd & ~KEY_TOUCH;
+            if (playing) rk &= ~(KEY_UP | KEY_DOWN);   /* volume: its strip updates on a spare refresh */
+            if (rk) dirty = 1; }
         /* The 3D slider is NOT a key. Without this the strength blend only tracked it while
          * frames were arriving -- move it on a paused frame and nothing redrew. */
         if (is3d) { static float last_sl = -1.0f; float sl = osGet3DSliderState();
@@ -5782,8 +5786,11 @@ static MoflexResult moflex_play_ring(const char *path) {
                    /* a film frame: reuse the panel texture (kept current between frames, below) so
                     * the present is never late; refresh it here only on a UI change, or when no
                     * spare refresh has come for ~2 s (60 fps material has none) */
-                   if (show >= 0 && !dirty && !g_panel_force && ++g_panel_age < 48) ui_tex_blit(bot);
-                   else g_panel_sw(bot, title, disp_us, dur_us, playing); }   /* panel (lock toast on top) */
+                   /* a volume change rides on this present as a strip update (unforced g_panel_prep
+                    * takes the cheap path): the slider follows the finger without a full repaint */
+                   static int vol_shown = -1; int vnow = (int)(g_vol * 100 + 0.5f);
+                   if (show >= 0 && !dirty && !g_panel_force && vnow == vol_shown && ++g_panel_age < 48) ui_tex_blit(bot);
+                   else { g_panel_sw(bot, title, disp_us, dur_us, playing); vol_shown = vnow; } }   /* panel (lock toast on top) */
             u64 _tg = svcGetSystemTick(); C3D_FrameEnd(0); pf_gpu += svcGetSystemTick() - _tg;
             dirty2 = dirty; dirty = 0;   /* second pass fills the other buffer (see above) */
             if (show >= 0) {
