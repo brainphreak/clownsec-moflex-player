@@ -2984,9 +2984,10 @@ static void g_submenu_prep(int is3d) {
     ui_capture(1);
     int sel = -1; u32 sig = 0; int n = mb_rows(is3d, &sel, &sig);
     int top, step, bh; submenu_layout(n > 0 ? n : 1, &top, &step, &bh);
-    /* the 4-case rule holds while a band reaches only its neighbours' edge (not their label) and no
-     * further row's glow: true for the usual 8-ish rows, checked rather than assumed */
-    int geo_ok = n > 0 && n <= MB_ROWS && bh + MB_MARGIN - step <= (bh - 8) / 2 && 2 * step >= bh + MB_MARGIN + 5;
+    /* the 4-case rule holds while nothing from two rows away -- its face or its 5 px glow -- reaches a
+     * band. Neighbours' labels may (tight lists like CC): labels are in the signature, so any change
+     * to one starts the cache over. Up to ~13 rows; checked rather than assumed. */
+    int geo_ok = n > 0 && n <= MB_ROWS && 2 * step >= bh + MB_MARGIN + 5;
     int partial = had && geo_ok && g_mb_ok && g_mb_menu == g_submenu && g_mb_n == n && g_mb_sig == sig
                   && sel >= 0 && sel < n && g_mb_sel >= 0;
     if (!partial) {
