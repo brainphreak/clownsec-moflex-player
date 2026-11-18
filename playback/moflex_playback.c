@@ -5140,8 +5140,12 @@ static MoflexResult moflex_play_ring(const char *path) {
             static int arrow_n = 0; int arrow_due = 0;
             if (kh & (KEY_LEFT | KEY_RIGHT | KEY_UP | KEY_DOWN)) { if (++arrow_n % 3 == 0) arrow_due = 1; }
             else { if (arrow_n) arrow_due = 1; arrow_n = 0; }
+            /* playing: the menu is re-rendered in a spare refresh and the next film frame shows it --
+             * a forced pass here only re-showed the OLD menu texture, at the cost of synced frames
+             * on the decode thread (two per press: quick moves through a list stuttered the film) */
             if (kd || arrow_due || tmoved || g_submenu != sm_was) {
-                dirty = 1; g_sub_redraw = 1;
+                g_sub_redraw = 1;
+                if (!playing || !g_submenu || g_submenu != sm_was) dirty = 1;   /* paused / opened / closed: now */
             }
             if (g_hq_req) {
                 /* HQ row in VIEW: the ring's texture format is fixed at init, so the film has to
@@ -5572,6 +5576,7 @@ static MoflexResult moflex_play_ring(const char *path) {
          * two synced top-screen frames on the decode thread, so fast tapping starved playback. */
         {   u32 rk = kd & ~KEY_TOUCH;
             if (playing) rk &= ~(KEY_UP | KEY_DOWN);   /* volume: its strip updates on a spare refresh */
+            if (playing && g_submenu) rk = 0;          /* a menu: shown by the next film frame (above) */
             if (rk) dirty = 1; }
         /* The 3D slider is NOT a key. Without this the strength blend only tracked it while
          * frames were arriving -- move it on a paused frame and nothing redrew. */
@@ -5785,8 +5790,9 @@ static MoflexResult moflex_play_ring(const char *path) {
             else if (g_submenu) {                                         /* submenu: panel stale on exit */
                 /* playing: redraw the menu in a spare refresh (below), not inside this frame's draw --
                  * a menu redraw per arrow press here paused the film for a moment each time */
-                if (playing && g_submenu_stale() && g_sub_last != -1) ui_tex_blit(bot);
-                else g_submenu_sw(bot, is3d);
+                static int sm_wait = 0;   /* busy Old-3DS 3D has few spare refreshes: after 4 frames, render here */
+                if (playing && g_submenu_stale() && g_sub_last != -1 && ++sm_wait <= 4) ui_tex_blit(bot);
+                else { g_submenu_sw(bot, is3d); sm_wait = 0; }
                 g_panel_force = 1; }
             else { if (dirty && !pv_hold) g_panel_force = 1;              /* UI changed -> re-render the panel;
                                                                             * seeking: only the bar/time strips move */
@@ -5852,7 +5858,7 @@ static MoflexResult moflex_play_ring(const char *path) {
                 int64_t nx = (pv_hold || pv_wait) ? pv_disp : ((s.wr - rd) > 0 && ready[rd % NB]) ? bts[rd % NB] : cur_us;
                 g_panel_prep(title, nx, dur_us, playing);
             } else if (playing && !g_screen_off && g_submenu && g_submenu_stale()) {
-                g_submenu_prep(is3d); dirty = 1;   /* shown by the next pass */
+                g_submenu_prep(is3d);   /* shown by the next film frame (a forced pass only cost a synced frame) */
             } }
 
         /* Roll the HUD every ~24 presented frames. CADENCE is the judder meter: v2/v3 = frames held 2/3
