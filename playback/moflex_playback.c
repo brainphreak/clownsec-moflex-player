@@ -64,7 +64,12 @@ static void vol_load(void) {
     FILE *f = fopen("sdmc:/moflex_player/volume.txt", "rb");
     if (f) { float v; if (fscanf(f, "%f", &v) == 1 && v >= 0.25f && v <= 4.0f) g_vol = v; fclose(f); }
 }
-static void vol_save(void) {
+/* ring_stats: where the playback thread's UI time goes this playback (ticks / counts) */
+static u64 g_t_pfull, g_t_pstrip, g_t_menu, g_t_rebake, g_t_vsave;
+static u32 g_n_pfull, g_n_pstrip, g_n_menu, g_n_vsave;
+static void vol_save_(void);
+static void vol_save(void) { u64 t0 = svcGetSystemTick(); vol_save_(); g_t_vsave += svcGetSystemTick() - t0; g_n_vsave++; }
+static void vol_save_(void) {
     mkdir("sdmc:/moflex_player", 0777);
     FILE *f = fopen("sdmc:/moflex_player/volume.txt", "wb");
     if (f) { fprintf(f, "%.2f\n", g_vol); fclose(f); }
@@ -2523,6 +2528,7 @@ static void g_panel_prep(const char *title, int64_t cur, int64_t dur, int playin
     if (!full && !toast_chg && sec == l_sec && bar == l_bar && vol == l_vol) return;
     u64 pt0 = svcGetSystemTick();
     ui_capture(1);
+    int wasfull = full || !g_panel_cheap;
     if (full || !g_panel_cheap) {               /* the gradient background (New 3DS) can't be patched by a flat fill */
         int lt = g_lock_toast;
         g_lock_toast = 0;                       /* the panel alone first: what goes back when the popup goes */
@@ -2560,7 +2566,8 @@ static void g_panel_prep(const char *title, int64_t cur, int64_t dur, int playin
                           * playback and its screens never appear (looked like a hang on exit) */
     }
     g_panel_force = 0; l_sec = sec; l_bar = bar; l_play = playing; l_vol = vol; l_batt = g_batt_pct; l_chg = g_batt_chg; l_zm = vw; l_title = title; l_lock = g_touch_locked; l_toast = g_lock_toast > 0;
-    { u64 dt = svcGetSystemTick() - pt0; if (dt > g_panel_max) g_panel_max = dt; }
+    { u64 dt = svcGetSystemTick() - pt0; if (dt > g_panel_max) g_panel_max = dt;
+      if (wasfull) { g_t_pfull += dt; g_n_pfull++; } else { g_t_pstrip += dt; g_n_pstrip++; } }
     g_sub_redraw = 1;                           /* the shared UI texture no longer holds the menu */
 }
 
@@ -2926,10 +2933,12 @@ static int g_sub_toast = -1;
 static int g_submenu_stale(void) { return g_sub_redraw || g_submenu != g_sub_last || (g_lock_toast > 0) != g_sub_toast; }
 static void g_submenu_prep(int is3d) {
     if (!ui_tex_init() || !g_submenu_stale()) return;
+    u64 mt0 = svcGetSystemTick();
     g_sub_redraw = 0; g_sub_last = g_submenu; g_panel_buf_ok = 0; g_sub_toast = g_lock_toast > 0;
     ui_capture(1);
     if (g_submenu == 4) snd_render(); else if (g_submenu == 3) view_render(); else if (g_submenu == 2) srtpicker_render(); else submenu_render(is3d);
     ui_tex_upload();
+    g_t_menu += svcGetSystemTick() - mt0; g_n_menu++;
 }
 static void g_submenu_sw(C3D_RenderTarget *bot, int is3d) {
     if (!ui_tex_init()) return;
@@ -3596,7 +3605,7 @@ static void r3_bake(int16_t *dst, const int16_t *src, int ns, float g) {
  * stalled the audio feed. Returns 1 while buffers are still at an old volume. */
 static int r3_rebake_step(int max) {
     if (!r3_aok || !r3_raw) return 0;
-    int done = 0, left = 0;
+    int done = 0, left = 0; u64 rt0 = svcGetSystemTick();
     for (int j = 0; j < r3_nawb; j++) {
         int i = (r3_awi + j) % r3_nawb;             /* oldest queued first = the next to be heard */
         if (r3_wb[i].status != NDSP_WBUF_QUEUED || r3_wb[i].nsamples == 0 || r3_bvol[i] == g_vol) continue;
@@ -3611,6 +3620,7 @@ static int r3_rebake_step(int max) {
         LightLock_Unlock(&g_alk);
         done++;
     }
+    if (done) g_t_rebake += svcGetSystemTick() - rt0;
     return left;
 }
 static float al_update(const int16_t *s, int ns) {
@@ -4990,6 +5000,7 @@ static MoflexResult moflex_play_ring(const char *path) {
     long st_drop = 0; u64 st_starve_ticks = 0, st_starve_t0 = 0; g_st_rdmax = 0; g_st_rdslow = 0;
     g_st_elide = g_st_yqstale = g_st_skipped = 0; g_st_busy = 0;
     g_panel_max = 0; g_upl_max = 0;
+    g_t_pfull = g_t_pstrip = g_t_menu = g_t_rebake = g_t_vsave = 0; g_n_pfull = g_n_pstrip = g_n_menu = g_n_vsave = 0;
     /* session totals, written to sdmc:/moflex_player/ring_stats.txt when playback ends */
     long st_v2 = 0, st_v3 = 0, st_vx = 0, st_stut = 0, st_shown = 0, st_decn = 0; long long st_dec = 0, st_dmax = 0;
     u64 st_maxgap = 0, st_t0 = osGetTime();
@@ -5900,10 +5911,12 @@ static MoflexResult moflex_play_ring(const char *path) {
         if (sf) {
             st_v2 += cad_v2; st_v3 += cad_v3; st_vx += cad_vx; st_dec += s.wk_dec; st_decn += s.wk_n;
             struct mallinfo mi = mallinfo();
-            fprintf(sf, "%s | %s %s | %.0fs (playing %.0fs, %.1f fps) shown=%ld stutters=%ld maxgap=%llums cadence v2=%ld v3=%ld bad=%ld slips=%ld lock=%.2f@%.4f panel=%.1fms upl=%.1fms | drop=%ld starve=%.1fs rdmax=%lums rdslow=%lu src=%s | not-shown: elided=%lu stale=%lu skipped=%lu | busy=%.0f%% fps=%.2f | decode %.2f ms/pair max %.1f | NB=%d+q%d heap peak %lu KB, linear free %lu KB | %s\n",
+            fprintf(sf, "%s | %s %s | %.0fs (playing %.0fs, %.1f fps) shown=%ld stutters=%ld maxgap=%llums cadence v2=%ld v3=%ld bad=%ld slips=%ld lock=%.2f@%.4f panel=%.1fms upl=%.1fms | ui: full=%lu/%.0fms strip=%lu/%.0fms menu=%lu/%.0fms rebake=%.0fms vsave=%lu/%.0fms | drop=%ld starve=%.1fs rdmax=%lums rdslow=%lu src=%s | not-shown: elided=%lu stale=%lu skipped=%lu | busy=%.0f%% fps=%.2f | decode %.2f ms/pair max %.1f | NB=%d+q%d heap peak %lu KB, linear free %lu KB | %s\n",
                     BUILD_TAG, r3_isnew ? "new3ds" : "old3ds", is3d ? "3D" : "2D", (osGetTime() - st_t0) / 1000.0,
                     st_play_ms / 1000.0, st_play_ms ? st_shown * 1000.0 / st_play_ms : 0.0,
                     st_shown, st_stut, (unsigned long long)st_maxgap, st_v2, st_v3, st_vx, st_slip, vl_vk, (double)vl_speed, PF_MS(g_panel_max), PF_MS(g_upl_max),
+                    (unsigned long)g_n_pfull, PF_MS(g_t_pfull), (unsigned long)g_n_pstrip, PF_MS(g_t_pstrip),
+                    (unsigned long)g_n_menu, PF_MS(g_t_menu), PF_MS(g_t_rebake), (unsigned long)g_n_vsave, PF_MS(g_t_vsave),
                     st_drop, PF_MS(st_starve_ticks) / 1000.0, (unsigned long)g_st_rdmax, (unsigned long)g_st_rdslow,
                     strncmp(path, "bigtop:", 7) ? "sd" : "bigtop",
                     (unsigned long)g_st_elide, (unsigned long)g_st_yqstale, (unsigned long)g_st_skipped,
