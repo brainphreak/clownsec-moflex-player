@@ -1,6 +1,7 @@
 /* Clownsec Big Top client. See bigtop.h. */
 #include "bigtop.h"
 #include "httpfile.h"
+#include "livemoflex.h"
 #include "downloader.h"
 #include "cJSON.h"
 #include <3ds.h>
@@ -334,10 +335,27 @@ void bt_path_item(const char *path, char *id, int cap) {
     snprintf(id, (size_t)cap, "%.*s", (int)(b - a - 1), a + 1);
 }
 
+static struct { int on, fmt; char id[40]; long long dur_ms, start_ms; } g_live;
+void bt_live_arm(const char *item_id, int fmt, long long dur_ms, long long start_ms) {
+    snprintf(g_live.id, sizeof g_live.id, "%s", item_id);
+    g_live.fmt = fmt; g_live.dur_ms = dur_ms; g_live.start_ms = start_ms > 0 ? start_ms : 0;
+    g_live.on = 1;
+    live_install_hook();
+}
+void bt_live_disarm(void) { g_live.on = 0; }
+
 FILE *bt_open_media(const char *path) {
     char id[40]; bt_path_item(path, id, sizeof id);
     if (!id[0]) return NULL;                         /* not ours: the card */
     if (!g_play_cfg.url[0]) bt_cfg_load(&g_play_cfg);
+    if (g_live.on && !strcmp(g_live.id, id)) {      /* encoded as it plays: the live reader */
+        char url[320];
+        snprintf(url, sizeof url, "%s/api/items/%s/stream.moflex?fmt=%d&client=%s",
+                 g_play_cfg.url, id, g_live.fmt, g_play_cfg.client);
+        FILE *f = NULL;
+        if (!live_open_dur(url, g_live.start_ms * 1000, g_live.dur_ms * 1000, &f)) return NULL;
+        return f;
+    }
     long long size = -1;
     for (int i = 0; i < 8; i++) if (!strcmp(g_sizes[i].id, id) && g_sizes[i].size > 0) size = g_sizes[i].size;
     char url[256]; snprintf(url, sizeof url, "%s/api/items/%s/file", g_play_cfg.url, id);

@@ -9,6 +9,7 @@ int mfx_rbuf_size = MFX_RBUF;
 
 /* ---- buffered byte reader (mirrors avio_* used by moflex.c) ---- */
 static void io_fill(MfxDemux *m) {
+    if (m->io_err) { m->rn = m->rp = 0; m->eof = 1; return; }   /* never read from where a failed seek left us */
     m->rbase = (int64_t)ftello(m->f) - m->base;      /* logical pos within [base, base+file_size) */
     int toread = mfx_rbuf_size;
     int64_t remain = m->file_size - m->rbase;         /* never read past the window (CIA-embedded moflex) */
@@ -35,7 +36,7 @@ static void    io_seek(MfxDemux *m, int64_t off, int whence) {
     if (target >= m->rbase && target <= m->rbase + m->rn) {
         m->rp = (int)(target - m->rbase);
     } else {
-        fseeko(m->f, (off_t)(m->base + target), SEEK_SET);   /* physical = base + logical */
+        m->io_err = fseeko(m->f, (off_t)(m->base + target), SEEK_SET) != 0;   /* physical = base + logical */
         m->rn = m->rp = 0; m->rbase = target;
     }
     m->eof = 0;
@@ -105,7 +106,7 @@ static int moflex_read_sync(MfxDemux *m) {
         return 1;
     }
     io_seek(m, 2, SEEK_CUR);
-    m->ts   = (int64_t)io_rb64(m);
+    m->ts   = (int64_t)io_rb64(m) + m->ts_off;
     m->size = io_rb16(m) + 1;
 
     while (!io_feof(m)) {
@@ -228,10 +229,46 @@ int mfx_open_window(MfxDemux *m, FILE *f, int64_t base, int64_t size) {
     return 0;
 }
 
-int mfx_open(MfxDemux *m, FILE *f) { return mfx_open_window(m, f, 0, -1); }
+int (*mfx_open_hook)(MfxDemux *m, FILE *f);
+int mfx_open(MfxDemux *m, FILE *f) {
+    if (mfx_open_hook) { int r = mfx_open_hook(m, f); if (r != -2) return r; }
+    return mfx_open_window(m, f, 0, -1);
+}
 
 static int seek_off(MfxDemux *m, int64_t off, int64_t *landed_off);
+
+#define MFX_LIVE_SIZE (1LL << 50)   /* a live stream has no end we know of: reads run until EOF */
+int mfx_open_live(MfxDemux *m, FILE *f, int64_t (*live_seek)(void *, int64_t), void *ctx,
+                  int64_t t0_us, int64_t duration_us) {
+    memset(m, 0, sizeof(*m));
+    m->f = f;
+    m->rbuf = (uint8_t *)malloc(mfx_rbuf_size);
+    if (!m->rbuf) return -1;
+    m->file_size = MFX_LIVE_SIZE;
+    m->duration_us = duration_us;
+    m->live_seek = live_seek; m->live_ctx = ctx; m->ts_off = t0_us;
+    m->rn = m->rp = 0; m->rbase = 0; m->eof = 0;
+    m->io_err = fseeko(f, 0, SEEK_SET) != 0;   /* opened again on the same stream (after a probe): its start */
+    if (moflex_read_sync(m) != 0) return -1;
+    io_seek(m, 0, SEEK_SET);
+    return 0;
+}
+/* live: a new stream from the source starting at target_us, read from its first block */
+static int live_seek_time(MfxDemux *m, int64_t target_us) {
+    if (target_us < 0) target_us = 0;
+    if (m->duration_us > 0 && target_us > m->duration_us - 1000000) target_us = m->duration_us - 1000000;
+    if (target_us < 0) target_us = 0;
+    int64_t t0 = m->live_seek(m->live_ctx, target_us);
+    if (t0 < 0) { m->eof = 1; return -1; }
+    m->ts_off = t0;
+    m->rn = m->rp = 0; m->rbase = 0;      /* the stream restarted at byte 0: drop what the reader held */
+    m->io_err = fseeko(m->f, 0, SEEK_SET) != 0;
+    m->eof = 0; m->in_block = 0;
+    for (int i = 0; i < m->nb_streams; i++) m->streams[i].acc_size = 0;
+    return seek_off(m, 0, NULL);
+}
 int mfx_seek_frac(MfxDemux *m, double frac) {
+    if (m->live_seek) return live_seek_time(m, (int64_t)(frac * m->duration_us));
     if (m->file_size <= 0) return -1;
     if (frac < 0) frac = 0;
     if (frac > 0.999) frac = 0.999;
@@ -264,7 +301,7 @@ static int seek_off(MfxDemux *m, int64_t off, int64_t *landed_off) {
             int ok;
             if (m->duration_us > 0) ok = (ts >= 0 && ts <= m->duration_us + 2000000);
             else                    ok = (ts >= 0 && ts < 100LL * 3600 * 1000000);
-            if (ok) { m->ts = ts; io_seek(m, after - 2, SEEK_SET); found = 1;
+            if (ok) { m->ts = ts + m->ts_off; io_seek(m, after - 2, SEEK_SET); found = 1;
                       if (landed_off) *landed_off = after - 2; break; }  /* real sync */
             io_seek(m, after, SEEK_SET);             /* false match; keep scanning */
             prev = -1;
@@ -293,6 +330,7 @@ static void seek_learn(MfxDemux *m, int64_t off, int64_t ts) {
  * the bracket is under 64 KB (a fraction of a second). The previous version halved the whole file 12
  * times per seek, each probe a resync scan, and landed up to ~0.5 MB early. */
 int mfx_seek_time(MfxDemux *m, int64_t target_us) {
+    if (m->live_seek) return live_seek_time(m, target_us);
     if (m->duration_us <= 0 || m->file_size <= 0) return mfx_seek_frac(m, 0);
     if (target_us <= 0) return mfx_seek_frac(m, 0);   /* seek-to-start: no search needed */
     if (target_us > m->duration_us) target_us = m->duration_us;

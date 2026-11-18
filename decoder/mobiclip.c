@@ -928,6 +928,21 @@ static int add_coefficients(AVCodecContext *avctx, AVFrame *frame,
     return r;
 }
 
+#ifdef MOBI_STATS   /* host analysis only: how blocks are coded, per plane class */
+#include <stdio.h>
+static long g_bst[2][4];   /* [luma, chroma][P 8x8, P split4, I 8x8, I split4] */
+__attribute__((destructor)) static void mobi_stats_dump(void) {
+    for (int c = 0; c < 2; c++) {
+        long p = g_bst[c][0] + g_bst[c][1], i = g_bst[c][2] + g_bst[c][3];
+        fprintf(stderr, "%s: P-frame blocks with coeffs %ld (8x8 %.1f%%, split 4x4 %.1f%%) | intra blocks with coeffs %ld (8x8 %.1f%%, split %.1f%%)\n",
+                c ? "chroma" : "luma  ", p, p ? 100.0 * g_bst[c][0] / p : 0, p ? 100.0 * g_bst[c][1] / p : 0,
+                i, i ? 100.0 * g_bst[c][2] / i : 0, i ? 100.0 * g_bst[c][3] / i : 0);
+    }
+}
+#define BST(plane, k) (g_bst[(plane) > 0][k]++)
+#else
+#define BST(plane, k) ((void)0)
+#endif
 static int add_pframe_coefficients(AVCodecContext *avctx, AVFrame *frame,
                                    int bx, int by, int size, int plane)
 {
@@ -936,9 +951,11 @@ static int add_pframe_coefficients(AVCodecContext *avctx, AVFrame *frame,
     int ret, idx = get_ue_golomb_31(gb);
 
     if (idx == 0) {
+        BST(plane, 0);
         return add_coefficients(avctx, frame, bx, by, size, plane);
     } else if ((unsigned)idx < FF_ARRAY_ELEMS(pframe_block4x4_coefficients_tab)) {
         int flags = pframe_block4x4_coefficients_tab[idx];
+        BST(plane, 1);
 
         for (int y = by; y < by + 8; y += 4) {
             for (int x = bx; x < bx + 8; x += 4) {
@@ -1254,11 +1271,13 @@ static int process_block(AVCodecContext *avctx, AVFrame *frame,
         return AVERROR_INVALIDDATA;
 
     if (tmp == 0) {
+        BST(plane, 2);
         if (pmode < 0)
             pmode = get_prediction(avctx, x, y, 8);
         ret = predict_intra(avctx, frame, x, y, pmode, 1, 8, plane);
     } else {
         int flags = block4x4_coefficients_tab[tmp - 1];
+        BST(plane, 3);
 
         for (int by = y; by < y + 8; by += 4) {
             for (int bx = x; bx < x + 8; bx += 4) {

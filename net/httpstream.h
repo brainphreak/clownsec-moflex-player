@@ -20,6 +20,7 @@ size_t hs_read(HttpStream *s, void *p, size_t n);
 size_t hs_buffered(HttpStream *s);
 /* The transfer has ended: 1 = completed, -1 = failed (see hs_http), 0 = still running. */
 int    hs_done(HttpStream *s);
+int    hs_curl_rc(HttpStream *s);       /* curl result once the transfer ended */
 long   hs_http(HttpStream *s);          /* HTTP status once known, else 0 */
 unsigned long long hs_total(HttpStream *s);   /* body bytes received so far */
 void   hs_close(HttpStream *s);         /* abort + join + free */

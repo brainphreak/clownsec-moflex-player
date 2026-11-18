@@ -72,6 +72,11 @@ int  bt_sub_download(const BtCfg *c, const char *item_id, int n, const char *des
 void bt_media_path(const BtCfg *c, const BtItem *it, const char *title, char *out, int cap);
 /* moflex_set_open_hook target: opens a bigtop: path as a stream from the server set up. */
 FILE *bt_open_media(const char *path);
+/* Live moflex (an MP4/MKV the server encodes as it plays, for an Old 3DS): until disarmed, opening
+ * this item's bigtop: path opens /stream.moflex from start_ms instead of the file. fmt: 0 2D,
+ * 1 full side-by-side, 2 half side-by-side. */
+void bt_live_arm(const char *item_id, int fmt, long long dur_ms, long long start_ms);
+void bt_live_disarm(void);
 /* the item id inside a bigtop: path ("" if it isn't one) */
 void bt_path_item(const char *path, char *id, int cap);
 

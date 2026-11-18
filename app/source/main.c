@@ -6785,11 +6785,26 @@ static MoflexResult bt_stream_play(const BtCfg *c, const BtItem *it, const char 
 }
 
 static int bt_play(const BtCfg *c, const BtItem *it, const char *title) {
-    if (it->stream) return bt_stream_play(c, it, title) == MOFLEX_QUIT_EXIT;
+    int live = 0;
+    if (it->stream) {
+        bool isn = false; APT_CheckNew3DS(&isn);
+        if (isn) return bt_stream_play(c, it, title) == MOFLEX_QUIT_EXIT;   /* H.264 in hardware */
+        live = 1;   /* Old 3DS: no H.264 decoder -- Big Top encodes moflex as it plays */
+    }
     static char path[300];
     bt_media_path(c, it, title, path, sizeof path);
     BtItem fresh;                                         /* the list may be minutes old */
     long long pos_ms = bt_item(c, it->id, &fresh) ? fresh.pos : it->pos;
+    if (live) {
+        int fmt = 0;                                      /* the frame's shape, the Format row's choice over it */
+        if (it->is3d) fmt = !strcmp(it->layout, "fsbs") ? 1 : 2;
+        char key[48]; snprintf(key, sizeof key, "bigtop:%s", it->id);
+        { int saved = moflex_fmt_load_key(key); if (saved >= 0) fmt = saved; }
+        long long dur_ms = it->dur > 0 ? it->dur : (long long)it->runtime * 60000;
+        /* the stream starts where playback will: the resume point, so the engine's resume seek
+         * lands on the stream's own start instead of restarting the encoder */
+        bt_live_arm(it->id, fmt, dur_ms, pos_ms > 10000 ? pos_ms : 0);
+    }
     if (pos_ms > 10000) moflex_resume_save(path, pos_ms * 1000);
     else moflex_resume_clear(path);
     /* subtitle files beside the video on the server: into moviedata/ under the video's name, where
@@ -6834,6 +6849,11 @@ static int bt_play(const BtCfg *c, const BtItem *it, const char *title) {
     g_play_to_browser = 1;
     moflex_watched_set(path, 0);      /* the engine sets it again when this playback finishes */
     MoflexResult r = play_movie(path);
+    bt_live_disarm();
+    if (live && r == MOFLEX_ERROR) {
+        msg_screen("BIG TOP", "Big Top couldn't stream this video\nto an Old 3DS.\n\nOld 3DS streaming of MP4/MKV needs\na Big Top with the moflex encoder.");
+        return 0;
+    }
     httpfile_drop_cache();                                /* the video's kept blocks: memory back */
     long long at = moflex_resume_get(path);               /* where the engine stopped (0 = the end) */
     long long dur = (long long)it->runtime * 60000;
