@@ -5051,7 +5051,11 @@ static MoflexResult moflex_play_ring(const char *path) {
      * and the stale one, which the panel interleaves as doubled lines. Every dirty repaint
      * therefore runs twice. */
     int dirty2 = 0;
-    const int PRIME = (NB >= 16) ? 8 : (NB > 2 ? NB / 2 : 1);   /* pre-roll depth, clamped to a small ring */
+    /* pre-roll depth, clamped to a small ring. A Big Top stream banks the ring nearly full first
+     * (~1 s on an Old 3DS): starting on 8 pairs (a third of a second) let the first network
+     * stalls -- up to 1.2 s in ring_stats -- show as skips until the bank caught up */
+    const int PRIME = !strncmp(path, "bigtop:", 7) && NB > 4 ? NB - 2
+                    : (NB >= 16) ? 8 : (NB > 2 ? NB / 2 : 1);
     int64_t cur_us = 0, dur_us = m.duration_us, seek_to_us = 0; int want_seek = 0, shold = 0;
     int scrubbing = 0; int64_t scrub_us = 0;   /* touch-drag on the bar: preview while held, seek on release */
     int tseek = 0, tseek_hold = 0;             /* touch rewind (-1) / fast-forward (+1) held */
