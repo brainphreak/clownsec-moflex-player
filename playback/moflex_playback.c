@@ -3450,6 +3450,7 @@ static int64_t r3_trim_from = -1;  /* drop audio before this content time (us); 
 static int64_t r3_pkt_start = -1;  /* content start of the packet being fed (us), -1 = unknown */
 static int     r3_last_fr = 0;     /* frames the last fed packet decoded to (before any trim) */
 static float r3_bal[R3_AWB];       /* the levelling factor each buffer was baked with */
+static float r3_bvol[R3_AWB];      /* the volume each buffer was baked with (a change re-bakes it) */
 static int r3_awi, r3_nawb, r3_arate, r3_achn, r3_aok, r3_acnt[R3_AWB];
 static long long r3_aplayed; static int64_t r3_apos;   /* elapsed audible us, -1 = not started */
 static volatile u32 g_r3_last_present;   /* osGetTime() of the last shown frame -- elision starving-guard */
@@ -3569,16 +3570,28 @@ static void r3_bake(int16_t *dst, const int16_t *src, int ns, float g) {
         dst[i] = (int16_t)(t > 32767 ? 32767 : (t < -32768 ? -32768 : t));
     }
 }
-static void r3_rebake(void) {
-    if (!r3_aok || !r3_raw) return;
-    LightLock_Lock(&g_alk);
-    for (int i = 0; i < r3_nawb; i++) {
-        if (r3_wb[i].status != NDSP_WBUF_QUEUED || r3_wb[i].nsamples == 0) continue;   /* playing/done: leave */
-        int ns = (int)r3_wb[i].nsamples * r3_achn;
-        r3_bake(r3_ab[i], r3_raw + (size_t)i * R3_ABUF * r3_achn, ns, g_vol * r3_bal[i]);
-        DSP_FlushDataCache(r3_ab[i], ns * 2);
+/* A volume change re-bakes the queued audio a few buffers per loop, the ones heard next first.
+ * Re-baking the whole ~2 s queue at once was 10-20 ms of an Old 3DS's frame on the playback
+ * thread, under the audio lock -- every step of a slider drag or a held D-pad dropped a frame and
+ * stalled the audio feed. Returns 1 while buffers are still at an old volume. */
+static int r3_rebake_step(int max) {
+    if (!r3_aok || !r3_raw) return 0;
+    int done = 0, left = 0;
+    for (int j = 0; j < r3_nawb; j++) {
+        int i = (r3_awi + j) % r3_nawb;             /* oldest queued first = the next to be heard */
+        if (r3_wb[i].status != NDSP_WBUF_QUEUED || r3_wb[i].nsamples == 0 || r3_bvol[i] == g_vol) continue;
+        if (done >= max) { left = 1; break; }
+        LightLock_Lock(&g_alk);
+        if (r3_wb[i].status == NDSP_WBUF_QUEUED) {  /* not started while we looked */
+            int ns = (int)r3_wb[i].nsamples * r3_achn;
+            r3_bake(r3_ab[i], r3_raw + (size_t)i * R3_ABUF * r3_achn, ns, g_vol * r3_bal[i]);
+            DSP_FlushDataCache(r3_ab[i], ns * 2);
+        }
+        r3_bvol[i] = g_vol;
+        LightLock_Unlock(&g_alk);
+        done++;
     }
-    LightLock_Unlock(&g_alk);
+    return left;
 }
 static float al_update(const int16_t *s, int ns) {
     double sq = 0.0;
@@ -3621,7 +3634,7 @@ static int r3_audio_feed_raw(const uint8_t *data, int size) {
       float al = (g_autolvl > 0 && g_autolvl <= 2) ? al_update(s, ns) : 1.0f;
       LightLock_Lock(&g_alk);
       if (r3_raw) memcpy(r3_raw + (size_t)r3_awi * R3_ABUF * r3_achn, s, (size_t)ns * 2);
-      r3_bal[r3_awi] = al;
+      r3_bal[r3_awi] = al; r3_bvol[r3_awi] = g_vol;
       r3_bake(s, s, ns, g_vol * al);
       DSP_FlushDataCache(r3_ab[r3_awi], fr * r3_achn * 2);
       memset(w, 0, sizeof *w); w->data_vaddr = r3_ab[r3_awi]; w->nsamples = fr;
@@ -5525,8 +5538,8 @@ static MoflexResult moflex_play_ring(const char *path) {
         if (have_audio && playing) r3_audio_poll();   /* clock FROZEN while paused -> pause is instant */
         if (g_vol != vol_applied) {   /* heard now: re-bake the queued audio; saved once it settles */
             vol_applied = g_vol; vol_changed_at = osGetTime();
-            if (have_audio) r3_rebake();
         }
+        if (have_audio) r3_rebake_step(3);   /* the queue catches up in ~0.2 s, ~1 ms a loop */
 
         /* Old-3DS (not threaded): decode a pair INLINE here, once per iteration, when there's ring room.
          * (New-3DS does this on the decode thread instead.) */
