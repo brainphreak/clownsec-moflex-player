@@ -1170,6 +1170,7 @@ static void draw_info_top(const CatEntry *e, const u16 *poster) {
         ui_text(tx, ty, 1, is3d ? UI_NEONP : UI_DIM,
                 is3d ? "3D  (stereoscopic)" : "2D"); ty += 14;
     }
+    if (e->fmt[0]) { ui_text(tx, ty, 1, UI_DIM, e->fmt); ty += 14; }   /* Big Top: MOFLEX / MP4 - encoded live */
     {   /* embedded tracks: cached at scan (local) or from the catalog fields */
         char line[96];
         if (e->audio_langs[0]) { snprintf(line, sizeof line, "Audio: %s", e->audio_langs); ui_text_wrap(tx, &ty, 1, UI_NEONC, line, 30, 2); }
@@ -6962,6 +6963,11 @@ static void bt_draw_top(int i) {
     if (!m.desc[0] && e->episodes) snprintf(m.desc, sizeof m.desc, "%d episodes, %d watched", e->episodes, e->seen);
     snprintf(m.category, sizeof m.category, "Big Top");
     m.year = e->year; m.runtime = e->runtime; m.is3d = e->is3d;
+    if (e->fmt[0]) {   /* what the file is, and how it reaches this console */
+        bool isnew = false; APT_CheckNew3DS(&isnew);
+        if (!e->stream) snprintf(m.fmt, sizeof m.fmt, "%s", e->fmt);
+        else snprintf(m.fmt, sizeof m.fmt, "%s - %s", e->fmt, isnew ? "H.264 stream" : "encoded live");
+    }
     static u16 art[POSTER_W * POSTER_H];
     int have = 0;
     if (e->poster) {

@@ -119,6 +119,7 @@ static void fill(BtItem *it, cJSON *e) {
     it->episodes = (int)jn(e, "episodes"); it->seen = (int)jn(e, "seen"); it->watched = (int)jn(e, "watched");
     it->super = (int)jn(e, "super"); it->pos = jn(e, "pos"); it->size = jn(e, "size");
     it->stream = (int)jn(e, "stream"); it->dur = jn(e, "dur"); js(e, "layout", it->layout, sizeof it->layout);
+    js(e, "fmt", it->fmt, sizeof it->fmt);
 }
 static int fill_array(cJSON *arr, BtItem **out, const char *force_type) {
     int n = cJSON_GetArraySize(arr);

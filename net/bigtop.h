@@ -27,6 +27,7 @@ typedef struct {
     int  stream;                  /* not moflex (MP4/MKV/AVI...): the server transcodes it -> stream_play */
     long long dur;                /* stream: length in ms */
     char layout[8];               /* stream 3D: "hsbs" / "fsbs" */
+    char fmt[8];                  /* the file's container: "MOFLEX", "MP4", "MKV", ... */
 } BtItem;
 
 /* a streamed video's tracks (GET /api/items/<id>) */

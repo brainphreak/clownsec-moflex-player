@@ -25,6 +25,7 @@ typedef struct {
                                * catalog's superMoflex field; local files probe the trailer */
     char audio_langs[48];     /* "English, Japanese" (catalog audioTracks / trailer tags) */
     char sub_langs[64];       /* "ENG SDH GER ..." (catalog embeddedSubtitles / trailer tags) */
+    char fmt[32];             /* Big Top: the file's container and how it plays ("MP4 - encoded live") */
 } CatEntry;
 
 /* kind: 0 = clownsec shape (movies[]/tvShows[]), 1 = zackk shape (items[]).
