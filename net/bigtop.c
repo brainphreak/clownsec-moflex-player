@@ -2,6 +2,7 @@
 #include "bigtop.h"
 #include "httpfile.h"
 #include "livemoflex.h"
+#include "moflex_playback.h"   /* moflex_resume_get: where playback will start */
 #include "downloader.h"
 #include "cJSON.h"
 #include <3ds.h>
@@ -352,8 +353,13 @@ FILE *bt_open_media(const char *path) {
         char url[320];
         snprintf(url, sizeof url, "%s/api/items/%s/stream.moflex?fmt=%d&client=%s",
                  g_play_cfg.url, id, g_live.fmt, g_play_cfg.client);
+        /* start where playback will: the resume point as it is NOW -- after the Resume / Start over
+         * prompt, which clears it on Start over (arming with the old point made Start over resume).
+         * The same rule as the engine's: past 3 s and not in the last 10 s. */
+        long long rp = moflex_resume_get(path), st = 0;
+        if (rp > 3000000 && (g_live.dur_ms <= 0 || rp / 1000 < g_live.dur_ms - 10000)) st = rp;
         FILE *f = NULL;
-        if (!live_open_dur(url, g_live.start_ms * 1000, g_live.dur_ms * 1000, &f)) return NULL;
+        if (!live_open_dur(url, st, g_live.dur_ms * 1000, &f)) return NULL;
         return f;
     }
     long long size = -1;
