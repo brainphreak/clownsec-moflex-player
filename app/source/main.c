@@ -4289,8 +4289,10 @@ static void ver_parse(const char *s, int *a, int *b) {
         else break;
     }
 }
+static volatile int s_upd_answered;   /* a source gave a real version this check (manual check) */
+static int s_upd_tries = 8;             /* rounds before giving up (a manual check asks twice) */
 static void update_check(void) {   /* worker thread; printf-free so it can't hit the locale fault */
-    for (int try = 0; try < 8 && !s_dt_abort; try++) {
+    for (int try = 0; try < s_upd_tries && !s_dt_abort; try++) {
         if (try) for (int w = 0; w < 50 && !s_dt_abort; w++) svcSleepThread(100 * 1000 * 1000LL);   /* 5s, abortable */
         if (osGetWifiStrength() == 0) continue;   /* offline or still associating -> retry, never block */
         char *buf = NULL; size_t len = 0;
@@ -4313,6 +4315,7 @@ static void update_check(void) {   /* worker thread; printf-free so it can't hit
             free(b);
         }
         if (!buf) continue;                       /* no source answered -> retry */
+        s_upd_answered = 1;
         src = best_src;
         s_upd_src = src;
         ver_parse(BUILD_TAG, &cd, &cn);
@@ -4537,6 +4540,36 @@ static int self_update(void) {
     else { snprintf(m, sizeof m, "Updated to %s.\nThe player will now restart.", s_upd); aptSetChainloaderToSelf(); }
     msg_screen_btn("UPDATE INSTALLED", m, "OKAY");
     return 1;
+}
+
+static int startup_detect_poll(void);
+/* Tap on the version: check now instead of only at start-up. 1 = an update installed (exit). */
+static int update_check_now(void) {
+    if (!s_upd[0]) {
+        if (!s_dtw_exit) { msg_screen("UPDATES", "Already checking for an update.\nTry again in a moment."); return 0; }
+        s_upd_answered = 0; s_upd_tries = 2;
+        s_dt_done = 0; s_dt_abort = 0; s_dt_consumed = 1; s_dtw_exit = 0;   /* consumed: no new-video prompt */
+        s32 prio = 0x30; svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
+        if (!threadCreate(detect_worker, NULL, 32 * 1024, prio + 1, -2, true)) { s_dtw_exit = 1; return 0; }
+        msg_screen_nowait("UPDATES", "Checking for updates...\n\nB - cancel");
+        while (aptMainLoop() && !s_dtw_exit) {
+            hidScanInput();
+            if (hidKeysDown() & KEY_B) s_dt_abort = 1;   /* the worker stops at its next step */
+            svcSleepThread(50 * 1000 * 1000LL);
+        }
+        s_upd_tries = 8;
+        if (s_dt_abort) return 0;
+        if (!s_upd[0]) {
+            char m[96];
+            if (s_upd_answered) snprintf(m, sizeof m, "You're up to date.\n\nThis is build %s.", BUILD_TAG);
+            else snprintf(m, sizeof m, "Couldn't reach the update server.\nIs Wi-Fi on?");
+            msg_screen("UPDATES", m);
+            return 0;
+        }
+    }
+    s_upd_shown = 0;                     /* offer it (again) */
+    startup_detect_poll();
+    return s_upd_quit;
 }
 
 /* Home screen polls this once per frame; runs the prompts when the background walk lands. */
@@ -6550,6 +6583,10 @@ static int home_gui(void) {
             touchPosition t; hidTouchRead(&t);
             if (t.px >= THSW_X && t.px < THSW_X + THSW_W &&
                 t.py >= THSW_Y && t.py < THSW_Y + THSW_H) { themes_screen(); redraw = 1; continue; }
+            if (t.px >= UI_W - 90 && t.py < 36) {   /* the version (top right): check for an update now */
+                if (update_check_now()) return -1;
+                redraw = 1; continue;
+            }
             for (int i = 0; i < 3; i++) {
                 HomeBtn *b = &g_btns[i];
                 if (t.px >= b->x && t.px < b->x + b->w && t.py >= b->y && t.py < b->y + b->h)
