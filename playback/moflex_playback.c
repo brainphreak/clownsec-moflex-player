@@ -16,6 +16,7 @@
 #include "adpcm_moflex.h"
 #include "ui_gfx.h"
 #include "y2r_video.h"
+#include "httpfile.h"   /* Big Top files: how much is fetched ahead (start-up pre-roll) */
 #include <citro2d.h>   /* Old-3DS GPU playback path (no CPU transpose) */
 
 extern int    mobi_init(AVCodecContext *);
@@ -5733,7 +5734,20 @@ static MoflexResult moflex_play_ring(const char *path) {
          * early only when video can't progress (the reader holds a packet for the full bank and the
          * video backlog is dry) -- starting on the full bank alone began the sound with 1-2 pairs ready,
          * the catch-up then dropped video to the next keyframe: stills, then a jump. */
-        if (have_audio && !gated && playing && ((s.wr - rd) >= PRIME || (s.audio_pre_full && r3_vqc < 2) || s.done)) {
+        /* a Big Top file: also a few seconds of the compressed stream fetched ahead (~768 KB, ~3 s at
+         * 1.5-2 Mbit/s), at most 6 s of waiting. The frame ring holds ~1 s; the Wi-Fi stalls up to
+         * 1.2 s, and the read-ahead only grows as reading goes on -- so the start skipped. */
+        int net_ok = 1;
+        {   static u64 net_t0; long long ahead = httpfile_buffered_ahead();
+            if (!gated && playing && ahead >= 0) {
+                if (!net_t0) net_t0 = osGetTime();
+                httpfile_full_ahead();
+                /* the first start waits for ~3 s of stream; after a seek ~1 s, so seeking stays quick */
+                int first = st_shown == 0;
+                net_ok = ahead >= (first ? 768 : 256) * 1024 || osGetTime() - net_t0 > (first ? 6000u : 2500u);
+            }
+            if (gated) net_t0 = 0; }
+        if (have_audio && !gated && playing && net_ok && ((s.wr - rd) >= PRIME || (s.audio_pre_full && r3_vqc < 2) || s.done)) {
             gated = 1; ndspChnSetPaused(0, false); r3_apos = 0; }
 
         if (sd_land_t && !sd_stuck_logged && osGetTime() - sd_land_t > 2000) {

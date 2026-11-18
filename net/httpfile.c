@@ -119,6 +119,7 @@ static unsigned long hf_heap_free_kb(void) {
     }
     return lo;
 }
+static HFile *g_hf_cur;   /* the most recently opened file still open (playback's, after the probe) */
 static int slot_of(HFile *h, long long blk) {
     for (int i = 0; i < h->nslots; i++)
         if (h->slots[i].state != SL_EMPTY && h->slots[i].blk == blk) return i;
@@ -281,6 +282,7 @@ static int hf_seek(void *c, off_t *off, int whence) {
 
 static int hf_close(void *c) {
     HFile *h = (HFile *)c;
+    if (g_hf_cur == h) g_hf_cur = NULL;
     h->stop = 1;
     if (h->th) { threadJoin(h->th, U64_MAX); threadFree(h->th); }
     if (g_hf_open > 0) g_hf_open--;
@@ -349,5 +351,31 @@ FILE *httpfile_open(const char *url, long long size, size_t ring_bytes) {
     FILE *f = fopencookie(h, "rb", io);
     if (!f) { hf_close(h); return NULL; }
     setvbuf(f, NULL, _IOFBF, 32 * 1024);
+    g_hf_cur = h;
     return f;
+}
+
+/* bytes downloaded and waiting, straight on from where reading is (to the end of the file counts
+ * as plenty); -1 when no Big Top file is open */
+long long httpfile_buffered_ahead(void) {
+    HFile *h = g_hf_cur;
+    if (!h) return -1;
+    LightLock_Lock(&h->lk);
+    long long nblk = (h->size + HB_SIZE - 1) / HB_SIZE, b = h->cur, n = 0;
+    while (b < nblk) {
+        int i = slot_of(h, b);
+        if (i < 0 || h->slots[i].state != SL_READY) break;
+        b++; n++;
+    }
+    LightLock_Unlock(&h->lk);
+    return b >= nblk ? (1LL << 40) : n * HB_SIZE;
+}
+/* playback is starting: read ahead as far as the window allows at once (it grows with straight
+ * reading, so a short look at a file doesn't download much) */
+void httpfile_full_ahead(void) {
+    HFile *h = g_hf_cur;
+    if (!h) return;
+    LightLock_Lock(&h->lk);
+    if (h->seq < 2 * HB_AHEAD) h->seq = 2 * HB_AHEAD;
+    LightLock_Unlock(&h->lk);
 }
