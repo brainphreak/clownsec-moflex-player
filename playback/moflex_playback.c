@@ -5127,7 +5127,15 @@ static MoflexResult moflex_play_ring(const char *path) {
             submenu_input(kd, kh, tp, is3d, path);
             /* repaint on input only (held arrows repeat, a finger may drag); the menu texture is
              * reused otherwise, and new film frames still present on their own */
-            if (kd || (kh & (KEY_LEFT | KEY_RIGHT | KEY_UP | KEY_DOWN | KEY_TOUCH)) || g_submenu != sm_was) {
+            /* a resting stylus repainted the whole menu (~20 ms on an Old 3DS) every frame it stayed
+             * down: only a touch that MOVES repaints (a drag still follows the finger) */
+            static int sm_tx = -1, sm_ty = -1;
+            int tmoved = 0;
+            if (kh & KEY_TOUCH) {
+                if (sm_tx < 0 || abs(tp.px - sm_tx) > 1 || abs(tp.py - sm_ty) > 1) tmoved = 1;
+                sm_tx = tp.px; sm_ty = tp.py;
+            } else sm_tx = sm_ty = -1;
+            if (kd || (kh & (KEY_LEFT | KEY_RIGHT | KEY_UP | KEY_DOWN)) || tmoved || g_submenu != sm_was) {
                 dirty = 1; g_sub_redraw = 1;
             }
             if (g_hq_req) {
