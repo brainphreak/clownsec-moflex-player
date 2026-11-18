@@ -350,6 +350,12 @@ FILE *bt_open_media(const char *path) {
     if (!id[0]) return NULL;                         /* not ours: the card */
     if (!g_play_cfg.url[0]) bt_cfg_load(&g_play_cfg);
     if (g_live.on && !strcmp(g_live.id, id)) {      /* encoded as it plays: the live reader */
+        int lf = moflex_live_fmt_get();          /* the VIDEO menu's Format choice, if it changed it */
+        if (lf >= 0 && lf != g_live.fmt) {
+            char key[48]; snprintf(key, sizeof key, "bigtop:%s", id);
+            moflex_fmt_save_key(key, lf);           /* remembered for this title */
+            g_live.fmt = lf;
+        }
         char url[320];
         snprintf(url, sizeof url, "%s/api/items/%s/stream.moflex?fmt=%d&client=%s",
                  g_play_cfg.url, id, g_live.fmt, g_play_cfg.client);

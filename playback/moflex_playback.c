@@ -2673,6 +2673,11 @@ static int g_view_is3d = 1;
  * the menu is exactly what it was. */
 #define VIEW_ACT_FMT 98
 static int g_kit_fmt_row = 0, g_kit_fmt = 0, g_kit_fmt_changed = 0;
+/* a Big Top live stream (the server encodes the frame shape it is asked for): the ring engine
+ * shows the Format row too, and a change re-opens the film in place in the new shape. -1 = none */
+static int g_live_fmt = -1;
+void moflex_live_fmt_set(int fmt) { g_live_fmt = fmt; }
+int  moflex_live_fmt_get(void) { return g_live_fmt; }
 static int g_view_sel = 0, g_view_rep = 0;
 static int g_hq_req = 0;      /* set when the HQ row is toggled; the panel turns it into a replay */
 /* display row -> action code (the 2D list skips convergence + ghost) */
@@ -5073,6 +5078,8 @@ static MoflexResult moflex_play_ring(const char *path) {
     int vol_drag = 0;                           /* touch-drag on the volume slider (applies live) */
     int resume_exact = 0;                       /* resume only: decode forward to the EXACT saved second */
     g_submenu = 0; g_sub_sel = 0;               /* subtitle menu starts closed */
+    g_kit_fmt_row = g_live_fmt >= 0;            /* live stream: VIDEO gets the Format row */
+    if (g_kit_fmt_row) { g_kit_fmt = g_live_fmt; g_kit_fmt_changed = 0; }
     g_touch_locked = 0; g_lock_toast = 0; g_backlight_on = 1;   /* touch unlocked, backlight on */
     int64_t rpos = resume_load(path), last_save = 0;
     if (rpos > 3000000 && (dur_us <= 0 || rpos < dur_us - 10000000)) { seek_to_us = rpos; want_seek = 1; last_save = rpos; resume_exact = 1; }
@@ -5270,6 +5277,12 @@ static MoflexResult moflex_play_ring(const char *path) {
                 /* HQ row in VIEW: the ring's texture format is fixed at init, so the film has to
                  * be re-opened for a colour-depth change to take -- resume puts it back in place. */
                 g_hq_req = 0; g_hq = !g_hq; hq_save();
+                result = MOFLEX_REPLAY; break;
+            }
+            if (g_kit_fmt_changed && g_live_fmt >= 0) {
+                /* Format on a live stream: the server re-encodes in the new shape -- re-open in
+                 * place (resume puts it back where it was) */
+                g_kit_fmt_changed = 0; g_live_fmt = g_kit_fmt;
                 result = MOFLEX_REPLAY; break;
             }
         } else {
@@ -7368,6 +7381,7 @@ int moflex_subs_append_srt(const char *text) {
     return g_nsubs - before;
 }
 int moflex_fmt_load_key(const char *key) { return kit_fmt_load(key); }
+void moflex_fmt_save_key(const char *key, int fmt) { kit_fmt_save(key, fmt); }
 int moflex_subs_wanted(const char *key, const char *audio_lang) {
     subcfg_load(key);                     /* before playback: the globals are reloaded at open anyway */
     if (!g_cfg_fresh) return g_sub_on;

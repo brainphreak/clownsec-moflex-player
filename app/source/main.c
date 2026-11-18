@@ -6860,6 +6860,7 @@ static int bt_play(const BtCfg *c, const BtItem *it, const char *title) {
         /* the stream starts where playback will: the resume point, so the engine's resume seek
          * lands on the stream's own start instead of restarting the encoder */
         bt_live_arm(it->id, fmt, dur_ms, pos_ms > 10000 ? pos_ms : 0);
+        moflex_live_fmt_set(fmt);                         /* VIDEO > Format can change it while playing */
     }
     if (pos_ms > 10000) moflex_resume_save(path, pos_ms * 1000);
     else moflex_resume_clear(path);
@@ -6906,6 +6907,7 @@ static int bt_play(const BtCfg *c, const BtItem *it, const char *title) {
     moflex_watched_set(path, 0);      /* the engine sets it again when this playback finishes */
     MoflexResult r = play_movie(path);
     bt_live_disarm();
+    moflex_live_fmt_set(-1);
     if (live && r == MOFLEX_ERROR) {
         msg_screen("BIG TOP", "Big Top couldn't stream this video\nto an Old 3DS.\n\nOld 3DS streaming of MP4/MKV needs\na Big Top with the moflex encoder.");
         return 0;
