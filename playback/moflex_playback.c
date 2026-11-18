@@ -2931,13 +2931,107 @@ static int snd_input(u32 kd, u32 kh, touchPosition tp) {
  * choppy for a while after closing. */
 static int g_sub_toast = -1;
 static int g_submenu_stale(void) { return g_sub_redraw || g_submenu != g_sub_last || (g_lock_toast > 0) != g_sub_toast; }
+/* ---- menu band cache ----
+ * Moving the highlight changes only the rows next to the old and new one, so those rows' bands are
+ * redrawn under a vertical clip (ui_clip_y: pixel-identical to a full redraw, proven on the host)
+ * and kept: with the labels unchanged a band can only look 4 ways -- its row highlighted, the row
+ * above or below highlighted (their glow and 2 px of their face reach in), or none -- so after a
+ * pass through the list a move is a few memcpys and a small upload instead of a full ~21 ms render
+ * (13 of those a second starved Old-3DS 3D: ring_stats menu=270/5760ms in 21 s). Anything else --
+ * another menu, a label changed (left/right on a value), the lock popup -- renders in full and
+ * starts the cache over. */
+#define MB_ROWS 16
+#define MB_MARGIN 6                         /* the selected row's glow spreads 5 px */
+static u16 *g_mb[MB_ROWS][4];
+static int  g_mb_menu = -1, g_mb_n = 0, g_mb_sel = -1, g_mb_ok = 0;
+static u32  g_mb_sig = 0;
+static void mb_drop(void) {
+    for (int i = 0; i < MB_ROWS; i++) for (int k = 0; k < 4; k++) { free(g_mb[i][k]); g_mb[i][k] = NULL; }
+    g_mb_ok = 0;
+}
+/* the current menu's rows: labels hashed with everything else it draws; -1 = not a row menu */
+static int mb_rows(int is3d, int *sel, u32 *sig) {
+    char lab[48]; int n; u32 h = 2166136261u;
+    #define MB_H(v) (h = (h ^ (u32)(v)) * 16777619u)
+    #define MB_HS(str) do { for (const char *q_ = (str); *q_; q_++) MB_H((u8)*q_); MB_H(0); } while (0)
+    if (g_submenu == 4) {
+        int act[SND_ROWS_MAX]; n = snd_rows(act);
+        for (int i = 0; i < n; i++) { snd_label(act[i], lab, sizeof lab); MB_HS(lab); }
+        MB_H(g_autolvl); *sel = g_snd_sel;
+    } else if (g_submenu == 3) {
+        n = VIEW_ROWS;
+        for (int i = 0; i < n; i++) { view_label(i, lab, sizeof lab); MB_HS(lab); }
+        *sel = g_view_sel;
+    } else if (g_submenu == 1) {
+        int act[16]; n = submenu_actions(is3d, act);
+        for (int i = 0; i < n; i++) { submenu_label(act[i], lab, sizeof lab); MB_HS(lab); }
+        *sel = g_sub_sel;
+    } else return -1;                      /* the SRT picker scrolls and pages: always in full */
+    MB_H(g_submenu); MB_H(n); MB_H(g_lock_toast > 0);
+    #undef MB_H
+    #undef MB_HS
+    *sig = h;
+    return n;
+}
+static void mb_render(int is3d) {
+    if (g_submenu == 4) snd_render(); else if (g_submenu == 3) view_render(); else if (g_submenu == 2) srtpicker_render(); else submenu_render(is3d);
+}
 static void g_submenu_prep(int is3d) {
     if (!ui_tex_init() || !g_submenu_stale()) return;
     u64 mt0 = svcGetSystemTick();
+    int had = (g_sub_last == g_submenu);   /* the UI buffer still holds this menu */
     g_sub_redraw = 0; g_sub_last = g_submenu; g_panel_buf_ok = 0; g_sub_toast = g_lock_toast > 0;
     ui_capture(1);
-    if (g_submenu == 4) snd_render(); else if (g_submenu == 3) view_render(); else if (g_submenu == 2) srtpicker_render(); else submenu_render(is3d);
-    ui_tex_upload();
+    int sel = -1; u32 sig = 0; int n = mb_rows(is3d, &sel, &sig);
+    int top, step, bh; submenu_layout(n > 0 ? n : 1, &top, &step, &bh);
+    /* the 4-case rule holds while a band reaches only its neighbours' edge (not their label) and no
+     * further row's glow: true for the usual 8-ish rows, checked rather than assumed */
+    int geo_ok = n > 0 && n <= MB_ROWS && bh + MB_MARGIN - step <= (bh - 8) / 2 && 2 * step >= bh + MB_MARGIN + 5;
+    int partial = had && geo_ok && g_mb_ok && g_mb_menu == g_submenu && g_mb_n == n && g_mb_sig == sig
+                  && sel >= 0 && sel < n && g_mb_sel >= 0;
+    if (!partial) {
+        mb_drop();
+        mb_render(is3d);
+        ui_tex_upload();
+        if (geo_ok) {
+            g_mb_ok = 1; g_mb_menu = g_submenu; g_mb_n = n; g_mb_sig = sig; g_mb_sel = sel;
+            for (int i = 0; i < n; i++) {       /* the full render holds every band in its current look */
+                int c = sel == i ? 0 : sel == i - 1 ? 1 : sel == i + 1 ? 2 : 3;
+                int y0 = top + i * step - MB_MARGIN, y1 = top + i * step + bh + MB_MARGIN;
+                if (y0 < 0) y0 = 0; if (y1 > UI_H) y1 = UI_H;
+                g_mb[i][c] = (u16 *)malloc((size_t)UI_W * (y1 - y0) * 2);
+                if (g_mb[i][c]) ui_rect_save(0, y0, UI_W, y1 - y0, g_mb[i][c]);
+            }
+        }
+    } else if (sel != g_mb_sel) {
+        int old = g_mb_sel, rows[6], nr = 0;
+        for (int d = -1; d <= 1; d++) {
+            int a = old + d, b = sel + d;
+            if (a >= 0 && a < n) rows[nr++] = a;
+            if (b >= 0 && b < n) rows[nr++] = b;
+        }
+        for (int k = 0; k < nr; k++) {
+            int i = rows[k], dup = 0;
+            for (int q = 0; q < k; q++) if (rows[q] == i) dup = 1;
+            if (dup) continue;
+            int was = old == i ? 0 : old == i - 1 ? 1 : old == i + 1 ? 2 : 3;
+            int now = sel == i ? 0 : sel == i - 1 ? 1 : sel == i + 1 ? 2 : 3;
+            if (was == now) continue;           /* this band looks the same as before */
+            int y0 = top + i * step - MB_MARGIN, y1 = top + i * step + bh + MB_MARGIN;
+            if (y0 < 0) y0 = 0; if (y1 > UI_H) y1 = UI_H;
+            int bhh = y1 - y0;
+            if (g_mb[i][now]) ui_rect_load(0, y0, UI_W, bhh, g_mb[i][now]);
+            else {
+                ui_clip_y(y0, y1); mb_render(is3d); ui_clip_reset();
+                g_mb[i][now] = (u16 *)malloc((size_t)UI_W * bhh * 2);   /* no memory: just not kept */
+                if (g_mb[i][now]) ui_rect_save(0, y0, UI_W, bhh, g_mb[i][now]);
+            }
+            ui_tex_upload_rect(0, y0, UI_W, y1);
+        }
+        C3D_TexFlush(&g_uitex);
+        ui_capture(0);
+        g_mb_sel = sel;
+    } else ui_capture(0);                   /* nothing visible changed (a moved stylus, a stale flag) */
     g_t_menu += svcGetSystemTick() - mt0; g_n_menu++;
 }
 static void g_submenu_sw(C3D_RenderTarget *bot, int is3d) {
@@ -3593,8 +3687,11 @@ static inline int al_soft(int v) {
  * its levelling factor, and a volume change re-bakes every buffer still waiting to play. */
 static void r3_bake(int16_t *dst, const int16_t *src, int ns, float g) {
     if (g == 1.0f) { if (dst != src) memcpy(dst, src, (size_t)ns * 2); return; }
+    /* fixed point (Q10): a float convert + multiply + convert per sample was most of the cost of
+     * re-baking after a volume change on an Old 3DS (gains stay far below the 64x int32 limit) */
+    int gq = (int)(g * 1024.0f + 0.5f);
     for (int i = 0; i < ns; i++) {
-        int t = (int)(src[i] * g);
+        int t = (src[i] * gq) >> 10;
         t = al_soft(t);                       /* bend the peaks rather than square them */
         dst[i] = (int16_t)(t > 32767 ? 32767 : (t < -32768 ? -32768 : t));
     }
@@ -3605,10 +3702,15 @@ static void r3_bake(int16_t *dst, const int16_t *src, int ns, float g) {
  * stalled the audio feed. Returns 1 while buffers are still at an old volume. */
 static int r3_rebake_step(int max) {
     if (!r3_aok || !r3_raw) return 0;
-    int done = 0, left = 0; u64 rt0 = svcGetSystemTick();
+    int done = 0, left = 0, seen = 0; u64 rt0 = svcGetSystemTick();
     for (int j = 0; j < r3_nawb; j++) {
         int i = (r3_awi + j) % r3_nawb;             /* oldest queued first = the next to be heard */
-        if (r3_wb[i].status != NDSP_WBUF_QUEUED || r3_wb[i].nsamples == 0 || r3_bvol[i] == g_vol) continue;
+        if (r3_wb[i].status != NDSP_WBUF_QUEUED || r3_wb[i].nsamples == 0) continue;
+        /* only the next ~0.4 s: while a slider moves the volume keeps changing, and re-baking the
+         * whole ~2 s queue each time was 12% of an Old 3DS (ring_stats rebake=4491ms in 36 s). The
+         * rest is re-baked as it comes within reach, still before it is heard. */
+        if (++seen > 8) break;
+        if (r3_bvol[i] == g_vol) continue;
         if (done >= max) { left = 1; break; }
         LightLock_Lock(&g_alk);
         if (r3_wb[i].status == NDSP_WBUF_QUEUED) {  /* not started while we looked */
@@ -5000,6 +5102,7 @@ static MoflexResult moflex_play_ring(const char *path) {
     long st_drop = 0; u64 st_starve_ticks = 0, st_starve_t0 = 0; g_st_rdmax = 0; g_st_rdslow = 0;
     g_st_elide = g_st_yqstale = g_st_skipped = 0; g_st_busy = 0;
     g_panel_max = 0; g_upl_max = 0;
+    mb_drop(); g_mb_menu = -1;
     g_t_pfull = g_t_pstrip = g_t_menu = g_t_rebake = g_t_vsave = 0; g_n_pfull = g_n_pstrip = g_n_menu = g_n_vsave = 0;
     /* session totals, written to sdmc:/moflex_player/ring_stats.txt when playback ends */
     long st_v2 = 0, st_v3 = 0, st_vx = 0, st_stut = 0, st_shown = 0, st_decn = 0; long long st_dec = 0, st_dmax = 0;
@@ -5937,6 +6040,7 @@ static MoflexResult moflex_play_ring(const char *path) {
     if (result == MOFLEX_QUIT_BACK && dur_us > 0 && cur_us >= dur_us - 2000000 &&
         autonext_wanted(path)) result = MOFLEX_EOF;
     if (vol_dirty) vol_save();
+    mb_drop();
     /* release panel services (restore backlight first so we never leave the screen dark) */
     if (g_screen_off) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; }
     if (g_lcd_ok) { gspLcdExit(); g_lcd_ok = 0; }

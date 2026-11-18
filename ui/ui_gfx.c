@@ -176,6 +176,8 @@ void theme_save(void) {
  * copy in one shot in ui_present() -- avoids clear->draw flicker on the live fb.
  * Sized for the wider top screen (400x240); bottom uses the first 320 columns. */
 static u16 g_buf[UI_TW * UI_H];
+static int g_cy0 = 0, g_cy1 = UI_H;   /* vertical clip (ui_clip_y) */
+#define CLIPPED_Y(yy) ((yy) < g_cy0 || (yy) >= g_cy1)
 static u16 *g_fb = g_buf;
 static int g_w = UI_W;
 static gfxScreen_t g_screen = GFX_BOTTOM;
@@ -206,12 +208,16 @@ void ui_present(void) {
     gfxFlushBuffers();
 }
 
+void ui_clip_y(int y0, int y1) { g_cy0 = y0 < 0 ? 0 : y0; g_cy1 = y1 > UI_H ? UI_H : y1; }
+void ui_clip_reset(void) { g_cy0 = 0; g_cy1 = UI_H; }
 void ui_px(int x, int y, u16 c) {
-    if ((unsigned)x < (unsigned)g_w && (unsigned)y < UI_H)
+    if ((unsigned)x < (unsigned)g_w && (unsigned)y < UI_H && !CLIPPED_Y(y))
         g_fb[x * UI_H + (UI_H - 1 - y)] = c;      /* rotated framebuffer */
 }
 
+static void fill_rect_fast(int x, int y, int w, int h, u16 c);
 void ui_clear(u16 c) {
+    if (g_cy0 > 0 || g_cy1 < UI_H) { fill_rect_fast(0, 0, g_w, UI_H, c); return; }
     int n = g_w * UI_H;
     for (int i = 0; i < n; i++) g_fb[i] = c;
 }
@@ -222,7 +228,7 @@ void ui_clear(u16 c) {
  * (panel, in-film menus) cost tens of ms on Old 3DS. */
 static void fill_rect_fast(int x, int y, int w, int h, u16 c) {
     int x0 = x < 0 ? 0 : x, x1 = x + w > g_w ? g_w : x + w;
-    int y0 = y < 0 ? 0 : y, y1 = y + h > UI_H ? UI_H : y + h;
+    int y0 = y < g_cy0 ? g_cy0 : y, y1 = y + h > g_cy1 ? g_cy1 : y + h;
     if (x0 >= x1 || y0 >= y1) return;
     int n = y1 - y0;
     for (int i = x0; i < x1; i++) {
@@ -236,6 +242,7 @@ void ui_text(int x, int y, int scale, u16 c, const char *s) {
     while (*s) {
         const char *g = ui_glyph(ui_u8_next(&s));
         for (int row = 0; row < 8; row++) {
+            if (y + row * scale + scale <= g_cy0 || y + row * scale >= g_cy1) continue;
             char bits = g[row];
             for (int col = 0; col < 8; col++)
                 if (bits & (1 << col))
@@ -299,7 +306,7 @@ void ui_pause(int cx, int cy, int size, u16 c) {
 
 /* ---- widget kit ---- */
 void ui_blend_px(int x, int y, u16 c, int a) {
-    if ((unsigned)x >= (unsigned)g_w || (unsigned)y >= UI_H) return;
+    if ((unsigned)x >= (unsigned)g_w || (unsigned)y >= UI_H || CLIPPED_Y(y)) return;
     if (a <= 0) return;
     if (a >= 255) { ui_px(x, y, c); return; }
     u16 *p = &g_fb[x * UI_H + (UI_H - 1 - y)];
@@ -346,7 +353,7 @@ static u16 lerp565(u16 a, u16 b, int t, int tmax) {
  * run written in one loop; only the curved ends are per pixel. Same coverage, same writes, same order
  * of blends per pixel as the per-pixel originals -- verified identical on the host. */
 static void row_put(int x0, int x1, int y, u16 c) {
-    if ((unsigned)y >= UI_H) return;
+    if ((unsigned)y >= UI_H || CLIPPED_Y(y)) return;
     if (x0 < 0) x0 = 0; if (x1 > g_w) x1 = g_w;
     u16 *p = g_fb + (UI_H - 1 - y);
     for (int i = x0; i < x1; i++) p[i * UI_H] = c;
@@ -361,6 +368,7 @@ void ui_fill_round(int x, int y, int w, int h, int r, u16 c) {
     if (r <= 0) { fill_rect_fast(x, y, w, h, c); return; }
     int m0 = r, m1 = w - r, e0 = r < w ? r : w, e1 = m1 > e0 ? m1 : e0;
     for (int j = 0; j < h; j++) {
+        if (CLIPPED_Y(y + j)) continue;
         for (int i = 0; i < e0; i++) cov_px(x + i, y + j, c, round_cov(i, j, w, h, r));
         for (int i = e1; i < w; i++) cov_px(x + i, y + j, c, round_cov(i, j, w, h, r));
         if (m1 > m0) {
@@ -375,6 +383,7 @@ void ui_vgrad_round(int x, int y, int w, int h, int r, u16 top, u16 bot) {
     int rr = r > 0 ? r : 0;
     int m0 = rr, m1 = w - rr, e0 = rr < w ? rr : w, e1 = m1 > e0 ? m1 : e0;
     for (int j = 0; j < h; j++) {
+        if (CLIPPED_Y(y + j)) continue;
         u16 c = lerp565(top, bot, j, h - 1);
         for (int i = 0; i < e0; i++) cov_px(x + i, y + j, c, round_cov(i, j, w, h, r));
         for (int i = e1; i < w; i++) cov_px(x + i, y + j, c, round_cov(i, j, w, h, r));
@@ -402,6 +411,7 @@ void ui_frame_round(int x, int y, int w, int h, int r, u16 c, int thick) {
     int c0 = o0 > n0 ? o0 : n0, c1 = o1 < n1 ? o1 : n1;
     if (c1 < c0) c1 = c0;
     for (int j = 0; j < h; j++) {
+        if (CLIPPED_Y(y + j)) continue;
         for (int i = 0; i < w; i++) {
             if (i == c0 && c1 > c0) {
                 int a = frame_a(c0, j, w, h, r, thick, iw, ih, ir);
@@ -425,6 +435,7 @@ static void glow_round_skip(int x, int y, int w, int h, int r, u16 c, int spread
         int m0 = gr > 0 ? gr : 0, m1 = gr > 0 ? gw - gr : gw;
         for (int j = 0; j < gh; j++) {
             int ay = gy + j, skiprow = (ay >= sy0 && ay < sy1 && sx1 > sx0);
+            if (CLIPPED_Y(ay)) continue;
             for (int i = 0; i < gw; i++) {
                 int ax = gx + i;
                 if (i == m0 && m1 > m0) {               /* middle run: inside or not, decided by the row */
