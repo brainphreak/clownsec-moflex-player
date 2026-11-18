@@ -53,9 +53,15 @@ static void setup(CURL *e, const char *url) {
 }
 
 /* ---- progress bridge ---- */
-typedef struct { dl_progress_cb cb; void *user; curl_off_t resume_off; } Prog;
+typedef struct { dl_progress_cb cb; void *user; curl_off_t resume_off; uint32_t last_d, last_t; } Prog;
+/* the user cancelled (CANCEL / B via the progress callback, or the global abort hook); also gives
+ * the callback a turn while nothing arrives, so the screen -- and HOME -- stay alive */
 static int (*g_abort_cb)(void) = NULL;
 void download_set_abort(int (*abort_cb)(void)) { g_abort_cb = abort_cb; }
+static bool dl_cancelled(Prog *pr) {
+    if (g_abort_cb && g_abort_cb()) return true;
+    return pr && pr->cb && !pr->cb(pr->user, pr->last_d, pr->last_t);
+}
 static int xfer_cb(void *p, curl_off_t dltotal, curl_off_t dlnow, curl_off_t ul, curl_off_t un) {
     (void)ul; (void)un;
     if (g_abort_cb && g_abort_cb()) return 1;   /* user wants to move on -> abort this transfer */
@@ -63,15 +69,16 @@ static int xfer_cb(void *p, curl_off_t dltotal, curl_off_t dlnow, curl_off_t ul,
     curl_off_t off = pr ? pr->resume_off : 0;   /* bytes already on disk (resumed transfers) */
     curl_off_t now = off + dlnow;
     curl_off_t tot = (dltotal > 0) ? off + dltotal : 0;
+    if (pr) { pr->last_d = (uint32_t)now; pr->last_t = (uint32_t)tot; }
     if (pr && pr->cb && !pr->cb(pr->user, (uint32_t)now, (uint32_t)tot)) return 1; /* abort */
     return 0;
 }
 
 /* Sliced retry backoff so CANCEL reacts within ~100ms even between attempts (a stalled
  * transfer used to grind through minutes of timeouts+sleeps looking completely hung). */
-static bool dl_backoff(int attempt) {   /* false = user aborted */
+static bool dl_backoff_pr(int attempt, Prog *pr) {   /* false = user aborted */
     for (int t = (attempt + 1) * 5; t > 0; t--) {
-        if (g_abort_cb && g_abort_cb()) return false;
+        if (dl_cancelled(pr)) return false;   /* CANCEL / B count between tries too */
         svcSleepThread(100 * 1000 * 1000LL);
     }
     return true;
@@ -257,6 +264,26 @@ static void url_enc(const char *in, char *out, size_t cap) {
     out[o] = 0;
 }
 
+/* httpcBeginRequest (connect + TLS + request) has no timeout: against a silent server it sat for a
+ * long time with the screen, CANCEL, B and even HOME dead. It runs on a helper thread now while
+ * the caller keeps checking for a cancel, which httpcCancelConnection turns into an early return. */
+typedef struct { httpcContext *c; volatile int done; Result r; } HfBegin;
+static void hf_begin_thread(void *a) { HfBegin *b = (HfBegin *)a; b->r = httpcBeginRequest(b->c); b->done = 1; }
+#define HF_SLICE_NS (250LL * 1000 * 1000)   /* waits are sliced so a cancel lands within ~1/4 s */
+static int hf_begin(httpcContext *c, Prog *pr) {   /* 0 ok, HF_ABORT, HF_USE_CURL */
+    HfBegin b = { c, 0, 0 };
+    s32 prio = 0x30; svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
+    Thread t = threadCreate(hf_begin_thread, &b, 16 * 1024, prio, -2, false);
+    if (!t) return R_FAILED(httpcBeginRequest(c)) ? HF_USE_CURL : 0;   /* no thread: the old way */
+    int cancelled = 0;
+    while (!b.done) {
+        svcSleepThread(100 * 1000 * 1000LL);
+        if (!cancelled && dl_cancelled(pr)) { cancelled = 1; httpcCancelConnection(c); }
+    }
+    threadJoin(t, U64_MAX); threadFree(t);
+    if (cancelled) return HF_ABORT;
+    return R_FAILED(b.r) ? HF_USE_CURL : 0;
+}
 static int httpc_fetch(const char *url, DlFile *df, Prog *pr) {
     char cur[1024]; url_enc(url, cur, sizeof cur);
     for (int redir = 0; redir < 8; redir++) {
@@ -274,10 +301,16 @@ static int httpc_fetch(const char *url, DlFile *df, Prog *pr) {
         /* Any pre-body failure hands the attempt to curl -- the exact behavior of the proven
          * builds. (Tradeoff, accepted: on a truly dead network curl's DNS wait can run long,
          * but the UI is protected by the bounded 15s stop-wait, and every screen stays free.) */
-        if (R_FAILED(httpcBeginRequest(&c))) { httpcCloseContext(&c); return HF_USE_CURL; }
+        { int br = hf_begin(&c, pr); if (br) { httpcCloseContext(&c); return br; } }
         u32 status = 0;
-        if (R_FAILED(httpcGetResponseStatusCodeTimeout(&c, &status, HF_STALL_NS))) {
-            httpcCloseContext(&c); return HF_USE_CURL;
+        {   Result sr; s64 waited = 0;
+            for (;;) {
+                sr = httpcGetResponseStatusCodeTimeout(&c, &status, HF_SLICE_NS);
+                if (sr != (Result)HTTPC_RESULTCODE_TIMEDOUT) break;
+                if (dl_cancelled(pr)) { httpcCancelConnection(&c); httpcCloseContext(&c); return HF_ABORT; }
+                if ((waited += HF_SLICE_NS) >= HF_STALL_NS) break;
+            }
+            if (R_FAILED(sr)) { httpcCloseContext(&c); return HF_USE_CURL; }
         }
         if (status >= 300 && status < 400) {
             char loc[1024] = "";
@@ -299,15 +332,29 @@ static int httpc_fetch(const char *url, DlFile *df, Prog *pr) {
         if (!buf) { httpcCloseContext(&c); return HF_USE_CURL; }
         u32 got_total = 0;
         int ret = HF_OK;
-        Result r;
+        Result r; s64 stalled = 0;
         do {
-            r = httpcReceiveDataTimeout(&c, buf, HF_CHUNK, HF_STALL_NS);
+            r = httpcReceiveDataTimeout(&c, buf, HF_CHUNK, HF_SLICE_NS);
             int pending = (r == (Result)HTTPC_RESULTCODE_DOWNLOADPENDING);
+            if (r == (Result)HTTPC_RESULTCODE_TIMEDOUT) {   /* nothing for a slice: keep the UI alive */
+                u32 now = 0; httpcGetDownloadSizeState(&c, &now, NULL);
+                u32 chunk = now - got_total;
+                if (chunk && dl_sink(df, buf, chunk) != chunk) { ret = HF_FAIL; break; }
+                if (chunk) { got_total = now; stalled = 0; } else stalled += HF_SLICE_NS;
+                if (pr) { pr->last_d = (uint32_t)(pr->resume_off + got_total);
+                          pr->last_t = want ? (uint32_t)(pr->resume_off + want) : 0; }
+                if (dl_cancelled(pr)) { httpcCancelConnection(&c); ret = HF_ABORT; break; }
+                if (stalled >= HF_STALL_NS) { ret = HF_FAIL; break; }   /* the same 10 s stall limit */
+                continue;
+            }
+            stalled = 0;
             if (R_FAILED(r) && !pending) { ret = HF_FAIL; break; }
             u32 now = 0; httpcGetDownloadSizeState(&c, &now, NULL);
             u32 chunk = now - got_total;                       /* bytes valid in buf this round */
             if (chunk && dl_sink(df, buf, chunk) != chunk) { ret = HF_FAIL; break; }
             got_total = now;
+            if (pr) { pr->last_d = (uint32_t)(pr->resume_off + got_total);
+                      pr->last_t = want ? (uint32_t)(pr->resume_off + want) : 0; }
             if (g_abort_cb && g_abort_cb()) { ret = HF_ABORT; break; }
             if (pr && pr->cb && !pr->cb(pr->user, (uint32_t)(pr->resume_off + got_total),
                                         (uint32_t)(want ? pr->resume_off + want : 0))) { ret = HF_ABORT; break; }
@@ -342,7 +389,7 @@ bool download_to_file(const char *url, const char *dest, dl_progress_cb cb, void
          * (menus hung 1-2 min behind the download when a single write was 256KB). */
         WBuf *wb = wb_open(f);        /* NULL (alloc/thread fail) -> plain direct writes */
         DlFile df = { f, wb, off, 0, 0 };
-        Prog pr = { cb, user, off };
+        Prog pr = { cb, user, off, (uint32_t)off, 0 };
 
         /* Fast path: the http:C sysmodule (TLS off our core). Falls through to curl if it can't. */
         int hr = HF_USE_CURL;
@@ -359,7 +406,7 @@ bool download_to_file(const char *url, const char *dest, dl_progress_cb cb, void
             }
             if (hr == HF_ABORT) return false;            /* user cancelled -> keep .part */
             if (df.range_ignored) remove(part);          /* server can't resume -> start clean */
-            if (!dl_backoff(attempt)) return false;      /* cancel-responsive backoff */
+            if (!dl_backoff_pr(attempt, &pr)) return false;   /* cancel-responsive backoff */
             continue;                                    /* then resume/retry */
         }
 
@@ -392,7 +439,7 @@ bool download_to_file(const char *url, const char *dest, dl_progress_cb cb, void
         }
         if (r == CURLE_ABORTED_BY_CALLBACK) return false;   /* user cancelled -> keep .part */
         if (df.range_ignored) remove(part);                 /* server can't resume -> start clean */
-        if (!dl_backoff(attempt)) return false;             /* cancel-responsive backoff, then retry */
+        if (!dl_backoff_pr(attempt, &pr)) return false;   /* cancel-responsive backoff, then retry */
     }
     return false;   /* give up for now; .part stays for a later Resume / Start-over */
 }

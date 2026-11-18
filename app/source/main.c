@@ -645,6 +645,9 @@ static u64  g_last_prog;
 
 static bool dl_progress(void *u, u32 d, u32 t) {
     (void)u;
+    /* main thread only (the background downloader has dlw_progress): keep HOME / sleep / power
+     * working while a download runs or waits -- the downloader now calls back during stalls too */
+    if (!aptMainLoop()) return false;
     hidScanInput();
     if (hidKeysDown() & KEY_B) return false;   /* cancel */
     if (hidKeysHeld() & KEY_TOUCH) { touchPosition tp; hidTouchRead(&tp);   /* tap CANCEL */
@@ -1884,6 +1887,7 @@ static int catalog_pick_group(const CatEntry *cat, int nc, const char *filt_cat,
  * way out (the transfer only gives up after its 20 s connect / 10 s stall timeouts, and retries) */
 static int s_fetch_cancelled;
 static int fetch_abort_b(void) {
+    if (!aptMainLoop()) { s_fetch_cancelled = 1; return 1; }   /* HOME works while fetching */
     hidScanInput();
     if (hidKeysDown() & KEY_B) s_fetch_cancelled = 1;
     return s_fetch_cancelled;
