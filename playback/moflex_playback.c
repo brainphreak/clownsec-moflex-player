@@ -2674,6 +2674,9 @@ static int g_view_is3d = 1;
  * the menu is exactly what it was. */
 #define VIEW_ACT_FMT 98
 static int g_kit_fmt_row = 0, g_kit_fmt = 0, g_kit_fmt_changed = 0;
+/* the Format being chosen in VIDEO (-1 = none): left/right move it, A (or closing the menu)
+ * applies it -- applying restarts a stream, so each step must not */
+static int g_kit_fmt_pend = -1;
 /* a Big Top live stream (the server encodes the frame shape it is asked for): the ring engine
  * shows the Format row too, and a change re-opens the film in place in the new shape. -1 = none */
 static int g_live_fmt = -1;
@@ -2696,7 +2699,11 @@ static void view_label(int row, char *r, int cap) {
     }
     if (i == VIEW_ACT_FMT) {
         static const char *const F[3] = { "2D", "3D SBS", "3D Half SBS" };
-        snprintf(r, cap, "Format:  %s   (A changes)", F[g_kit_fmt >= 0 && g_kit_fmt <= 2 ? g_kit_fmt : 0]);
+        int f = g_kit_fmt_pend >= 0 ? g_kit_fmt_pend : g_kit_fmt;
+        if (g_kit_fmt_pend >= 0 && g_kit_fmt_pend != g_kit_fmt)
+            snprintf(r, cap, "Format:  < %s >   A applies", F[f >= 0 && f <= 2 ? f : 0]);
+        else
+            snprintf(r, cap, "Format:  < %s >", F[f >= 0 && f <= 2 ? f : 0]);
         return;
     }
     switch (i) {
@@ -2741,7 +2748,11 @@ static void view_render(void) {
 }
 /* One frame of VIEW input. Returns 1 when the screen should close. */
 static int view_input(u32 kd, u32 kh, touchPosition tp) {
-    if (kd & (KEY_B | KEY_SELECT)) return 1;
+    if (kd & (KEY_B | KEY_SELECT)) {
+        if (g_kit_fmt_pend >= 0 && g_kit_fmt_pend != g_kit_fmt) { g_kit_fmt = g_kit_fmt_pend; g_kit_fmt_changed = 1; }
+        g_kit_fmt_pend = -1;   /* a Format chosen but not applied: closing the menu applies it */
+        return 1;
+    }
     if (kd & KEY_DOWN) g_view_sel = (g_view_sel + 1) % VIEW_ROWS;
     if (kd & KEY_UP)   g_view_sel = (g_view_sel + VIEW_ROWS - 1) % VIEW_ROWS;
     int t_side = 0, t_row = (kd & KEY_TOUCH) ? submenu_hit(tp.px, tp.py, VIEW_ROWS, &t_side) : -1;
@@ -2756,10 +2767,17 @@ static int view_input(u32 kd, u32 kh, touchPosition tp) {
     else { rep = (kd & (KEY_LEFT | KEY_RIGHT | KEY_TOUCH)) ? held : 0;
            if (rep) g_view_rep = 0;
            else { g_view_rep++; if (g_view_rep > 8 && g_view_rep % 2 == 0) rep = held; } }
-    if (i == VIEW_ACT_FMT) {   /* A / tap / right: next format; left: previous */
-        int d = (kd & KEY_LEFT) ? -1 : (press || (kd & KEY_RIGHT) ||
-                (t_row >= 0 && t_row == g_view_sel && (kd & KEY_TOUCH))) ? 1 : 0;
-        if (d) { g_kit_fmt = (g_kit_fmt + 3 + d) % 3; g_kit_fmt_changed = 1; }
+    if (i == VIEW_ACT_FMT) {   /* left/right or a tap on a half: choose; A applies */
+        int d = (kd & KEY_LEFT) ? -1 : (kd & KEY_RIGHT) ? 1
+              : (t_row >= 0 && t_row == g_view_sel && (kd & KEY_TOUCH)) ? t_side : 0;
+        if (d) {
+            int f = g_kit_fmt_pend >= 0 ? g_kit_fmt_pend : g_kit_fmt;
+            g_kit_fmt_pend = (f + 3 + d) % 3;
+        }
+        if (press && g_kit_fmt_pend >= 0) {
+            if (g_kit_fmt_pend != g_kit_fmt) { g_kit_fmt = g_kit_fmt_pend; g_kit_fmt_changed = 1; }
+            g_kit_fmt_pend = -1;
+        }
         return 0;
     }
     if (i == VIEW_ACT_HQ) {
@@ -5081,6 +5099,7 @@ static MoflexResult moflex_play_ring(const char *path) {
     g_submenu = 0; g_sub_sel = 0;               /* subtitle menu starts closed */
     g_kit_fmt_row = g_live_fmt >= 0;            /* live stream: VIDEO gets the Format row */
     if (g_kit_fmt_row) { g_kit_fmt = g_live_fmt; g_kit_fmt_changed = 0; }
+    g_kit_fmt_pend = -1;
     g_touch_locked = 0; g_lock_toast = 0; g_backlight_on = 1;   /* touch unlocked, backlight on */
     int64_t rpos = resume_load(path), last_save = 0;
     if (rpos > 3000000 && (dur_us <= 0 || rpos < dur_us - 10000000)) { seek_to_us = rpos; want_seek = 1; last_save = rpos; resume_exact = 1; }
