@@ -94,6 +94,13 @@ int moflex_seek_wait_hook(int poll) {
     if (kd & (KEY_B | KEY_START | KEY_TOUCH | KEY_LEFT | KEY_RIGHT)) { g_seek_cut_kd |= kd; g_seek_cut = 1; return 1; }
     return 0;
 }
+/* diagnostics logs are opt-in: create sdmc:/moflex_player/debug_on.txt to turn them on. Normal use
+ * never writes them -- no SD writes while a film plays, no logs that grow forever. */
+static int dbg_on(void) {
+    static int on = -1;
+    if (on < 0) { FILE *m = fopen("sdmc:/moflex_player/debug_on.txt", "rb"); on = m ? 1 : 0; if (m) fclose(m); }
+    return on;
+}
 static FILE *media_fopen(const char *path) {
     if (g_open_hook) { FILE *f = g_open_hook(path); if (f) return f; }
     return fopen(path, "rb");
@@ -5887,7 +5894,7 @@ static MoflexResult moflex_play_ring(const char *path) {
         if (have_audio && !gated && playing && net_ok && ((s.wr - rd) >= PRIME || (s.audio_pre_full && r3_vqc < 2) || s.done)) {
             gated = 1; ndspChnSetPaused(0, false); r3_apos = 0; }
 
-        if (sd_land_t && !sd_stuck_logged && osGetTime() - sd_land_t > 2000) {
+        if (sd_land_t && !sd_stuck_logged && osGetTime() - sd_land_t > 2000 && dbg_on()) {
             if (st_shown - sd_shown0 < 5) {      /* 2 s after a landing and the picture hasn't moved */
                 int q = 0, pl = 0, dn = 0;
                 for (int i = 0; i < r3_nawb; i++) { if (r3_wb[i].status == NDSP_WBUF_QUEUED) q++;
@@ -5932,7 +5939,7 @@ static MoflexResult moflex_play_ring(const char *path) {
                 r3_av_ready = 1;
             }
             int64_t ae = (have_audio && apos >= 0) ? apos + r3_av_skew : apos;
-            if (sd_pend && have_audio && r3_av_ready && apos >= 0) {
+            if (sd_pend && have_audio && r3_av_ready && apos >= 0 && dbg_on()) {
                 if (!sd_at) sd_at = osGetTime();
                 else if (osGetTime() - sd_at > 3000) {
                     sd_pend = 0;
@@ -6174,7 +6181,7 @@ static MoflexResult moflex_play_ring(const char *path) {
     g_reader_on = 0;
     g_seek_busy = 0; g_seek_cut = 0; g_seek_cut_kd = 0;
     r3_retire(&s);                            /* no conversion may outlive the ring textures */
-    {   /* one line per playback, appended: how the engine actually did on this console + file */
+    if (dbg_on()) {   /* one line per playback, appended: how the engine actually did on this console + file */
         {   /* keep it small: start over past 64 KB (a few hundred playbacks) */
             struct stat sst;
             if (stat("sdmc:/moflex_player/ring_stats.txt", &sst) == 0 && sst.st_size > 64 * 1024) remove("sdmc:/moflex_player/ring_stats.txt");

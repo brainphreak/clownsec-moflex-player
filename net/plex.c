@@ -20,9 +20,17 @@ static int  g_slow = 0;         /* the last request was cut off part-way (too sl
 static void (*g_progress)(int, int) = NULL;
 const char *plex_error(void) { return g_err; }
 
+/* diagnostics logs are opt-in: create sdmc:/moflex_player/debug_on.txt to turn them on. Normal use
+ * never writes them -- no SD writes while a film plays, no logs that grow forever. */
+static int dbg_on(void) {
+    static int on = -1;
+    if (on < 0) { FILE *m = fopen("sdmc:/moflex_player/debug_on.txt", "rb"); on = m ? 1 : 0; if (m) fclose(m); }
+    return on;
+}
 #define PLEX_LOG "sdmc:/moflex_player/plex_log.txt"
 static int g_log_on = 0; static u64 g_log_t0 = 0;
 void plex_log_begin(const char *what) {
+    if (!dbg_on()) return;
     mkdir("sdmc:/moflex_player", 0777);
     FILE *f = fopen(PLEX_LOG, "wb"); if (!f) return;
 #ifdef BUILD_TAG

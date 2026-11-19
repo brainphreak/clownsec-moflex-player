@@ -293,6 +293,58 @@ static int scan_skip_dir(const char *n) {
     return is_hidden_dir(n);
 }
 
+/* "Does this CIA hold a movie?" answers, kept across launches (sdmc:/moflex_player/cia_movies.cache).
+ * Finding out means opening the CIA and reading into it; a folder of games paid that for every file
+ * on every visit. Keyed by path + size, so a replaced file is looked at again. */
+#define CIAC_MAX  256
+#define CIAC_PLEN 240
+#define CIAC_FILE "sdmc:/moflex_player/cia_movies.cache"
+typedef struct { char path[CIAC_PLEN]; long long size; int has; } CiaCacheEnt;
+static CiaCacheEnt *g_ciac = NULL;
+static int g_ciac_n = -1, g_ciac_next = 0, g_ciac_dirty = 0;
+static void ciac_load(void) {
+    g_ciac_n = 0;
+    if (!g_ciac) g_ciac = (CiaCacheEnt *)calloc(CIAC_MAX, sizeof *g_ciac);
+    if (!g_ciac) return;
+    FILE *f = fopen(CIAC_FILE, "r");
+    if (!f) return;
+    char line[CIAC_PLEN + 48];
+    while (g_ciac_n < CIAC_MAX && fgets(line, sizeof line, f)) {
+        long long sz; int has, pos = 0;
+        if (sscanf(line, "%lld %d %n", &sz, &has, &pos) < 2 || !pos) continue;
+        char *pth = line + pos; size_t L = strlen(pth);
+        while (L && (pth[L - 1] == '\n' || pth[L - 1] == '\r')) pth[--L] = 0;
+        if (!L || L >= CIAC_PLEN) continue;
+        CiaCacheEnt *c = &g_ciac[g_ciac_n++];
+        snprintf(c->path, sizeof c->path, "%s", pth); c->size = sz; c->has = !!has;
+    }
+    fclose(f);
+    g_ciac_next = g_ciac_n % CIAC_MAX;
+}
+static void ciac_save(void) {
+    if (!g_ciac_dirty || !g_ciac) return;
+    g_ciac_dirty = 0;
+    mkdir("sdmc:/moflex_player", 0777);
+    FILE *f = fopen(CIAC_FILE, "w");
+    if (!f) return;
+    for (int i = 0; i < g_ciac_n; i++) fprintf(f, "%lld %d %s\n", g_ciac[i].size, g_ciac[i].has, g_ciac[i].path);
+    fclose(f);
+}
+static int cia_movie_cached(const char *full) {
+    struct stat st;
+    if (stat(full, &st)) return 0;                                  /* one stat, for CIAs only */
+    if (g_ciac_n < 0) ciac_load();
+    if (!g_ciac || strlen(full) >= CIAC_PLEN) return cia_has_moflex(full);   /* no room to remember it */
+    for (int i = 0; i < g_ciac_n; i++)
+        if (g_ciac[i].size == (long long)st.st_size && !strcmp(g_ciac[i].path, full)) return g_ciac[i].has;
+    int has = cia_has_moflex(full);
+    int slot = g_ciac_n < CIAC_MAX ? g_ciac_n++ : g_ciac_next;      /* full: overwrite the oldest */
+    g_ciac_next = (slot + 1) % CIAC_MAX;
+    snprintf(g_ciac[slot].path, CIAC_PLEN, "%s", full); g_ciac[slot].size = st.st_size; g_ciac[slot].has = has;
+    g_ciac_dirty = 1;
+    return has;
+}
+
 static void scan(void) {
     nentries = 0;
     DIR *d = opendir(cwd);
@@ -302,12 +354,15 @@ static void scan(void) {
             if (e->d_name[0] == '.' && !s_show_hidden) continue;   /* dotfiles hidden unless revealed */
             char full[PATHLEN + NAMELEN];
             snprintf(full, sizeof(full), "%s%s", cwd, e->d_name);
-            struct stat st;
-            int isdir = (stat(full, &st) == 0) && S_ISDIR(st.st_mode);
+            /* The listing already says file or folder (d_type), as in the library scan. A stat() per
+             * entry -- each one several SD requests -- was most of the time to open a big folder. */
+            int isdir;
+            if (e->d_type != DT_UNKNOWN) isdir = (e->d_type == DT_DIR);
+            else { struct stat st; isdir = (stat(full, &st) == 0) && S_ISDIR(st.st_mode); }
             if (isdir && !s_show_hidden && is_hidden_dir(e->d_name)) continue;   /* system folders */
             if (!isdir && s_filter_movies) {                 /* movies-only view (play, or manage toggle) */
                 if (!is_moflex(e->d_name)) continue;          /* only .moflex / .cia */
-                if (cia_is_cia(e->d_name) && !cia_has_moflex(full)) continue;   /* only movie CIAs */
+                if (cia_is_cia(e->d_name) && !cia_movie_cached(full)) continue;   /* only movie CIAs (remembered) */
             }
             /* else (manage + show-all): list every file so it works as a general download/file tool */
             snprintf(entries[nentries].name, NAMELEN, "%s", e->d_name);
@@ -316,6 +371,7 @@ static void scan(void) {
         }
         closedir(d);
     }
+    ciac_save();                                              /* new CIA answers: one small write */
     qsort(entries, nentries, sizeof(Entry), cmp_entry);
     if (sel >= nentries) sel = nentries ? nentries - 1 : 0;
     scroll = 0;
@@ -6497,11 +6553,15 @@ static void home_draw(int bsel, long long rpos) {
 }
 
 /* ---- WHAT'S NEW: shown once per release note (not per build). Bump WHATSNEW_ID with new notes. ---- */
-#define WHATSNEW_ID   "engine2"
+#define WHATSNEW_ID   "61119-2"
 #define WHATSNEW_SEEN "sdmc:/moflex_player/whatsnew_seen.txt"
 static const char *const k_whatsnew[] = {
-    "2D and 3D moflex are now fully supported on Old 3DS, both local files and streaming from the CLOWNSEC Big Top streaming app.",
-    "A new playback engine on every 3DS: smoother video and steady frame pacing, even in heavy action scenes.",
+    "A new playback engine on every 3DS: smoother video, steady frame pacing, and seeking with a picture preview while you drag.",
+    "Old 3DS: 2D and 3D moflex now play smoothly, from the SD card and streamed from Big Top.",
+    "CLOWNSEC Big Top: stream the movies on your computer to the 3DS. MP4 and MKV work too (an Old 3DS gets them as live moflex).",
+    "Plex: browse and play your Plex server's movies and shows (New 3DS).",
+    "SUPER MOFLEX: up to 8 audio tracks, and other versions of a film (VIDEO > Version), each with its own default audio.",
+    "Faster file browser, quicker menus and volume while playing. Tap the version on the home screen to check for an update.",
     "Found a bug? Report it to bugs@clownsec.com",
 };
 #define WN_CW    37          /* characters per line (8 px font, 12 px margins) */

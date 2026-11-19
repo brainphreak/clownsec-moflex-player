@@ -23,6 +23,13 @@
 #define HF_STALL_MS 20000           /* a block that doesn't arrive in this long: the read fails */
 #define HB_BATCH    8               /* steady read-ahead fetches up to this many blocks per request
                                      * (512 KB): an Old 3DS pays a lot per request */
+/* diagnostics logs are opt-in: create sdmc:/moflex_player/debug_on.txt to turn them on. Normal use
+ * never writes them -- no SD writes while a film plays, no logs that grow forever. */
+static int dbg_on(void) {
+    static int on = -1;
+    if (on < 0) { FILE *m = fopen("sdmc:/moflex_player/debug_on.txt", "rb"); on = m ? 1 : 0; if (m) fclose(m); }
+    return on;
+}
 #define HF_LOG      "sdmc:/moflex_player/bigtop_log.txt"
 
 /* why the last network read gave up: 0 = it didn't, 1 = the viewer held B, 2 = the server went quiet */
@@ -288,7 +295,7 @@ static int hf_close(void *c) {
     if (g_hf_open > 0) g_hf_open--;
     /* one line per opened file: was playback waiting on the network, or not? */
     u64 secs = (osGetTime() - h->t_open) / 1000;
-    if (secs >= 3) {
+    if (secs >= 3 && dbg_on()) {
         FILE *lf = fopen(HF_LOG, "ab");
         if (lf) {
             const char *nm = strrchr(h->url, '/');
