@@ -1086,9 +1086,12 @@ static struct {
     struct { s64 off, len; char lbl[8]; } tvid[TRA_VID_MAX];
     int tvid_n;
     char vid_main[8];
+    /* 'VAU0': each video version's default audio track, main first (1 = track 1 .. 8; 0 = none) */
+    u8 vaud[TRA_VID_MAX + 1]; int vaud_n;
 } g_tra;
 /* alternate video versions (SUPER MOFLEX 'VID1'): the ring engine fills these per file */
 static int g_vid_n = 0, g_vid_sel = 0, g_vid_pend = -1, g_vid_req = 0;
+static int g_vid_switched = 0;              /* the viewer just picked another version: its default audio applies */
 static char g_vid_for[256];                 /* the file g_vid_sel belongs to */
 static void tra_aud_select(int k) {
     if (k < 0 || k >= g_tra.taud_n) return;
@@ -1152,6 +1155,10 @@ static void trailer_probe(FILE *f) {
                 memcpy(g_tra.tvid[k].lbl, l, 7); g_tra.tvid[k].lbl[7] = 0;
                 g_tra.tvid[k].off = p + 16; g_tra.tvid[k].len = (s64)len - 8;
             }
+        }
+        else if (!memcmp(h, "VAU0", 4) && len >= 1) {
+            u8 v[TRA_VID_MAX + 1]; int n = len < sizeof v ? (int)len : (int)sizeof v;
+            if (fread(v, 1, n, f) == (size_t)n) { memcpy(g_tra.vaud, v, n); g_tra.vaud_n = n; }
         }
         else if (!memcmp(h, "VLB0", 4) && len >= 8) {
             u8 l[8];
@@ -5130,6 +5137,13 @@ static MoflexResult moflex_play_ring(const char *path) {
         g_atrk_streams[g_atrk_n++] = -1 - k;    /* -1-k = trailer track k (Audio Track 2, 3, ...) */
     }
     def_pick_audio();     /* no saved track: the viewer's preferred language, when the file has it */
+    /* the builder's default audio for this video version ('VAU0'): on a file's first play and right
+     * after the viewer switches versions -- their own pick in SOUND stays free after that */
+    if ((g_cfg_fresh || g_vid_switched) && g_vid_n > 1 && g_vid_sel < g_tra.vaud_n) {
+        int t = (int)g_tra.vaud[g_vid_sel] - 1;
+        if (t >= 0 && t < g_atrk_n) g_atrk_sel = t;
+    }
+    g_vid_switched = 0;
     def_apply_subs(g_atrk_n > 0 && g_atrk_sel < ATRK_MAX ? g_atrk_lbl[g_atrk_sel] : g_tra.lang_main);
     if (g_atrk_n > 1) {   /* dual audio: honor this movie's saved track (subcfg, loaded above) */
         if (g_atrk_sel < 0 || g_atrk_sel >= g_atrk_n) g_atrk_sel = 0;
@@ -5392,7 +5406,7 @@ static MoflexResult moflex_play_ring(const char *path) {
             if (g_vid_req) {
                 /* Version row in VIDEO: another demux window, possibly another stream layout --
                  * re-open in place, exactly like HQ (resume puts it back where it was) */
-                g_vid_req = 0; subcfg_save(path); resume_save_us(path, cur_us);
+                g_vid_req = 0; g_vid_switched = 1; subcfg_save(path); resume_save_us(path, cur_us);
                 result = MOFLEX_REPLAY; break;
             }
             if (g_hq_req) {
