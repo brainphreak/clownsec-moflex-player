@@ -1067,6 +1067,8 @@ static void subcfg_path(const char *movie, char *out, size_t cap) {
  * Layout: [blocks][sections][u64 payload_off][8B "CSXTRA01"]; section [4cc][u32 len][data]:
  * 'SUB0' = srt bytes, 'AUD0' = u32 rate, u16 chn, u16 samples/pkt, fixed-size ADPCM packets
  * (in-band framing) -> packet k sits at k*pktbytes, time = k*pktsamp/rate: seek is arithmetic. */
+#define TRA_AUD_MAX 7          /* + the in-band track = the 8 the audio menu holds */
+#define TRA_VID_MAX 3
 static struct {
     int present;               /* footer found on this file */
     s64 payload_off;           /* demux window ends here (blocks only) */
@@ -1075,7 +1077,26 @@ static struct {
     u32 aud_rate, aud_pktbytes;
     u16 aud_chn, aud_pktsamp;
     char lang_main[4], lang_alt[4];   /* LNG0 / AUD1 tags ("ENG"/"JPN"); empty = untagged */
+    /* every AUD0/AUD1 section, in file order (Audio Track 2, 3, ...). The aud_* fields above are
+     * the ACTIVE one -- tra_aud_select() copies a track in -- so the reader needs no changes. */
+    struct { s64 off; u32 pkts, rate, pktbytes; u16 chn, pktsamp; char lang[4]; } taud[TRA_AUD_MAX];
+    int taud_n;
+    /* alternate VIDEO versions: 'VID1' = char label[8] + a complete moflex (blocks only), played
+     * as its own demux window. 'VLB0' = char label[8] of the in-band (main) version. */
+    struct { s64 off, len; char lbl[8]; } tvid[TRA_VID_MAX];
+    int tvid_n;
+    char vid_main[8];
 } g_tra;
+/* alternate video versions (SUPER MOFLEX 'VID1'): the ring engine fills these per file */
+static int g_vid_n = 0, g_vid_sel = 0, g_vid_pend = -1, g_vid_req = 0;
+static char g_vid_for[256];                 /* the file g_vid_sel belongs to */
+static void tra_aud_select(int k) {
+    if (k < 0 || k >= g_tra.taud_n) return;
+    g_tra.aud_off = g_tra.taud[k].off; g_tra.aud_pkts = g_tra.taud[k].pkts;
+    g_tra.aud_rate = g_tra.taud[k].rate; g_tra.aud_pktbytes = g_tra.taud[k].pktbytes;
+    g_tra.aud_chn = g_tra.taud[k].chn; g_tra.aud_pktsamp = g_tra.taud[k].pktsamp;
+    memcpy(g_tra.lang_alt, g_tra.taud[k].lang, 4);
+}
 static void trailer_probe(FILE *f) {
     memset(&g_tra, 0, sizeof g_tra);
     if (fseeko(f, -16, SEEK_END)) return;
@@ -1106,25 +1127,39 @@ static void trailer_probe(FILE *f) {
             u8 l[4];
             if (fread(l, 1, 4, f) == 4) { memcpy(g_tra.lang_main, l, 3); g_tra.lang_main[3] = 0; }
         }
-        else if ((!memcmp(h, "AUD0", 4) || !memcmp(h, "AUD1", 4)) && len > 8) {
+        else if ((!memcmp(h, "AUD0", 4) || !memcmp(h, "AUD1", 4)) && len > 8 && g_tra.taud_n < TRA_AUD_MAX) {
             int v1 = !memcmp(h, "AUD1", 4);
             int ah = v1 ? 12 : 8;
             u8 a[12];
             if ((u32)len > (u32)ah && fread(a, 1, ah, f) == (size_t)ah) {
-                g_tra.aud_rate = a[0] | (a[1] << 8) | ((u32)a[2] << 16) | ((u32)a[3] << 24);
-                g_tra.aud_chn = (u16)(a[4] | (a[5] << 8));
-                g_tra.aud_pktsamp = (u16)(a[6] | (a[7] << 8));
-                if (v1) { memcpy(g_tra.lang_alt, a + 8, 3); g_tra.lang_alt[3] = 0; }
-                if (g_tra.aud_rate >= 8000 && g_tra.aud_rate <= 48000 &&
-                    g_tra.aud_chn >= 1 && g_tra.aud_chn <= 2 && g_tra.aud_pktsamp >= 256) {
-                    g_tra.aud_pktbytes = 4u * g_tra.aud_chn + (u32)g_tra.aud_pktsamp * g_tra.aud_chn / 2;
-                    g_tra.aud_off = p + 8 + ah;
-                    g_tra.aud_pkts = (len - ah) / g_tra.aud_pktbytes;
+                u32 rate = a[0] | (a[1] << 8) | ((u32)a[2] << 16) | ((u32)a[3] << 24);
+                u16 chn = (u16)(a[4] | (a[5] << 8)), ps = (u16)(a[6] | (a[7] << 8));
+                if (rate >= 8000 && rate <= 48000 && chn >= 1 && chn <= 2 && ps >= 256) {
+                    int k = g_tra.taud_n++;
+                    g_tra.taud[k].rate = rate; g_tra.taud[k].chn = chn; g_tra.taud[k].pktsamp = ps;
+                    g_tra.taud[k].pktbytes = 4u * chn + (u32)ps * chn / 2;
+                    g_tra.taud[k].off = p + 8 + ah;
+                    g_tra.taud[k].pkts = (len - ah) / g_tra.taud[k].pktbytes;
+                    memset(g_tra.taud[k].lang, 0, 4);
+                    if (v1) memcpy(g_tra.taud[k].lang, a + 8, 3);
                 }
             }
         }
+        else if (!memcmp(h, "VID1", 4) && len > 8 + 64 && g_tra.tvid_n < TRA_VID_MAX) {
+            u8 l[8];
+            if (fread(l, 1, 8, f) == 8) {
+                int k = g_tra.tvid_n++;
+                memcpy(g_tra.tvid[k].lbl, l, 7); g_tra.tvid[k].lbl[7] = 0;
+                g_tra.tvid[k].off = p + 16; g_tra.tvid[k].len = (s64)len - 8;
+            }
+        }
+        else if (!memcmp(h, "VLB0", 4) && len >= 8) {
+            u8 l[8];
+            if (fread(l, 1, 8, f) == 8) { memcpy(g_tra.vid_main, l, 7); g_tra.vid_main[7] = 0; }
+        }
         p += 8 + len;
     }
+    tra_aud_select(0);         /* Audio Track 2 until the viewer picks another */
     g_tra.present = 1;
 }
 
@@ -1248,7 +1283,7 @@ static void def_pick_subtrack(void) {
 /* fresh video: the preferred audio language, once the track labels are known */
 static void def_pick_audio(void) {
     if (!g_cfg_fresh || g_def.alang <= 0) return;
-    for (int t = 0; t < g_atrk_n && t < 4; t++)
+    for (int t = 0; t < g_atrk_n && t < ATRK_MAX; t++)
         if (lang_match(g_atrk_lbl[t], g_def.alang)) { g_atrk_sel = t; return; }
 }
 /* fresh video: subtitles on/off, once both the subtitles and the audio language are settled */
@@ -1276,10 +1311,24 @@ static void subcfg_save(const char *movie) {
      * framing ride in trailing fields, which older builds never read. */
     int coarse = (g_sub_size * SUB_SIZE_OLD + SUB_SIZE_MAX - 1) / SUB_SIZE_MAX;
     if (coarse < 1) coarse = 1;
-    fprintf(f, "1 %d %d %d %d %lld %d %d %d %d %d %d %d %d %d %d\n%s\n", g_sub_on, g_sub_pos > 120, coarse,
+    fprintf(f, "1 %d %d %d %d %lld %d %d %d %d %d %d %d %d %d %d %d\n%s\n", g_sub_on, g_sub_pos > 120, coarse,
             g_sub_depth, (long long)g_sub_off, g_sub_enc, g_atrk_sel, g_sub_font, g_sub_pos,
-            g_sub_size, g_zoom, g_conv, g_ghost, g_sub_tpos, g_sub_link, g_sub_file);
+            g_sub_size, g_zoom, g_conv, g_ghost, g_sub_tpos, g_sub_link,
+            g_vid_for[0] && !strcmp(g_vid_for, movie) ? g_vid_sel : 0, g_sub_file);
     fclose(f);
+}
+/* the saved video version (field 17 of the first line; 0 when absent). Read on its own because the
+ * ring needs it BEFORE it opens the demuxer, while subcfg_load runs later. */
+static int vsel_peek(const char *movie) {
+    char p[256]; subcfg_path(movie, p, sizeof p);
+    FILE *f = fopen(p, "rb"); if (!f) return 0;
+    char line[512]; int v = 0;
+    if (fgets(line, sizeof line, f)) {
+        int n = 0; char *t = strtok(line, " \r\n");
+        while (t) { if (++n == 17) { v = atoi(t); break; } t = strtok(NULL, " \r\n"); }
+    }
+    fclose(f);
+    return v >= 0 && v <= TRA_VID_MAX ? v : 0;
 }
 static void subcfg_load(const char *movie) {
     /* Appearance is PER MOVIE, so start from the defaults every time: without this a film with no
@@ -1302,7 +1351,7 @@ static void subcfg_load(const char *movie) {
     int ver = 0, on = 0, top = 0, size = 1, depth = 0, enc = 0; long long off = 0;
     if (fscanf(f, "%d %d %d %d %d %lld %d", &ver, &on, &top, &size, &depth, &off, &enc) == 7 && ver == 1) {
         int asel = 0, fnt = 0, pos = -1;
-        if (fscanf(f, "%d", &asel) == 1 && asel >= 0 && asel < 4) g_atrk_sel = asel;   /* newer files */
+        if (fscanf(f, "%d", &asel) == 1 && asel >= 0 && asel < ATRK_MAX) g_atrk_sel = asel;   /* newer files */
         /* written since 60803: a file without them predates the choice, so it gets the default
          * rather than whatever the previously-played movie left in the global */
         g_sub_font = (fscanf(f, "%d", &fnt) == 1) ? !!fnt : 0;
@@ -2667,7 +2716,8 @@ static int g_view_is3d = 1;
  * to VIEW and lives here as a trailing row on that console. Kept OUT of the index remap below
  * by giving it its own action code, so the existing rows keep their numbers. */
 #define VIEW_BASE (g_view_is3d ? VIEW_ROWS_3D : VIEW_ROWS_2D)
-#define VIEW_ROWS (VIEW_BASE + (g_hq_avail ? 1 : 0) + g_kit_fmt_row)
+#define VIEW_ROWS (VIEW_BASE + (g_hq_avail ? 1 : 0) + g_kit_fmt_row + (g_vid_n > 1 ? 1 : 0))
+#define VIEW_ACT_VER 97
 #define VIEW_ACT_HQ 99
 /* MP4 only (player_kit): a trailing "3D format" row -- 2D / SBS / Half SBS -- for files whose
  * frame shape cannot say which they are. The moflex engines never set g_kit_fmt_row, so for them
@@ -2683,11 +2733,19 @@ static int g_live_fmt = -1;
 void moflex_live_fmt_set(int fmt) { g_live_fmt = fmt; }
 int  moflex_live_fmt_get(void) { return g_live_fmt; }
 static int g_view_sel = 0, g_view_rep = 0;
-static int g_hq_req = 0;      /* set when the HQ row is toggled; the panel turns it into a replay */
+static int g_hq_req = 0;
+static char g_vid_lbl_buf[8];
+static const char *vid_label(int v) {      /* the name the Version row shows for version v */
+    const char *l = v <= 0 ? g_tra.vid_main : (v - 1 < g_tra.tvid_n ? g_tra.tvid[v - 1].lbl : "");
+    if (l && l[0]) return l;
+    if (v <= 0) return "MAIN";
+    snprintf(g_vid_lbl_buf, sizeof g_vid_lbl_buf, "V%d", v + 1); return g_vid_lbl_buf;
+}      /* set when the HQ row is toggled; the panel turns it into a replay */
 /* display row -> action code (the 2D list skips convergence + ghost) */
 static int view_act(int row) {
     if (g_hq_avail && row == VIEW_BASE) return VIEW_ACT_HQ;
     if (g_kit_fmt_row && row == VIEW_BASE + (g_hq_avail ? 1 : 0)) return VIEW_ACT_FMT;
+    if (g_vid_n > 1 && row == VIEW_BASE + (g_hq_avail ? 1 : 0) + g_kit_fmt_row) return VIEW_ACT_VER;
     if (!g_view_is3d && row >= 2) row += 2;
     return row;
 }
@@ -2695,6 +2753,14 @@ static void view_label(int row, char *r, int cap) {
     int i = view_act(row);
     if (i == VIEW_ACT_HQ) {
         snprintf(r, cap, "HQ colour:  %s   (A toggles)", g_hq ? "24-bit" : "16-bit");
+        return;
+    }
+    if (i == VIEW_ACT_VER) {
+        int v = g_vid_pend >= 0 ? g_vid_pend : g_vid_sel;
+        if (g_vid_pend >= 0 && g_vid_pend != g_vid_sel)
+            snprintf(r, cap, "Version:  < %s >   A applies", vid_label(v));
+        else
+            snprintf(r, cap, "Version:  < %s >  (%d/%d)", vid_label(v), v + 1, g_vid_n);
         return;
     }
     if (i == VIEW_ACT_FMT) {
@@ -2751,6 +2817,8 @@ static int view_input(u32 kd, u32 kh, touchPosition tp) {
     if (kd & (KEY_B | KEY_SELECT)) {
         if (g_kit_fmt_pend >= 0 && g_kit_fmt_pend != g_kit_fmt) { g_kit_fmt = g_kit_fmt_pend; g_kit_fmt_changed = 1; }
         g_kit_fmt_pend = -1;   /* a Format chosen but not applied: closing the menu applies it */
+        if (g_vid_pend >= 0 && g_vid_pend != g_vid_sel) { g_vid_sel = g_vid_pend; g_vid_req = 1; }
+        g_vid_pend = -1;       /* same for a Version */
         return 1;
     }
     if (kd & KEY_DOWN) g_view_sel = (g_view_sel + 1) % VIEW_ROWS;
@@ -2777,6 +2845,19 @@ static int view_input(u32 kd, u32 kh, touchPosition tp) {
         if (press && g_kit_fmt_pend >= 0) {
             if (g_kit_fmt_pend != g_kit_fmt) { g_kit_fmt = g_kit_fmt_pend; g_kit_fmt_changed = 1; }
             g_kit_fmt_pend = -1;
+        }
+        return 0;
+    }
+    if (i == VIEW_ACT_VER) {   /* left/right or a tap on a half: choose; A applies (it re-opens the film) */
+        int d = (kd & KEY_LEFT) ? -1 : (kd & KEY_RIGHT) ? 1
+              : (t_row >= 0 && t_row == g_view_sel && (kd & KEY_TOUCH)) ? t_side : 0;
+        if (d && g_vid_n > 1) {
+            int v = g_vid_pend >= 0 ? g_vid_pend : g_vid_sel;
+            g_vid_pend = (v + g_vid_n + d) % g_vid_n;
+        }
+        if (press && g_vid_pend >= 0) {
+            if (g_vid_pend != g_vid_sel) { g_vid_sel = g_vid_pend; g_vid_req = 1; g_vid_pend = -1; return 1; }
+            g_vid_pend = -1;
         }
         return 0;
     }
@@ -4845,9 +4926,21 @@ static MoflexResult moflex_play_ring(const char *path) {
     FILE *f = media_fopen(path);
     if (!f) return MOFLEX_ERROR;
     trailer_probe(f);
+    /* video version: the in-band one, or an alternate stored in the trailer (VID1). The choice
+     * survives the in-place re-open a switch does (same path), and is saved per movie. */
+    if (strcmp(g_vid_for, path)) { snprintf(g_vid_for, sizeof g_vid_for, "%s", path); g_vid_sel = vsel_peek(path); }
+    g_vid_n = g_tra.present && g_tra.tvid_n > 0 ? 1 + g_tra.tvid_n : 0;
+    if (g_vid_sel < 0 || g_vid_sel >= (g_vid_n > 0 ? g_vid_n : 1)) g_vid_sel = 0;
+    g_vid_pend = -1; g_vid_req = 0;
+    s64 vwin_base = 0, vwin_size = g_tra.payload_off;
+    if (g_vid_sel > 0) { vwin_base = g_tra.tvid[g_vid_sel - 1].off; vwin_size = g_tra.tvid[g_vid_sel - 1].len; }
     MfxDemux m;
-    int mo = g_tra.present ? mfx_open_window(&m, f, 0, g_tra.payload_off)
+    int mo = g_tra.present ? mfx_open_window(&m, f, vwin_base, vwin_size)
                            : mfx_open_auto(&m, f, path);
+    if (mo != 0 && g_vid_sel > 0) {      /* a broken alternate: fall back to the main version */
+        g_vid_sel = 0; vwin_base = 0; vwin_size = g_tra.payload_off;
+        mo = mfx_open_window(&m, f, vwin_base, vwin_size);
+    }
     if (mo != 0) { fclose(f); return MOFLEX_ERROR; }
     int vi = -1, ai = -1;
     memset(g_atrk_name, 0, sizeof g_atrk_name); g_kstrk_n = 0;
@@ -4856,7 +4949,7 @@ static MoflexResult moflex_play_ring(const char *path) {
         if (m.streams[i].media_type == MFX_TYPE_VIDEO && vi < 0) vi = i;
         if (m.streams[i].media_type == MFX_TYPE_AUDIO) {
             if (ai < 0) ai = i;
-            if (g_atrk_n < 4) g_atrk_streams[g_atrk_n++] = i;
+            if (g_atrk_n < ATRK_MAX) g_atrk_streams[g_atrk_n++] = i;
         }
     }
     if (vi < 0) { mfx_close(&m); fclose(f); return MOFLEX_ERROR; }
@@ -4866,7 +4959,7 @@ static MoflexResult moflex_play_ring(const char *path) {
     if (!g_tra.present) embsub_scan(&m);   /* consumes head packets -> reopen for a clean start */
     else g_emb_sub_found = 0;
     mfx_close(&m);
-    mo = g_tra.present ? mfx_open_window(&m, f, 0, g_tra.payload_off)
+    mo = g_tra.present ? mfx_open_window(&m, f, vwin_base, vwin_size)
                        : mfx_open_auto(&m, f, path);
     if (mo != 0) { fclose(f); return MOFLEX_ERROR; }
     int is3d = mfx_detect_stereo(&m);
@@ -5028,20 +5121,23 @@ static MoflexResult moflex_play_ring(const char *path) {
         mobi_close(&ctx); free(ctx.priv_data); mfx_close(&m); fclose(f);
         return MOFLEX_FALLBACK;
     }
-    for (int t = 0; t < g_atrk_n && t < 4; t++) snprintf(g_atrk_lbl[t], 4, "A%d", t + 1);
+    for (int t = 0; t < g_atrk_n && t < ATRK_MAX; t++) snprintf(g_atrk_lbl[t], 4, "A%d", t + 1);
     if (g_atrk_n > 0 && g_tra.lang_main[0]) snprintf(g_atrk_lbl[0], 4, "%s", g_tra.lang_main);
-    if (g_tra.present && g_tra.aud_pkts > 0 && g_atrk_n < 4) {
-        snprintf(g_atrk_lbl[g_atrk_n], 4, "%s", g_tra.lang_alt[0] ? g_tra.lang_alt : "A2");
-        g_atrk_streams[g_atrk_n++] = -1;    /* -1 = the trailer source (Audio Track N) */
+    for (int k = 0; g_tra.present && k < g_tra.taud_n && g_atrk_n < ATRK_MAX; k++) {
+        if (g_tra.taud[k].pkts == 0) continue;
+        if (g_tra.taud[k].lang[0]) snprintf(g_atrk_lbl[g_atrk_n], 4, "%s", g_tra.taud[k].lang);
+        else snprintf(g_atrk_lbl[g_atrk_n], 4, "A%d", g_atrk_n + 1);
+        g_atrk_streams[g_atrk_n++] = -1 - k;    /* -1-k = trailer track k (Audio Track 2, 3, ...) */
     }
     def_pick_audio();     /* no saved track: the viewer's preferred language, when the file has it */
-    def_apply_subs(g_atrk_n > 0 && g_atrk_sel < 4 ? g_atrk_lbl[g_atrk_sel] : g_tra.lang_main);
+    def_apply_subs(g_atrk_n > 0 && g_atrk_sel < ATRK_MAX ? g_atrk_lbl[g_atrk_sel] : g_tra.lang_main);
     if (g_atrk_n > 1) {   /* dual audio: honor this movie's saved track (subcfg, loaded above) */
         if (g_atrk_sel < 0 || g_atrk_sel >= g_atrk_n) g_atrk_sel = 0;
         if (g_atrk_streams[g_atrk_sel] >= 0) {
             ai = g_atrk_streams[g_atrk_sel];
             arate = m.streams[ai].sample_rate; chn = m.streams[ai].channels;
         } else {                            /* trailer track selected: audio reads from the tail */
+            tra_aud_select(-1 - g_atrk_streams[g_atrk_sel]);
             arate = (int)g_tra.aud_rate; chn = g_tra.aud_chn;
             have_audio = 1;
         }
@@ -5293,6 +5389,12 @@ static MoflexResult moflex_play_ring(const char *path) {
                 g_sub_redraw = 1;
                 if (!playing || !g_submenu || g_submenu != sm_was) dirty = 1;   /* paused / opened / closed: now */
             }
+            if (g_vid_req) {
+                /* Version row in VIDEO: another demux window, possibly another stream layout --
+                 * re-open in place, exactly like HQ (resume puts it back where it was) */
+                g_vid_req = 0; subcfg_save(path); resume_save_us(path, cur_us);
+                result = MOFLEX_REPLAY; break;
+            }
             if (g_hq_req) {
                 /* HQ row in VIEW: the ring's texture format is fixed at init, so the film has to
                  * be re-opened for a colour-depth change to take -- resume puts it back in place. */
@@ -5421,9 +5523,10 @@ static MoflexResult moflex_play_ring(const char *path) {
                 int newsi = g_atrk_streams[g_atrk_sel];
                 int to_tr = (newsi < 0);              /* < 0 = the CSXTRA trailer's own track */
                 int nrate = 0, nchn = 0, ok = 1;
+                int tk = to_tr ? -1 - newsi : -1;     /* which trailer track */
                 if (to_tr) {
-                    if (g_tra.present && g_tra.aud_pkts > 0 && g_tra.aud_rate)
-                        { nrate = (int)g_tra.aud_rate; nchn = (int)g_tra.aud_chn; }
+                    if (g_tra.present && tk < g_tra.taud_n && g_tra.taud[tk].pkts > 0 && g_tra.taud[tk].rate)
+                        { nrate = (int)g_tra.taud[tk].rate; nchn = (int)g_tra.taud[tk].chn; }
                     else ok = 0;
                     if (ok && !s.trf) {               /* first crossing needs its private handle */
                         s.trf = media_fopen(path);
@@ -5436,6 +5539,7 @@ static MoflexResult moflex_play_ring(const char *path) {
                     subcfg_save(path); result = MOFLEX_REPLAY; break;
                 }
                 WORKER_LOCK();
+                if (to_tr) tra_aud_select(tk);        /* the reader reads aud_*: swap it under the lock */
                 s.tr_active = to_tr;
                 s.aidx = to_tr ? -2 : newsi;          /* -2 deliberately matches no in-band stream */
                 s.audio_pre_full = 0;                 /* the old track's gate must not stick */
