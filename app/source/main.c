@@ -23,6 +23,7 @@
 #include "poster.h"
 #include "movieinfo.h"
 #include "trailer.h"
+#include "epmeta.h"
 #include "unzip.h"
 #include "cia_moflex.h"
 #include "ui_gfx.h"
@@ -2302,6 +2303,21 @@ static void ep_show_prefix(const char *fname, char *out, size_t cap) {
     if (L >= cap) L = cap - 1;
     memcpy(out, fname, L); out[L] = 0;
 }
+/* What an episode file is -- show, season, episode, title: the file's own info first (Studio 1.7+
+ * stores it), the file name for whatever it leaves out. A file that once crashed a scan is never
+ * opened: its name has to do. */
+static int scan_skipped(const char *path);
+static int ep_meta(const char *full, EpMeta *m) {
+    if (scan_skipped(full)) return epmeta_from_name(full, m);
+    return epmeta_get(full, m);
+}
+static int ep_meta_in(const char *dir, const char *fname, EpMeta *m) {
+    char full[PATHLEN + NAMELEN];
+    size_t L = strlen(dir);
+    snprintf(full, sizeof full, "%s%s%s", dir, (L && dir[L - 1] == '/') ? "" : "/", fname);
+    return ep_meta(full, m);
+}
+
 /* Add ONE show entry. name may be NULL (derive from the folder). url may be a real folder OR a
  * virtual "<folder>/<Show Name>" key when several shows share one folder. */
 static void lib_add_show_named(const char *urlpath, const char *name, const CatEntry *src) {
@@ -2316,7 +2332,7 @@ static void lib_add_show_named(const char *urlpath, const char *name, const CatE
     if (name && name[0]) snprintf(newname, sizeof newname, "%s", name);
     else show_name_from_dir(url, newname, sizeof newname);
     for (int i = 0; i < g_lib_n; i++)
-        if (g_lib[i].is_zip == 2 && !strcasecmp(g_lib[i].name, newname)) return;
+        if (g_lib[i].is_zip == 2 && (!strcasecmp(g_lib[i].name, newname) || epmeta_same_show(g_lib[i].name, newname))) return;
     CatEntry *c = &g_lib[g_lib_n];
     if (src) *c = *src;
     else { memset(c, 0, sizeof *c); movieinfo_load(url, c); }
@@ -2341,11 +2357,12 @@ static void lib_add_shows_in_dir(const char *dir, const CatEntry *src) {
     if (!d) return;
     struct dirent *e;
     while ((e = readdir(d))) {
-        if (e->d_name[0] == '.' || !is_moflex(e->d_name) || !has_episode_tag(e->d_name)) continue;
-        char pfx[96]; ep_show_prefix(e->d_name, pfx, sizeof pfx);
+        if (e->d_name[0] == '.' || !is_moflex(e->d_name)) continue;
+        EpMeta em; if (!ep_meta_in(dir, e->d_name, &em)) continue;
+        const char *pfx = em.show;
         if (!pfx[0]) continue;
         int found = 0;
-        for (int i = 0; i < np && !found; i++) if (!strcasecmp(pref[i], pfx)) found = 1;
+        for (int i = 0; i < np && !found; i++) if (epmeta_same_show(pref[i], pfx)) found = 1;
         if (!found && np < 24) snprintf(pref[np++], sizeof pref[0], "%s", pfx);
     }
     closedir(d);
@@ -2361,6 +2378,7 @@ static void lib_add_shows_in_dir(const char *dir, const CatEntry *src) {
 static int epname_cmp(const void *a, const void *b) { return strcasecmp((const char *)a, (const char *)b); }
 #define EP_MAX 100
 static char s_epfile[EP_MAX][PATHLEN + NAMELEN];   /* full episode paths (may span season folders) */
+static EpMeta s_epm[EP_MAX];                       /* what each one is (for order + labels) */
 /* Tolerant collector: EVERY .moflex in the folder, no SxxEyy requirement. Last-resort fallback so
  * a show whose files are named "Show - 01.moflex" (miniseries without tags) still lists episodes
  * (name order; the picker labels fall back to the filename when there is no tag). */
@@ -2370,7 +2388,8 @@ static void ep_collect_dir_any(const char *dirpath, int *n) {
     struct dirent *e;
     while ((e = readdir(d)) && *n < EP_MAX) {
         if (e->d_name[0] == '.' || !is_moflex(e->d_name)) continue;
-        snprintf(s_epfile[*n], sizeof s_epfile[0], "%s/%s", dirpath, e->d_name); (*n)++;
+        snprintf(s_epfile[*n], sizeof s_epfile[0], "%s/%s", dirpath, e->d_name);
+        ep_meta(s_epfile[*n], &s_epm[*n]); (*n)++;
     }
     closedir(d);
 }
@@ -2379,12 +2398,11 @@ static void ep_collect_dir_named(const char *dirpath, const char *showname, int 
     if (!d) return;
     struct dirent *e;
     while ((e = readdir(d)) && *n < EP_MAX) {
-        if (e->d_name[0] == '.' || !is_moflex(e->d_name) || !has_episode_tag(e->d_name)) continue;
-        if (showname && showname[0]) {   /* only this show's episodes (flat multi-show folders) */
-            char pfx[96]; ep_show_prefix(e->d_name, pfx, sizeof pfx);
-            if (strcasecmp(pfx, showname)) continue;
-        }
-        snprintf(s_epfile[*n], sizeof s_epfile[0], "%s/%s", dirpath, e->d_name); (*n)++;
+        if (e->d_name[0] == '.' || !is_moflex(e->d_name)) continue;
+        EpMeta em; if (!ep_meta_in(dirpath, e->d_name, &em)) continue;
+        if (showname && showname[0] && !epmeta_same_show(em.show, showname)) continue;   /* only this show's (flat multi-show folders) */
+        snprintf(s_epfile[*n], sizeof s_epfile[0], "%s/%s", dirpath, e->d_name);
+        s_epm[*n] = em; (*n)++;
     }
     closedir(d);
 }
@@ -2426,7 +2444,17 @@ static int show_collect_eps(const char *showname, const char *url) {
         size_t L = strlen(pdir); while (L > 1 && pdir[L - 1] == '/') pdir[--L] = 0;
         ep_collect_dir_named(pdir, showname, &n);
     }
-    if (n) qsort(s_epfile, n, sizeof s_epfile[0], epname_cmp);   /* SxxEyy sorts into watch order */
+    /* watch order: season, then episode (episode 0 before 1; season 0, the specials, last); the
+     * file name breaks ties and orders files that carry no numbers at all */
+    for (int i = 1; i < n; i++)
+        for (int j = i; j > 0; j--) {
+            int c = (s_epm[j - 1].is_ep && s_epm[j].is_ep) ? epmeta_order(&s_epm[j - 1], &s_epm[j]) : 0;
+            if (c == 0) c = epname_cmp(s_epfile[j - 1], s_epfile[j]);
+            if (c <= 0) break;
+            static char tp[PATHLEN + NAMELEN]; EpMeta tm;
+            memcpy(tp, s_epfile[j], sizeof tp); memcpy(s_epfile[j], s_epfile[j - 1], sizeof tp); memcpy(s_epfile[j - 1], tp, sizeof tp);
+            tm = s_epm[j]; s_epm[j] = s_epm[j - 1]; s_epm[j - 1] = tm;
+        }
     return n;
 }
 static int show_first_episode(const CatEntry *e, char *out, int cap) {
@@ -2443,11 +2471,12 @@ static int show_first_episode(const CatEntry *e, char *out, int cap) {
  * which is how S01e13 rolls into S02e01. */
 static int next_episode_path(const char *path, char *out, int cap) {
     const char *sl = strrchr(path, '/');
-    if (!sl || !has_episode_tag(sl + 1)) return 0;          /* a film has no "next" */
+    EpMeta em;
+    if (!sl || !ep_meta(path, &em)) return 0;               /* a film has no "next" */
     char dir[PATHLEN + NAMELEN];
     snprintf(dir, sizeof dir, "%.*s", (int)(sl - path), path);
     char show[96];
-    ep_show_prefix(sl + 1, show, sizeof show);
+    snprintf(show, sizeof show, "%s", em.show);
     /* Always a real string: show_collect_eps dereferences showname when it compares sibling
      * season folders, so NULL there is a crash. Empty is fine -- it just means "no prefix
      * filter", which is the right behaviour for a file named plainly "S01e01 - Title". */
@@ -2465,6 +2494,8 @@ static int next_episode_path(const char *path, char *out, int cap) {
 /* Label for the up-next panel: the episode's own filename, minus the show prefix and the
  * extension, so it reads "S02e07 - Pride" rather than repeating the show name every time. */
 static void next_episode_label(const char *path, char *out, size_t cap) {
+    EpMeta em;
+    if (ep_meta(path, &em)) { epmeta_label(&em, out, cap); return; }   /* "S02e07 - Pride" */
     const char *sl = strrchr(path, '/');
     const char *fn = sl ? sl + 1 : path;
     char show[96];
@@ -2486,12 +2517,9 @@ static void next_episode_label(const char *path, char *out, size_t cap) {
  * nobody is watching. A visible countdown you can stop costs one screen and no guessing. */
 /* Season/episode numbers out of a SxxEyy tag. 1 = parsed. */
 static int ep_numbers(const char *path, int *season, int *ep) {
-    const char *sl = strrchr(path, '/');
-    const char *t = ep_tag_at(sl ? sl + 1 : path);
-    if (!t) return 0;
-    *season = atoi(t + 1);
-    const char *q = t + 1; while (isdigit((unsigned char)*q)) q++;
-    *ep = atoi(q + 1);
+    EpMeta em;
+    if (!ep_meta(path, &em)) return 0;
+    *season = em.season; *ep = em.episode;
     return 1;
 }
 
@@ -2606,10 +2634,12 @@ static int show_pick_episode(const char *showname, const char *url, char *out, s
     int n = show_collect_eps(showname, url);
     if (n == 0) return -1;
     for (int i = 0; i < n; i++) {
-        const char *b = strrchr(s_epfile[i], '/'); b = b ? b + 1 : s_epfile[i];
-        const char *tag = ep_tag_at(b);
-        char nm[64]; snprintf(nm, sizeof nm, "%s", tag ? tag : b);
-        strip_ext(nm); strip_3d_tags(nm);
+        char nm[160];
+        if (s_epm[i].is_ep) epmeta_label(&s_epm[i], nm, sizeof nm);   /* "S04e00 - Title" */
+        else {
+            const char *b = strrchr(s_epfile[i], '/'); b = b ? b + 1 : s_epfile[i];
+            snprintf(nm, sizeof nm, "%s", b); strip_ext(nm); strip_3d_tags(nm);
+        }
         snprintf(eps[i], 64, "%.63s", nm);
         epst[i] = (signed char)ep_status(s_epfile[i]);
     }
@@ -2763,7 +2793,8 @@ static void lib_scan_dir(const char *dir, int depth) {
             snprintf(sub, sizeof sub, "%s/", full);
             lib_scan_dir(sub, depth + 1);
         } else if (is_moflex(e->d_name)) {
-            if (has_episode_tag(e->d_name)) {   /* TV episode -> grouped into a SHOW entry (even a
+            EpMeta em;
+            if (ep_meta(full, &em)) {           /* TV episode -> grouped into a SHOW entry (even a
                                                 * single loose episode at SD root gets its own show) */
                 if (!shows_done) { lib_add_shows_in_dir(dir, NULL); shows_done = 1; }
                 continue;
@@ -2880,6 +2911,7 @@ static void lib_rescan(void) {
     ui_text_center(UI_W / 2, 128, 1, UI_DIM, "searching the SD card for movies"); ui_present();
     gfxFlushBuffers(); gfxSwapBuffers();
     scan_begin();                                 /* crash recovery: see scan_guard() */
+    epmeta_cache_clear();                         /* files may have been re-saved since */
     s_scan_btn = 1;
     lib_scan_dir("sdmc:/", 0);
     s_scan_btn = 0;
@@ -3049,6 +3081,17 @@ __attribute__((unused)) static void lib_detect_dir(const char *dir, int depth) {
                     char vurl[PATHLEN + NAMELEN];
                     snprintf(vurl, sizeof vurl, "%s/%s", parent, pfx);
                     if (dt_covered(vurl)) continue;
+                    /* libraries since 61121 key a show by its tidied name ("Show (2009)") or the
+                     * name the episode's own info gives -- the file is opened only when neither
+                     * name is known, so the startup check stays a directory walk */
+                    EpMeta nm; epmeta_from_name(e->d_name, &nm);
+                    snprintf(vurl, sizeof vurl, "%s/%s", parent, nm.show);
+                    if (nm.show[0] && dt_covered(vurl)) continue;
+                    EpMeta fm;
+                    if (!scan_skipped(full) && epmeta_get(full, &fm) && fm.show[0]) {
+                        snprintf(vurl, sizeof vurl, "%s/%s", parent, fm.show);
+                        if (dt_covered(vurl)) continue;
+                    }
                 }
                 int dup = 0;                                 /* count each new show folder once */
                 int tracked = s_new_n < NEWLIST_MAX ? s_new_n : NEWLIST_MAX;
@@ -3060,6 +3103,15 @@ __attribute__((unused)) static void lib_detect_dir(const char *dir, int depth) {
             }
             if (dt_covered(full)) continue;                                /* cheap hash check first */
             if (scan_skipped(full)) continue;                              /* crashed a scan: never open */
+            if (depth > 0) {                                               /* an episode its own info names
+                                                                              (renamed, no SxxEyy) in a
+                                                                              show folder we list: not new */
+                char parent[PATHLEN + NAMELEN];
+                snprintf(parent, sizeof parent, "%s", dir);
+                size_t pl = strlen(parent); while (pl > 1 && parent[pl - 1] == '/') parent[--pl] = 0;
+                EpMeta fm;
+                if (dt_covered(parent) && epmeta_get(full, &fm)) continue;
+            }
             if (cia_is_cia(e->d_name) && !cia_has_moflex(full)) continue;  /* open only NEW CIAs */
             if (s_newlist && s_new_n < NEWLIST_MAX) snprintf(s_newlist[s_new_n], sizeof s_newlist[0], "%s", full);
             s_new_n++;
@@ -3076,6 +3128,11 @@ static void lib_add_new(void) {
         struct stat stq;
         if (!stat(full, &stq) && S_ISDIR(stq.st_mode)) { lib_add_shows_in_dir(full, NULL); continue; }   /* new show folder(s) */
         const char *b = strrchr(full, '/'); b = b ? b + 1 : full;
+        { EpMeta em;                                      /* an episode (its own info says so): its show */
+          if (ep_meta(full, &em)) {
+              char dir[PATHLEN + NAMELEN]; snprintf(dir, sizeof dir, "%.*s", (int)(b - full), full);
+              lib_add_shows_in_dir(dir, NULL); continue;
+          } }
         CatEntry *c = &g_lib[g_lib_n];
         movieinfo_load(full, c);                          /* .nfo if it already has one */
         snprintf(c->url, sizeof c->url, "%s", full);
@@ -3199,7 +3256,8 @@ static void lib_add_extracted_dir(const char *dir, const CatEntry *src, int dept
         if (stat(full, &st)) continue;
         if (S_ISDIR(st.st_mode)) lib_add_extracted_dir(full, src, depth + 1);
         else if (is_moflex(e->d_name)) {
-            if (has_episode_tag(e->d_name)) eps++;
+            EpMeta em;
+            if (ep_meta(full, &em)) eps++;
             else if (src) lib_add_downloaded(full, src);
             else { CatEntry blank; memset(&blank, 0, sizeof blank); lib_add_downloaded(full, &blank); }
         }
@@ -7380,6 +7438,41 @@ static int play_and_handle(const char *path, int origin) {
  * so it never strands the console in the HOME Menu. */
 extern u64 g_lab_deadline;
 extern int g_lab_noq, g_lab_noflush, g_lab_noov;
+/* libtest=<folder>: the REAL library code on a folder -- which files are episodes, how they group
+ * into shows, their order, labels and the next-episode chain -- written to sdmc:/lab/last.log */
+static void lab_libtest(const char *dir) {
+    FILE *o = fopen("sdmc:/lab/last.log", "w");
+    if (!o) return;
+    if (!g_lib) g_lib = (CatEntry *)malloc(sizeof(CatEntry) * LIB_MAX);
+    g_lib_n = 0;
+    epmeta_cache_clear();
+    u64 t0 = osGetTime();
+    lib_scan_dir(dir, 1);
+    fprintf(o, "LIBTEST %s: %d entries in %llu ms\n", dir, g_lib_n, (unsigned long long)(osGetTime() - t0));
+    for (int i = 0; i < g_lib_n; i++) {
+        CatEntry *c = &g_lib[i];
+        fprintf(o, "[%s] name=\"%s\" url=%s category=%s\n", c->is_zip == 2 ? "SHOW" : "FILM", c->name, c->url, c->category);
+        if (c->is_zip != 2) continue;
+        int n = show_collect_eps(c->name, c->url);
+        for (int k = 0; k < n; k++) {
+            char lb[160]; next_episode_label(s_epfile[k], lb, sizeof lb);
+            const char *b = strrchr(s_epfile[k], '/');
+            fprintf(o, "   %d. %-40s <- %s\n", k + 1, lb, b ? b + 1 : s_epfile[k]);
+        }
+        if (n > 0) {
+            char cur[PATHLEN + NAMELEN], nx[PATHLEN + NAMELEN];
+            snprintf(cur, sizeof cur, "%s", s_epfile[0]);
+            fprintf(o, "   next chain:");
+            for (int g = 0; g < 12 && next_episode_path(cur, nx, sizeof nx); g++) {
+                const char *b = strrchr(nx, '/'); fprintf(o, " -> %s", b ? b + 1 : nx);
+                snprintf(cur, sizeof cur, "%s", nx);
+            }
+            fprintf(o, "\n");
+        }
+    }
+    fclose(o);
+    aptSetChainloader(0x000400000F8A4000ULL, MEDIATYPE_SD);
+}
 static void lab_autoplay(void) {
     char prm[1024] = "", file[512] = "sdmc:/lab/office_head.moflex";
     int start = 0, secs = 60;
@@ -7392,6 +7485,7 @@ static void lab_autoplay(void) {
         else if (!strncmp(l, "noq=", 4)) g_lab_noq = atoi(l + 4);
         else if (!strncmp(l, "noflush=", 8)) g_lab_noflush = atoi(l + 8);
         else if (!strncmp(l, "noov=", 5)) g_lab_noov = atoi(l + 5);
+        else if (!strncmp(l, "libtest=", 8)) { lab_libtest(l + 8); return; }
     }
     if (secs < 5) secs = 5;
     if (secs > 600) secs = 600;
