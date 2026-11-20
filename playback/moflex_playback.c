@@ -96,7 +96,13 @@ int moflex_seek_wait_hook(int poll) {
 }
 /* diagnostics logs are opt-in: create sdmc:/moflex_player/debug_on.txt to turn them on. Normal use
  * never writes them -- no SD writes while a film plays, no logs that grow forever. */
+#ifdef LAB_AUTOPLAY
+u64 g_lab_deadline;   /* lab build: playback stops on its own at this osGetTime() */
+#endif
 static int dbg_on(void) {
+#ifdef LAB_AUTOPLAY
+    return 1;          /* lab build: always write ring_stats.txt */
+#endif
     static int on = -1;
     if (on < 0) { FILE *m = fopen("sdmc:/moflex_player/debug_on.txt", "rb"); on = m ? 1 : 0; if (m) fclose(m); }
     return on;
@@ -2364,7 +2370,19 @@ static void g_y2r_exit(void) {
     y2rExit();                                /* (DriverFinalize happens inside) */
     g_y2r_up = 0;
 }
+#ifdef LAB_AUTOPLAY
+/* lab timers (ticks): Y2R start (input flush + setup), wait for the hardware, texture flush after;
+ * queue conversion total; experiment switches read from sdmc:/lab/params.txt by main.c */
+volatile u64 g_lt_ystart, g_lt_ywait, g_lt_yflush, g_lt_conv, g_lt_n;
+int g_lab_noq, g_lab_noflush;
+#define LT0 u64 _lt0 = svcGetSystemTick();
+#define LT(v) v += svcGetSystemTick() - _lt0;
+#else
+#define LT0
+#define LT(v)
+#endif
 static void g_y2r_start(AVFrame *o, C3D_Tex *tex, int W, int H) {
+    LT0
     if (g_pq_dirty) { g_pq_dirty = 0; pq_apply(); }   /* between conversions: never mid-transfer */
     int cw = W / 2, ch = H / 2, bpp = g_y2r_bpp;
     GSPGPU_FlushDataCache(o->data[0], (u32)W * H);
@@ -2375,14 +2393,25 @@ static void g_y2r_start(AVFrame *o, C3D_Tex *tex, int W, int H) {
     Y2RU_SetSendingV(o->data[2], (u32)cw * ch, (s16)cw, 0);
     Y2RU_SetReceiving(tex->data, (u32)W * H * bpp, (s16)(W * bpp * 8), (s16)((GT_W - W) * bpp * 8));
     svcClearEvent(g_y2r_done); Y2RU_StartConversion();
+    LT(g_lt_ystart)
+#ifdef LAB_AUTOPLAY
+    g_lt_n++;
+#endif
 }
 /* NOTE: uses the raw cache syscall, NOT C3D_TexFlush (which goes through the shared GSP session) --
  * this runs on the decode thread and must not touch GSP while the main thread renders. */
 static void g_y2r_wait(C3D_Tex *tex) {
+    LT0
     if (R_FAILED(svcWaitSynchronization(g_y2r_done, 300000000LL)))
         Y2RU_StopConversion();   /* timed out: clear the wedged conversion so the NEXT frame can
                                   * convert -- self-heals in-session instead of black-until-reopen */
+    LT(g_lt_ywait)
+#ifdef LAB_AUTOPLAY
+    if (g_lab_noflush) return;
+    _lt0 = svcGetSystemTick();
+#endif
     svcFlushProcessDataCache(CUR_PROCESS_HANDLE, (u32)tex->data, tex->size);
+    LT(g_lt_yflush)
 }
 
 /* draw an outlined button box (citro2d) + centered label */
@@ -3960,7 +3989,18 @@ typedef struct { AVFrame L, R; int64_t rts, bts; int swap; } R3YQ;
 static R3YQ g_yq[YQ_MAX];
 static volatile int g_yq_h, g_yq_n;
 static int g_yq_cap;                     /* 0 = off (New 3DS, or not enough memory) */
+/* 3D queue conversion, overlapped: the head pair's LEFT eye converts while the producer decodes the
+ * next pair's first eye; then the right eye is started (r3_yq_mid) and converts during the second.
+ * Converting both eyes back to back left the CPU idle on the Y2R wait -- ~13% of an Old 3DS
+ * (Spider Noir S01e01 1:48-2:08: 10 stutters with the queue vs 1 without, before this). */
+static int g_yq_lf;                      /* the head pair's left eye is converting */
+static C3D_Tex *g_yq_lfA, *g_yq_lfB;     /* its left / right target textures */
+static int g_yq_lfslot, g_yq_lfW, g_yq_lfH;
+#ifdef LAB_AUTOPLAY
+int g_lab_noov;                          /* lab: back-to-back conversion (the old way) */
+#endif
 static void r3_vq_clear(void) { int n, kf; int64_t ts; while (r3_vqc > 0) free(r3_vq_pop(&n, &ts, &kf));
+    if (g_yq_lf) { g_y2r_wait(g_yq_lfA); g_yq_lf = 0; }   /* never drop a conversion mid-flight */
     g_yq_h = g_yq_n = 0;                 /* the queued frames go with any seek / reset */
     LightLock_Lock(&g_vqlk);
     r3_vqh = r3_vqt = r3_vqc = 0; r3_kfph = r3_kfpt = r3_kfpc = 0; r3_pushv = 0;
@@ -4502,7 +4542,18 @@ typedef struct {
 static int r3_pend = -1;                 /* ring slot whose last conversion is in flight, -1 = none */
 static C3D_Tex *r3_pend_tex;
 static int64_t r3_pend_rts, r3_pend_bts;
+/* finish the overlapped conversion's first half: left eye done -> start the right eye (pending) */
+static void r3_yq_mid(void) {
+    if (!g_yq_lf) return;
+    R3YQ *e = &g_yq[g_yq_h];
+    g_y2r_wait(g_yq_lfA);
+    g_y2r_start(&e->R, g_yq_lfB, g_yq_lfW, g_yq_lfH);
+    r3_pend = g_yq_lfslot; r3_pend_tex = g_yq_lfB; r3_pend_rts = e->rts; r3_pend_bts = e->bts;
+    g_yq_h = (g_yq_h + 1) % YQ_MAX; g_yq_n = g_yq_n - 1;
+    g_yq_lf = 0;
+}
 static void r3_retire(R3S *s) {
+    if (g_yq_lf) r3_yq_mid();             /* a half-done conversion completes first, always */
     if (r3_pend < 0) return;
     g_y2r_wait(r3_pend_tex);
     r3_rts[r3_pend] = r3_pend_rts; r3_bts[r3_pend] = r3_pend_bts;
@@ -4526,7 +4577,26 @@ static void r3_yq_push(R3S *s, const AVFrame *L, const AVFrame *R, int64_t rts, 
     __sync_synchronize(); g_yq_n = g_yq_n + 1;
 }
 /* the oldest queued pair -> the next ring slot (the second eye's conversion is left in flight) */
+/* 3D: start the head pair's left eye and return (r3_yq_mid starts the right). 0 = nothing started */
+static int r3_yq_begin(R3S *s) {
+    R3YQ *e = &g_yq[g_yq_h];
+    if (s->old3ds && r3_apos >= 0) {   /* already behind the audio: present would discard it unseen */
+        int stale = (e->rts + s->pair_dur < r3_apos);
+        int starving = ((u32)osGetTime() - g_r3_last_present) >= 100;
+        if (stale && !starving) { g_yq_h = (g_yq_h + 1) % YQ_MAX; g_yq_n = g_yq_n - 1; g_st_yqstale++; return 0; }
+    }
+    r3_retire(s);
+    int slot = s->wr % s->NB;
+    g_yq_lfA = e->swap ? &r3_texR[slot] : &r3_texL[slot]; g_yq_lfB = e->swap ? &r3_texL[slot] : &r3_texR[slot];
+    g_yq_lfslot = slot; g_yq_lfW = s->W; g_yq_lfH = s->H;
+    g_y2r_start(&e->L, g_yq_lfA, s->W, s->H);
+    g_yq_lf = 1;
+    return 1;
+}
 static void r3_yq_convert(R3S *s) {
+#ifdef LAB_AUTOPLAY
+    u64 _lc0 = svcGetSystemTick();
+#endif
     R3YQ *e = &g_yq[g_yq_h];
     if (s->old3ds && r3_apos >= 0) {   /* already behind the audio: present would discard it unseen */
         int stale = (e->rts + s->pair_dur < r3_apos);
@@ -4544,6 +4614,9 @@ static void r3_yq_convert(R3S *s) {
     }
     r3_pend = slot; r3_pend_rts = e->rts; r3_pend_bts = e->bts;
     g_yq_h = (g_yq_h + 1) % YQ_MAX; g_yq_n = g_yq_n - 1;
+#ifdef LAB_AUTOPLAY
+    g_lt_conv += svcGetSystemTick() - _lc0;
+#endif
 }
 
 /* Decode+bank ONE pair into ring slot wr%NB (or drop a pair while catching up). Runs under s->lock. */
@@ -4596,9 +4669,18 @@ static int r3_read_some(R3S *s, int maxpk) {
 
 static volatile int g_reader_on;          /* the core-1 reader thread is running */
 static void r3_produce(R3S *s) {
+    if (g_yq_lf) r3_yq_mid();                     /* (a previous call left a left eye converting) */
     if (g_yq_cap > 0) {                           /* the ring takes a queued pair as soon as it has room */
-        if (g_yq_n > 0 && (s->wr + r3_inflight() - s->rd) < s->NB - 1) { r3_yq_convert(s); return; }
-        if (g_yq_n >= g_yq_cap) return;           /* ring and queue both full */
+        if (g_yq_n > 0 && (s->wr + r3_inflight() - s->rd) < s->NB - 1) {
+            /* 3D with a pair to decode as well: start the left eye and decode while it converts */
+            int ov = s->is3d && g_yq_n < g_yq_cap && r3_vqc >= 2 && !s->skipping;
+#ifdef LAB_AUTOPLAY
+            if (g_lab_noov) ov = 0;
+#endif
+            if (!ov) { r3_yq_convert(s); return; }
+            r3_yq_begin(s);
+        }
+        else if (g_yq_n >= g_yq_cap) return;      /* ring and queue both full */
     }
     if (!g_reader_on) r3_read_some(s, 1 << 30);   /* no reader thread: read inline, as before */
     if (r3_vqc < 2) return;   /* not enough for a pair yet */
@@ -4659,6 +4741,7 @@ static void r3_produce(R3S *s) {
     AVPacket ap;
     uint8_t *p = r3_vq_pop(&n, &vts, &kf); ap.data = p; ap.size = n;
     int okL = (mobi_decode(s->ctx, s->fL, &gotL, &ap) >= 0 && gotL); free(p);
+    if (g_yq_lf) r3_yq_mid();                     /* left eye converted meanwhile: the right converts during eye 2 */
     s->cur_us = vts;
     /* Old-3DS catch-up ELISION: a pair already behind the audio clock will be discarded unseen by
      * present, so decode it (references must stay perfect) but skip the Y2R + ring publish. Force a real
@@ -4991,6 +5074,9 @@ static MoflexResult moflex_play_ring(const char *path) {
     {   bool isn = false; APT_CheckNew3DS(&isn);
         /* A/B TEST: queue off for Big Top streams (Killer Klowns fails on Old 3DS only, curl 27 + a
          * citro2d overflow; New 3DS -- no queue -- plays it). Local files keep the queue. */
+#ifdef LAB_AUTOPLAY
+        if (g_lab_noq) isn = true;   /* lab: run without the frame queue */
+#endif
         if (!isn && strncmp(path, "bigtop:", 7)) {   /* Old 3DS: a frame queue in free heap, as deep as fits with room to spare */
             int fpp = is3d ? 2 : 1, cap = is3d ? 24 : 48;
             size_t fb = (size_t)W * H * 3 / 2 + 3 * 1024;
@@ -5430,6 +5516,9 @@ static MoflexResult moflex_play_ring(const char *path) {
             }
         } else {
         if (kd & KEY_B) { result = MOFLEX_QUIT_BACK; break; }
+#ifdef LAB_AUTOPLAY
+        if (g_lab_deadline && osGetTime() > g_lab_deadline) { result = MOFLEX_QUIT_BACK; break; }
+#endif
         if (kd & KEY_A) {
             if (s.done && (s.wr - rd) == 0 && g_yq_n == 0) { seek_to_us = 0; want_seek = 1; }   /* at the end: replay */
             else { playing = !playing; if (have_audio) ndspChnSetPaused(0, !playing);
@@ -6202,6 +6291,13 @@ static MoflexResult moflex_play_ring(const char *path) {
                     st_play_ms ? PF_MS(g_st_busy) * 100.0 / st_play_ms : 0.0, 1e6 / (double)pair_dur,
                     st_decn ? PF_MS(st_dec) / st_decn : 0.0, PF_MS(st_dmax), NB, g_yq_cap,
                     (unsigned long)(mi.arena / 1024), (unsigned long)(linearSpaceFree() / 1024), title);
+#ifdef LAB_AUTOPLAY
+            {   double tk = SYSCLOCK_ARM11 / 1000.0, pl = st_play_ms ? st_play_ms : 1;
+                fprintf(sf, "LAB y2r: n=%llu start %.2f ms/s, wait %.2f ms/s, texflush %.2f ms/s (%.3f ms each) | queue convert %.1f ms/s | noq=%d noflush=%d\n",
+                        (unsigned long long)g_lt_n, g_lt_ystart / tk * 1000 / pl, g_lt_ywait / tk * 1000 / pl,
+                        g_lt_yflush / tk * 1000 / pl, g_lt_n ? g_lt_yflush / tk / g_lt_n : 0.0, g_lt_conv / tk * 1000 / pl,
+                        g_lab_noq, g_lab_noflush); }
+#endif
             fclose(sf);
         }
     }

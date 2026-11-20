@@ -30,6 +30,11 @@ CFLAGS  := -w -Wreturn-type -O3 -mword-relocations -ffunction-sections -D__3DS__
 ifneq ($(TEST_CHANNEL),)
 CFLAGS  += -DTEST_CHANNEL
 endif
+# Lab build (lab/build_real.sh): autoplay sdmc:/lab/params.txt, then back to the Moflex Lab Host
+ifneq ($(LAB_AUTOPLAY),)
+CFLAGS  += -DLAB_AUTOPLAY
+endif
+CFLAGS  += $(EXTRA_CFLAGS)
 ifneq ($(UPDATE_TEST_URL),)
 CFLAGS  += -DUPDATE_TEST_URL=\"$(UPDATE_TEST_URL)\"
 endif

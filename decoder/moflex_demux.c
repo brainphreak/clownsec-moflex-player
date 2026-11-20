@@ -197,25 +197,34 @@ int mfx_open_window(MfxDemux *m, FILE *f, int64_t base, int64_t size) {
     if (size >= 0) m->file_size = size;
     else { fseeko(f, 0, SEEK_END); m->file_size = (int64_t)ftello(f) - base; }
     {
-        int plen = 2 * 1024 * 1024;
-        if ((int64_t)plen > m->file_size) plen = (int)m->file_size;
-        int64_t probe = m->file_size - plen;
-        uint8_t *pb = (uint8_t *)malloc(plen);
+        /* The last sync block is normally in the final 2 MB. But when the audio outlasts the video,
+         * the encoder writes the leftover audio as blocks with no sync markers -- minutes of it
+         * (To Love Ru OVA S03e01: 3 min, 8.5 MB) -- so step back 2 MB at a time, up to 64 MB. */
+        const int CH = 2 * 1024 * 1024;
+        uint8_t *pb = (uint8_t *)malloc(CH + 12);
         if (pb) {
-            fseeko(f, base + probe, SEEK_SET);
-            int got = (int)fread(pb, 1, plen, f);
             int64_t last = 0;
             const int64_t MAX_US = 24LL * 3600 * 1000000;   /* 24h sanity cap */
-            for (int i = 0; i + 12 < got; i++)
-                if (pb[i] == 0x4C && pb[i + 1] == 0x32) {
-                    int64_t t = 0;
-                    for (int j = 0; j < 8; j++) t = (t << 8) | pb[i + 4 + j];
-                    /* accept only sane, monotonically-increasing timestamps -- the 0x4C32 byte
-                     * pattern also appears inside media data, so reject garbage (negative, absurd,
-                     * or out-of-order) to avoid a bogus duration that breaks the bar and seeking. */
-                    if (t > last && t < MAX_US) last = t;
-                    i += 11;
-                }
+            for (int64_t end = m->file_size; end > 0 && last == 0 && m->file_size - end < 64LL * 1024 * 1024;
+                 end -= CH) {
+                int64_t probe = end - CH;
+                if (probe < 0) probe = 0;
+                int want = (int)(end - probe);
+                if (end + 12 <= m->file_size) want += 12;   /* overlap: a header split across chunks */
+                fseeko(f, base + probe, SEEK_SET);
+                int got = (int)fread(pb, 1, want, f);
+                for (int i = 0; i + 12 < got; i++)
+                    if (pb[i] == 0x4C && pb[i + 1] == 0x32) {
+                        int64_t t = 0;
+                        for (int j = 0; j < 8; j++) t = (t << 8) | pb[i + 4 + j];
+                        /* accept only sane, monotonically-increasing timestamps -- the 0x4C32 byte
+                         * pattern also appears inside media data, so reject garbage (negative, absurd,
+                         * or out-of-order) to avoid a bogus duration that breaks the bar and seeking. */
+                        if (t > last && t < MAX_US) last = t;
+                        i += 11;
+                    }
+                if (probe == 0) break;
+            }
             m->duration_us = last;
             free(pb);
         }

@@ -66,6 +66,10 @@ static void idle_apt_hook(APT_HookType t, void *u) {
          * handoff -- HOME hangs the whole console until it's released. Drop it for the suspend;
          * the transfer is frozen while we're suspended anyway. */
         if (s_dlw_ndm) { dl_wifi_hold(0); s_ndm_resume = 1; }
+        /* HOME and the power button never reach idle_scan (APT takes them directly), so a press
+         * while the screens are dark would leave the HOME Menu / power menu dark too -- only a
+         * lid cycle relit them. Relight on the way out. */
+        if (s_idle_off) idle_backlight(1);
     }
     if (t == APTHOOK_ONRESTORE || t == APTHOOK_ONWAKEUP) {
         s_idle_last = osGetTime();   /* the idle_scan relight invariant handles the screens */
@@ -7370,6 +7374,44 @@ static int play_and_handle(const char *path, int origin) {
 /* ---------- main ---------- */
 
 #define SOC_BUF_SZ 0x100000
+#ifdef LAB_AUTOPLAY
+/* Lab build (Moflex Lab Test title): play sdmc:/lab/params.txt's file= from start= for secs=, write
+ * the engine's ring_stats line to sdmc:/lab/last.log, and chain-load back to the Moflex Lab Host --
+ * so it never strands the console in the HOME Menu. */
+extern u64 g_lab_deadline;
+extern int g_lab_noq, g_lab_noflush, g_lab_noov;
+static void lab_autoplay(void) {
+    char prm[1024] = "", file[512] = "sdmc:/lab/office_head.moflex";
+    int start = 0, secs = 60;
+    FILE *p = fopen("sdmc:/lab/params.txt", "r");
+    if (p) { size_t n = fread(prm, 1, sizeof prm - 1, p); prm[n] = 0; fclose(p); }
+    for (char *l = strtok(prm, "\r\n"); l; l = strtok(NULL, "\r\n")) {
+        if (!strncmp(l, "file=", 5)) snprintf(file, sizeof file, "%s", l + 5);
+        else if (!strncmp(l, "start=", 6)) start = atoi(l + 6);
+        else if (!strncmp(l, "secs=", 5)) secs = atoi(l + 5);
+        else if (!strncmp(l, "noq=", 4)) g_lab_noq = atoi(l + 4);
+        else if (!strncmp(l, "noflush=", 8)) g_lab_noflush = atoi(l + 8);
+        else if (!strncmp(l, "noov=", 5)) g_lab_noov = atoi(l + 5);
+    }
+    if (secs < 5) secs = 5;
+    if (secs > 600) secs = 600;
+    remove("sdmc:/moflex_player/ring_stats.txt");
+    if (start > 0) moflex_resume_save(file, (long long)start * 1000000LL); else moflex_resume_clear(file);
+    g_lab_deadline = osGetTime() + (u64)secs * 1000 + 2000;
+    u64 t0 = osGetTime();
+    int r = (int)moflex_play(file);
+    FILE *o = fopen("sdmc:/lab/last.log", "w");
+    if (o) {
+        fprintf(o, "REAL file=%s start=%d secs=%d result=%d wall=%.1fs\n", file, start, secs, r, (osGetTime() - t0) / 1000.0);
+        FILE *rs = fopen("sdmc:/moflex_player/ring_stats.txt", "r");
+        if (rs) { char ln[4096]; while (fgets(ln, sizeof ln, rs)) fputs(ln, o); fclose(rs); }
+        else fputs("(no ring_stats)\n", o);
+        fclose(o);
+    }
+    moflex_resume_clear(file);
+    aptSetChainloader(0x000400000F8A4000ULL, MEDIATYPE_SD);   /* back to the lab host */
+}
+#endif
 int main(void) {
     /* Initialize newlib's global locale ON THE MAIN THREAD before any worker spawns. The
      * background SD scan snprintf()s every filename on a libctru thread, and __global_locale's
@@ -7394,6 +7436,10 @@ int main(void) {
     consoleInit(GFX_BOTTOM, NULL);
     gfxSetDoubleBuffering(GFX_BOTTOM, false);
     branding_show();                                  /* 3D CLOWNSEC logo on top */
+#ifdef LAB_AUTOPLAY
+    lab_autoplay();
+    goto lab_teardown;
+#endif
 
     extplay_load();
     extplay_restore();           /* FIRST: bring back a movie lent to the 3D Movie Player (any model) */
@@ -7424,6 +7470,9 @@ int main(void) {
             else if (g_now_playing_path[0] && play_and_handle(g_now_playing_path, PLAY_FROM_HOME)) running = 0;
         }
     }
+#ifdef LAB_AUTOPLAY
+lab_teardown:
+#endif
     s_dt_abort = 1;   /* stop the background SD walk before teardown */
     for (int w = 0; w < 20 && !s_dt_done && !s_dt_consumed; w++) svcSleepThread(25 * 1000 * 1000LL);
     for (int w = 0; w < 30 && !s_dtw_exit; w++) svcSleepThread(100 * 1000 * 1000LL);   /* update fetch too */
