@@ -24,7 +24,25 @@ typedef struct {
     long long pos, size;          /* resume point (ms), file size */
     char genres[96];
     char summary[420];
+    int  stream;                  /* not moflex (MP4/MKV/AVI...): the server transcodes it -> stream_play */
+    long long dur;                /* stream: length in ms */
+    char layout[8];               /* stream 3D: "hsbs" / "fsbs" */
+    char fmt[8];                  /* the file's container: "MOFLEX", "MP4", "MKV", ... */
 } BtItem;
+
+/* a streamed video's tracks (GET /api/items/<id>) */
+typedef struct {
+    int  n_audio, audio_def;
+    char alang[8][8], aname[8][48];
+    int  n_burn;                  /* picture subtitles the server can burn in */
+    char bname[8][48];
+    char err[160];                /* why it can't stream now ("needs FFmpeg..."), "" = it can */
+} BtTracks;
+int  bt_tracks(const BtCfg *c, const char *id, BtTracks *t);     /* 1 = read */
+/* The transcoded stream from at_ms: MPEG-TS of H.264 + AAC. fmt = the player's layout (non-zero:
+ * a 3D-sized frame); audio / burn = track indexes (-1 = default / none). */
+#include "httpstream.h"
+HttpStream *bt_stream_open(const BtCfg *c, const char *id, long long at_ms, int fmt, int audio, int burn);
 
 typedef struct { char url[128]; char name[64]; char id[24]; char version[24]; } BtServer;
 
@@ -55,6 +73,11 @@ int  bt_sub_download(const BtCfg *c, const char *item_id, int n, const char *des
 void bt_media_path(const BtCfg *c, const BtItem *it, const char *title, char *out, int cap);
 /* moflex_set_open_hook target: opens a bigtop: path as a stream from the server set up. */
 FILE *bt_open_media(const char *path);
+/* Live moflex (an MP4/MKV the server encodes as it plays, for an Old 3DS): until disarmed, opening
+ * this item's bigtop: path opens /stream.moflex from start_ms instead of the file. fmt: 0 2D,
+ * 1 full side-by-side, 2 half side-by-side. */
+void bt_live_arm(const char *item_id, int fmt, long long dur_ms, long long start_ms);
+void bt_live_disarm(void);
 /* the item id inside a bigtop: path ("" if it isn't one) */
 void bt_path_item(const char *path, char *id, int cap);
 

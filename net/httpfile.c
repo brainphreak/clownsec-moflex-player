@@ -21,7 +21,15 @@
 #define HB_AHEAD    24              /* fetched ahead while reading straight through (~1.5 MB) */
 #define HB_AHEAD_J  2               /* ...and just after a jump, until reading settles */
 #define HF_STALL_MS 20000           /* a block that doesn't arrive in this long: the read fails */
-#define HB_BATCH    4               /* read-ahead fetches this many blocks per request (256 KB) */
+#define HB_BATCH    8               /* steady read-ahead fetches up to this many blocks per request
+                                     * (512 KB): an Old 3DS pays a lot per request */
+/* diagnostics logs are opt-in: create sdmc:/moflex_player/debug_on.txt to turn them on. Normal use
+ * never writes them -- no SD writes while a film plays, no logs that grow forever. */
+static int dbg_on(void) {
+    static int on = -1;
+    if (on < 0) { FILE *m = fopen("sdmc:/moflex_player/debug_on.txt", "rb"); on = m ? 1 : 0; if (m) fclose(m); }
+    return on;
+}
 #define HF_LOG      "sdmc:/moflex_player/bigtop_log.txt"
 
 /* why the last network read gave up: 0 = it didn't, 1 = the viewer held B, 2 = the server went quiet */
@@ -36,6 +44,14 @@ void httpfile_reset(void) { g_hf_gave_up = 0; }
 
 enum { SL_EMPTY = 0, SL_PENDING, SL_READY, SL_FAILED };
 typedef struct { long long blk; int state, len; u64 used; uint8_t *data; } Slot;
+
+/* The player opens a video twice in a row -- a quick look (2D or 3D?), then playback. The first
+ * one's blocks are kept here for the second instead of downloading the start again. */
+static struct { char *url; Slot *slots; uint8_t *mem; int nslots; u64 t; } g_park;
+void httpfile_drop_cache(void) {
+    free(g_park.slots); free(g_park.mem); free(g_park.url);
+    memset(&g_park, 0, sizeof g_park);
+}
 
 typedef struct {
     char *url;
@@ -53,6 +69,8 @@ typedef struct {
     CURL *e; Slot *fills[HB_BATCH]; int nfill, fill_i;
     /* for the log */
     u64 t_open, wait_ms, wait_max, fetch_ms; int waits, fetches, failed; long long bytes;
+    int f_rc, f_code, f_got, f_want;   /* the first failed request: curl code, HTTP status, bytes got/asked */
+    unsigned long f_heap;              /* largest free heap block when it failed (KB) */
 } HFile;
 
 /* ---- the file's size: one HEAD (cached for the last few URLs; a file is opened several times) ---- */
@@ -98,6 +116,17 @@ static size_t on_block(char *p, size_t sz, size_t nm, void *u) {
 static int on_abort(void *u, curl_off_t a, curl_off_t b, curl_off_t c, curl_off_t d) {
     (void)a; (void)b; (void)c; (void)d; return ((HFile *)u)->stop;
 }
+/* largest block malloc can still give (KB, probed in 256 KB steps up to 16 MB): a failed request can be
+ * curl running out of memory */
+static unsigned long hf_heap_free_kb(void) {
+    unsigned long lo = 0, hi = 16 * 1024;
+    while (hi - lo > 256) {
+        unsigned long mid = (lo + hi) / 2; void *p = malloc(mid * 1024);
+        if (p) { free(p); lo = mid; } else hi = mid;
+    }
+    return lo;
+}
+static HFile *g_hf_cur;   /* the most recently opened file still open (playback's, after the probe) */
 static int slot_of(HFile *h, long long blk) {
     for (int i = 0; i < h->nslots; i++)
         if (h->slots[i].state != SL_EMPTY && h->slots[i].blk == blk) return i;
@@ -115,13 +144,24 @@ static int next_jobs(HFile *h) {
         if (i >= 0) h->fills[h->nfill++] = &h->slots[i];
         return h->nfill;
     }
-    int ahead = h->seq >= 3 ? HB_AHEAD : HB_AHEAD_J;
-    for (long long b = h->cur; b < h->cur + ahead && b < nblk; b++) {
+    /* the window grows with straight reading: a short look at the file (the player's 2D/3D probe)
+     * mustn't pull 1.5 MB it will never read -- that was ~7 s of waiting on an Old 3DS */
+    int ahead = h->seq / 2 + HB_AHEAD_J; if (ahead > HB_AHEAD) ahead = HB_AHEAD;
+    int batch = h->seq >= 12 ? HB_BATCH : h->seq >= 3 ? 4 : 1;
+    /* Top up in whole batches, not a block at a time: as reading moves on one block, the window's
+     * end moves one block too, and refilling just that made every request 64 KB. On a 3DS each
+     * request costs ~150-250 ms of its own, so wait until a batch is missing -- unless what's
+     * buffered ahead of the reader is getting short. */
+    long long b0 = h->cur;
+    while (b0 < h->cur + ahead && b0 < nblk && slot_of(h, b0) >= 0) b0++;
+    if (b0 >= nblk || b0 >= h->cur + ahead) return 0;               /* window full */
+    if (b0 - h->cur > ahead - batch && b0 + batch <= nblk) return 0; /* plenty buffered: wait for a batch */
+    for (long long b = b0; b < h->cur + ahead && b < nblk; b++) {
         if (slot_of(h, b) >= 0) { if (h->nfill) break; continue; }   /* a run of missing blocks only */
         int i = claim(h, b);
         if (i < 0) break;
         h->fills[h->nfill++] = &h->slots[i];
-        if (h->nfill == (h->seq >= 3 ? HB_BATCH : 1)) break;
+        if (h->nfill == batch) break;
     }
     return h->nfill;
 }
@@ -173,7 +213,12 @@ static void worker(void *arg) {
         int ok = rc == CURLE_OK && (code == 206 || (code == 200 && a == 0)) && got == (int)(b - a + 1);
         LightLock_Lock(&h->lk);
         for (int j = 0; j < n; j++) h->fills[j]->state = ok ? SL_READY : SL_FAILED;
-        h->fetches++; h->fetch_ms += osGetTime() - t; h->bytes += got; if (!ok) h->failed++;
+        h->fetches++; h->fetch_ms += osGetTime() - t; h->bytes += got;
+        if (!ok && !h->stop) {                  /* a request cut off by closing the file isn't a failure */
+            if (!h->failed) { h->f_rc = (int)rc; h->f_code = (int)code; h->f_got = got; h->f_want = (int)(b - a + 1);
+                              h->f_heap = hf_heap_free_kb(); }   /* free heap AT the failure */
+            h->failed++;
+        }
         LightLock_Unlock(&h->lk);
         if (!ok && !h->stop) svcSleepThread(200 * 1000 * 1000LL);   /* don't hammer a failing server */
     }
@@ -190,7 +235,9 @@ static ssize_t hf_read(void *c, char *buf, size_t n) {
     int off = (int)(h->pos % HB_SIZE), fails = 0;
     u64 t0 = osGetTime();
     LightLock_Lock(&h->lk);
-    h->seq = (blk == h->last || blk == h->last + 1) ? h->seq + 1 : 0;   /* straight through, or a jump */
+    /* straight-through reading, counted in BLOCKS: stdio calls this per small buffer, and counting
+     * calls let a short look at the file (the 2D/3D probe) ramp the read-ahead to its maximum */
+    h->seq = blk == h->last ? h->seq : blk == h->last + 1 ? h->seq + 1 : 0;
     h->last = blk; h->cur = blk;
     for (;;) {
         int i = slot_of(h, blk);
@@ -242,27 +289,35 @@ static int hf_seek(void *c, off_t *off, int whence) {
 
 static int hf_close(void *c) {
     HFile *h = (HFile *)c;
+    if (g_hf_cur == h) g_hf_cur = NULL;
     h->stop = 1;
     if (h->th) { threadJoin(h->th, U64_MAX); threadFree(h->th); }
     if (g_hf_open > 0) g_hf_open--;
     /* one line per opened file: was playback waiting on the network, or not? */
     u64 secs = (osGetTime() - h->t_open) / 1000;
-    if (secs >= 3) {
+    if (secs >= 3 && dbg_on()) {
         FILE *lf = fopen(HF_LOG, "ab");
         if (lf) {
             const char *nm = strrchr(h->url, '/');
             fprintf(lf, "%llus open, %lld KB in %d requests (%d failed), %llu ms/request avg, "
-                        "%.0f KB/s while fetching; reads waited %d times, %llu ms total, longest %llu ms%s  [%s]\n",
+                        "%.0f KB/s while fetching; reads waited %d times, %llu ms total, longest %llu ms%s"
+                        " | first fail: curl %d http %d got %d/%d heap %lu KB | heap free at close %lu KB  [%s]\n",
                     secs, h->bytes / 1024, h->fetches, h->failed,
                     h->fetches ? h->fetch_ms / (u64)h->fetches : 0ULL,
                     h->fetch_ms ? (double)h->bytes / 1024.0 / ((double)h->fetch_ms / 1000.0) : 0.0,
                     h->waits, h->wait_ms, h->wait_max,
                     h->aborted ? (g_hf_gave_up == 1 ? ", stopped with B" : ", gave up (no data)") : "",
+                    h->f_rc, h->f_code, h->f_got, h->f_want, h->f_heap, hf_heap_free_kb(),
                     nm ? nm : h->url);
             fclose(lf);
         }
     }
-    free(h->mem); free(h->slots); free(h->url); free(h);
+    /* keep the blocks a moment for the playback that usually reopens this file right away */
+    httpfile_drop_cache();
+    for (int i = 0; i < h->nslots; i++) if (h->slots[i].state != SL_READY) h->slots[i].state = SL_EMPTY;
+    g_park.url = h->url; g_park.slots = h->slots; g_park.mem = h->mem; g_park.nslots = h->nslots;
+    g_park.t = osGetTime();
+    free(h);
     return 0;
 }
 
@@ -276,20 +331,58 @@ FILE *httpfile_open(const char *url, long long size, size_t ring_bytes) {
     h->nslots = ring_bytes ? (int)(ring_bytes / HB_SIZE) : (g_hf_open == 0 ? HB_SLOTS : HB_SLOTS_2ND);
     if (h->nslots < HB_AHEAD + 8) h->nslots = HB_AHEAD + 8;
     h->url = strdup(url); h->size = size; h->want = -1; h->last = -10; h->t_open = osGetTime();
-    h->slots = (Slot *)calloc((size_t)h->nslots, sizeof(Slot));
-    h->mem = (uint8_t *)malloc((size_t)h->nslots * HB_SIZE);
+    if (g_park.url && h->url && !strcmp(g_park.url, h->url) && g_park.nslots == h->nslots &&
+        osGetTime() - g_park.t < 20000) {
+        h->slots = g_park.slots; h->mem = g_park.mem;     /* the same file again: its blocks are here */
+        free(g_park.url); memset(&g_park, 0, sizeof g_park);
+    } else {
+        httpfile_drop_cache();
+        h->slots = (Slot *)calloc((size_t)h->nslots, sizeof(Slot));
+        h->mem = (uint8_t *)malloc((size_t)h->nslots * HB_SIZE);
+        if (h->slots) for (int i = 0; i < h->nslots; i++) h->slots[i].data = h->mem + (size_t)i * HB_SIZE;
+    }
     if (!h->url || !h->slots || !h->mem) { free(h->mem); free(h->slots); free(h->url); free(h); return NULL; }
-    for (int i = 0; i < h->nslots; i++) h->slots[i].data = h->mem + (size_t)i * HB_SIZE;
     LightLock_Init(&h->lk);
-    /* the system core: the moflex decoder owns core 2 and would starve a lowest-priority fetch */
+    s32 prio = 0x30; svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
+    bool isnew = false; APT_CheckNew3DS(&isnew);
+    (void)isnew;
+    /* Both models: the system core at the lowest priority. The decoder owns the app core (and
+     * core 2 on a New 3DS); the audio thread on the system core outranks this one, so the
+     * fetch only takes what's left. (On the app core, above the decoder, it took frames from
+     * Old 3DS video; the 2D audio stutter blamed on this core was the 2D player itself.) */
     h->th = threadCreate(worker, h, 64 * 1024, 0x3F, 1, false);
-    if (!h->th) { s32 prio = 0x30; svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
-                  h->th = threadCreate(worker, h, 64 * 1024, prio - 1, -2, false); }
+    if (!h->th) h->th = threadCreate(worker, h, 64 * 1024, prio - 1, -2, false);
     if (!h->th) { free(h->mem); free(h->slots); free(h->url); free(h); return NULL; }
     cookie_io_functions_t io = { hf_read, NULL, hf_seek, hf_close };
     g_hf_open++;
     FILE *f = fopencookie(h, "rb", io);
     if (!f) { hf_close(h); return NULL; }
     setvbuf(f, NULL, _IOFBF, 32 * 1024);
+    g_hf_cur = h;
     return f;
+}
+
+/* bytes downloaded and waiting, straight on from where reading is (to the end of the file counts
+ * as plenty); -1 when no Big Top file is open */
+long long httpfile_buffered_ahead(void) {
+    HFile *h = g_hf_cur;
+    if (!h) return -1;
+    LightLock_Lock(&h->lk);
+    long long nblk = (h->size + HB_SIZE - 1) / HB_SIZE, b = h->cur, n = 0;
+    while (b < nblk) {
+        int i = slot_of(h, b);
+        if (i < 0 || h->slots[i].state != SL_READY) break;
+        b++; n++;
+    }
+    LightLock_Unlock(&h->lk);
+    return b >= nblk ? (1LL << 40) : n * HB_SIZE;
+}
+/* playback is starting: read ahead as far as the window allows at once (it grows with straight
+ * reading, so a short look at a file doesn't download much) */
+void httpfile_full_ahead(void) {
+    HFile *h = g_hf_cur;
+    if (!h) return;
+    LightLock_Lock(&h->lk);
+    if (h->seq < 2 * HB_AHEAD) h->seq = 2 * HB_AHEAD;
+    LightLock_Unlock(&h->lk);
 }

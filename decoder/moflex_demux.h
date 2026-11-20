@@ -32,6 +32,7 @@ typedef struct {
 } MfxPacket;
 
 #define MFX_RBUF (64 * 1024)
+extern int mfx_rbuf_size;      /* bytes per SD read; defaults to MFX_RBUF (lab can raise it before mfx_open) */
 
 typedef struct {
     FILE   *f;
@@ -61,14 +62,36 @@ typedef struct {
     int      audio_only;    /* if set, mfx_next_packet skips (seeks past) non-audio chunks */
 
     unsigned br_last, br_pos;  /* bit reader */
+
+    /* seek memory: block (offset, ts) pairs found by earlier seeks, sorted by offset, so a later seek
+     * brackets its target at once; and the last target's answer, so the same time lands identically */
+#define MFX_KN 64
+    int64_t  kofs[MFX_KN], kts[MFX_KN];
+    int      kn;
+    int      ls_valid;
+    int64_t  ls_t, ls_off;
+    /* live stream (a server encoding as it plays): forward-only, timestamps restart at 0 in each
+     * stream, a seek asks the source for a new stream starting at the target time */
+    int64_t (*live_seek)(void *ctx, int64_t t_us);   /* NULL = a file */
+    void    *live_ctx;
+    int64_t  ts_off;        /* added to every block timestamp: the current stream's start time */
+    int      io_err;        /* the last seek failed (a live stream no longer holds that data): reads give EOF */
 } MfxDemux;
 
 /* Returns 0 on success. Parses the first sync so stream table is known. */
 int  mfx_open(MfxDemux *m, FILE *f);
+/* If set, mfx_open asks it first: it returns -2 for a FILE it doesn't own, else mfx_open's result
+ * (a live stream's FILE opens with mfx_open_live wherever the player opens it). */
+extern int (*mfx_open_hook)(MfxDemux *m, FILE *f);
 
 /* Like mfx_open but reads only the window [base, base+size) of the file -- used to play a moflex
  * embedded inside a (unencrypted) CIA in place. size < 0 = to end of file. */
 int  mfx_open_window(MfxDemux *m, FILE *f, int64_t base, int64_t size);
+/* A live stream read through f (see net/livemoflex): it begins at t0_us, the whole title lasts
+ * duration_us (from the server). Seeks call live_seek(ctx, t), which reopens f at a new stream
+ * starting at the returned time. */
+int  mfx_open_live(MfxDemux *m, FILE *f, int64_t (*live_seek)(void *, int64_t), void *ctx,
+                   int64_t t0_us, int64_t duration_us);
 void mfx_close(MfxDemux *m);
 
 /* Returns 1 and fills *pkt on a packet, 0 at EOF, <0 on error. */

@@ -176,6 +176,8 @@ void theme_save(void) {
  * copy in one shot in ui_present() -- avoids clear->draw flicker on the live fb.
  * Sized for the wider top screen (400x240); bottom uses the first 320 columns. */
 static u16 g_buf[UI_TW * UI_H];
+static int g_cy0 = 0, g_cy1 = UI_H;   /* vertical clip (ui_clip_y) */
+#define CLIPPED_Y(yy) ((yy) < g_cy0 || (yy) >= g_cy1)
 static u16 *g_fb = g_buf;
 static int g_w = UI_W;
 static gfxScreen_t g_screen = GFX_BOTTOM;
@@ -190,6 +192,14 @@ int ui_width(void) { return g_w; }
 static int g_capture = 0;
 void ui_capture(int on) { g_capture = on; }
 const u16 *ui_pixels(void) { return g_buf; }
+/* columns are contiguous: (x, y) lives at [x*UI_H + (UI_H-1-y)], so rows y..y+h-1 of a column are
+ * one run starting at UI_H-1-(y+h-1) */
+void ui_rect_save(int x, int y, int w, int h, u16 *out) {
+    for (int c = 0; c < w; c++) memcpy(out + c * h, g_buf + (x + c) * UI_H + (UI_H - y - h), (size_t)h * 2);
+}
+void ui_rect_load(int x, int y, int w, int h, const u16 *in) {
+    for (int c = 0; c < w; c++) memcpy(g_buf + (x + c) * UI_H + (UI_H - y - h), in + c * h, (size_t)h * 2);
+}
 
 void ui_present(void) {
     if (g_capture) return;   /* caller lifts g_buf into a citro2d texture instead (no fb copy) */
@@ -198,26 +208,41 @@ void ui_present(void) {
     gfxFlushBuffers();
 }
 
+void ui_clip_y(int y0, int y1) { g_cy0 = y0 < 0 ? 0 : y0; g_cy1 = y1 > UI_H ? UI_H : y1; }
+void ui_clip_reset(void) { g_cy0 = 0; g_cy1 = UI_H; }
 void ui_px(int x, int y, u16 c) {
-    if ((unsigned)x < (unsigned)g_w && (unsigned)y < UI_H)
+    if ((unsigned)x < (unsigned)g_w && (unsigned)y < UI_H && !CLIPPED_Y(y))
         g_fb[x * UI_H + (UI_H - 1 - y)] = c;      /* rotated framebuffer */
 }
 
+static void fill_rect_fast(int x, int y, int w, int h, u16 c);
 void ui_clear(u16 c) {
+    if (g_cy0 > 0 || g_cy1 < UI_H) { fill_rect_fast(0, 0, g_w, UI_H, c); return; }
     int n = g_w * UI_H;
     for (int i = 0; i < n; i++) g_fb[i] = c;
 }
 
-void ui_fill(int x, int y, int w, int h, u16 c) {
-    for (int j = 0; j < h; j++)
-        for (int i = 0; i < w; i++)
-            ui_px(x + i, y + j, c);
+/* Solid rectangle straight into the rotated buffer, one contiguous run per column (the buffer is
+ * column-major). Same pixels as ui_px per pixel -- clipped the same way -- at a fraction of the cost:
+ * the per-pixel call, bounds test and row-wise walk against the layout made every software screen
+ * (panel, in-film menus) cost tens of ms on Old 3DS. */
+static void fill_rect_fast(int x, int y, int w, int h, u16 c) {
+    int x0 = x < 0 ? 0 : x, x1 = x + w > g_w ? g_w : x + w;
+    int y0 = y < g_cy0 ? g_cy0 : y, y1 = y + h > g_cy1 ? g_cy1 : y + h;
+    if (x0 >= x1 || y0 >= y1) return;
+    int n = y1 - y0;
+    for (int i = x0; i < x1; i++) {
+        u16 *p = g_fb + i * UI_H + (UI_H - y1);   /* rows y1-1 .. y0 are contiguous here */
+        for (int k = 0; k < n; k++) p[k] = c;
+    }
 }
+void ui_fill(int x, int y, int w, int h, u16 c) { fill_rect_fast(x, y, w, h, c); }
 
 void ui_text(int x, int y, int scale, u16 c, const char *s) {
     while (*s) {
         const char *g = ui_glyph(ui_u8_next(&s));
         for (int row = 0; row < 8; row++) {
+            if (y + row * scale + scale <= g_cy0 || y + row * scale >= g_cy1) continue;
             char bits = g[row];
             for (int col = 0; col < 8; col++)
                 if (bits & (1 << col))
@@ -281,7 +306,7 @@ void ui_pause(int cx, int cy, int size, u16 c) {
 
 /* ---- widget kit ---- */
 void ui_blend_px(int x, int y, u16 c, int a) {
-    if ((unsigned)x >= (unsigned)g_w || (unsigned)y >= UI_H) return;
+    if ((unsigned)x >= (unsigned)g_w || (unsigned)y >= UI_H || CLIPPED_Y(y)) return;
     if (a <= 0) return;
     if (a >= 255) { ui_px(x, y, c); return; }
     u16 *p = &g_fb[x * UI_H + (UI_H - 1 - y)];
@@ -323,64 +348,147 @@ static u16 lerp565(u16 a, u16 b, int t, int tmax) {
     return (u16)((r << 11) | (g << 5) | bl);
 }
 
-void ui_fill_round(int x, int y, int w, int h, int r, u16 c) {
-    for (int j = 0; j < h; j++)
-        for (int i = 0; i < w; i++) {
-            int cov = round_cov(i, j, w, h, r);
-            if (cov >= 255) ui_px(x + i, y + j, c);
-            else if (cov > 0) ui_blend_px(x + i, y + j, c, cov);
-        }
+/* Rounded shapes, exact but fast. Along the straight middle stretch [r, w-r) a pixel's coverage depends
+ * only on its row (the nearest centre is straight above/below), so it is computed once per row and the
+ * run written in one loop; only the curved ends are per pixel. Same coverage, same writes, same order
+ * of blends per pixel as the per-pixel originals -- verified identical on the host. */
+static void row_put(int x0, int x1, int y, u16 c) {
+    if ((unsigned)y >= UI_H || CLIPPED_Y(y)) return;
+    if (x0 < 0) x0 = 0; if (x1 > g_w) x1 = g_w;
+    u16 *p = g_fb + (UI_H - 1 - y);
+    for (int i = x0; i < x1; i++) p[i * UI_H] = c;
 }
-
-void ui_vgrad_round(int x, int y, int w, int h, int r, u16 top, u16 bot) {
+static void row_blend(int x0, int x1, int y, u16 c, int a) {
+    for (int i = x0; i < x1; i++) ui_blend_px(i, y, c, a);
+}
+static inline void cov_px(int x, int y, u16 c, int cov) {
+    if (cov >= 255) ui_px(x, y, c); else if (cov > 0) ui_blend_px(x, y, c, cov);
+}
+void ui_fill_round(int x, int y, int w, int h, int r, u16 c) {
+    if (r <= 0) { fill_rect_fast(x, y, w, h, c); return; }
+    int m0 = r, m1 = w - r, e0 = r < w ? r : w, e1 = m1 > e0 ? m1 : e0;
     for (int j = 0; j < h; j++) {
-        u16 c = lerp565(top, bot, j, h - 1);
-        for (int i = 0; i < w; i++) {
-            int cov = round_cov(i, j, w, h, r);
-            if (cov >= 255) ui_px(x + i, y + j, c);
-            else if (cov > 0) ui_blend_px(x + i, y + j, c, cov);
+        if (CLIPPED_Y(y + j)) continue;
+        for (int i = 0; i < e0; i++) cov_px(x + i, y + j, c, round_cov(i, j, w, h, r));
+        for (int i = e1; i < w; i++) cov_px(x + i, y + j, c, round_cov(i, j, w, h, r));
+        if (m1 > m0) {
+            int cov = round_cov(m0, j, w, h, r);
+            if (cov >= 255) row_put(x + m0, x + m1, y + j, c);
+            else if (cov > 0) row_blend(x + m0, x + m1, y + j, c, cov);
         }
     }
 }
 
+void ui_vgrad_round(int x, int y, int w, int h, int r, u16 top, u16 bot) {
+    int rr = r > 0 ? r : 0;
+    int m0 = rr, m1 = w - rr, e0 = rr < w ? rr : w, e1 = m1 > e0 ? m1 : e0;
+    for (int j = 0; j < h; j++) {
+        if (CLIPPED_Y(y + j)) continue;
+        u16 c = lerp565(top, bot, j, h - 1);
+        for (int i = 0; i < e0; i++) cov_px(x + i, y + j, c, round_cov(i, j, w, h, r));
+        for (int i = e1; i < w; i++) cov_px(x + i, y + j, c, round_cov(i, j, w, h, r));
+        if (m1 > m0) {
+            int cov = round_cov(m0, j, w, h, r);
+            if (cov >= 255) row_put(x + m0, x + m1, y + j, c);
+            else if (cov > 0) row_blend(x + m0, x + m1, y + j, c, cov);
+        }
+    }
+}
+
+static inline int frame_a(int i, int j, int w, int h, int r, int thick, int iw, int ih, int ir) {
+    int oc = round_cov(i, j, w, h, r);            /* coverage of the outer edge */
+    if (oc <= 0) return 0;
+    int ii = i - thick, jj = j - thick;           /* coverage of the inner edge */
+    int ic = (ii >= 0 && jj >= 0 && ii < iw && jj < ih) ? round_cov(ii, jj, iw, ih, ir) : 0;
+    return oc - ic;                               /* the ring = outside inner, inside outer (both AA) */
+}
 void ui_frame_round(int x, int y, int w, int h, int r, u16 c, int thick) {
     if (thick < 1) thick = 1;
     int iw = w - 2 * thick, ih = h - 2 * thick, ir = r - thick; if (ir < 0) ir = 0;
-    for (int j = 0; j < h; j++)
+    /* columns where BOTH edges are column-independent: outer middle and inner middle overlap */
+    int o0 = r > 0 ? r : 0, o1 = r > 0 ? w - r : w;
+    int n0 = thick + (ir > 0 ? ir : 0), n1 = thick + iw - (ir > 0 ? ir : 0);
+    int c0 = o0 > n0 ? o0 : n0, c1 = o1 < n1 ? o1 : n1;
+    if (c1 < c0) c1 = c0;
+    for (int j = 0; j < h; j++) {
+        if (CLIPPED_Y(y + j)) continue;
         for (int i = 0; i < w; i++) {
-            int oc = round_cov(i, j, w, h, r);            /* coverage of the outer edge */
-            if (oc <= 0) continue;
-            int ii = i - thick, jj = j - thick;           /* coverage of the inner edge */
-            int ic = (ii >= 0 && jj >= 0 && ii < iw && jj < ih) ? round_cov(ii, jj, iw, ih, ir) : 0;
-            int a = oc - ic;                              /* the ring = outside inner, inside outer (both AA) */
+            if (i == c0 && c1 > c0) {
+                int a = frame_a(c0, j, w, h, r, thick, iw, ih, ir);
+                if (a >= 255) row_put(x + c0, x + c1, y + j, c);
+                else if (a > 0) row_blend(x + c0, x + c1, y + j, c, a);
+                i = c1 - 1; continue;
+            }
+            int a = frame_a(i, j, w, h, r, thick, iw, ih, ir);
             if (a <= 0) continue;
             if (a >= 255) ui_px(x + i, y + j, c);
             else ui_blend_px(x + i, y + j, c, a);
         }
+    }
 }
 
-void ui_glow_round(int x, int y, int w, int h, int r, u16 c, int spread, int alpha) {
+/* skip rect (absolute, x0..x1 x y0..y1, may be empty): pixels the caller overwrites solidly afterwards */
+static void glow_round_skip(int x, int y, int w, int h, int r, u16 c, int spread, int alpha,
+                            int sx0, int sy0, int sx1, int sy1) {
     for (int g = spread; g >= 1; g--) {          /* stacked expanded rings build a soft halo */
         int gx = x - g, gy = y - g, gw = w + 2 * g, gh = h + 2 * g, gr = r + g;
-        for (int j = 0; j < gh; j++)
-            for (int i = 0; i < gw; i++)
-                if (in_round(i, j, gw, gh, gr)) ui_blend_px(gx + i, gy + j, c, alpha);
+        int m0 = gr > 0 ? gr : 0, m1 = gr > 0 ? gw - gr : gw;
+        for (int j = 0; j < gh; j++) {
+            int ay = gy + j, skiprow = (ay >= sy0 && ay < sy1 && sx1 > sx0);
+            if (CLIPPED_Y(ay)) continue;
+            for (int i = 0; i < gw; i++) {
+                int ax = gx + i;
+                if (i == m0 && m1 > m0) {               /* middle run: inside or not, decided by the row */
+                    if (in_round(m0, j, gw, gh, gr))
+                        for (int k = gx + m0; k < gx + m1; k++) {
+                            if (skiprow && k >= sx0 && k < sx1) { k = sx1 - 1; continue; }
+                            ui_blend_px(k, ay, c, alpha);
+                        }
+                    i = m1 - 1; continue;
+                }
+                if (skiprow && ax >= sx0 && ax < sx1) continue;
+                if (in_round(i, j, gw, gh, gr)) ui_blend_px(ax, ay, c, alpha);
+            }
+        }
     }
+}
+void ui_glow_round(int x, int y, int w, int h, int r, u16 c, int spread, int alpha) {
+    glow_round_skip(x, y, w, h, r, c, spread, alpha, 0, 0, 0, 0);
 }
 
 void ui_button(int x, int y, int w, int h, const char *label, int selected, u16 accent) {
     int r = h / 2 < 12 ? h / 2 : 12;
-    if (selected) ui_glow_round(x, y, w, h, r, accent, 5, 26);
+    /* the glow under the button's solid interior is painted over by the fill below: don't blend it */
+    if (selected) {   /* rows whose middle run the gradient covers fully (it is written solid there) */
+        int sy0 = -1, sy1 = -1;
+        if (w > 2 * r)
+            for (int j = 0; j < h; j++) if (round_cov(r, j, w, h, r) >= 255) { if (sy0 < 0) sy0 = j; sy1 = j + 1; }
+        if (sy0 >= 0) glow_round_skip(x, y, w, h, r, accent, 5, 26, x + r, y + sy0, x + w - r, y + sy1);
+        else          glow_round_skip(x, y, w, h, r, accent, 5, 26, 0, 0, 0, 0);
+    }
     u16 top = selected ? TH_SEL : UI_BG2;
     u16 bot = selected ? TH_SELLO : UI_BG;
     ui_vgrad_round(x, y, w, h, r, top, bot);
     ui_frame_round(x, y, w, h, r, selected ? accent : UI_DIM, selected ? 2 : 1);
     u16 tc = selected ? accent : UI_INK;
-    const char *lbl = label; char buf[64];   /* truncate a too-long label so it can't spill the button */
+    const char *lbl = label; char buf[64];   /* a too-long label must not spill the button */
     int maxw = w - 8;
     if (ui_text_w(1, label) > maxw) {
-        int maxch = maxw / 8 - 2; if (maxch < 1) maxch = 1;
-        snprintf(buf, sizeof buf, "%.*s..", maxch, label); lbl = buf;
+        /* make room before cutting words: first squeeze the wide gaps ("Zoom:  100%   (hint)"),
+         * then drop a trailing "(hint)", and only then truncate with ".." */
+        int o = 0;
+        for (const char *p = label; *p && o < (int)sizeof buf - 1; p++)
+            if (!(*p == ' ' && o > 0 && buf[o - 1] == ' ')) buf[o++] = *p;
+        buf[o] = 0; lbl = buf;
+        if (ui_text_w(1, buf) > maxw && o > 0 && buf[o - 1] == ')') {
+            char *lp = strrchr(buf, '(');
+            if (lp && lp > buf + 1 && lp[-1] == ' ') lp[-1] = 0;
+        }
+        if (ui_text_w(1, buf) > maxw) {
+            char t[64]; snprintf(t, sizeof t, "%s", buf);
+            int maxch = maxw / 8 - 2; if (maxch < 1) maxch = 1;
+            snprintf(buf, sizeof buf, "%.*s..", maxch, t);
+        }
     }
     ui_text_center(x + w / 2, y + (h - 8) / 2, 1, tc, lbl);
 }

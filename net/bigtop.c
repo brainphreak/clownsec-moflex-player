@@ -1,6 +1,8 @@
 /* Clownsec Big Top client. See bigtop.h. */
 #include "bigtop.h"
 #include "httpfile.h"
+#include "livemoflex.h"
+#include "moflex_playback.h"   /* moflex_resume_get: where playback will start */
 #include "downloader.h"
 #include "cJSON.h"
 #include <3ds.h>
@@ -116,6 +118,8 @@ static void fill(BtItem *it, cJSON *e) {
     it->poster = (int)jn(e, "poster"); it->season = (int)jn(e, "season"); it->episode = (int)jn(e, "episode");
     it->episodes = (int)jn(e, "episodes"); it->seen = (int)jn(e, "seen"); it->watched = (int)jn(e, "watched");
     it->super = (int)jn(e, "super"); it->pos = jn(e, "pos"); it->size = jn(e, "size");
+    it->stream = (int)jn(e, "stream"); it->dur = jn(e, "dur"); js(e, "layout", it->layout, sizeof it->layout);
+    js(e, "fmt", it->fmt, sizeof it->fmt);
 }
 static int fill_array(cJSON *arr, BtItem **out, const char *force_type) {
     int n = cJSON_GetArraySize(arr);
@@ -333,12 +337,76 @@ void bt_path_item(const char *path, char *id, int cap) {
     snprintf(id, (size_t)cap, "%.*s", (int)(b - a - 1), a + 1);
 }
 
+static struct { int on, fmt; char id[40]; long long dur_ms, start_ms; } g_live;
+void bt_live_arm(const char *item_id, int fmt, long long dur_ms, long long start_ms) {
+    snprintf(g_live.id, sizeof g_live.id, "%s", item_id);
+    g_live.fmt = fmt; g_live.dur_ms = dur_ms; g_live.start_ms = start_ms > 0 ? start_ms : 0;
+    g_live.on = 1;
+    live_install_hook();
+}
+void bt_live_disarm(void) { g_live.on = 0; }
+
 FILE *bt_open_media(const char *path) {
     char id[40]; bt_path_item(path, id, sizeof id);
     if (!id[0]) return NULL;                         /* not ours: the card */
     if (!g_play_cfg.url[0]) bt_cfg_load(&g_play_cfg);
+    if (g_live.on && !strcmp(g_live.id, id)) {      /* encoded as it plays: the live reader */
+        int lf = moflex_live_fmt_get();          /* the VIDEO menu's Format choice, if it changed it */
+        if (lf >= 0 && lf != g_live.fmt) {
+            char key[48]; snprintf(key, sizeof key, "bigtop:%s", id);
+            moflex_fmt_save_key(key, lf);           /* remembered for this title */
+            g_live.fmt = lf;
+        }
+        char url[320];
+        snprintf(url, sizeof url, "%s/api/items/%s/stream.moflex?fmt=%d&client=%s",
+                 g_play_cfg.url, id, g_live.fmt, g_play_cfg.client);
+        /* start where playback will: the resume point as it is NOW -- after the Resume / Start over
+         * prompt, which clears it on Start over (arming with the old point made Start over resume).
+         * The same rule as the engine's: past 3 s and not in the last 10 s. */
+        long long rp = moflex_resume_get(path), st = 0;
+        if (rp > 3000000 && (g_live.dur_ms <= 0 || rp / 1000 < g_live.dur_ms - 10000)) st = rp;
+        FILE *f = NULL;
+        if (!live_open_dur(url, st, g_live.dur_ms * 1000, &f)) return NULL;
+        return f;
+    }
     long long size = -1;
     for (int i = 0; i < 8; i++) if (!strcmp(g_sizes[i].id, id) && g_sizes[i].size > 0) size = g_sizes[i].size;
     char url[256]; snprintf(url, sizeof url, "%s/api/items/%s/file", g_play_cfg.url, id);
     return httpfile_open(url, size, 0);
+}
+
+/* ---- streamed (transcoded) videos ---- */
+int bt_tracks(const BtCfg *c, const char *id, BtTracks *t) {
+    memset(t, 0, sizeof *t); t->audio_def = -1;
+    char path[96]; snprintf(path, sizeof path, "/api/items/%s", id);
+    char *body = NULL;
+    long code = bt_req(c->url, c->client, path, &body, 0, 1);
+    cJSON *r = (code == 200 && body) ? cJSON_Parse(body) : NULL;
+    free(body);
+    if (!r) return 0;
+    js(r, "streamErr", t->err, sizeof t->err);
+    cJSON *e;
+    cJSON *a = cJSON_GetObjectItemCaseSensitive(r, "audioTracks");
+    if (cJSON_IsArray(a)) cJSON_ArrayForEach(e, a) {
+        if (t->n_audio >= 8) break;
+        int i = t->n_audio++;
+        js(e, "lang", t->alang[i], sizeof t->alang[i]); js(e, "name", t->aname[i], sizeof t->aname[i]);
+        if (jn(e, "default") && t->audio_def < 0) t->audio_def = i;
+    }
+    cJSON *b = cJSON_GetObjectItemCaseSensitive(r, "burnSubs");
+    if (cJSON_IsArray(b)) cJSON_ArrayForEach(e, b) {
+        if (t->n_burn >= 8) break;
+        js(e, "name", t->bname[t->n_burn], sizeof t->bname[0]); t->n_burn++;
+    }
+    cJSON_Delete(r);
+    return 1;
+}
+
+HttpStream *bt_stream_open(const BtCfg *c, const char *id, long long at_ms, int fmt, int audio, int burn) {
+    char url[320];
+    snprintf(url, sizeof url, "%s/api/items/%s/stream.ts?t=%lld&fmt=%d&audio=%d&burn=%d&client=%s",
+             c->url, id, at_ms > 0 ? at_ms : 0, fmt, audio, burn, c->client);
+    HttpStream *s = hs_open(url, NULL, 2u << 20);
+    if (!s) snprintf(g_err, sizeof g_err, "Could not start the stream.");
+    return s;
 }

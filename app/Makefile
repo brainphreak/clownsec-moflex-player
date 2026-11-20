@@ -22,9 +22,19 @@ BUILD_TAG ?= $(shell ./buildnum.sh)
 export BUILD_TAG
 CFLAGS  := -w -Wreturn-type -O3 -mword-relocations -ffunction-sections -D__3DS__ -D_GNU_SOURCE \
 	-DBUILD_TAG=\"$(BUILD_TAG)\" \
+	-DMOBI_OPT_CONST=0x08bbda5e \
 	-Wno-error=implicit-function-declaration $(ARCH) $(INCLUDE)
 # Test builds only: UPDATE_TEST_URL=https://.../latest.txt points the update check (and the
 # self-updater's download, which sits beside it) somewhere other than the public release.
+# Engine test channel: TEST_CHANNEL=1 builds update only from the engine-test release (see RELEASING.md)
+ifneq ($(TEST_CHANNEL),)
+CFLAGS  += -DTEST_CHANNEL
+endif
+# Lab build (lab/build_real.sh): autoplay sdmc:/lab/params.txt, then back to the Moflex Lab Host
+ifneq ($(LAB_AUTOPLAY),)
+CFLAGS  += -DLAB_AUTOPLAY
+endif
+CFLAGS  += $(EXTRA_CFLAGS)
 ifneq ($(UPDATE_TEST_URL),)
 CFLAGS  += -DUPDATE_TEST_URL=\"$(UPDATE_TEST_URL)\"
 endif

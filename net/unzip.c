@@ -6,8 +6,16 @@
 #include <stdio.h>
 #include <stdarg.h>
 
+/* diagnostics logs are opt-in: create sdmc:/moflex_player/debug_on.txt to turn them on. Normal use
+ * never writes them -- no SD writes while a film plays, no logs that grow forever. */
+static int dbg_on(void) {
+    static int on = -1;
+    if (on < 0) { FILE *m = fopen("sdmc:/moflex_player/debug_on.txt", "rb"); on = m ? 1 : 0; if (m) fclose(m); }
+    return on;
+}
 /* extraction forensics: one small log per unzip run -- the last lines name the failing layer */
 static void uz_log(const char *fmt, ...) {
+    if (!dbg_on()) return;
     FILE *f = fopen("sdmc:/moflex_player/unzip_log.txt", "ab");
     if (!f) return;
     va_list ap; va_start(ap, fmt);

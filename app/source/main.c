@@ -66,6 +66,10 @@ static void idle_apt_hook(APT_HookType t, void *u) {
          * handoff -- HOME hangs the whole console until it's released. Drop it for the suspend;
          * the transfer is frozen while we're suspended anyway. */
         if (s_dlw_ndm) { dl_wifi_hold(0); s_ndm_resume = 1; }
+        /* HOME and the power button never reach idle_scan (APT takes them directly), so a press
+         * while the screens are dark would leave the HOME Menu / power menu dark too -- only a
+         * lid cycle relit them. Relight on the way out. */
+        if (s_idle_off) idle_backlight(1);
     }
     if (t == APTHOOK_ONRESTORE || t == APTHOOK_ONWAKEUP) {
         s_idle_last = osGetTime();   /* the idle_scan relight invariant handles the screens */
@@ -293,6 +297,58 @@ static int scan_skip_dir(const char *n) {
     return is_hidden_dir(n);
 }
 
+/* "Does this CIA hold a movie?" answers, kept across launches (sdmc:/moflex_player/cia_movies.cache).
+ * Finding out means opening the CIA and reading into it; a folder of games paid that for every file
+ * on every visit. Keyed by path + size, so a replaced file is looked at again. */
+#define CIAC_MAX  256
+#define CIAC_PLEN 240
+#define CIAC_FILE "sdmc:/moflex_player/cia_movies.cache"
+typedef struct { char path[CIAC_PLEN]; long long size; int has; } CiaCacheEnt;
+static CiaCacheEnt *g_ciac = NULL;
+static int g_ciac_n = -1, g_ciac_next = 0, g_ciac_dirty = 0;
+static void ciac_load(void) {
+    g_ciac_n = 0;
+    if (!g_ciac) g_ciac = (CiaCacheEnt *)calloc(CIAC_MAX, sizeof *g_ciac);
+    if (!g_ciac) return;
+    FILE *f = fopen(CIAC_FILE, "r");
+    if (!f) return;
+    char line[CIAC_PLEN + 48];
+    while (g_ciac_n < CIAC_MAX && fgets(line, sizeof line, f)) {
+        long long sz; int has, pos = 0;
+        if (sscanf(line, "%lld %d %n", &sz, &has, &pos) < 2 || !pos) continue;
+        char *pth = line + pos; size_t L = strlen(pth);
+        while (L && (pth[L - 1] == '\n' || pth[L - 1] == '\r')) pth[--L] = 0;
+        if (!L || L >= CIAC_PLEN) continue;
+        CiaCacheEnt *c = &g_ciac[g_ciac_n++];
+        snprintf(c->path, sizeof c->path, "%s", pth); c->size = sz; c->has = !!has;
+    }
+    fclose(f);
+    g_ciac_next = g_ciac_n % CIAC_MAX;
+}
+static void ciac_save(void) {
+    if (!g_ciac_dirty || !g_ciac) return;
+    g_ciac_dirty = 0;
+    mkdir("sdmc:/moflex_player", 0777);
+    FILE *f = fopen(CIAC_FILE, "w");
+    if (!f) return;
+    for (int i = 0; i < g_ciac_n; i++) fprintf(f, "%lld %d %s\n", g_ciac[i].size, g_ciac[i].has, g_ciac[i].path);
+    fclose(f);
+}
+static int cia_movie_cached(const char *full) {
+    struct stat st;
+    if (stat(full, &st)) return 0;                                  /* one stat, for CIAs only */
+    if (g_ciac_n < 0) ciac_load();
+    if (!g_ciac || strlen(full) >= CIAC_PLEN) return cia_has_moflex(full);   /* no room to remember it */
+    for (int i = 0; i < g_ciac_n; i++)
+        if (g_ciac[i].size == (long long)st.st_size && !strcmp(g_ciac[i].path, full)) return g_ciac[i].has;
+    int has = cia_has_moflex(full);
+    int slot = g_ciac_n < CIAC_MAX ? g_ciac_n++ : g_ciac_next;      /* full: overwrite the oldest */
+    g_ciac_next = (slot + 1) % CIAC_MAX;
+    snprintf(g_ciac[slot].path, CIAC_PLEN, "%s", full); g_ciac[slot].size = st.st_size; g_ciac[slot].has = has;
+    g_ciac_dirty = 1;
+    return has;
+}
+
 static void scan(void) {
     nentries = 0;
     DIR *d = opendir(cwd);
@@ -302,12 +358,15 @@ static void scan(void) {
             if (e->d_name[0] == '.' && !s_show_hidden) continue;   /* dotfiles hidden unless revealed */
             char full[PATHLEN + NAMELEN];
             snprintf(full, sizeof(full), "%s%s", cwd, e->d_name);
-            struct stat st;
-            int isdir = (stat(full, &st) == 0) && S_ISDIR(st.st_mode);
+            /* The listing already says file or folder (d_type), as in the library scan. A stat() per
+             * entry -- each one several SD requests -- was most of the time to open a big folder. */
+            int isdir;
+            if (e->d_type != DT_UNKNOWN) isdir = (e->d_type == DT_DIR);
+            else { struct stat st; isdir = (stat(full, &st) == 0) && S_ISDIR(st.st_mode); }
             if (isdir && !s_show_hidden && is_hidden_dir(e->d_name)) continue;   /* system folders */
             if (!isdir && s_filter_movies) {                 /* movies-only view (play, or manage toggle) */
                 if (!is_moflex(e->d_name)) continue;          /* only .moflex / .cia */
-                if (cia_is_cia(e->d_name) && !cia_has_moflex(full)) continue;   /* only movie CIAs */
+                if (cia_is_cia(e->d_name) && !cia_movie_cached(full)) continue;   /* only movie CIAs (remembered) */
             }
             /* else (manage + show-all): list every file so it works as a general download/file tool */
             snprintf(entries[nentries].name, NAMELEN, "%s", e->d_name);
@@ -316,6 +375,7 @@ static void scan(void) {
         }
         closedir(d);
     }
+    ciac_save();                                              /* new CIA answers: one small write */
     qsort(entries, nentries, sizeof(Entry), cmp_entry);
     if (sel >= nentries) sel = nentries ? nentries - 1 : 0;
     scroll = 0;
@@ -645,6 +705,9 @@ static u64  g_last_prog;
 
 static bool dl_progress(void *u, u32 d, u32 t) {
     (void)u;
+    /* main thread only (the background downloader has dlw_progress): keep HOME / sleep / power
+     * working while a download runs or waits -- the downloader now calls back during stalls too */
+    if (!aptMainLoop()) return false;
     hidScanInput();
     if (hidKeysDown() & KEY_B) return false;   /* cancel */
     if (hidKeysHeld() & KEY_TOUCH) { touchPosition tp; hidTouchRead(&tp);   /* tap CANCEL */
@@ -1128,6 +1191,12 @@ static int entry_super(const CatEntry *e, char *audio, int acap, char *subs, int
  * Reset whenever the highlight moves -- scrolling belongs to the thing you are looking at. */
 static int g_desc_scroll = 0, g_desc_over = 0, g_desc_total = 0;
 #define DESC_LINES 12
+/* How many description lines the panel shows. It is NOT a constant: the description starts lower
+ * when there are Audio/Subs/genre lines above it (a SUPER MOFLEX has all three), and a fixed 12
+ * then ran over the "more..." hint and off the bottom of the screen. Set by draw_info_top() from
+ * where the text actually starts; the scroll handlers use it for the last scroll position. */
+static int g_desc_lines = DESC_LINES;
+#define DESC_HINT_Y 228                 /* the "more... ZL/ZR" hint row */
 static void draw_info_top(const CatEntry *e, const u16 *poster) {
     ui_begin(GFX_TOP);
     ui_clear(UI_BG);
@@ -1161,6 +1230,7 @@ static void draw_info_top(const CatEntry *e, const u16 *poster) {
         ui_text(tx, ty, 1, is3d ? UI_NEONP : UI_DIM,
                 is3d ? "3D  (stereoscopic)" : "2D"); ty += 14;
     }
+    if (e->fmt[0]) { ui_text(tx, ty, 1, UI_DIM, e->fmt); ty += 14; }   /* Big Top: MOFLEX / MP4 - encoded live */
     {   /* embedded tracks: cached at scan (local) or from the catalog fields */
         char line[96];
         if (e->audio_langs[0]) { snprintf(line, sizeof line, "Audio: %s", e->audio_langs); ui_text_wrap(tx, &ty, 1, UI_NEONC, line, 30, 2); }
@@ -1168,17 +1238,26 @@ static void draw_info_top(const CatEntry *e, const u16 *poster) {
     }
     if (e->genres[0]) { ui_text_wrap(tx, &ty, 1, UI_GRAY, e->genres, 30, 3); ty += 4; }
     if (e->desc[0]) {
-        int total = ui_text_wrap_from(tx, &ty, 1, UI_INK, e->desc, 30, DESC_LINES, g_desc_scroll);
-        g_desc_over = (total > DESC_LINES); g_desc_total = total;
+        /* lines are 10 px (8 px glyphs + 2): fit to the screen edge when it all fits, otherwise
+         * stop above the hint row so the two never overlap */
+        int dummy = ty;
+        int total = ui_text_wrap_from(tx, &dummy, 1, UI_INK, e->desc, 30, 0, 0);   /* count only */
+        int fit_all  = (240 - 2 - 8 - ty) / 10 + 1;
+        int fit_hint = (DESC_HINT_Y - 2 - 8 - ty) / 10 + 1;
+        g_desc_lines = (total <= fit_all) ? fit_all : fit_hint;
+        if (g_desc_lines < 1) g_desc_lines = 1;
+        if (g_desc_scroll > total - g_desc_lines) g_desc_scroll = total - g_desc_lines > 0 ? total - g_desc_lines : 0;
+        ui_text_wrap_from(tx, &ty, 1, UI_INK, e->desc, 30, g_desc_lines, g_desc_scroll);
+        g_desc_over = (total > g_desc_lines); g_desc_total = total;
         if (g_desc_over) {
             /* Say that there is more, and which buttons reach it. A New 3DS has ZL/ZR; every
              * console has L with up and down, so neither is left without a way down the page. */
             char hint[40];
-            int shown = total - g_desc_scroll; if (shown > DESC_LINES) shown = DESC_LINES;
+            int shown = total - g_desc_scroll; if (shown > g_desc_lines) shown = g_desc_lines;
             snprintf(hint, sizeof hint, "%s ZL/ZR or L+%s",
                      g_desc_scroll + shown < total ? "more..." : "end.",
                      g_desc_scroll > 0 ? "up/down" : "down");
-            ui_text(tx, 228, 1, UI_DIM, hint);
+            ui_text(tx, DESC_HINT_Y, 1, UI_DIM, hint);
         }
     } else { g_desc_over = 0; g_desc_total = 0; }
     ui_present();
@@ -1865,14 +1944,29 @@ static int catalog_pick_group(const CatEntry *cat, int nc, const char *filt_cat,
     return 1;
 }
 
+/* B while a catalog is fetched: a slow or silent server used to leave "Fetching..." up with no
+ * way out (the transfer only gives up after its 20 s connect / 10 s stall timeouts, and retries) */
+static int s_fetch_cancelled;
+static int fetch_abort_b(void) {
+    if (!aptMainLoop()) { s_fetch_cancelled = 1; return 1; }   /* HOME works while fetching */
+    hidScanInput();
+    if (hidKeysDown() & KEY_B) s_fetch_cancelled = 1;
+    return s_fetch_cancelled;
+}
 static void catalog_browse(const Source *src) {
     ui_begin(GFX_BOTTOM); ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
     ui_text_center(UI_W / 2, 100, 2, UI_NEON, "Fetching...");
-    ui_text_fit(UI_W / 2, 130, 1, UI_DIM, src->name, UI_W - 16); ui_present();
+    ui_text_fit(UI_W / 2, 130, 1, UI_DIM, src->name, UI_W - 16);
+    ui_text(8, 226, 1, UI_DIM, "B - cancel"); ui_present();
     gfxFlushBuffers(); gfxSwapBuffers();
 
     char *json = NULL; size_t len = 0;
-    if (!download_to_mem(src->url, &json, &len, 32 * 1024 * 1024)) {
+    s_fetch_cancelled = 0;
+    download_set_abort(fetch_abort_b);
+    int got = download_to_mem(src->url, &json, &len, 32 * 1024 * 1024);
+    download_set_abort(NULL);
+    if (s_fetch_cancelled) { free(json); return; }       /* back to the list, no message */
+    if (!got) {
         msg_screen("DOWNLOAD", "Fetch failed.\nIs Wi-Fi on? Is the URL right?"); return;
     }
     int cap = 4096;
@@ -1987,7 +2081,7 @@ cb_rebuild:;   /* X-search inside the list jumps back here with filt_search set 
             if ((kh & KEY_L) && (k & KEY_UP))   sd = -1;
             if (sd) {
                 g_desc_scroll += sd * 4;
-                int last = g_desc_total - DESC_LINES;      /* never past the final line */
+                int last = g_desc_total - g_desc_lines;      /* never past the final line */
                 if (g_desc_scroll > last) g_desc_scroll = last;
                 if (g_desc_scroll < 0)    g_desc_scroll = 0;
                 redraw = 1;
@@ -3235,7 +3329,7 @@ ll_rebuild:;   /* X-search inside the list jumps back here with s_lib_search set
             if ((kh & KEY_L) && (k & KEY_UP))   sd = -1;
             if (sd) {
                 g_desc_scroll += sd * 4;
-                int last = g_desc_total - DESC_LINES;      /* never past the final line */
+                int last = g_desc_total - g_desc_lines;      /* never past the final line */
                 if (g_desc_scroll > last) g_desc_scroll = last;
                 if (g_desc_scroll < 0)    g_desc_scroll = 0;
                 redraw = 1;
@@ -4219,12 +4313,16 @@ static int startup_detect_poll(void);
 #define LATEST_URL_STABLE "https://github.com/brainphreak/clownsec-moflex-player/releases/download/v1.0/latest.txt"
 #define LATEST_URL_BETA   "https://github.com/brainphreak/clownsec-moflex-player/releases/download/v1.1.0-beta/latest.txt"
 #define LATEST_URL_MP4    "https://github.com/brainphreak/clownsec-moflex-player/releases/download/mp4-beta/latest.txt"
+/* engine test channel (UniqueID 0xf8a2f, builds made with TEST_CHANNEL=1): installs beside the
+ * official app and only ever updates from its own release */
+#define LATEST_URL_TEST   "https://github.com/brainphreak/clownsec-moflex-player/releases/download/engine-test/latest.txt"
 /* The same files are mirrored on clownsec.com in GitHub's layout (<release tag>/latest.txt with the
  * channel's .cia/.3dsx beside it): when GitHub's release downloads fail (they 504'd for hours on
  * 2026-11-08 and every player silently saw "no update"), the check and the download fall back. */
 #define LATEST_URL_STABLE_M "https://www.clownsec.com/player/v1.0/latest.txt"
 #define LATEST_URL_BETA_M   "https://www.clownsec.com/player/v1.1.0-beta/latest.txt"
 #define LATEST_URL_MP4_M    "https://www.clownsec.com/player/mp4-beta/latest.txt"
+#define LATEST_URL_TEST_M   "https://www.clownsec.com/player/engine-test/latest.txt"
 #define UPD_SOURCES 2                 /* 0 = GitHub, 1 = clownsec.com mirror */
 static int s_upd_src = 0;             /* the source whose latest.txt answered: download from it first */
 static const char *latest_url_n(int src) {
@@ -4232,9 +4330,13 @@ static const char *latest_url_n(int src) {
     (void)src;
     return UPDATE_TEST_URL;
 #endif
+#ifdef TEST_CHANNEL
+    return src ? LATEST_URL_TEST_M : LATEST_URL_TEST;   /* the .3dsx too: HBL has no TitleID to tell */
+#endif
     u64 tid = 0;
     APT_GetProgramID(&tid);
     u32 uid = (u32)((tid >> 8) & 0xFFFFF);
+    if (uid == 0xf8a2f) return src ? LATEST_URL_TEST_M : LATEST_URL_TEST;
     if (uid == 0xf8a2d) return src ? LATEST_URL_BETA_M : LATEST_URL_BETA;
     if (uid == 0xf8a2e) return src ? LATEST_URL_MP4_M : LATEST_URL_MP4;
     return src ? LATEST_URL_STABLE_M : LATEST_URL_STABLE;
@@ -4252,8 +4354,10 @@ static void ver_parse(const char *s, int *a, int *b) {
         else break;
     }
 }
+static volatile int s_upd_answered;   /* a source gave a real version this check (manual check) */
+static int s_upd_tries = 8;             /* rounds before giving up (a manual check asks twice) */
 static void update_check(void) {   /* worker thread; printf-free so it can't hit the locale fault */
-    for (int try = 0; try < 8 && !s_dt_abort; try++) {
+    for (int try = 0; try < s_upd_tries && !s_dt_abort; try++) {
         if (try) for (int w = 0; w < 50 && !s_dt_abort; w++) svcSleepThread(100 * 1000 * 1000LL);   /* 5s, abortable */
         if (osGetWifiStrength() == 0) continue;   /* offline or still associating -> retry, never block */
         char *buf = NULL; size_t len = 0;
@@ -4261,15 +4365,23 @@ static void update_check(void) {   /* worker thread; printf-free so it can't hit
         /* A server error still "downloads": GitHub's 504 is a 92-byte HTML page that parses as
          * version 0. Only a body that starts with a real "MAJOR.MINOR" counts as an answer;
          * anything else tries the mirror, then the next round. */
+        /* Ask EVERY source and keep the newest answer: GitHub's download link is cached for minutes
+         * after a release, so a stale-but-valid reply from it hid an update the mirror already had. */
+        int best_src = -1;
         for (src = 0; src < UPD_SOURCES && !s_dt_abort; src++) {
-            if (download_to_mem(latest_url_n(src), &buf, &len, 256) && buf) {
-                buf[len < 255 ? len : 255] = 0;
-                ver_parse(buf, &ld, &ln);
-                if (buf[0] >= '0' && buf[0] <= '9' && ld > 0) break;
+            char *b = NULL; size_t bl = 0; int d = 0, n = 0;
+            if (download_to_mem(latest_url_n(src), &b, &bl, 256) && b) {
+                b[bl < 255 ? bl : 255] = 0;
+                ver_parse(b, &d, &n);
+                if (b[0] >= '0' && b[0] <= '9' && d > 0 && (best_src < 0 || d > ld || (d == ld && n > ln))) {
+                    free(buf); buf = b; b = NULL; len = bl; ld = d; ln = n; best_src = src;
+                }
             }
-            free(buf); buf = NULL;
+            free(b);
         }
         if (!buf) continue;                       /* no source answered -> retry */
+        s_upd_answered = 1;
+        src = best_src;
         s_upd_src = src;
         ver_parse(BUILD_TAG, &cd, &cn);
         if (ld > cd || (ld == cd && ln > cn)) {   /* copy "MAJOR.MINOR" verbatim, no snprintf */
@@ -4355,6 +4467,11 @@ static void upd_asset_url(char *out, size_t n, const char *ext, int src) {
     u64 tid = 0; APT_GetProgramID(&tid);
     u32 uid = (u32)((tid >> 8) & 0xFFFFF);
     const char *nm = uid == 0xf8a2d ? "clownsec_player_beta" : uid == 0xf8a2e ? "clownsec_player_mp4" : "clownsec_player";
+#ifdef TEST_CHANNEL
+    nm = "clownsec_player_test";
+#else
+    if (uid == 0xf8a2f) nm = "clownsec_player_test";
+#endif
     snprintf(out, n, "%.*s%s%s", base, lu, nm, ext);
 }
 static void upd_screen(const char *title, const char *line, int pct) {
@@ -4488,6 +4605,36 @@ static int self_update(void) {
     else { snprintf(m, sizeof m, "Updated to %s.\nThe player will now restart.", s_upd); aptSetChainloaderToSelf(); }
     msg_screen_btn("UPDATE INSTALLED", m, "OKAY");
     return 1;
+}
+
+static int startup_detect_poll(void);
+/* Tap on the version: check now instead of only at start-up. 1 = an update installed (exit). */
+static int update_check_now(void) {
+    if (!s_upd[0]) {
+        if (!s_dtw_exit) { msg_screen("UPDATES", "Already checking for an update.\nTry again in a moment."); return 0; }
+        s_upd_answered = 0; s_upd_tries = 2;
+        s_dt_done = 0; s_dt_abort = 0; s_dt_consumed = 1; s_dtw_exit = 0;   /* consumed: no new-video prompt */
+        s32 prio = 0x30; svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
+        if (!threadCreate(detect_worker, NULL, 32 * 1024, prio + 1, -2, true)) { s_dtw_exit = 1; return 0; }
+        msg_screen_nowait("UPDATES", "Checking for updates...\n\nB - cancel");
+        while (aptMainLoop() && !s_dtw_exit) {
+            hidScanInput();
+            if (hidKeysDown() & KEY_B) s_dt_abort = 1;   /* the worker stops at its next step */
+            svcSleepThread(50 * 1000 * 1000LL);
+        }
+        s_upd_tries = 8;
+        if (s_dt_abort) return 0;
+        if (!s_upd[0]) {
+            char m[96];
+            if (s_upd_answered) snprintf(m, sizeof m, "You're up to date.\n\nThis is build %s.", BUILD_TAG);
+            else snprintf(m, sizeof m, "Couldn't reach the update server.\nIs Wi-Fi on?");
+            msg_screen("UPDATES", m);
+            return 0;
+        }
+    }
+    s_upd_shown = 0;                     /* offer it (again) */
+    startup_detect_poll();
+    return s_upd_quit;
 }
 
 /* Home screen polls this once per frame; runs the prompts when the background walk lands. */
@@ -5024,6 +5171,7 @@ static int extplay_launch(const char *path) {
     return 1;
 }
 
+static int g_play_to_browser = 0;   /* set by a browser (Big Top, Plex) that redraws its own top screen */
 static MoflexResult play_movie(const char *path) {
     /* a Big Top video streams from the server: none of the card checks below apply to it */
     int remote = !strncmp(path, "bigtop:", 7);
@@ -5132,7 +5280,9 @@ static MoflexResult play_movie(const char *path) {
     cia_clear_selection();
     consoleInit(GFX_BOTTOM, NULL);
     gfxSetDoubleBuffering(GFX_BOTTOM, false);
-    branding_show();               /* restore the 3D logo on the top screen */
+    /* back to a browser: it draws the movie's info on top itself, so no logo in between */
+    if (!g_play_to_browser) branding_show();   /* restore the 3D logo on the top screen */
+    g_play_to_browser = 0;
     return r;
 }
 
@@ -6274,7 +6424,7 @@ static int plex_browse(void) {
         int sel = catalog_pick(ttl[depth], sub[0] ? sub : NULL, names, shown, 0, NULL);
         s_plex_items = NULL; s_plex_n = 0;
         if (view != it) free(view);
-        branding_show();                      /* the logo back while the next list loads */
+        /* the top keeps the last info until the next list draws its own (no logo flash) */
         free(names);
         if (sel == -4) {                      /* X: search this list (B clears it) */
             free(map);
@@ -6324,7 +6474,8 @@ static void settings_menu(void) {
     for (;;) {
         char r1[40]; const char *rows[6]; int act[6], n = 0;
         rows[n] = "PLAYBACK DEFAULTS"; act[n++] = 0;
-        rows[n] = "PLEX SERVER"; act[n++] = 2;
+        {   bool isnew = false; APT_CheckNew3DS(&isnew);   /* Plex needs a New 3DS (H.264) */
+            if (isnew) { rows[n] = "PLEX SERVER"; act[n++] = 2; } }
         rows[n] = "BIG TOP SERVER"; act[n++] = 3;
         if (g_extplay_ok) { snprintf(r1, sizeof r1, "OLD 3DS: PLAY MOVIES WITH..."); rows[n] = r1; act[n++] = 1; }
         rows[n] = "DONE"; act[n++] = -1;
@@ -6405,8 +6556,76 @@ static void home_draw(int bsel, long long rpos) {
     }
 }
 
+/* ---- WHAT'S NEW: shown once per release note (not per build). Bump WHATSNEW_ID with new notes. ---- */
+#define WHATSNEW_ID   "61119-2"
+#define WHATSNEW_SEEN "sdmc:/moflex_player/whatsnew_seen.txt"
+static const char *const k_whatsnew[] = {
+    "A new playback engine on every 3DS: smoother video, steady frame pacing, and seeking with a picture preview while you drag.",
+    "Old 3DS: 2D and 3D moflex now play smoothly, from the SD card and streamed from Big Top.",
+    "CLOWNSEC Big Top: stream the movies on your computer to the 3DS. MP4 and MKV work too (an Old 3DS gets them as live moflex).",
+    "Plex: browse and play your Plex server's movies and shows (New 3DS).",
+    "SUPER MOFLEX: up to 8 audio tracks, and other versions of a film (VIDEO > Version), each with its own default audio.",
+    "Faster file browser, quicker menus and volume while playing. Tap the version on the home screen to check for an update.",
+    "Found a bug? Report it to bugs@clownsec.com",
+};
+#define WN_CW    37          /* characters per line (8 px font, 12 px margins) */
+#define WN_LINES 13          /* visible body lines between the rule and the button */
+static void whatsnew_maybe_show(void) {
+    char seen[40] = "";
+    FILE *f = fopen(WHATSNEW_SEEN, "r");
+    if (f) { if (!fgets(seen, sizeof seen, f)) seen[0] = 0; fclose(f); }
+    seen[strcspn(seen, "\r\n")] = 0;
+    if (!strcmp(seen, WHATSNEW_ID)) return;
+    const int np = (int)(sizeof k_whatsnew / sizeof k_whatsnew[0]);
+    int plines[8], total = 0;
+    for (int i = 0; i < np; i++) {
+        int y = 0; plines[i] = ui_text_wrap_from(0, &y, 1, UI_INK, k_whatsnew[i], WN_CW, 0, 0);
+        total += plines[i] + (i + 1 < np ? 1 : 0);   /* a blank line between paragraphs */
+    }
+    int scroll = 0, maxscroll = total > WN_LINES ? total - WN_LINES : 0;
+    int redraw = 1, tdown = 0, tx0 = 0, ty0 = 0;
+    while (aptMainLoop()) {
+        hidScanInput();
+        u32 k = hidKeysDown(), ku = hidKeysUp();
+        if (k & (KEY_A | KEY_B)) break;
+        if ((k & KEY_DOWN) && scroll < maxscroll) { scroll++; redraw = 1; }
+        if ((k & KEY_UP) && scroll > 0) { scroll--; redraw = 1; }
+        touchPosition tp; hidTouchRead(&tp);
+        if (k & KEY_TOUCH) { tdown = 1; tx0 = tp.px; ty0 = tp.py; }
+        else if ((ku & KEY_TOUCH) && tdown) { tdown = 0; if (ty0 >= 206 && ty0 < 234 && tx0 >= 110 && tx0 < 210) break; }
+        if (redraw) {
+            ui_begin(GFX_BOTTOM);
+            ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
+            ui_text_center_fit(UI_W / 2, 14, 2, UI_NEON, "WHAT'S NEW", UI_W - 16);
+            ui_glow_round(28, 42, UI_W - 56, 2, 1, UI_NEON, 3, 30);
+            ui_fill_round(28, 42, UI_W - 56, 2, 1, UI_NEON);
+            int y = 56, line = 0, room = WN_LINES;            /* line = index into the whole text */
+            for (int i = 0; i < np && room > 0; i++) {
+                int skip = scroll > line ? scroll - line : 0;  /* lines of this paragraph above the window */
+                if (skip < plines[i]) {
+                    int y0 = y;
+                    ui_text_wrap_from(12, &y, 1, UI_INK, k_whatsnew[i], WN_CW, room, skip);
+                    room -= (y - y0) / 10;
+                }
+                line += plines[i];
+                if (i + 1 < np) { if (line >= scroll && room > 0) { y += 10; room--; } line++; }   /* paragraph gap */
+            }
+            if (scroll < maxscroll) ui_text(12, 194, 1, UI_NEON, "v more");
+            if (scroll > 0) ui_text(UI_W - 12 - 8 * 6, 194, 1, UI_NEON, "^ back");
+            ui_button(110, 206, 100, 28, "OKAY", 0, UI_NEONP);
+            ui_present(); redraw = 0;
+        }
+        gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
+    }
+    mkdir("sdmc:/moflex_player", 0777);
+    f = fopen(WHATSNEW_SEEN, "w");
+    if (f) { fputs(WHATSNEW_ID "\n", f); fclose(f); }
+}
+
 static int home_gui(void) {
     static int bsel = 0;   /* remember the highlighted button across screens (B back keeps it) */
+    static int s_whatsnew_done = 0;
+    if (!s_whatsnew_done) { s_whatsnew_done = 1; whatsnew_maybe_show(); }
     int redraw = 1;
     if (startup_detect_poll()) redraw = 1;   /* background new-video check landed while we were away */
     /* read the resume position ONCE (not every frame -- that hammered the SD card) */
@@ -6433,6 +6652,10 @@ static int home_gui(void) {
             touchPosition t; hidTouchRead(&t);
             if (t.px >= THSW_X && t.px < THSW_X + THSW_W &&
                 t.py >= THSW_Y && t.py < THSW_Y + THSW_H) { themes_screen(); redraw = 1; continue; }
+            if (t.px >= UI_W - 90 && t.py < 36) {   /* the version (top right): check for an update now */
+                if (update_check_now()) return -1;
+                redraw = 1; continue;
+            }
             for (int i = 0; i < 3; i++) {
                 HomeBtn *b = &g_btns[i];
                 if (t.px >= b->x && t.px < b->x + b->w && t.py >= b->y && t.py < b->y + b->h)
@@ -6548,11 +6771,162 @@ static void bt_setup(void) {
 
 /* Play one video: the server's resume point is offered (it knows where this console -- or this
  * console before a reinstall -- stopped), then progress goes back to it. 1 = the app is closing. */
+/* ---- Big Top: MP4/MKV/AVI, transcoded by the server to the stream the Plex path plays ---- */
+typedef struct {
+    BtCfg c; char id[40];
+    int audio;                      /* index into t.aname (-1: the file's default) */
+    int burn, burn_sel, is3d;       /* burn: a picture track is burned in (2D); burn_sel: which */
+    BtTracks t;
+    BtSub subs[16]; int ntext;      /* text tracks (sidecar files + the file's own): files we draw */
+    int nsub, cur; char sname[24][48];
+    char err[200];
+} BtPlay;
+static void bts_set_burn(void *ctx, int on) { ((BtPlay *)ctx)->burn = on; }
+static void bts_set_audio(void *ctx, int idx) {
+    BtPlay *p = (BtPlay *)ctx;
+    if (idx >= 0 && idx < p->t.n_audio) p->audio = idx;   /* the player restarts the stream */
+}
+/* track idx of the CC list: text tracks first (downloaded, drawn by the player -- both eyes in
+ * 3D), then picture tracks (burned in by the server, 2D only) */
+static int bts_apply(BtPlay *p, int idx, char *path, int cap) {
+    path[0] = 0;
+    if (idx < 0 || idx >= p->nsub) return 0;
+    int was_burn = p->burn, was_sel = p->burn_sel, fl = 0;
+    p->burn = 0; p->cur = idx;
+    if (idx < p->ntext) {
+        snprintf(path, (size_t)cap, "sdmc:/moflex_player/.btsub.%s", p->subs[idx].ext[0] ? p->subs[idx].ext : "srt");
+        if (bt_sub_download(&p->c, p->id, p->subs[idx].n, path)) fl = STREAM_SUB_FILE; else path[0] = 0;
+    } else if (!p->is3d) {
+        p->burn = 1; p->burn_sel = idx - p->ntext; fl = STREAM_SUB_BURN;
+    }
+    if (was_burn != p->burn || (p->burn && was_sel != p->burn_sel)) fl |= STREAM_SUB_RESTART;
+    return fl;
+}
+static int bts_set_sub(void *ctx, int idx, long long now_us, char *path, int cap) {
+    (void)now_us; return bts_apply((BtPlay *)ctx, idx, path, cap);
+}
+static HttpStream *bts_open(void *ctx, long long at_us, int fmt) {
+    BtPlay *p = (BtPlay *)ctx;
+    p->is3d = fmt != 0;
+    HttpStream *s = bt_stream_open(&p->c, p->id, at_us / 1000, fmt,
+                                   p->audio, (p->burn && fmt == 0) ? p->burn_sel : -1);
+    if (!s) snprintf(p->err, sizeof p->err, "%s", bt_error());
+    return s;
+}
+static void bts_close(void *ctx, HttpStream *s) { (void)ctx; hs_close(s); }
+typedef struct { BtCfg c; char id[40]; char state[12]; long long pos, dur; } BtRep;
+static void bt_rep_thread(void *a) {
+    BtRep *r = (BtRep *)a;
+    bt_progress(&r->c, r->id, r->pos, r->dur, r->state);
+    free(r);
+}
+static long long s_bts_dur;
+static void bts_report(void *ctx, const char *state, long long pos_us) {
+    BtPlay *p = (BtPlay *)ctx;
+    BtRep *r = (BtRep *)malloc(sizeof *r); if (!r) return;
+    r->c = p->c; snprintf(r->id, sizeof r->id, "%s", p->id); snprintf(r->state, sizeof r->state, "%s", state);
+    r->pos = pos_us / 1000; r->dur = s_bts_dur;
+    if (!strcmp(state, "stopped")) { bt_rep_thread(r); return; }   /* the last word: wait for it */
+    if (!threadCreate(bt_rep_thread, r, 16 * 1024, 0x3F, -2, true)) free(r);
+}
+static const char *bts_error(void *ctx) {
+    BtPlay *p = (BtPlay *)ctx;
+    return p->err[0] ? p->err : "Big Top didn't send the video. Is FFmpeg working on the Big Top computer?";
+}
+static MoflexResult bt_stream_play(const BtCfg *c, const BtItem *it, const char *title) {
+    static BtPlay p;
+    memset(&p, 0, sizeof p);
+    p.c = *c; snprintf(p.id, sizeof p.id, "%s", it->id); p.audio = -1; p.burn_sel = -1;
+    msg_screen_nowait(title, "Getting the video's details...");
+    BtItem fresh;
+    long long pos_ms = bt_item(c, it->id, &fresh) ? fresh.pos : it->pos;
+    long long dur_ms = it->dur > 0 ? it->dur : (long long)it->runtime * 60000;
+    s_bts_dur = dur_ms;
+    if (!bt_tracks(c, it->id, &p.t)) { msg_screen("BIG TOP", bt_error()); return MOFLEX_QUIT_BACK; }
+    if (p.t.err[0]) { msg_screen("BIG TOP", p.t.err); return MOFLEX_QUIT_BACK; }
+    long long start = 0;
+    if (pos_ms > 10000 && (dur_ms <= 0 || pos_ms < dur_ms - 30000)) {
+        long t = (long)(pos_ms / 1000);
+        char m[80]; snprintf(m, sizeof m, "Resume from %ld:%02ld:%02ld?", t / 3600, (t / 60) % 60, t % 60);
+        int a = prompt2(title, m, "RESUME", "START OVER");
+        if (a < 0) return MOFLEX_QUIT_BACK;
+        if (a == 0) start = pos_ms * 1000;
+    }
+    char key[48]; snprintf(key, sizeof key, "bigtop:%s", it->id);
+    /* the frame's layout: what the server says, the Format row's choice over it */
+    int fmt = 0;
+    if (it->is3d) fmt = !strcmp(it->layout, "fsbs") ? 1 : 2;
+    /* audio: the file's default, unless Playback Defaults names a language another track is */
+    int asel = p.t.audio_def >= 0 ? p.t.audio_def : 0;
+    {   MoflexDefaults d; moflex_defaults_get(&d);
+        if (p.t.n_audio > 1 && d.alang > 0 && !moflex_lang_match(p.t.alang[asel], d.alang))
+            for (int i = 0; i < p.t.n_audio; i++)
+                if (moflex_lang_match(p.t.alang[i], d.alang)) { asel = i; p.audio = i; break; }
+    }
+    const char *alang = p.t.n_audio > 0 ? p.t.alang[asel] : "";
+    {   int saved = moflex_fmt_load_key(key); if (saved >= 0) fmt = saved; }
+    p.is3d = fmt != 0;
+    /* subtitles: the text tracks (sidecar files + the file's own), then the picture ones */
+    msg_screen_nowait(title, "Getting subtitles...");
+    int ns = bt_subs(c, it->id, p.subs, 16);
+    p.ntext = ns > 0 ? ns : 0;
+    for (int i = 0; i < p.ntext; i++)
+        snprintf(p.sname[i], sizeof p.sname[i], "%.36s%s [%s]", p.subs[i].label[0] ? p.subs[i].label : "Default",
+                 p.subs[i].forced && !ci_contains(p.subs[i].label, "forced") ? " Forced" : "", p.subs[i].ext);
+    p.nsub = p.ntext;
+    for (int i = 0; i < p.t.n_burn && p.nsub < 24; i++, p.nsub++)
+        snprintf(p.sname[p.nsub], sizeof p.sname[0], "%.38s [burn]", p.t.bname[i]);
+    static char subfile[64]; subfile[0] = 0;
+    int burnable = 0, subs_on = moflex_subs_wanted(key, alang), pick = -1;
+    if (p.nsub > 0) {
+        MoflexDefaults d; moflex_defaults_get(&d);
+        int want = d.slang > 0 ? d.slang : 1;
+        for (int i = 0; i < p.ntext && pick < 0; i++) {   /* the preferred language, not forced-only */
+            char tok[16]; snprintf(tok, sizeof tok, "%s", p.subs[i].label);
+            char *q = strpbrk(tok, ". -"); if (q) *q = 0;
+            if (!p.subs[i].forced && moflex_lang_match(tok, want)) pick = i;
+        }
+        if (pick < 0) pick = 0;
+        int fl = bts_apply(&p, pick, subfile, sizeof subfile);
+        if (fl & STREAM_SUB_BURN) { burnable = 1; p.burn = subs_on; }
+    }
+    msg_screen_nowait(title, "Starting the video...\n(the screen stays dark until it\narrives)");
+    StreamSrc s = { &p, title, key, dur_ms * 1000, start, fmt,
+                    bts_open, bts_close, bts_report, bts_error, subfile,
+                    burnable, subs_on, bts_set_burn,
+                    p.t.n_audio, asel, (const char (*)[8])p.t.alang, (const char (*)[48])p.t.aname, bts_set_audio,
+                    NULL,
+                    p.nsub, pick, (const char (*)[48])p.sname, bts_set_sub };
+    MoflexResult r = stream_play(&s);
+    consoleInit(GFX_BOTTOM, NULL);
+    gfxSetDoubleBuffering(GFX_BOTTOM, false);
+    branding_show();
+    if (r != MOFLEX_QUIT_EXIT && stream_last_error()[0]) msg_screen("BIG TOP", stream_last_error());
+    return r;
+}
+
 static int bt_play(const BtCfg *c, const BtItem *it, const char *title) {
+    int live = 0;
+    if (it->stream) {
+        bool isn = false; APT_CheckNew3DS(&isn);
+        if (isn) return bt_stream_play(c, it, title) == MOFLEX_QUIT_EXIT;   /* H.264 in hardware */
+        live = 1;   /* Old 3DS: no H.264 decoder -- Big Top encodes moflex as it plays */
+    }
     static char path[300];
     bt_media_path(c, it, title, path, sizeof path);
     BtItem fresh;                                         /* the list may be minutes old */
     long long pos_ms = bt_item(c, it->id, &fresh) ? fresh.pos : it->pos;
+    if (live) {
+        int fmt = 0;                                      /* the frame's shape, the Format row's choice over it */
+        if (it->is3d) fmt = !strcmp(it->layout, "fsbs") ? 1 : 2;
+        char key[48]; snprintf(key, sizeof key, "bigtop:%s", it->id);
+        { int saved = moflex_fmt_load_key(key); if (saved >= 0) fmt = saved; }
+        long long dur_ms = it->dur > 0 ? it->dur : (long long)it->runtime * 60000;
+        /* the stream starts where playback will: the resume point, so the engine's resume seek
+         * lands on the stream's own start instead of restarting the encoder */
+        bt_live_arm(it->id, fmt, dur_ms, pos_ms > 10000 ? pos_ms : 0);
+        moflex_live_fmt_set(fmt);                         /* VIDEO > Format can change it while playing */
+    }
     if (pos_ms > 10000) moflex_resume_save(path, pos_ms * 1000);
     else moflex_resume_clear(path);
     /* subtitle files beside the video on the server: into moviedata/ under the video's name, where
@@ -6594,7 +6968,16 @@ static int bt_play(const BtCfg *c, const BtItem *it, const char *title) {
     /* the first seconds are the player reading the start (and end) of the file over Wi-Fi */
     msg_screen_nowait(title, "Connecting to Big Top...");
     httpfile_reset();
+    g_play_to_browser = 1;
+    moflex_watched_set(path, 0);      /* the engine sets it again when this playback finishes */
     MoflexResult r = play_movie(path);
+    bt_live_disarm();
+    moflex_live_fmt_set(-1);
+    if (live && r == MOFLEX_ERROR) {
+        msg_screen("BIG TOP", "Big Top couldn't stream this video\nto an Old 3DS.\n\nOld 3DS streaming of MP4/MKV needs\na Big Top with the moflex encoder.");
+        return 0;
+    }
+    httpfile_drop_cache();                                /* the video's kept blocks: memory back */
     long long at = moflex_resume_get(path);               /* where the engine stopped (0 = the end) */
     long long dur = (long long)it->runtime * 60000;
     int gave_up = httpfile_gave_up();
@@ -6603,7 +6986,12 @@ static int bt_play(const BtCfg *c, const BtItem *it, const char *title) {
          * place it was is the last one the server heard (it may have been mid-seek) */
         moflex_resume_save(path, pos_ms * 1000);
         if (gave_up == 2) msg_screen("BIG TOP", "Lost the connection to Big Top.\n\nIs the computer still on and on\nthis Wi-Fi?");
-    } else if (r == MOFLEX_EOF) { bt_progress(c, it->id, dur, dur, "stopped"); bt_watched(c, it->id, 1); }
+    } else if (r == MOFLEX_EOF || moflex_watched(path)) {
+        /* played to the end. With no next episode on the SD card the engine parks on the last
+         * frame and B returns QUIT_BACK, with the resume point cleared -- that used to report
+         * "stopped at 0" and Big Top never marked the episode watched */
+        bt_progress(c, it->id, dur, dur, "stopped"); bt_watched(c, it->id, 1);
+    }
     else if (r != MOFLEX_QUIT_EXIT || at > 0) bt_progress(c, it->id, at / 1000, dur, "stopped");
     return r == MOFLEX_QUIT_EXIT;
 }
@@ -6639,6 +7027,11 @@ static void bt_draw_top(int i) {
     if (!m.desc[0] && e->episodes) snprintf(m.desc, sizeof m.desc, "%d episodes, %d watched", e->episodes, e->seen);
     snprintf(m.category, sizeof m.category, "Big Top");
     m.year = e->year; m.runtime = e->runtime; m.is3d = e->is3d;
+    if (e->fmt[0]) {   /* what the file is, and how it reaches this console */
+        bool isnew = false; APT_CheckNew3DS(&isnew);
+        if (!e->stream) snprintf(m.fmt, sizeof m.fmt, "%s", e->fmt);
+        else snprintf(m.fmt, sizeof m.fmt, "%s - %s", e->fmt, isnew ? "H.264 stream" : "encoded live");
+    }
     static u16 art[POSTER_W * POSTER_H];
     int have = 0;
     if (e->poster) {
@@ -6727,7 +7120,8 @@ static int bt_browse(void) {
         int sel = catalog_pick(ttl[depth], sub[0] ? sub : NULL, names, shown, 0, NULL);
         s_bt_items = NULL; s_bt_n = 0;
         if (view != it) free(view);
-        branding_show();
+        /* no logo here: the top keeps the last info until the next list draws its own (the logo
+         * flashed between every list and after every movie) */
         free(names);
         if (sel == -4) {                                  /* X: search this list */
             free(map);
@@ -6778,10 +7172,33 @@ static int bt_browse(void) {
 
 static int open_pick(void) {
     int sel = 0, redraw = 1;
+    /* Plex sends H.264, which only a New 3DS decodes: an Old 3DS gets BIG TOP across the last row */
+    bool isnew = false; APT_CheckNew3DS(&isnew);
     while (aptMainLoop()) {
         hidScanInput();
         u32 k = hidKeysDown();
         if (k & KEY_B) return -1;
+        if (!isnew) {
+            if (k & KEY_DOWN)  { if (sel < 4) sel++; redraw = 1; }
+            if (k & KEY_UP)    { if (sel > 0) sel--; redraw = 1; }
+            if (k & KEY_A) return sel == 4 ? 5 : sel;
+            if (k & KEY_TOUCH) { touchPosition tp; hidTouchRead(&tp);
+                for (int i = 0; i < 5; i++) if (tp.py >= 40 + i * 39 && tp.py < 40 + i * 39 + 34)
+                    return i == 4 ? 5 : i; }
+            if (redraw) {
+                ui_begin(GFX_BOTTOM);
+                ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
+                ui_text_center(UI_W / 2, 12, 2, UI_NEON, "OPEN VIDEO");
+                ui_button(34,  40, UI_W - 68, 34, "LIBRARY",         sel == 0, UI_NEON);
+                ui_button(34,  79, UI_W - 68, 34, "FILESYSTEM",      sel == 1, UI_NEONP);
+                ui_button(34, 118, UI_W - 68, 34, "RECENTLY PLAYED", sel == 2, UI_NEONC);
+                ui_button(34, 157, UI_W - 68, 34, "WALK THE AISLE",  sel == 3, UI_NEON);
+                ui_button(34, 196, UI_W - 68, 34, "BIG TOP",         sel == 4, UI_NEONC);
+                ui_present(); redraw = 0;
+            }
+            gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
+            continue;
+        }
         /* five rows; the last is PLEX | BIG TOP side by side (sel 4 / 5) */
         if (k & KEY_DOWN)  { if (sel < 4) sel++; redraw = 1; }
         if (k & KEY_UP)    { if (sel == 5) sel = 3; else if (sel > 0) sel--; redraw = 1; }
@@ -6957,6 +7374,44 @@ static int play_and_handle(const char *path, int origin) {
 /* ---------- main ---------- */
 
 #define SOC_BUF_SZ 0x100000
+#ifdef LAB_AUTOPLAY
+/* Lab build (Moflex Lab Test title): play sdmc:/lab/params.txt's file= from start= for secs=, write
+ * the engine's ring_stats line to sdmc:/lab/last.log, and chain-load back to the Moflex Lab Host --
+ * so it never strands the console in the HOME Menu. */
+extern u64 g_lab_deadline;
+extern int g_lab_noq, g_lab_noflush, g_lab_noov;
+static void lab_autoplay(void) {
+    char prm[1024] = "", file[512] = "sdmc:/lab/office_head.moflex";
+    int start = 0, secs = 60;
+    FILE *p = fopen("sdmc:/lab/params.txt", "r");
+    if (p) { size_t n = fread(prm, 1, sizeof prm - 1, p); prm[n] = 0; fclose(p); }
+    for (char *l = strtok(prm, "\r\n"); l; l = strtok(NULL, "\r\n")) {
+        if (!strncmp(l, "file=", 5)) snprintf(file, sizeof file, "%s", l + 5);
+        else if (!strncmp(l, "start=", 6)) start = atoi(l + 6);
+        else if (!strncmp(l, "secs=", 5)) secs = atoi(l + 5);
+        else if (!strncmp(l, "noq=", 4)) g_lab_noq = atoi(l + 4);
+        else if (!strncmp(l, "noflush=", 8)) g_lab_noflush = atoi(l + 8);
+        else if (!strncmp(l, "noov=", 5)) g_lab_noov = atoi(l + 5);
+    }
+    if (secs < 5) secs = 5;
+    if (secs > 600) secs = 600;
+    remove("sdmc:/moflex_player/ring_stats.txt");
+    if (start > 0) moflex_resume_save(file, (long long)start * 1000000LL); else moflex_resume_clear(file);
+    g_lab_deadline = osGetTime() + (u64)secs * 1000 + 2000;
+    u64 t0 = osGetTime();
+    int r = (int)moflex_play(file);
+    FILE *o = fopen("sdmc:/lab/last.log", "w");
+    if (o) {
+        fprintf(o, "REAL file=%s start=%d secs=%d result=%d wall=%.1fs\n", file, start, secs, r, (osGetTime() - t0) / 1000.0);
+        FILE *rs = fopen("sdmc:/moflex_player/ring_stats.txt", "r");
+        if (rs) { char ln[4096]; while (fgets(ln, sizeof ln, rs)) fputs(ln, o); fclose(rs); }
+        else fputs("(no ring_stats)\n", o);
+        fclose(o);
+    }
+    moflex_resume_clear(file);
+    aptSetChainloader(0x000400000F8A4000ULL, MEDIATYPE_SD);   /* back to the lab host */
+}
+#endif
 int main(void) {
     /* Initialize newlib's global locale ON THE MAIN THREAD before any worker spawns. The
      * background SD scan snprintf()s every filename on a libctru thread, and __global_locale's
@@ -6981,6 +7436,10 @@ int main(void) {
     consoleInit(GFX_BOTTOM, NULL);
     gfxSetDoubleBuffering(GFX_BOTTOM, false);
     branding_show();                                  /* 3D CLOWNSEC logo on top */
+#ifdef LAB_AUTOPLAY
+    lab_autoplay();
+    goto lab_teardown;
+#endif
 
     extplay_load();
     extplay_restore();           /* FIRST: bring back a movie lent to the 3D Movie Player (any model) */
@@ -7011,6 +7470,9 @@ int main(void) {
             else if (g_now_playing_path[0] && play_and_handle(g_now_playing_path, PLAY_FROM_HOME)) running = 0;
         }
     }
+#ifdef LAB_AUTOPLAY
+lab_teardown:
+#endif
     s_dt_abort = 1;   /* stop the background SD walk before teardown */
     for (int w = 0; w < 20 && !s_dt_done && !s_dt_consumed; w++) svcSleepThread(25 * 1000 * 1000LL);
     for (int w = 0; w < 30 && !s_dtw_exit; w++) svcSleepThread(100 * 1000 * 1000LL);   /* update fetch too */

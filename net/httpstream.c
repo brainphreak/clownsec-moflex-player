@@ -12,6 +12,7 @@ struct HttpStream {
     LightLock lock;
     volatile int stop, done;                 /* done: 1 ok, -1 failed */
     volatile long http;
+    volatile int crc;                        /* curl result once done */
     volatile unsigned long long total;
     Thread th;
 };
@@ -64,7 +65,7 @@ static void worker(void *arg) {
     curl_easy_setopt(e, CURLOPT_XFERINFODATA, s);
     CURLcode rc = curl_easy_perform(e);
     long code = 0; curl_easy_getinfo(e, CURLINFO_RESPONSE_CODE, &code);
-    s->http = code;
+    s->http = code; s->crc = (int)rc;
     s->done = (rc == CURLE_OK && code >= 200 && code < 300) ? 1 : -1;
     curl_slist_free_all(hl);
     curl_easy_cleanup(e);
@@ -120,3 +121,5 @@ void hs_close(HttpStream *s) {
     for (int i = 0; i < s->nhdr; i++) free(s->hdr[i]);
     free(s->hdr); free(s->ring); free(s->url); free(s);
 }
+
+int hs_curl_rc(HttpStream *s) { return s->crc; }

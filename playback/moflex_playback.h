@@ -82,6 +82,11 @@ int  moflex_subs_load_file(const char *path);              /* load + show a subt
 int  moflex_subs_stream_begin(void);                      /* subtitles that will arrive while playing */
 int  moflex_subs_append_srt(const char *text);            /* whole SRT blocks; returns cues added */
 int  moflex_fmt_load_key(const char *key);                 /* a video's saved 3D Format choice, -1 = none */
+void moflex_fmt_save_key(const char *key, int fmt);
+/* Big Top live stream: its frame shape (0 2D, 1 SBS, 2 half SBS), shown and changeable in VIDEO;
+ * -1 = not a live stream */
+void moflex_live_fmt_set(int fmt);
+int  moflex_live_fmt_get(void);
 /* Would the player show subtitles for this video at start? Its own saved on/off if it has one,
  * else the Playback Defaults (As found = off: nothing is "found" until a track is drawn). */
 int  moflex_subs_wanted(const char *key, const char *audio_lang);

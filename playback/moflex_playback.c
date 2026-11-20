@@ -2,6 +2,7 @@
 #include "store.h"   /* gpu_park_program */
 
 #include <3ds.h>
+#include <malloc.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,9 +16,11 @@
 #include "adpcm_moflex.h"
 #include "ui_gfx.h"
 #include "y2r_video.h"
+#include "httpfile.h"   /* Big Top files: how much is fetched ahead (start-up pre-roll) */
 #include <citro2d.h>   /* Old-3DS GPU playback path (no CPU transpose) */
 
 extern int    mobi_init(AVCodecContext *);
+extern int    mobi_npic;              /* decoder frame-pool size, read at init (the Old-3DS frame queue) */
 extern int    mobi_decode(AVCodecContext *, AVFrame *, int *, AVPacket *);
 extern void   mobi_recon_par_exit(void);   /* join the New-3DS decode-pipeline worker thread */
 extern void   mobi_flush(AVCodecContext *);
@@ -62,7 +65,12 @@ static void vol_load(void) {
     FILE *f = fopen("sdmc:/moflex_player/volume.txt", "rb");
     if (f) { float v; if (fscanf(f, "%f", &v) == 1 && v >= 0.25f && v <= 4.0f) g_vol = v; fclose(f); }
 }
-static void vol_save(void) {
+/* ring_stats: where the playback thread's UI time goes this playback (ticks / counts) */
+static u64 g_t_pfull, g_t_pstrip, g_t_menu, g_t_rebake, g_t_vsave;
+static u32 g_n_pfull, g_n_pstrip, g_n_menu, g_n_vsave;
+static void vol_save_(void);
+static void vol_save(void) { u64 t0 = svcGetSystemTick(); vol_save_(); g_t_vsave += svcGetSystemTick() - t0; g_n_vsave++; }
+static void vol_save_(void) {
     mkdir("sdmc:/moflex_player", 0777);
     FILE *f = fopen("sdmc:/moflex_player/volume.txt", "wb");
     if (f) { fprintf(f, "%.2f\n", g_vol); fclose(f); }
@@ -85,6 +93,20 @@ int moflex_seek_wait_hook(int poll) {
     u32 kd = hidKeysDown();
     if (kd & (KEY_B | KEY_START | KEY_TOUCH | KEY_LEFT | KEY_RIGHT)) { g_seek_cut_kd |= kd; g_seek_cut = 1; return 1; }
     return 0;
+}
+/* diagnostics logs are opt-in: create sdmc:/moflex_player/debug_on.txt to turn them on. Normal use
+ * never writes them -- no SD writes while a film plays, no logs that grow forever. */
+#ifdef LAB_AUTOPLAY
+static long long g_lab_st[8][3]; static int g_lab_stn;   /* lab: where each stutter happened */
+u64 g_lab_deadline;   /* lab build: playback stops on its own at this osGetTime() */
+#endif
+static int dbg_on(void) {
+#ifdef LAB_AUTOPLAY
+    return 1;          /* lab build: always write ring_stats.txt */
+#endif
+    static int on = -1;
+    if (on < 0) { FILE *m = fopen("sdmc:/moflex_player/debug_on.txt", "rb"); on = m ? 1 : 0; if (m) fclose(m); }
+    return on;
 }
 static FILE *media_fopen(const char *path) {
     if (g_open_hook) { FILE *f = g_open_hook(path); if (f) return f; }
@@ -1059,6 +1081,8 @@ static void subcfg_path(const char *movie, char *out, size_t cap) {
  * Layout: [blocks][sections][u64 payload_off][8B "CSXTRA01"]; section [4cc][u32 len][data]:
  * 'SUB0' = srt bytes, 'AUD0' = u32 rate, u16 chn, u16 samples/pkt, fixed-size ADPCM packets
  * (in-band framing) -> packet k sits at k*pktbytes, time = k*pktsamp/rate: seek is arithmetic. */
+#define TRA_AUD_MAX 7          /* + the in-band track = the 8 the audio menu holds */
+#define TRA_VID_MAX 3
 static struct {
     int present;               /* footer found on this file */
     s64 payload_off;           /* demux window ends here (blocks only) */
@@ -1067,7 +1091,29 @@ static struct {
     u32 aud_rate, aud_pktbytes;
     u16 aud_chn, aud_pktsamp;
     char lang_main[4], lang_alt[4];   /* LNG0 / AUD1 tags ("ENG"/"JPN"); empty = untagged */
+    /* every AUD0/AUD1 section, in file order (Audio Track 2, 3, ...). The aud_* fields above are
+     * the ACTIVE one -- tra_aud_select() copies a track in -- so the reader needs no changes. */
+    struct { s64 off; u32 pkts, rate, pktbytes; u16 chn, pktsamp; char lang[4]; } taud[TRA_AUD_MAX];
+    int taud_n;
+    /* alternate VIDEO versions: 'VID1' = char label[8] + a complete moflex (blocks only), played
+     * as its own demux window. 'VLB0' = char label[8] of the in-band (main) version. */
+    struct { s64 off, len; char lbl[8]; } tvid[TRA_VID_MAX];
+    int tvid_n;
+    char vid_main[8];
+    /* 'VAU0': each video version's default audio track, main first (1 = track 1 .. 8; 0 = none) */
+    u8 vaud[TRA_VID_MAX + 1]; int vaud_n;
 } g_tra;
+/* alternate video versions (SUPER MOFLEX 'VID1'): the ring engine fills these per file */
+static int g_vid_n = 0, g_vid_sel = 0, g_vid_pend = -1, g_vid_req = 0;
+static int g_vid_switched = 0;              /* the viewer just picked another version: its default audio applies */
+static char g_vid_for[256];                 /* the file g_vid_sel belongs to */
+static void tra_aud_select(int k) {
+    if (k < 0 || k >= g_tra.taud_n) return;
+    g_tra.aud_off = g_tra.taud[k].off; g_tra.aud_pkts = g_tra.taud[k].pkts;
+    g_tra.aud_rate = g_tra.taud[k].rate; g_tra.aud_pktbytes = g_tra.taud[k].pktbytes;
+    g_tra.aud_chn = g_tra.taud[k].chn; g_tra.aud_pktsamp = g_tra.taud[k].pktsamp;
+    memcpy(g_tra.lang_alt, g_tra.taud[k].lang, 4);
+}
 static void trailer_probe(FILE *f) {
     memset(&g_tra, 0, sizeof g_tra);
     if (fseeko(f, -16, SEEK_END)) return;
@@ -1098,25 +1144,43 @@ static void trailer_probe(FILE *f) {
             u8 l[4];
             if (fread(l, 1, 4, f) == 4) { memcpy(g_tra.lang_main, l, 3); g_tra.lang_main[3] = 0; }
         }
-        else if ((!memcmp(h, "AUD0", 4) || !memcmp(h, "AUD1", 4)) && len > 8) {
+        else if ((!memcmp(h, "AUD0", 4) || !memcmp(h, "AUD1", 4)) && len > 8 && g_tra.taud_n < TRA_AUD_MAX) {
             int v1 = !memcmp(h, "AUD1", 4);
             int ah = v1 ? 12 : 8;
             u8 a[12];
             if ((u32)len > (u32)ah && fread(a, 1, ah, f) == (size_t)ah) {
-                g_tra.aud_rate = a[0] | (a[1] << 8) | ((u32)a[2] << 16) | ((u32)a[3] << 24);
-                g_tra.aud_chn = (u16)(a[4] | (a[5] << 8));
-                g_tra.aud_pktsamp = (u16)(a[6] | (a[7] << 8));
-                if (v1) { memcpy(g_tra.lang_alt, a + 8, 3); g_tra.lang_alt[3] = 0; }
-                if (g_tra.aud_rate >= 8000 && g_tra.aud_rate <= 48000 &&
-                    g_tra.aud_chn >= 1 && g_tra.aud_chn <= 2 && g_tra.aud_pktsamp >= 256) {
-                    g_tra.aud_pktbytes = 4u * g_tra.aud_chn + (u32)g_tra.aud_pktsamp * g_tra.aud_chn / 2;
-                    g_tra.aud_off = p + 8 + ah;
-                    g_tra.aud_pkts = (len - ah) / g_tra.aud_pktbytes;
+                u32 rate = a[0] | (a[1] << 8) | ((u32)a[2] << 16) | ((u32)a[3] << 24);
+                u16 chn = (u16)(a[4] | (a[5] << 8)), ps = (u16)(a[6] | (a[7] << 8));
+                if (rate >= 8000 && rate <= 48000 && chn >= 1 && chn <= 2 && ps >= 256) {
+                    int k = g_tra.taud_n++;
+                    g_tra.taud[k].rate = rate; g_tra.taud[k].chn = chn; g_tra.taud[k].pktsamp = ps;
+                    g_tra.taud[k].pktbytes = 4u * chn + (u32)ps * chn / 2;
+                    g_tra.taud[k].off = p + 8 + ah;
+                    g_tra.taud[k].pkts = (len - ah) / g_tra.taud[k].pktbytes;
+                    memset(g_tra.taud[k].lang, 0, 4);
+                    if (v1) memcpy(g_tra.taud[k].lang, a + 8, 3);
                 }
             }
         }
+        else if (!memcmp(h, "VID1", 4) && len > 8 + 64 && g_tra.tvid_n < TRA_VID_MAX) {
+            u8 l[8];
+            if (fread(l, 1, 8, f) == 8) {
+                int k = g_tra.tvid_n++;
+                memcpy(g_tra.tvid[k].lbl, l, 7); g_tra.tvid[k].lbl[7] = 0;
+                g_tra.tvid[k].off = p + 16; g_tra.tvid[k].len = (s64)len - 8;
+            }
+        }
+        else if (!memcmp(h, "VAU0", 4) && len >= 1) {
+            u8 v[TRA_VID_MAX + 1]; int n = len < sizeof v ? (int)len : (int)sizeof v;
+            if (fread(v, 1, n, f) == (size_t)n) { memcpy(g_tra.vaud, v, n); g_tra.vaud_n = n; }
+        }
+        else if (!memcmp(h, "VLB0", 4) && len >= 8) {
+            u8 l[8];
+            if (fread(l, 1, 8, f) == 8) { memcpy(g_tra.vid_main, l, 7); g_tra.vid_main[7] = 0; }
+        }
         p += 8 + len;
     }
+    tra_aud_select(0);         /* Audio Track 2 until the viewer picks another */
     g_tra.present = 1;
 }
 
@@ -1240,7 +1304,7 @@ static void def_pick_subtrack(void) {
 /* fresh video: the preferred audio language, once the track labels are known */
 static void def_pick_audio(void) {
     if (!g_cfg_fresh || g_def.alang <= 0) return;
-    for (int t = 0; t < g_atrk_n && t < 4; t++)
+    for (int t = 0; t < g_atrk_n && t < ATRK_MAX; t++)
         if (lang_match(g_atrk_lbl[t], g_def.alang)) { g_atrk_sel = t; return; }
 }
 /* fresh video: subtitles on/off, once both the subtitles and the audio language are settled */
@@ -1268,10 +1332,24 @@ static void subcfg_save(const char *movie) {
      * framing ride in trailing fields, which older builds never read. */
     int coarse = (g_sub_size * SUB_SIZE_OLD + SUB_SIZE_MAX - 1) / SUB_SIZE_MAX;
     if (coarse < 1) coarse = 1;
-    fprintf(f, "1 %d %d %d %d %lld %d %d %d %d %d %d %d %d %d %d\n%s\n", g_sub_on, g_sub_pos > 120, coarse,
+    fprintf(f, "1 %d %d %d %d %lld %d %d %d %d %d %d %d %d %d %d %d\n%s\n", g_sub_on, g_sub_pos > 120, coarse,
             g_sub_depth, (long long)g_sub_off, g_sub_enc, g_atrk_sel, g_sub_font, g_sub_pos,
-            g_sub_size, g_zoom, g_conv, g_ghost, g_sub_tpos, g_sub_link, g_sub_file);
+            g_sub_size, g_zoom, g_conv, g_ghost, g_sub_tpos, g_sub_link,
+            g_vid_for[0] && !strcmp(g_vid_for, movie) ? g_vid_sel : 0, g_sub_file);
     fclose(f);
+}
+/* the saved video version (field 17 of the first line; 0 when absent). Read on its own because the
+ * ring needs it BEFORE it opens the demuxer, while subcfg_load runs later. */
+static int vsel_peek(const char *movie) {
+    char p[256]; subcfg_path(movie, p, sizeof p);
+    FILE *f = fopen(p, "rb"); if (!f) return 0;
+    char line[512]; int v = 0;
+    if (fgets(line, sizeof line, f)) {
+        int n = 0; char *t = strtok(line, " \r\n");
+        while (t) { if (++n == 17) { v = atoi(t); break; } t = strtok(NULL, " \r\n"); }
+    }
+    fclose(f);
+    return v >= 0 && v <= TRA_VID_MAX ? v : 0;
 }
 static void subcfg_load(const char *movie) {
     /* Appearance is PER MOVIE, so start from the defaults every time: without this a film with no
@@ -1294,7 +1372,7 @@ static void subcfg_load(const char *movie) {
     int ver = 0, on = 0, top = 0, size = 1, depth = 0, enc = 0; long long off = 0;
     if (fscanf(f, "%d %d %d %d %d %lld %d", &ver, &on, &top, &size, &depth, &off, &enc) == 7 && ver == 1) {
         int asel = 0, fnt = 0, pos = -1;
-        if (fscanf(f, "%d", &asel) == 1 && asel >= 0 && asel < 4) g_atrk_sel = asel;   /* newer files */
+        if (fscanf(f, "%d", &asel) == 1 && asel >= 0 && asel < ATRK_MAX) g_atrk_sel = asel;   /* newer files */
         /* written since 60803: a file without them predates the choice, so it gets the default
          * rather than whatever the previously-played movie left in the global */
         g_sub_font = (fscanf(f, "%d", &fnt) == 1) ? !!fnt : 0;
@@ -1657,9 +1735,13 @@ static void sub_overlay(int is3d, int64_t us) {
 static int g_dbg_fps = 0, g_dbg_dec10 = 0, g_dbg_blit10 = 0, g_dbg_aud10 = 0;
 
 /* "touch is locked" toast box; drawn last so it sits on top of everything */
+#define TOAST_W 184
+#define TOAST_H 42
+#define TOAST_X ((UI_W - TOAST_W) / 2)
+#define TOAST_Y ((UI_H - TOAST_H) / 2)
 static void panel_lock_toast(void) {
     if (g_lock_toast <= 0) return;
-    int bw = 184, bh = 42, bx = (UI_W - bw) / 2, by = (UI_H - bh) / 2;
+    int bw = TOAST_W, bh = TOAST_H, bx = TOAST_X, by = TOAST_Y;
     ui_fill_round(bx, by, bw, bh, 8, UI_BG2);
     ui_frame_round(bx, by, bw, bh, 8, UI_NEONC, 2);
     ui_text_center(UI_W / 2, by + 8, 1, UI_NEONC, "SCREEN IS LOCKED");
@@ -1668,11 +1750,11 @@ static void panel_lock_toast(void) {
 
 static int g_panel_cheap = 0;   /* Old-3DS: skip the CPU-heavy full-screen gradient + glow blurs in the
                                  * software-rendered panel -- they steal decode time on the single core. */
-static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing) {
-    ui_begin(GFX_BOTTOM);
-    if (g_panel_cheap) ui_fill_round(0, 0, UI_W, UI_H, 0, UI_BG);          /* flat bg (cheap) */
-    else               ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
-
+/* The parts of the panel that change while a film plays, each drawn into its own strip so the
+ * once-a-second update can redraw just those strips (panel_update_partial) -- a full redraw takes
+ * ~35 ms on Old 3DS, two refreshes, and pushed a film frame late every second. */
+static int panel_title_scrolls(const char *title) { return ui_text_w(1, title) > VOL_X - 12 - 10; }
+static void panel_title_row(const char *title) {
     {   /* title: marquee-scroll when it overflows so the episode name is readable */
         int tw = ui_text_w(1, title), avail = VOL_X - 12 - 10;
         if (tw <= avail) ui_text(10, 8, 1, UI_NEON, title);
@@ -1685,12 +1767,57 @@ static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing)
             ui_text_clipped(10 - off, 8, 1, UI_NEON, title, 10, VOL_X - 12);
         }
     }
-
+}
+static void panel_time_row(int64_t cur, int64_t dur) {
     char tc[16], td[16], line[40];
     fmt_time(cur, tc, sizeof(tc));
     fmt_time(dur, td, sizeof(td));
     snprintf(line, sizeof(line), "%s / %s", tc, td);
     ui_text(10, 26, 1, UI_NEONC, line);
+}
+static void panel_bar(int64_t cur, int64_t dur) {
+    /* progress bar: rounded track + neon fill + glowing knob */
+    double frac = dur > 0 ? (double)cur / (double)dur : 0.0;
+    if (frac > 1) frac = 1;
+    ui_fill_round(BAR_X, BAR_Y, BAR_W, BAR_H, BAR_H / 2, TH_TRACK);
+    int fw = (int)(BAR_W * frac);
+    if (fw > 0) ui_fill_round(BAR_X, BAR_Y, fw, BAR_H, BAR_H / 2, UI_NEON);
+    int kx = BAR_X + fw, ky = BAR_Y + BAR_H / 2, kr = 8;
+    if (!g_panel_cheap) ui_glow_round(kx - kr, ky - kr, 2 * kr, 2 * kr, kr, UI_NEON, 4, 26);
+    ui_fill_round(kx - kr, ky - kr, 2 * kr, 2 * kr, kr, UI_WHITE);
+}
+/* strips (x0,y0)-(x1,y1), 8-aligned so they upload as whole texture tiles. Nothing else is drawn
+ * inside them: the time row ends well left of the battery (x >= 256), the bar's knob stays in y 57-73. */
+#define PT_TITLE_Y0 0
+#define PT_TITLE_Y1 24
+#define PT_TIME_X1 200
+#define PT_TIME_Y0 24
+#define PT_TIME_Y1 40
+#define PT_BAR_Y0 56
+#define PT_BAR_Y1 80
+static void panel_vol(void) {
+    /* volume slider (vertical, right) */
+    ui_fill_round(VOL_X, VOL_Y, 12, VOL_H, 6, TH_TRACK);
+    int vf = (int)(VOL_H * (g_vol / 4.0f));
+    if (vf > 0) ui_fill_round(VOL_X, VOL_Y + VOL_H - vf, 12, vf, 6, UI_NEON);
+    char vs[8]; snprintf(vs, sizeof(vs), "%d%%", (int)(g_vol * 100 + 0.5f));
+    ui_text(VOL_X - 16, VOL_Y - 12, 1, UI_INK, vs);   /* label above the slider (frees the button row) */
+}
+/* volume strips: the % label (x 280-320, y 76-85; the bar's knob ends at 73) and the slider
+ * (x 296-320, y 88-195; the CC/moon/AUTO buttons end at x 292) */
+#define PT_VLBL_X0 280
+#define PT_VLBL_Y0 76
+#define PT_VLBL_Y1 86
+#define PT_VSL_X0 296
+#define PT_VSL_Y0 88
+#define PT_VSL_Y1 196
+static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing) {
+    ui_begin(GFX_BOTTOM);
+    if (g_panel_cheap) ui_fill_round(0, 0, UI_W, UI_H, 0, UI_BG);          /* flat bg (cheap) */
+    else               ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
+
+    panel_title_row(title);
+    panel_time_row(cur, dur);
 
     /* battery: small icon + % at the far right of the time row (cyan while charging) */
     batt_refresh();
@@ -1713,15 +1840,7 @@ static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing)
     } else if (g_old3d_warn)   /* Old 3DS can't keep up with 3D's doubled frame rate */
         ui_text(10, 42, 1, UI_RED, "3D Has Performance Issues on Old3DS");
 
-    /* progress bar: rounded track + neon fill + glowing knob */
-    double frac = dur > 0 ? (double)cur / (double)dur : 0.0;
-    if (frac > 1) frac = 1;
-    ui_fill_round(BAR_X, BAR_Y, BAR_W, BAR_H, BAR_H / 2, TH_TRACK);
-    int fw = (int)(BAR_W * frac);
-    if (fw > 0) ui_fill_round(BAR_X, BAR_Y, fw, BAR_H, BAR_H / 2, UI_NEON);
-    int kx = BAR_X + fw, ky = BAR_Y + BAR_H / 2, kr = 8;
-    if (!g_panel_cheap) ui_glow_round(kx - kr, ky - kr, 2 * kr, 2 * kr, kr, UI_NEON, 4, 26);
-    ui_fill_round(kx - kr, ky - kr, 2 * kr, 2 * kr, kr, UI_WHITE);
+    panel_bar(cur, dur);
 
     /* transport: RW (<<)   glowing play/pause   FF (>>) */
     ui_play_l(RW_CX - 5, PLAY_CY, 14, UI_NEONC); ui_play_l(RW_CX + 6, PLAY_CY, 14, UI_NEONC);
@@ -1734,12 +1853,7 @@ static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing)
     if (playing) ui_pause(PLAY_CX, PLAY_CY, 22, UI_NEON);
     else         ui_play(PLAY_CX + 2, PLAY_CY, 22, UI_NEON);
 
-    /* volume slider (vertical, right) */
-    ui_fill_round(VOL_X, VOL_Y, 12, VOL_H, 6, TH_TRACK);
-    int vf = (int)(VOL_H * (g_vol / 4.0f));
-    if (vf > 0) ui_fill_round(VOL_X, VOL_Y + VOL_H - vf, 12, vf, 6, UI_NEON);
-    char vs[8]; snprintf(vs, sizeof(vs), "%d%%", (int)(g_vol * 100 + 0.5f));
-    ui_text(VOL_X - 16, VOL_Y - 12, 1, UI_INK, vs);   /* label above the slider (frees the button row) */
+    panel_vol();
 
     /* action buttons: SAME row as the home screen (OPEN VIDEO / MANAGE / ADD VIDEO) */
     ui_text(6, 190, 1, UI_INK, "Y=SUBS X=DARK A=PLAY L+R=LOCK");   /* key map (B=back is universal) */
@@ -2257,7 +2371,19 @@ static void g_y2r_exit(void) {
     y2rExit();                                /* (DriverFinalize happens inside) */
     g_y2r_up = 0;
 }
+#ifdef LAB_AUTOPLAY
+/* lab timers (ticks): Y2R start (input flush + setup), wait for the hardware, texture flush after;
+ * queue conversion total; experiment switches read from sdmc:/lab/params.txt by main.c */
+volatile u64 g_lt_ystart, g_lt_ywait, g_lt_yflush, g_lt_conv, g_lt_n;
+int g_lab_noq, g_lab_noflush;
+#define LT0 u64 _lt0 = svcGetSystemTick();
+#define LT(v) v += svcGetSystemTick() - _lt0;
+#else
+#define LT0
+#define LT(v)
+#endif
 static void g_y2r_start(AVFrame *o, C3D_Tex *tex, int W, int H) {
+    LT0
     if (g_pq_dirty) { g_pq_dirty = 0; pq_apply(); }   /* between conversions: never mid-transfer */
     int cw = W / 2, ch = H / 2, bpp = g_y2r_bpp;
     GSPGPU_FlushDataCache(o->data[0], (u32)W * H);
@@ -2268,14 +2394,25 @@ static void g_y2r_start(AVFrame *o, C3D_Tex *tex, int W, int H) {
     Y2RU_SetSendingV(o->data[2], (u32)cw * ch, (s16)cw, 0);
     Y2RU_SetReceiving(tex->data, (u32)W * H * bpp, (s16)(W * bpp * 8), (s16)((GT_W - W) * bpp * 8));
     svcClearEvent(g_y2r_done); Y2RU_StartConversion();
+    LT(g_lt_ystart)
+#ifdef LAB_AUTOPLAY
+    g_lt_n++;
+#endif
 }
 /* NOTE: uses the raw cache syscall, NOT C3D_TexFlush (which goes through the shared GSP session) --
  * this runs on the decode thread and must not touch GSP while the main thread renders. */
 static void g_y2r_wait(C3D_Tex *tex) {
+    LT0
     if (R_FAILED(svcWaitSynchronization(g_y2r_done, 300000000LL)))
         Y2RU_StopConversion();   /* timed out: clear the wedged conversion so the NEXT frame can
                                   * convert -- self-heals in-session instead of black-until-reopen */
+    LT(g_lt_ywait)
+#ifdef LAB_AUTOPLAY
+    if (g_lab_noflush) return;
+    _lt0 = svcGetSystemTick();
+#endif
     svcFlushProcessDataCache(CUR_PROCESS_HANDLE, (u32)tex->data, tex->size);
+    LT(g_lt_yflush)
 }
 
 /* draw an outlined button box (citro2d) + centered label */
@@ -2390,14 +2527,46 @@ static int ui_tex_init(void) {
 static void ui_tex_free(void) { if (g_uitex_ok) { C3D_TexDelete(&g_uitex); g_uitex_ok = 0; } }
 
 /* copy the offscreen UI buffer into the texture (the CPU-heavy 76800-pixel tiled copy) */
+/* Walked one 8x8 texture tile at a time, 8 source columns at once: the source is column-major
+ * (rotated framebuffer), so the old row-by-row walk missed the cache on nearly every one of the
+ * 76800 reads -- long enough on Old 3DS to push the next film frame a refresh late, once a second. */
+static u64 g_upl_max;   /* slowest panel/menu upload this playback (ticks), for ring_stats */
+static int g_panel_buf_ok = 0;   /* the UI buffer holds a complete panel (the menu/dark screen draw into it too) */
+static void ui_tiles(const u16 *src, u16 *dst, const u8 *mort, int x0, int y0, int x1, int y1) {
+    for (int tx = x0; tx < x1; tx += 8)
+        for (int ty = y0; ty < y1; ty += 8) {
+            u16 *t = dst + ((ty >> 3) * (GT_W >> 3) + (tx >> 3)) * 64;
+            for (int dx = 0; dx < 8; dx++) {
+                const u16 *col = src + (tx + dx) * UI_H + (UI_H - 1 - ty);   /* y = ty.. walks down this column */
+                const u8 *mo = mort + dx;
+                for (int dy = 0; dy < 8; dy++) t[mo[dy * 8]] = col[-dy];
+            }
+        }
+}
 static void ui_tex_upload(void) {
+    u64 t0 = svcGetSystemTick();
     ui_capture(0);
     const u16 *src = ui_pixels();                /* pixel (x,y) at [x*UI_H + (UI_H-1-y)] (rotated fb) */
     u16 *dst = (u16 *)g_uitex.data;
-    for (int y = 0; y < UI_H; y++)
-        for (int x = 0; x < UI_W; x++)
-            dst[r3_tile_off(x, y)] = src[x * UI_H + (UI_H - 1 - y)];
+    static u8 mort[64]; static int mort_ok;
+    if (!mort_ok) {
+        for (u32 y = 0; y < 8; y++) for (u32 x = 0; x < 8; x++)
+            mort[y * 8 + x] = (u8)((x & 1) | ((y & 1) << 1) | ((x & 2) << 1) | ((y & 2) << 2) | ((x & 4) << 2) | ((y & 4) << 3));
+        mort_ok = 1;
+    }
+    ui_tiles(src, dst, mort, 0, 0, UI_W, UI_H);
     C3D_TexFlush(&g_uitex);
+    u64 dt = svcGetSystemTick() - t0; if (dt > g_upl_max) g_upl_max = dt;
+}
+/* the tiles covering (x0,y0)-(x1,y1) only; the caller flushes the texture */
+static void ui_tex_upload_rect(int x0, int y0, int x1, int y1) {
+    static u8 mort[64]; static int mort_ok;
+    if (!mort_ok) {
+        for (u32 y = 0; y < 8; y++) for (u32 x = 0; x < 8; x++)
+            mort[y * 8 + x] = (u8)((x & 1) | ((y & 1) << 1) | ((x & 2) << 1) | ((y & 2) << 2) | ((x & 4) << 2) | ((y & 4) << 3));
+        mort_ok = 1;
+    }
+    ui_tiles(ui_pixels(), (u16 *)g_uitex.data, mort, x0 & ~7, y0 & ~7, x1, y1);
 }
 /* blit the (already-uploaded) UI texture onto the bottom screen -- cheap GPU only */
 static void ui_tex_blit(C3D_RenderTarget *bot) {
@@ -2412,21 +2581,88 @@ static void ui_tex_present(C3D_RenderTarget *bot) { ui_tex_upload(); ui_tex_blit
  * changed -- second tick, bar pixel, play state, volume, battery, or a forced event. The blit runs
  * every frame so the panel stays on screen with no flicker. This keeps the panel off the decode
  * critical path on Old-3DS (it was re-rendering + re-uploading every frame). */
+static int g_sub_redraw = 1;   /* the CC menu must re-render into the shared UI texture */
+static int g_sub_last = -1;    /* the menu screen the UI texture holds (-1: it holds the panel) */
 static int g_panel_force = 1;   /* force a re-render next time (first frame, wake from dark, submenu exit) */
+static int g_panel_age = 0;   /* presents since the panel was last brought up to date */
+/* in-film menu background: the full-screen gradient is the costliest part of a menu redraw, and on
+ * Old 3DS each arrow press redraws the menu while the film plays -- flat there, like the panel */
+static void menu_bg(void) {
+    if (g_panel_cheap) ui_fill_round(0, 0, UI_W, UI_H, 0, UI_BG);
+    else               ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
+}
+static u64 g_panel_max;       /* slowest panel redraw (draw + upload) this playback, ticks */
+static void g_panel_prep(const char *title, int64_t cur, int64_t dur, int playing);
 static void g_panel_sw(C3D_RenderTarget *bot, const char *title, int64_t cur, int64_t dur, int playing) {
     if (!ui_tex_init()) return;
-    static int64_t l_sec = -1; static int l_bar = -1, l_play = -1, l_vol = -1, l_batt = -2, l_zm = -1;
+    g_panel_prep(title, cur, dur, playing);
+    ui_tex_blit(bot);
+}
+/* Bring the panel texture up to date (software draw + tiled upload) when a visible element changed.
+ * The ring engine calls this in the spare refreshes BETWEEN film frames: done inside a present it
+ * pushed that frame a refresh late on Old 3DS -- a small hitch every second, when the clock ticked. */
+static void g_panel_prep(const char *title, int64_t cur, int64_t dur, int playing) {
+    if (!ui_tex_init()) return;
+    g_panel_age = 0;
+    static int64_t l_sec = -1; static int l_bar = -1, l_play = -1, l_vol = -1, l_batt = -2, l_chg = -1, l_zm = -1;
+    static const char *l_title; static int l_lock = -1, l_toast = -1;
     int vw = g_zoom * 1000 + (g_conv + CONV_MAX) * 32 + g_ghost + (g_autolvl ? 1 << 20 : 0);   /* any VIEW change repaints */
     int sec = (int)(cur / 1000000);
     int bar = dur > 0 ? (int)((double)BAR_W * (double)cur / (double)dur) : 0;
     int vol = (int)(g_vol * 100 + 0.5f);
-    if (g_panel_force || sec != l_sec || bar != l_bar || playing != l_play || vol != l_vol || g_batt_pct != l_batt || vw != l_zm) {
-        g_panel_force = 0; l_sec = sec; l_bar = bar; l_play = playing; l_vol = vol; l_batt = g_batt_pct; l_zm = vw;
-        ui_capture(1);
+    batt_refresh();                             /* throttled inside; the partial path below skips panel_draw */
+    int toast = g_lock_toast > 0;
+    int full = g_panel_force || !g_panel_buf_ok || playing != l_play || g_batt_pct != l_batt
+               || g_batt_chg != l_chg || vw != l_zm || title != l_title || g_touch_locked != l_lock;
+    /* the "screen is locked" popup is a patch: the panel under it is kept and put back, two small
+     * uploads -- it used to repaint the whole panel when it came AND when it went, ~20 ms each on an
+     * Old 3DS, so every tap on a locked screen dropped frames */
+    static u16 toast_under[TOAST_W * TOAST_H];
+    int toast_chg = toast != l_toast;
+    if (!full && !toast_chg && sec == l_sec && bar == l_bar && vol == l_vol) return;
+    u64 pt0 = svcGetSystemTick();
+    ui_capture(1);
+    int wasfull = full || !g_panel_cheap;
+    if (full || !g_panel_cheap) {               /* the gradient background (New 3DS) can't be patched by a flat fill */
+        int lt = g_lock_toast;
+        g_lock_toast = 0;                       /* the panel alone first: what goes back when the popup goes */
         panel_draw(title, cur, dur, playing);   /* fills g_buf; ui_present() is a no-op under capture */
+        g_lock_toast = lt;
+        ui_rect_save(TOAST_X, TOAST_Y, TOAST_W, TOAST_H, toast_under);
+        if (toast) panel_lock_toast();
         ui_tex_upload();
+        g_panel_buf_ok = 1; g_sub_last = -1;
+    } else {
+        /* only the clock/bar moved: redraw those strips (and a scrolling title) and upload their tiles */
+        ui_begin(GFX_BOTTOM);
+        ui_fill(8, PT_TIME_Y0, PT_TIME_X1 - 8, 12, UI_BG);   panel_time_row(cur, dur);
+        ui_fill(0, PT_BAR_Y0, UI_W, 20, UI_BG);              panel_bar(cur, dur);   /* y 56-75: the volume label starts at 76 */
+        ui_tex_upload_rect(0, PT_TIME_Y0, PT_TIME_X1, PT_TIME_Y1);
+        ui_tex_upload_rect(0, PT_BAR_Y0, UI_W, PT_BAR_Y1);
+        if (vol != l_vol) {   /* volume: its label + slider strips */
+            ui_fill(PT_VLBL_X0, PT_VLBL_Y0, UI_W - PT_VLBL_X0, PT_VLBL_Y1 - PT_VLBL_Y0, UI_BG);
+            ui_fill(PT_VSL_X0, PT_VSL_Y0, UI_W - PT_VSL_X0, PT_VSL_Y1 - PT_VSL_Y0, UI_BG);
+            panel_vol();
+            ui_tex_upload_rect(PT_VLBL_X0, 72, UI_W, PT_VLBL_Y1 + 2);
+            ui_tex_upload_rect(PT_VSL_X0, PT_VSL_Y0, UI_W, PT_VSL_Y1 + 4);
+        }
+        if (panel_title_scrolls(title)) {
+            ui_fill(8, 6, VOL_X - 12 - 8 + 2, 12, UI_BG);   panel_title_row(title);
+            ui_tex_upload_rect(0, PT_TITLE_Y0, VOL_X - 8, PT_TITLE_Y1);
+        }
+        if (toast_chg) {                        /* the popup on / off: its box only */
+            if (toast) panel_lock_toast();
+            else ui_rect_load(TOAST_X, TOAST_Y, TOAST_W, TOAST_H, toast_under);
+            ui_tex_upload_rect(TOAST_X, TOAST_Y, TOAST_X + TOAST_W, TOAST_Y + TOAST_H);
+        }
+        C3D_TexFlush(&g_uitex);
+        ui_capture(0);   /* as ui_tex_upload does: left on, the app's ui_present() stays a no-op after
+                          * playback and its screens never appear (looked like a hang on exit) */
     }
-    ui_tex_blit(bot);
+    g_panel_force = 0; l_sec = sec; l_bar = bar; l_play = playing; l_vol = vol; l_batt = g_batt_pct; l_chg = g_batt_chg; l_zm = vw; l_title = title; l_lock = g_touch_locked; l_toast = g_lock_toast > 0;
+    { u64 dt = svcGetSystemTick() - pt0; if (dt > g_panel_max) g_panel_max = dt;
+      if (wasfull) { g_t_pfull += dt; g_n_pfull++; } else { g_t_pstrip += dt; g_n_pstrip++; } }
+    g_sub_redraw = 1;                           /* the shared UI texture no longer holds the menu */
 }
 
 /* ==================== NON-BLOCKING SUBTITLE MENU (ring engine, live preview) ====================
@@ -2486,7 +2722,7 @@ static void submenu_render(int is3d) {
     int act[16]; int n = submenu_actions(is3d, act);
     int top, step, bh; submenu_layout(n, &top, &step, &bh);
     ui_begin(GFX_BOTTOM);
-    ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
+    menu_bg();
     ui_text_center(UI_W / 2, 14, 2, UI_NEON, "SUBTITLES");
     for (int i = 0; i < n; i++) {
         char r[40]; submenu_label(act[i], r, sizeof r);
@@ -2497,7 +2733,7 @@ static void srtpicker_render(void) {
     int vis = g_srt_n < SRT_VIS ? g_srt_n : SRT_VIS;
     int top, step, bh; submenu_layout(vis > 0 ? vis : 1, &top, &step, &bh);
     ui_begin(GFX_BOTTOM);
-    ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
+    menu_bg();
     ui_text_center(UI_W / 2, 14, 2, UI_NEON, "LOAD SUBTITLES");
     if (g_srt_n == 0) {   /* same two-line message as the released sub_load_menu */
         ui_text_center(UI_W / 2, 100, 1, UI_INK, "No .srt/.ass files found in the");
@@ -2524,19 +2760,36 @@ static int g_view_is3d = 1;
  * to VIEW and lives here as a trailing row on that console. Kept OUT of the index remap below
  * by giving it its own action code, so the existing rows keep their numbers. */
 #define VIEW_BASE (g_view_is3d ? VIEW_ROWS_3D : VIEW_ROWS_2D)
-#define VIEW_ROWS (VIEW_BASE + (g_hq_avail ? 1 : 0) + g_kit_fmt_row)
+#define VIEW_ROWS (VIEW_BASE + (g_hq_avail ? 1 : 0) + g_kit_fmt_row + (g_vid_n > 1 ? 1 : 0))
+#define VIEW_ACT_VER 97
 #define VIEW_ACT_HQ 99
 /* MP4 only (player_kit): a trailing "3D format" row -- 2D / SBS / Half SBS -- for files whose
  * frame shape cannot say which they are. The moflex engines never set g_kit_fmt_row, so for them
  * the menu is exactly what it was. */
 #define VIEW_ACT_FMT 98
 static int g_kit_fmt_row = 0, g_kit_fmt = 0, g_kit_fmt_changed = 0;
+/* the Format being chosen in VIDEO (-1 = none): left/right move it, A (or closing the menu)
+ * applies it -- applying restarts a stream, so each step must not */
+static int g_kit_fmt_pend = -1;
+/* a Big Top live stream (the server encodes the frame shape it is asked for): the ring engine
+ * shows the Format row too, and a change re-opens the film in place in the new shape. -1 = none */
+static int g_live_fmt = -1;
+void moflex_live_fmt_set(int fmt) { g_live_fmt = fmt; }
+int  moflex_live_fmt_get(void) { return g_live_fmt; }
 static int g_view_sel = 0, g_view_rep = 0;
-static int g_hq_req = 0;      /* set when the HQ row is toggled; the panel turns it into a replay */
+static int g_hq_req = 0;
+static char g_vid_lbl_buf[8];
+static const char *vid_label(int v) {      /* the name the Version row shows for version v */
+    const char *l = v <= 0 ? g_tra.vid_main : (v - 1 < g_tra.tvid_n ? g_tra.tvid[v - 1].lbl : "");
+    if (l && l[0]) return l;
+    if (v <= 0) return "MAIN";
+    snprintf(g_vid_lbl_buf, sizeof g_vid_lbl_buf, "V%d", v + 1); return g_vid_lbl_buf;
+}      /* set when the HQ row is toggled; the panel turns it into a replay */
 /* display row -> action code (the 2D list skips convergence + ghost) */
 static int view_act(int row) {
     if (g_hq_avail && row == VIEW_BASE) return VIEW_ACT_HQ;
     if (g_kit_fmt_row && row == VIEW_BASE + (g_hq_avail ? 1 : 0)) return VIEW_ACT_FMT;
+    if (g_vid_n > 1 && row == VIEW_BASE + (g_hq_avail ? 1 : 0) + g_kit_fmt_row) return VIEW_ACT_VER;
     if (!g_view_is3d && row >= 2) row += 2;
     return row;
 }
@@ -2546,9 +2799,21 @@ static void view_label(int row, char *r, int cap) {
         snprintf(r, cap, "HQ colour:  %s   (A toggles)", g_hq ? "24-bit" : "16-bit");
         return;
     }
+    if (i == VIEW_ACT_VER) {
+        int v = g_vid_pend >= 0 ? g_vid_pend : g_vid_sel;
+        if (g_vid_pend >= 0 && g_vid_pend != g_vid_sel)
+            snprintf(r, cap, "Version:  < %s >   (A applies)", vid_label(v));
+        else
+            snprintf(r, cap, "Version:  < %s >  (%d/%d)", vid_label(v), v + 1, g_vid_n);
+        return;
+    }
     if (i == VIEW_ACT_FMT) {
         static const char *const F[3] = { "2D", "3D SBS", "3D Half SBS" };
-        snprintf(r, cap, "Format:  %s   (A changes)", F[g_kit_fmt >= 0 && g_kit_fmt <= 2 ? g_kit_fmt : 0]);
+        int f = g_kit_fmt_pend >= 0 ? g_kit_fmt_pend : g_kit_fmt;
+        if (g_kit_fmt_pend >= 0 && g_kit_fmt_pend != g_kit_fmt)
+            snprintf(r, cap, "Format:  < %s >   (A applies)", F[f >= 0 && f <= 2 ? f : 0]);
+        else
+            snprintf(r, cap, "Format:  < %s >", F[f >= 0 && f <= 2 ? f : 0]);
         return;
     }
     switch (i) {
@@ -2583,7 +2848,7 @@ static void view_reset_row(int row) {
 static void view_render(void) {
     int top, step, bh; submenu_layout(VIEW_ROWS, &top, &step, &bh);
     ui_begin(GFX_BOTTOM);
-    ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
+    menu_bg();
     ui_text_center(UI_W / 2, 14, 2, UI_NEON, "VIDEO");
     for (int i = 0; i < VIEW_ROWS; i++) {
         char r[44]; view_label(i, r, sizeof r);
@@ -2593,7 +2858,13 @@ static void view_render(void) {
 }
 /* One frame of VIEW input. Returns 1 when the screen should close. */
 static int view_input(u32 kd, u32 kh, touchPosition tp) {
-    if (kd & (KEY_B | KEY_SELECT)) return 1;
+    if (kd & (KEY_B | KEY_SELECT)) {
+        if (g_kit_fmt_pend >= 0 && g_kit_fmt_pend != g_kit_fmt) { g_kit_fmt = g_kit_fmt_pend; g_kit_fmt_changed = 1; }
+        g_kit_fmt_pend = -1;   /* a Format chosen but not applied: closing the menu applies it */
+        if (g_vid_pend >= 0 && g_vid_pend != g_vid_sel) { g_vid_sel = g_vid_pend; g_vid_req = 1; }
+        g_vid_pend = -1;       /* same for a Version */
+        return 1;
+    }
     if (kd & KEY_DOWN) g_view_sel = (g_view_sel + 1) % VIEW_ROWS;
     if (kd & KEY_UP)   g_view_sel = (g_view_sel + VIEW_ROWS - 1) % VIEW_ROWS;
     int t_side = 0, t_row = (kd & KEY_TOUCH) ? submenu_hit(tp.px, tp.py, VIEW_ROWS, &t_side) : -1;
@@ -2608,10 +2879,30 @@ static int view_input(u32 kd, u32 kh, touchPosition tp) {
     else { rep = (kd & (KEY_LEFT | KEY_RIGHT | KEY_TOUCH)) ? held : 0;
            if (rep) g_view_rep = 0;
            else { g_view_rep++; if (g_view_rep > 8 && g_view_rep % 2 == 0) rep = held; } }
-    if (i == VIEW_ACT_FMT) {   /* A / tap / right: next format; left: previous */
-        int d = (kd & KEY_LEFT) ? -1 : (press || (kd & KEY_RIGHT) ||
-                (t_row >= 0 && t_row == g_view_sel && (kd & KEY_TOUCH))) ? 1 : 0;
-        if (d) { g_kit_fmt = (g_kit_fmt + 3 + d) % 3; g_kit_fmt_changed = 1; }
+    if (i == VIEW_ACT_FMT) {   /* left/right or a tap on a half: choose; A applies */
+        int d = (kd & KEY_LEFT) ? -1 : (kd & KEY_RIGHT) ? 1
+              : (t_row >= 0 && t_row == g_view_sel && (kd & KEY_TOUCH)) ? t_side : 0;
+        if (d) {
+            int f = g_kit_fmt_pend >= 0 ? g_kit_fmt_pend : g_kit_fmt;
+            g_kit_fmt_pend = (f + 3 + d) % 3;
+        }
+        if (press && g_kit_fmt_pend >= 0) {
+            if (g_kit_fmt_pend != g_kit_fmt) { g_kit_fmt = g_kit_fmt_pend; g_kit_fmt_changed = 1; }
+            g_kit_fmt_pend = -1;
+        }
+        return 0;
+    }
+    if (i == VIEW_ACT_VER) {   /* left/right or a tap on a half: choose; A applies (it re-opens the film) */
+        int d = (kd & KEY_LEFT) ? -1 : (kd & KEY_RIGHT) ? 1
+              : (t_row >= 0 && t_row == g_view_sel && (kd & KEY_TOUCH)) ? t_side : 0;
+        if (d && g_vid_n > 1) {
+            int v = g_vid_pend >= 0 ? g_vid_pend : g_vid_sel;
+            g_vid_pend = (v + g_vid_n + d) % g_vid_n;
+        }
+        if (press && g_vid_pend >= 0) {
+            if (g_vid_pend != g_vid_sel) { g_vid_sel = g_vid_pend; g_vid_req = 1; g_vid_pend = -1; return 1; }
+            g_vid_pend = -1;
+        }
         return 0;
     }
     if (i == VIEW_ACT_HQ) {
@@ -2745,7 +3036,7 @@ static void snd_render(void) {
     int act[SND_ROWS_MAX]; int n = snd_rows(act);
     int top, step, bh; submenu_layout(n, &top, &step, &bh);
     ui_begin(GFX_BOTTOM);
-    ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
+    menu_bg();
     ui_text_center(UI_W / 2, 14, 2, UI_NEON, "SOUND");
     for (int i = 0; i < n; i++) {
         char r[44]; snd_label(act[i], r, sizeof r);
@@ -2782,20 +3073,131 @@ static int snd_input(u32 kd, u32 kh, touchPosition tp) {
     }
     return 0;
 }
+/* The menu is re-rendered (software draw + the 76800-pixel tiled upload) only when it changed: input,
+ * a different screen, the lock toast, or the shared UI texture having been used by the panel. It used
+ * to redo all of that every frame while open -- on Old 3DS that runs on the decode core above the
+ * decoder and starved it: the film went choppy with the CC menu open, and the drained ring kept it
+ * choppy for a while after closing. */
+static int g_sub_toast = -1;
+static int g_submenu_stale(void) { return g_sub_redraw || g_submenu != g_sub_last || (g_lock_toast > 0) != g_sub_toast; }
+/* ---- menu band cache ----
+ * Moving the highlight changes only the rows next to the old and new one, so those rows' bands are
+ * redrawn under a vertical clip (ui_clip_y: pixel-identical to a full redraw, proven on the host)
+ * and kept: with the labels unchanged a band can only look 4 ways -- its row highlighted, the row
+ * above or below highlighted (their glow and 2 px of their face reach in), or none -- so after a
+ * pass through the list a move is a few memcpys and a small upload instead of a full ~21 ms render
+ * (13 of those a second starved Old-3DS 3D: ring_stats menu=270/5760ms in 21 s). Anything else --
+ * another menu, a label changed (left/right on a value), the lock popup -- renders in full and
+ * starts the cache over. */
+#define MB_ROWS 16
+#define MB_MARGIN 6                         /* the selected row's glow spreads 5 px */
+static u16 *g_mb[MB_ROWS][4];
+static int  g_mb_menu = -1, g_mb_n = 0, g_mb_sel = -1, g_mb_ok = 0;
+static u32  g_mb_sig = 0;
+static void mb_drop(void) {
+    for (int i = 0; i < MB_ROWS; i++) for (int k = 0; k < 4; k++) { free(g_mb[i][k]); g_mb[i][k] = NULL; }
+    g_mb_ok = 0;
+}
+/* the current menu's rows: labels hashed with everything else it draws; -1 = not a row menu */
+static int mb_rows(int is3d, int *sel, u32 *sig) {
+    char lab[48]; int n; u32 h = 2166136261u;
+    #define MB_H(v) (h = (h ^ (u32)(v)) * 16777619u)
+    #define MB_HS(str) do { for (const char *q_ = (str); *q_; q_++) MB_H((u8)*q_); MB_H(0); } while (0)
+    if (g_submenu == 4) {
+        int act[SND_ROWS_MAX]; n = snd_rows(act);
+        for (int i = 0; i < n; i++) { snd_label(act[i], lab, sizeof lab); MB_HS(lab); }
+        MB_H(g_autolvl); *sel = g_snd_sel;
+    } else if (g_submenu == 3) {
+        n = VIEW_ROWS;
+        for (int i = 0; i < n; i++) { view_label(i, lab, sizeof lab); MB_HS(lab); }
+        *sel = g_view_sel;
+    } else if (g_submenu == 1) {
+        int act[16]; n = submenu_actions(is3d, act);
+        for (int i = 0; i < n; i++) { submenu_label(act[i], lab, sizeof lab); MB_HS(lab); }
+        *sel = g_sub_sel;
+    } else return -1;                      /* the SRT picker scrolls and pages: always in full */
+    MB_H(g_submenu); MB_H(n); MB_H(g_lock_toast > 0);
+    #undef MB_H
+    #undef MB_HS
+    *sig = h;
+    return n;
+}
+static void mb_render(int is3d) {
+    if (g_submenu == 4) snd_render(); else if (g_submenu == 3) view_render(); else if (g_submenu == 2) srtpicker_render(); else submenu_render(is3d);
+}
+static void g_submenu_prep(int is3d) {
+    if (!ui_tex_init() || !g_submenu_stale()) return;
+    u64 mt0 = svcGetSystemTick();
+    int had = (g_sub_last == g_submenu);   /* the UI buffer still holds this menu */
+    g_sub_redraw = 0; g_sub_last = g_submenu; g_panel_buf_ok = 0; g_sub_toast = g_lock_toast > 0;
+    ui_capture(1);
+    int sel = -1; u32 sig = 0; int n = mb_rows(is3d, &sel, &sig);
+    int top, step, bh; submenu_layout(n > 0 ? n : 1, &top, &step, &bh);
+    /* the 4-case rule holds while nothing from two rows away -- its face or its 5 px glow -- reaches a
+     * band. Neighbours' labels may (tight lists like CC): labels are in the signature, so any change
+     * to one starts the cache over. Up to ~13 rows; checked rather than assumed. */
+    int geo_ok = n > 0 && n <= MB_ROWS && 2 * step >= bh + MB_MARGIN + 5;
+    int partial = had && geo_ok && g_mb_ok && g_mb_menu == g_submenu && g_mb_n == n && g_mb_sig == sig
+                  && sel >= 0 && sel < n && g_mb_sel >= 0;
+    if (!partial) {
+        mb_drop();
+        mb_render(is3d);
+        ui_tex_upload();
+        if (geo_ok) {
+            g_mb_ok = 1; g_mb_menu = g_submenu; g_mb_n = n; g_mb_sig = sig; g_mb_sel = sel;
+            for (int i = 0; i < n; i++) {       /* the full render holds every band in its current look */
+                int c = sel == i ? 0 : sel == i - 1 ? 1 : sel == i + 1 ? 2 : 3;
+                int y0 = top + i * step - MB_MARGIN, y1 = top + i * step + bh + MB_MARGIN;
+                if (y0 < 0) y0 = 0; if (y1 > UI_H) y1 = UI_H;
+                g_mb[i][c] = (u16 *)malloc((size_t)UI_W * (y1 - y0) * 2);
+                if (g_mb[i][c]) ui_rect_save(0, y0, UI_W, y1 - y0, g_mb[i][c]);
+            }
+        }
+    } else if (sel != g_mb_sel) {
+        int old = g_mb_sel, rows[6], nr = 0;
+        for (int d = -1; d <= 1; d++) {
+            int a = old + d, b = sel + d;
+            if (a >= 0 && a < n) rows[nr++] = a;
+            if (b >= 0 && b < n) rows[nr++] = b;
+        }
+        for (int k = 0; k < nr; k++) {
+            int i = rows[k], dup = 0;
+            for (int q = 0; q < k; q++) if (rows[q] == i) dup = 1;
+            if (dup) continue;
+            int was = old == i ? 0 : old == i - 1 ? 1 : old == i + 1 ? 2 : 3;
+            int now = sel == i ? 0 : sel == i - 1 ? 1 : sel == i + 1 ? 2 : 3;
+            if (was == now) continue;           /* this band looks the same as before */
+            int y0 = top + i * step - MB_MARGIN, y1 = top + i * step + bh + MB_MARGIN;
+            if (y0 < 0) y0 = 0; if (y1 > UI_H) y1 = UI_H;
+            int bhh = y1 - y0;
+            if (g_mb[i][now]) ui_rect_load(0, y0, UI_W, bhh, g_mb[i][now]);
+            else {
+                ui_clip_y(y0, y1); mb_render(is3d); ui_clip_reset();
+                g_mb[i][now] = (u16 *)malloc((size_t)UI_W * bhh * 2);   /* no memory: just not kept */
+                if (g_mb[i][now]) ui_rect_save(0, y0, UI_W, bhh, g_mb[i][now]);
+            }
+            ui_tex_upload_rect(0, y0, UI_W, y1);
+        }
+        C3D_TexFlush(&g_uitex);
+        ui_capture(0);
+        g_mb_sel = sel;
+    } else ui_capture(0);                   /* nothing visible changed (a moved stylus, a stale flag) */
+    g_t_menu += svcGetSystemTick() - mt0; g_n_menu++;
+}
 static void g_submenu_sw(C3D_RenderTarget *bot, int is3d) {
     if (!ui_tex_init()) return;
-    ui_capture(1);
-    if (g_submenu == 4) snd_render(); else if (g_submenu == 3) view_render(); else if (g_submenu == 2) srtpicker_render(); else submenu_render(is3d);
-    ui_tex_present(bot);
+    g_submenu_prep(is3d);
+    ui_tex_blit(bot);
 }
 /* dark bottom screen: pure black -- with ONLY the lock toast when it flashes on (never the panel) */
 static void g_dark_sw(C3D_RenderTarget *bot) {
     if (!ui_tex_init()) return;
-    ui_capture(1);
+    ui_capture(1); g_panel_buf_ok = 0; g_sub_last = -1;
     ui_begin(GFX_BOTTOM);
     ui_clear(0);          /* black */
     panel_lock_toast();
     ui_tex_present(bot);
+    g_sub_redraw = 1;
 }
 
 /* open the SRT picker: scan the movie folder + moviedata for .srt files */
@@ -2920,12 +3322,14 @@ static volatile int64_t g_aw_seek_us;
 static volatile int64_t g_aud_play_us;   /* content timestamp the DSP is actually playing now */
 static volatile int64_t g_aud_start = -1;/* audio timeline anchor (astart) -> video compares RELATIVE time */
 static volatile int64_t g_vid_us;        /* content timestamp the video has reached (main thread) */
+static volatile u64     g_aud_upd_tick;  /* svcGetSystemTick() when g_aud_play_us last moved */
 static void audio_worker(void *arg) {
     const char *path = (const char *)arg;
     FILE *af = media_fopen(path);
     if (!af) return;
     MfxDemux am;
-    if (mfx_open_auto(&am, af, path) != 0) { fclose(af); return; }
+    /* SUPER MOFLEX: stop at the trailer, same as the video side, so it's never read as audio */
+    if ((g_tra.present ? mfx_open_window(&am, af, 0, g_tra.payload_off) : mfx_open_auto(&am, af, path)) != 0) { fclose(af); return; }
     am.audio_only = 1;   /* skip video chunks entirely -> minimal core-1 work, less contention */
     int ai = -1;
     for (int i = 0; i < am.nb_streams; i++) if (am.streams[i].media_type == MFX_TYPE_AUDIO && ai < 0) ai = i;
@@ -2965,6 +3369,7 @@ static void audio_worker(void *arg) {
             if (astart < 0) { astart = am.ts; g_aud_start = am.ts; }   /* anchor the audio timeline */
             played += slot_ns[wb_idx]; slot_ns[wb_idx] = fr;   /* the slot we're reusing has finished */
             g_aud_play_us = astart + (int64_t)(played * 1000000LL / arate);
+            g_aud_upd_tick = svcGetSystemTick();
             float v = g_vol;
             if (v != 1.0f) { int16_t *s = abuf[wb_idx]; int ns = fr * chn;
                 for (int i = 0; i < ns; i++) { int t = (int)(s[i] * v); s[i] = (int16_t)(t > 32767 ? 32767 : (t < -32768 ? -32768 : t)); } }
@@ -3308,6 +3713,17 @@ gdone:
 #define R3_AWB  48            /* wavebufs: deep audio read-ahead so audio rides through decode dips */
 #define R3_ABUF 2048          /* max samples/ch per audio packet (real ~2k) */
 static ndspWaveBuf r3_wb[R3_AWB]; static int16_t *r3_ab[R3_AWB];
+static int16_t *r3_raw;            /* R3_AWB x R3_ABUF x channels unscaled samples, or NULL */
+/* AUDIO TRIM after a seek: the reader rewinds to the landing block, whose audio starts before the
+ * picture's first frame (up to ~1 s). That gap was past the A/V skew bound, so the offset was taken
+ * as 0 and the sound ran that far ahead. Instead the samples before the picture are cut, exactly:
+ * the reader gives each in-band packet's content start (block ts + the packets before it in the
+ * block), and the first packets are trimmed to r3_trim_from. The audio origin is then exact. */
+static int64_t r3_trim_from = -1;  /* drop audio before this content time (us); -1 = none */
+static int64_t r3_pkt_start = -1;  /* content start of the packet being fed (us), -1 = unknown */
+static int     r3_last_fr = 0;     /* frames the last fed packet decoded to (before any trim) */
+static float r3_bal[R3_AWB];       /* the levelling factor each buffer was baked with */
+static float r3_bvol[R3_AWB];      /* the volume each buffer was baked with (a change re-bakes it) */
 static int r3_awi, r3_nawb, r3_arate, r3_achn, r3_aok, r3_acnt[R3_AWB];
 static long long r3_aplayed; static int64_t r3_apos;   /* elapsed audible us, -1 = not started */
 static volatile u32 g_r3_last_present;   /* osGetTime() of the last shown frame -- elision starving-guard */
@@ -3319,10 +3735,28 @@ static int64_t r3_audio_t0 = -1;   /* content ts of the first audio sample after
 static int64_t r3_av_skew = 0;     /* constant apos offset = audio_origin - video_origin */
 static int     r3_av_ready = 0;    /* r3_av_skew has been captured for this segment */
 static u64 r3_last;   /* last poll tick, for the phase-locked clock */
+/* DISPLAY LOCK: the audio's playback speed (1.0 = as recorded). The present loop trims it a hair
+ * (23.976 fps on the 59.83 Hz LCD: 0.18% slower) so frames land on an exact 3,2,3,2 refresh pattern,
+ * and nudges it to hold A/V sync; the smoothed clock below advances at this speed. */
+static float r3_aspeed = 1.0f;
+static void r3_set_aspeed(float sp) { r3_aspeed = sp; ndspChnSetRate(0, (float)r3_arate * sp); }
+/* READER ON CORE 1: file reading + audio feeding run on their own thread, so the decode core never
+ * waits on the SD card / network. These locks guard what both sides touch. */
+static LightLock g_vqlk;     /* compressed-video backlog + keyframe list */
+static LightLock g_alk;      /* audio wavebuf bookkeeping (feed on the reader, poll on the UI thread) */
+static LightLock g_rdlk;     /* held by the reader for each read; WORKER_LOCK takes it to pause reading for a seek */
+/* Set while the UI thread waits in WORKER_LOCK. The reader re-took g_rdlk the instant it let go, so
+ * after a seek -- while it refilled ~3 s of audio and the video backlog -- a second seek could not get
+ * the lock until the refill was done: scrubbing again (or rewinding) looked stuck until playback
+ * reached the first target. With this set, both threads step aside instead of re-locking. */
+static volatile int g_wl_req = 0;
+static int g_locks_init;
+static void r3_locks_init(void) { if (!g_locks_init) { LightLock_Init(&g_vqlk); LightLock_Init(&g_alk); LightLock_Init(&g_rdlk); g_locks_init = 1; } }
+__attribute__((constructor)) static void r3_locks_ctor(void) { r3_locks_init(); }   /* every engine uses the queue */
 static void r3_audio_close(void);   /* used by the setup failure path below */
 static void r3_audio_setup(int arate, int chn) {
     r3_arate = arate; r3_achn = chn; r3_awi = 0; r3_aplayed = 0; r3_apos = -1; r3_last = 0;
-    r3_audio_t0 = -1; r3_av_skew = 0; r3_av_ready = 0;
+    r3_audio_t0 = -1; r3_av_skew = 0; r3_av_ready = 0; r3_aspeed = 1.0f;
     ndspChnReset(0); ndspChnSetInterp(0, NDSP_INTERP_POLYPHASE); ndspChnSetRate(0, (float)arate);
     ndspChnSetFormat(0, chn == 2 ? NDSP_FORMAT_STEREO_PCM16 : NDSP_FORMAT_MONO_PCM16);
     float mix[12]; memset(mix, 0, sizeof mix); mix[0] = mix[1] = 1.0f; ndspChnSetMix(0, mix);
@@ -3333,6 +3767,8 @@ static void r3_audio_setup(int arate, int chn) {
         r3_wb[r3_nawb].status = NDSP_WBUF_DONE;
     }
     if (r3_nawb < 8) { r3_audio_close(); return; }   /* leaking these bricked later C2D_Init -> dark screens */
+    free(r3_raw); r3_raw = (int16_t *)malloc((size_t)R3_AWB * R3_ABUF * chn * 2);   /* NULL: volume just lags */
+    for (int i = 0; i < R3_AWB; i++) r3_bal[i] = 1.0f;
     ndspChnSetPaused(0, true);   /* paused: bank audio during pre-roll, unpause aligned to content-0 */
     r3_aok = 1;
 }
@@ -3344,8 +3780,10 @@ static void r3_audio_setup(int arate, int chn) {
 static void r3_audio_poll(void) {
     if (!r3_aok) return;
     int adv = 0;
+    LightLock_Lock(&g_alk);
     for (int i = 0; i < r3_nawb; i++)
         if (r3_wb[i].status == NDSP_WBUF_DONE && !r3_acnt[i] && r3_wb[i].nsamples > 0) { r3_aplayed += r3_wb[i].nsamples; r3_acnt[i] = 1; adv = 1; }
+    LightLock_Unlock(&g_alk);
     (void)adv;
     if (r3_apos < 0) return;
     /* PHASE-LOCKED clock: advance purely on smooth real time (monotonic tick) EVERY poll -- never steps
@@ -3356,7 +3794,7 @@ static void r3_audio_poll(void) {
     if (r3_last == 0) r3_last = now;
     int64_t dt = (int64_t)((now - r3_last) * 1000000LL / SYSCLOCK_ARM11);
     r3_last = now;
-    r3_apos += dt;                                                  /* smooth free-run */
+    r3_apos += (int64_t)(dt * r3_aspeed);                           /* smooth free-run, at the audio's speed */
     int64_t audio = (int64_t)(r3_aplayed * 1000000LL / r3_arate);
     if (r3_apos < audio)                 r3_apos += (audio - r3_apos) / 8;               /* fell behind -> ease up */
     else if (r3_apos > audio + 100000)   r3_apos -= (r3_apos - audio - 100000) / 8;      /* too far ahead -> ease back */
@@ -3393,6 +3831,50 @@ static inline int al_soft(int v) {
     int y = AL_KNEE + (int)((float)span * d / (float)(d + span));
     return v < 0 ? -y : y;
 }
+/* VOLUME, applied the moment it changes. The gain is baked into the samples (so loud boosts bend
+ * softly through al_soft instead of clipping), but ~3 s of audio sits queued ahead -- a change used
+ * to be heard only once that had played. Each queued buffer keeps its unscaled samples (heap) and
+ * its levelling factor, and a volume change re-bakes every buffer still waiting to play. */
+static void r3_bake(int16_t *dst, const int16_t *src, int ns, float g) {
+    if (g == 1.0f) { if (dst != src) memcpy(dst, src, (size_t)ns * 2); return; }
+    /* fixed point (Q10): a float convert + multiply + convert per sample was most of the cost of
+     * re-baking after a volume change on an Old 3DS (gains stay far below the 64x int32 limit) */
+    int gq = (int)(g * 1024.0f + 0.5f);
+    for (int i = 0; i < ns; i++) {
+        int t = (src[i] * gq) >> 10;
+        t = al_soft(t);                       /* bend the peaks rather than square them */
+        dst[i] = (int16_t)(t > 32767 ? 32767 : (t < -32768 ? -32768 : t));
+    }
+}
+/* A volume change re-bakes the queued audio a few buffers per loop, the ones heard next first.
+ * Re-baking the whole ~2 s queue at once was 10-20 ms of an Old 3DS's frame on the playback
+ * thread, under the audio lock -- every step of a slider drag or a held D-pad dropped a frame and
+ * stalled the audio feed. Returns 1 while buffers are still at an old volume. */
+static int r3_rebake_step(int max) {
+    if (!r3_aok || !r3_raw) return 0;
+    int done = 0, left = 0, seen = 0; u64 rt0 = svcGetSystemTick();
+    for (int j = 0; j < r3_nawb; j++) {
+        int i = (r3_awi + j) % r3_nawb;             /* oldest queued first = the next to be heard */
+        if (r3_wb[i].status != NDSP_WBUF_QUEUED || r3_wb[i].nsamples == 0) continue;
+        /* only the next ~0.4 s: while a slider moves the volume keeps changing, and re-baking the
+         * whole ~2 s queue each time was 12% of an Old 3DS (ring_stats rebake=4491ms in 36 s). The
+         * rest is re-baked as it comes within reach, still before it is heard. */
+        if (++seen > 8) break;
+        if (r3_bvol[i] == g_vol) continue;
+        if (done >= max) { left = 1; break; }
+        LightLock_Lock(&g_alk);
+        if (r3_wb[i].status == NDSP_WBUF_QUEUED) {  /* not started while we looked */
+            int ns = (int)r3_wb[i].nsamples * r3_achn;
+            r3_bake(r3_ab[i], r3_raw + (size_t)i * R3_ABUF * r3_achn, ns, g_vol * r3_bal[i]);
+            DSP_FlushDataCache(r3_ab[i], ns * 2);
+        }
+        r3_bvol[i] = g_vol;
+        LightLock_Unlock(&g_alk);
+        done++;
+    }
+    if (done) g_t_rebake += svcGetSystemTick() - rt0;
+    return left;
+}
 static float al_update(const int16_t *s, int ns) {
     double sq = 0.0;
     for (int i = 0; i < ns; i += 4) sq += (double)s[i] * s[i];   /* every 4th sample is plenty */
@@ -3413,22 +3895,34 @@ static int r3_audio_feed_raw(const uint8_t *data, int size) {
     if (!r3_aok) return 1;
     ndspWaveBuf *w = &r3_wb[r3_awi];
     if (w->status != NDSP_WBUF_FREE && w->status != NDSP_WBUF_DONE) return 0;   /* full -> hold */
+    LightLock_Lock(&g_alk);
     if (w->status == NDSP_WBUF_DONE && !r3_acnt[r3_awi] && w->nsamples > 0) { r3_aplayed += w->nsamples; r3_acnt[r3_awi] = 1; }
+    LightLock_Unlock(&g_alk);
     int fr = adpcm_moflex_decode(data, size, r3_achn, r3_ab[r3_awi]);
-    if (fr <= 0 || fr > R3_ABUF) return 1;                                       /* bad -> drop */
+    if (fr <= 0 || fr > R3_ABUF) { r3_last_fr = 0; return 1; }                   /* bad -> drop */
+    r3_last_fr = fr;
+    if (r3_trim_from >= 0 && r3_pkt_start >= 0) {
+        int64_t st = r3_pkt_start, en = st + (int64_t)fr * 1000000 / r3_arate;
+        if (en <= r3_trim_from) return 1;                    /* wholly before the picture: consumed, not queued */
+        if (st < r3_trim_from) {                             /* straddles it: cut the head */
+            int n = (int)((r3_trim_from - st) * r3_arate / 1000000);
+            if (n > 0 && n < fr) { memmove(r3_ab[r3_awi], r3_ab[r3_awi] + n * r3_achn, (size_t)(fr - n) * r3_achn * 2); fr -= n; }
+            st = r3_trim_from;
+        }
+        r3_trim_from = -1;
+        if (r3_audio_t0 < 0) r3_audio_t0 = st;               /* the exact origin */
+    }
     { int16_t *s = r3_ab[r3_awi]; int ns = fr * r3_achn;
-      float g = g_vol;
-      if (g_autolvl > 0 && g_autolvl <= 2) g *= al_update(s, ns);
-      if (g != 1.0f) {
-          for (int i = 0; i < ns; i++) {
-              int t = (int)(s[i] * g);
-              t = al_soft(t);                       /* bend the peaks rather than square them */
-              s[i] = (int16_t)(t > 32767 ? 32767 : (t < -32768 ? -32768 : t));
-          }
-      } }
-    DSP_FlushDataCache(r3_ab[r3_awi], fr * r3_achn * 2);
-    memset(w, 0, sizeof *w); w->data_vaddr = r3_ab[r3_awi]; w->nsamples = fr;
-    ndspChnWaveBufAdd(0, w); r3_acnt[r3_awi] = 0; r3_awi = (r3_awi + 1) % r3_nawb;
+      float al = (g_autolvl > 0 && g_autolvl <= 2) ? al_update(s, ns) : 1.0f;
+      LightLock_Lock(&g_alk);
+      if (r3_raw) memcpy(r3_raw + (size_t)r3_awi * R3_ABUF * r3_achn, s, (size_t)ns * 2);
+      r3_bal[r3_awi] = al; r3_bvol[r3_awi] = g_vol;
+      r3_bake(s, s, ns, g_vol * al);
+      DSP_FlushDataCache(r3_ab[r3_awi], fr * r3_achn * 2);
+      memset(w, 0, sizeof *w); w->data_vaddr = r3_ab[r3_awi]; w->nsamples = fr;
+      ndspChnWaveBufAdd(0, w); r3_acnt[r3_awi] = 0;
+      LightLock_Unlock(&g_alk); }
+    r3_awi = (r3_awi + 1) % r3_nawb;
     return 1;
 }
 static int r3_audio_feed(MfxPacket *pkt) { return r3_audio_feed_raw(pkt->data, pkt->size); }
@@ -3438,11 +3932,13 @@ static void r3_audio_flush(void) {   /* on seek: drop everything queued, clock o
     for (int i = 0; i < r3_nawb; i++) { r3_wb[i].status = NDSP_WBUF_DONE; r3_acnt[i] = 1; }
     r3_awi = 0; r3_aplayed = 0; r3_apos = -1; r3_last = 0;
     r3_audio_t0 = -1; r3_av_skew = 0; r3_av_ready = 0;   /* re-anchor A/V on the next lock */
+    r3_trim_from = -1;
     ndspChnSetPaused(0, true);
 }
 static void r3_audio_close(void) {   /* safe to call in ANY state: frees partial allocations too */
     ndspChnWaveBufClear(0); ndspChnReset(0);
     for (int i = 0; i < R3_AWB; i++) if (r3_ab[i]) { linearFree(r3_ab[i]); r3_ab[i] = NULL; }
+    free(r3_raw); r3_raw = NULL;
     r3_nawb = 0; r3_aok = 0;
 }
 
@@ -3467,20 +3963,49 @@ static void r3_kfp_enq(int pos) {
 static int r3_vq_push(const uint8_t *d, int n, int64_t ts, int kf) {
     if (r3_vqc >= R3_VQ) return 0;
     uint8_t *p = (uint8_t *)malloc(n); if (!p) return 0;
-    memcpy(p, d, n); r3_vq[r3_vqt] = p; r3_vqn[r3_vqt] = n; r3_vqts[r3_vqt] = ts; r3_vqkf[r3_vqt] = (uint8_t)kf;
+    memcpy(p, d, n);
+    LightLock_Lock(&g_vqlk);
+    r3_vq[r3_vqt] = p; r3_vqn[r3_vqt] = n; r3_vqts[r3_vqt] = ts; r3_vqkf[r3_vqt] = (uint8_t)kf;
     r3_vqt = (r3_vqt + 1) % R3_VQ; r3_vqc++;
     if (kf && (r3_pushv & 1) == 0) r3_kfp_enq(r3_pushv / 2);   /* keyframe on a left eye -> its pair pos */
     r3_pushv++;
+    LightLock_Unlock(&g_vqlk);
     return 1;
 }
-static int  r3_vq_head_is_kf(void) { return r3_vqc > 0 && r3_vqkf[r3_vqh]; }
+static int  r3_vq_head_is_kf(void) { LightLock_Lock(&g_vqlk); int r = r3_vqc > 0 && r3_vqkf[r3_vqh]; LightLock_Unlock(&g_vqlk); return r; }
 static uint8_t *r3_vq_pop(int *n, int64_t *ts, int *kf) {
-    if (r3_vqc <= 0) return NULL;
+    LightLock_Lock(&g_vqlk);
+    if (r3_vqc <= 0) { LightLock_Unlock(&g_vqlk); return NULL; }
     uint8_t *p = r3_vq[r3_vqh]; *n = r3_vqn[r3_vqh]; *ts = r3_vqts[r3_vqh]; if (kf) *kf = r3_vqkf[r3_vqh];
-    r3_vqh = (r3_vqh + 1) % R3_VQ; r3_vqc--; return p;
+    r3_vqh = (r3_vqh + 1) % R3_VQ; r3_vqc--;
+    LightLock_Unlock(&g_vqlk);
+    return p;
 }
+/* DECODED-FRAME QUEUE (Old 3DS). The texture ring holds only ~1 s (26 pairs) of finished textures in
+ * scarce linear memory; heavy stretches longer than that drained it into stutters. Decoded pairs now
+ * wait as YUV in the decoder's own (enlarged) frame pool -- no copy -- and are converted into the
+ * ring as it frees: the cushion becomes ring + queue (~2 s more) using ordinary heap. */
+#define YQ_MAX 64
+typedef struct { AVFrame L, R; int64_t rts, bts; int swap; } R3YQ;
+static R3YQ g_yq[YQ_MAX];
+static volatile int g_yq_h, g_yq_n;
+static int g_yq_cap;                     /* 0 = off (New 3DS, or not enough memory) */
+/* 3D queue conversion, overlapped: the head pair's LEFT eye converts while the producer decodes the
+ * next pair's first eye; then the right eye is started (r3_yq_mid) and converts during the second.
+ * Converting both eyes back to back left the CPU idle on the Y2R wait -- ~13% of an Old 3DS
+ * (Spider Noir S01e01 1:48-2:08: 10 stutters with the queue vs 1 without, before this). */
+static int g_yq_lf;                      /* the head pair's left eye is converting */
+static C3D_Tex *g_yq_lfA, *g_yq_lfB;     /* its left / right target textures */
+static int g_yq_lfslot, g_yq_lfW, g_yq_lfH;
+#ifdef LAB_AUTOPLAY
+int g_lab_noov;                          /* lab: back-to-back conversion (the old way) */
+#endif
 static void r3_vq_clear(void) { int n, kf; int64_t ts; while (r3_vqc > 0) free(r3_vq_pop(&n, &ts, &kf));
-    r3_vqh = r3_vqt = r3_vqc = 0; r3_kfph = r3_kfpt = r3_kfpc = 0; r3_pushv = 0; }
+    if (g_yq_lf) { g_y2r_wait(g_yq_lfA); g_yq_lf = 0; }   /* never drop a conversion mid-flight */
+    g_yq_h = g_yq_n = 0;                 /* the queued frames go with any seek / reset */
+    LightLock_Lock(&g_vqlk);
+    r3_vqh = r3_vqt = r3_vqc = 0; r3_kfph = r3_kfpt = r3_kfpc = 0; r3_pushv = 0;
+    LightLock_Unlock(&g_vqlk); }
 
 #define R3_NB_MAX 40           /* ring bound; real depth grown at runtime from the linear heap */
 static C3D_Tex r3_texL[R3_NB_MAX], r3_texR[R3_NB_MAX];
@@ -3940,6 +4465,7 @@ static int g_ring_apt_w = 0, g_ring_apt_h = 0, g_ring_apt_bpp = 2;
 static volatile int g_ring_susp = 0;
 static LightLock  *g_ring_lock  = NULL;   /* &s.lock  when threaded, else NULL (Y2R on main thread) */
 static LightEvent *g_ring_wake  = NULL;   /* &s.wake  when threaded */
+static void r3_retire_any(void);   /* finish the producer's in-flight Y2R conversion (defined below) */
 static void mp_ring_apt_hook(APT_HookType hook, void *param) {
     (void)param;
     switch (hook) {
@@ -3950,7 +4476,8 @@ static void mp_ring_apt_hook(APT_HookType hook, void *param) {
              * hard-locks the GSP (needs a power-off). Release them here, re-acquire on restore. */
             if (g_ring_apt_audio) ndspChnSetPaused(0, true);
             g_ring_susp = 1;                            /* stop the worker from starting a new Y2R... */
-            if (g_ring_lock) { LightLock_Lock(g_ring_lock); LightLock_Unlock(g_ring_lock); }  /* ...and drain any in flight */
+            if (g_ring_lock) { LightLock_Lock(g_ring_lock); r3_retire_any(); LightLock_Unlock(g_ring_lock); }  /* ...and drain any in flight */
+            else r3_retire_any();
             if (g_screen_off) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; } g_backlight_on = 1;
             if (g_lcd_ok) gspLcdExit();                 /* release gsp::Lcd (else HOME hard-locks) */
             if (g_ring_apt_w) g_y2r_exit();             /* release Y2R + its event (only if it's up yet) */
@@ -3993,10 +4520,112 @@ typedef struct {
     int has_pending; MfxPacket pending;  /* a demuxed packet held across produce calls (audio bank was full) */
     LightLock lock;                      /* held by worker while touching demux/decoder/ring; by main during seek */
     LightEvent wake;                     /* main -> worker: slot freed / unpaused / seek finished */
+    /* SEEK PREVIEW: while a seek control is held the worker makes stills instead of playing. Main posts
+     * the newest target (pv_req/pv_req_seq); the worker decodes that landing's keyframe pair into a spare
+     * ring slot and publishes it (pv_done_*). Stale targets are skipped: it always takes the latest. */
+    volatile int pv_mode, pv_req_seq, pv_done_seq, pv_done_slot;
+    volatile long long pv_req, pv_done_T;
+    int pv_handled, pv_slot; long long pv_mark;
+    /* LANDING (on release): the worker runs the real seek too -- keyframe landing, 3D eye parity,
+     * prime pair -- so the UI never waits on it; a new touch cancels it (land_cancel). */
+    volatile int land_seq, land_done_seq, land_ok, land_slot, land_cancel;
+    volatile long long land_T, land_lts;
+    int land_handled;
+    volatile int land_active;            /* a landing (not a preview) is running: land_cancel applies */
+    volatile int vskip;                  /* reader: drop this many video packets (already decoded by the prime) */
+    int lastop_ok, lastop_slot; long long lastop_T, lastop_lts;   /* the worker's last r3_land: reusable on release */
+    long long a_blk, a_acc;              /* reader: current block ts, content start of its next audio packet */
 } R3S;
 
+/* Y2R OVERLAP: the last conversion of a pair is started but not waited for; it runs while the next
+ * pair decodes and is retired (waited + published) just before the next conversion starts, before the
+ * producer sleeps, and by WORKER_LOCK. While it is in flight its slot is not yet counted in s->wr. */
+static int r3_pend = -1;                 /* ring slot whose last conversion is in flight, -1 = none */
+static C3D_Tex *r3_pend_tex;
+static int64_t r3_pend_rts, r3_pend_bts;
+/* finish the overlapped conversion's first half: left eye done -> start the right eye (pending) */
+static void r3_yq_mid(void) {
+    if (!g_yq_lf) return;
+    R3YQ *e = &g_yq[g_yq_h];
+    g_y2r_wait(g_yq_lfA);
+    g_y2r_start(&e->R, g_yq_lfB, g_yq_lfW, g_yq_lfH);
+    r3_pend = g_yq_lfslot; r3_pend_tex = g_yq_lfB; r3_pend_rts = e->rts; r3_pend_bts = e->bts;
+    g_yq_h = (g_yq_h + 1) % YQ_MAX; g_yq_n = g_yq_n - 1;
+    g_yq_lf = 0;
+}
+static void r3_retire(R3S *s) {
+    if (g_yq_lf) r3_yq_mid();             /* a half-done conversion completes first, always */
+    if (r3_pend < 0) return;
+    g_y2r_wait(r3_pend_tex);
+    r3_rts[r3_pend] = r3_pend_rts; r3_bts[r3_pend] = r3_pend_bts;
+    __sync_synchronize(); r3_ready[r3_pend] = 1; s->wr = s->wr + 1;   /* publish AFTER the data is ready */
+    r3_pend = -1;
+}
+static inline int r3_inflight(void) { return r3_pend >= 0; }
+
+static R3S *g_ring_s;                    /* the live ring state, for the suspend hook */
+/* ring_stats: frames the producer never delivered (they don't show as drops or starvation) and how busy
+ * the producer was -- decode + conversion ticks */
+static volatile u32 g_st_elide, g_st_yqstale, g_st_skipped;
+static volatile u64 g_st_busy;
+static void r3_retire_any(void) { if (g_ring_s) r3_retire(g_ring_s); }
+
+static void r3_yq_push(R3S *s, const AVFrame *L, const AVFrame *R, int64_t rts, int64_t bts) {
+    R3YQ *e = &g_yq[(g_yq_h + g_yq_n) % YQ_MAX];
+    e->L = *L; if (R) e->R = *R;
+    for (int i = 0; i < 4; i++) { e->L._own[i] = 0; e->R._own[i] = 0; }   /* the decoder owns the buffers */
+    e->rts = rts; e->bts = bts; e->swap = s->eye_swap;
+    __sync_synchronize(); g_yq_n = g_yq_n + 1;
+}
+/* the oldest queued pair -> the next ring slot (the second eye's conversion is left in flight) */
+/* 3D: start the head pair's left eye and return (r3_yq_mid starts the right). 0 = nothing started */
+static int r3_yq_begin(R3S *s) {
+    R3YQ *e = &g_yq[g_yq_h];
+    if (s->old3ds && r3_apos >= 0) {   /* already behind the audio: present would discard it unseen */
+        int stale = (e->rts + s->pair_dur < r3_apos);
+        int starving = ((u32)osGetTime() - g_r3_last_present) >= 100;
+        if (stale && !starving) { g_yq_h = (g_yq_h + 1) % YQ_MAX; g_yq_n = g_yq_n - 1; g_st_yqstale++; return 0; }
+    }
+    r3_retire(s);
+    int slot = s->wr % s->NB;
+    g_yq_lfA = e->swap ? &r3_texR[slot] : &r3_texL[slot]; g_yq_lfB = e->swap ? &r3_texL[slot] : &r3_texR[slot];
+    g_yq_lfslot = slot; g_yq_lfW = s->W; g_yq_lfH = s->H;
+    g_y2r_start(&e->L, g_yq_lfA, s->W, s->H);
+    g_yq_lf = 1;
+    return 1;
+}
+static void r3_yq_convert(R3S *s) {
+#ifdef LAB_AUTOPLAY
+    u64 _lc0 = svcGetSystemTick();
+#endif
+    R3YQ *e = &g_yq[g_yq_h];
+    if (s->old3ds && r3_apos >= 0) {   /* already behind the audio: present would discard it unseen */
+        int stale = (e->rts + s->pair_dur < r3_apos);
+        int starving = ((u32)osGetTime() - g_r3_last_present) >= 100;
+        if (stale && !starving) { g_yq_h = (g_yq_h + 1) % YQ_MAX; g_yq_n = g_yq_n - 1; g_st_yqstale++; return; }
+    }
+    r3_retire(s);
+    int slot = s->wr % s->NB;
+    if (!s->is3d) {
+        g_y2r_start(&e->L, &r3_texL[slot], s->W, s->H); r3_pend_tex = &r3_texL[slot];
+    } else {
+        C3D_Tex *tA = e->swap ? &r3_texR[slot] : &r3_texL[slot], *tB = e->swap ? &r3_texL[slot] : &r3_texR[slot];
+        g_y2r_start(&e->L, tA, s->W, s->H); g_y2r_wait(tA);
+        g_y2r_start(&e->R, tB, s->W, s->H); r3_pend_tex = tB;
+    }
+    r3_pend = slot; r3_pend_rts = e->rts; r3_pend_bts = e->bts;
+    g_yq_h = (g_yq_h + 1) % YQ_MAX; g_yq_n = g_yq_n - 1;
+#ifdef LAB_AUTOPLAY
+    g_lt_conv += svcGetSystemTick() - _lc0;
+#endif
+}
+
 /* Decode+bank ONE pair into ring slot wr%NB (or drop a pair while catching up). Runs under s->lock. */
-static void r3_produce(R3S *s) {
+/* PHASE 0 + 1: trailer audio, then fill the video backlog and feed the DSP bank. Runs on the reader
+ * thread (core 1) when it exists, else at the top of r3_produce. maxpk bounds one call so a seek never
+ * waits long for the reader to let go. Returns the number of packets handled. */
+static int r3_read_some(R3S *s, int maxpk) {
+    int handled = 0;
     /* PHASE 0: trailer audio (Audio Track 2 of official-compatible files) -- fixed-size ADPCM
      * packets read from past the last block on a private FILE handle; in-band audio is skipped
      * entirely (s->aidx = -2 matches no stream). */
@@ -4008,29 +4637,53 @@ static void r3_produce(R3S *s) {
             if (r3_audio_t0 < 0)
                 r3_audio_t0 = (s64)s->tr_cur * g_tra.aud_pktsamp * 1000000LL / g_tra.aud_rate;
             if (!r3_audio_feed_raw(trbuf, (int)g_tra.aud_pktbytes)) { s->audio_pre_full = 1; break; }
-            s->tr_cur = s->tr_cur + 1;
+            s->tr_cur = s->tr_cur + 1; handled++;
         }
         if (s->tr_cur >= g_tra.aud_pkts) s->audio_pre_full = 1;   /* short track: don't gate forever */
     }
     /* PHASE 1: keep the video backlog full + feed audio to the DSP bank */
-    while (!s->done && r3_vqc < R3_VQ) {
-        if (!s->has_pending) { if (mfx_next_packet(s->m, &s->pending) != 1) { s->done = 1; break; } s->has_pending = 1; }
+    while (!s->done && r3_vqc < R3_VQ && handled < maxpk) {
+        if (!s->has_pending) { if (mfx_next_packet(s->m, &s->pending) != 1) { s->done = 1; break; } s->has_pending = 1; handled++; }
         int mt = s->m->streams[s->pending.stream_index].media_type;
         if (mt == MFX_TYPE_AUDIO && s->have_audio && s->pending.stream_index != s->aidx) {
             s->has_pending = 0;   /* a NON-selected audio track (dual audio): skip it entirely --
                                    * feeding every audio stream to one DSP channel garbles both */
         } else if (mt == MFX_TYPE_AUDIO && s->have_audio) {
+            if (s->m->ts != s->a_blk) { s->a_blk = s->m->ts; s->a_acc = s->m->ts; }
+            r3_pkt_start = s->a_acc;
             if (r3_audio_feed(&s->pending)) {
+                if (r3_last_fr > 0 && r3_arate > 0) s->a_acc += (int64_t)r3_last_fr * 1000000 / r3_arate;
                 if (r3_audio_t0 < 0) { int64_t at = s->m->ts; r3_audio_t0 = at < 0 ? 0 : at; }  /* audio origin */
                 s->has_pending = 0;
             }
             else { s->audio_pre_full = 1; break; }        /* bank full: hold packet, let main unpause audio */
+        } else if (mt == MFX_TYPE_VIDEO && s->vskip > 0) {
+            s->vskip--; s->has_pending = 0;        /* already decoded by the seek's prime */
         } else if (mt == MFX_TYPE_VIDEO) {
             int64_t vts = s->m->ts; if (vts < 0) vts = 0; if (s->dur_us > 0 && vts > s->dur_us) vts = s->dur_us;
             if (!r3_vq_push(s->pending.data, s->pending.size, vts, s->pending.keyframe)) break;
             s->has_pending = 0;
         } else s->has_pending = 0;
     }
+    return handled;
+}
+
+static volatile int g_reader_on;          /* the core-1 reader thread is running */
+static void r3_produce(R3S *s) {
+    if (g_yq_lf) r3_yq_mid();                     /* (a previous call left a left eye converting) */
+    if (g_yq_cap > 0) {                           /* the ring takes a queued pair as soon as it has room */
+        if (g_yq_n > 0 && (s->wr + r3_inflight() - s->rd) < s->NB - 1) {
+            /* 3D with a pair to decode as well: start the left eye and decode while it converts */
+            int ov = s->is3d && g_yq_n < g_yq_cap && r3_vqc >= 2 && !s->skipping;
+#ifdef LAB_AUTOPLAY
+            if (g_lab_noov) ov = 0;
+#endif
+            if (!ov) { r3_yq_convert(s); return; }
+            r3_yq_begin(s);
+        }
+        else if (g_yq_n >= g_yq_cap) return;      /* ring and queue both full */
+    }
+    if (!g_reader_on) r3_read_some(s, 1 << 30);   /* no reader thread: read inline, as before */
     if (r3_vqc < 2) return;   /* not enough for a pair yet */
 
     /* ================= CATCH-UP MODE (current: SKIP+FLUSH = avtest "mode 2") =================
@@ -4058,8 +4711,10 @@ static void r3_produce(R3S *s) {
      * buffered keyframe at/before the audio position (never past it -> no freeze). */
     long long dpair = s->dpair;
     int apos_pair = (r3_apos >= 0) ? (int)(r3_apos / s->pair_dur) : -1;
+    LightLock_Lock(&g_vqlk);
     while (r3_kfpc > 0 && r3_kfp[r3_kfph] < (int)dpair) { r3_kfph = (r3_kfph + 1) % R3_KFPN; r3_kfpc--; }
     int target  = (r3_kfpc > 0) ? r3_kfp[r3_kfph] : -1;
+    LightLock_Unlock(&g_vqlk);
     int canskip = (apos_pair >= 0) && (target > (int)dpair) && (target <= apos_pair);
     int drift   = (apos_pair >= 0) ? apos_pair - (int)dpair : 0;
     const int DRIFT_MAX = s->old3ds ? 6 : 20;   /* Old-3DS: resync early+often (short ghost, avtest's value).
@@ -4071,22 +4726,23 @@ static void r3_produce(R3S *s) {
          * that corrupts the whole GOP and the blockiness bleeds into the following calm scenes. The
          * cost is a brief freeze on the last clean frame, resolved the instant a keyframe lands. */
         if (r3_vqc == 0) { s->dpair = dpair + 1; return; }                 /* nothing buffered yet -> hold */
-        if (r3_vq_head_is_kf()) { s->skipping = 0; mobi_flush(s->ctx); }   /* FLUSH on resync (avtest mode 2,
+        if (r3_vq_head_is_kf()) { s->skipping = 0; r3_retire(s); g_yq_h = g_yq_n = 0; mobi_flush(s->ctx); }   /* FLUSH on resync (avtest mode 2,
                              * "looked best": clean picture + rare freezes, vs no-flush's persistent ghosting on
                              * this keyframe-sparse content). Matches the avtest degradation the user prefers. */
         else {
             int n, kf; int64_t ts; free(r3_vq_pop(&n, &ts, &kf)); if (r3_vqc > 0) free(r3_vq_pop(&n, &ts, &kf));
-            s->dpair = dpair + 1;
+            s->dpair = dpair + 1; g_st_skipped++;
             return;
         }
     }
 
     /* PHASE 2: decode a pair, Y2R into the ring slot (inline -- off the present path now). */
     u64 _pt = svcGetSystemTick();
-    int slot = s->wr % s->NB, n, kf, gotL = 0, gotR = 0; int64_t vts;
+    int slot = (s->wr + r3_inflight()) % s->NB, n, kf, gotL = 0, gotR = 0; int64_t vts;
     AVPacket ap;
     uint8_t *p = r3_vq_pop(&n, &vts, &kf); ap.data = p; ap.size = n;
     int okL = (mobi_decode(s->ctx, s->fL, &gotL, &ap) >= 0 && gotL); free(p);
+    if (g_yq_lf) r3_yq_mid();                     /* left eye converted meanwhile: the right converts during eye 2 */
     s->cur_us = vts;
     /* Old-3DS catch-up ELISION: a pair already behind the audio clock will be discarded unseen by
      * present, so decode it (references must stay perfect) but skip the Y2R + ring publish. Force a real
@@ -4097,40 +4753,244 @@ static void r3_produce(R3S *s) {
         int stale = (this_ts + s->pair_dur < r3_apos);
         int starving = ((u32)osGetTime() - g_r3_last_present) >= 100;
         elide = stale && !starving;
+        if (elide) g_st_elide++;
     }
     /* keep measuring all through the film: a scope feature can open on a 16:9 logo card, and
      * since bars only ever shrink, a wider shot arriving later corrects an early guess */
     { static int lbn = 0; if (okL && ++lbn >= 12) { lbn = 0; lb_sample(s->fL, s->W, s->H); } }
-    if (!s->is3d) {
-        if (okL && !elide) { g_y2r_start(s->fL, &r3_texL[slot], s->W, s->H); g_y2r_wait(&r3_texL[slot]);
-                   r3_rts[slot] = dpair * s->pair_dur; r3_bts[slot] = vts;
-                   __sync_synchronize(); r3_ready[slot] = 1; s->wr = s->wr + 1; }
+    if (g_yq_cap > 0) {                           /* queue mode: decode the pair, convert later */
+        if (!s->is3d) { if (okL && !elide) r3_yq_push(s, s->fL, NULL, dpair * s->pair_dur, vts); }
+        else if (r3_vqc > 0) {
+            int64_t vts2; p = r3_vq_pop(&n, &vts2, &kf); ap.data = p; ap.size = n;
+            int gotR = 0; int okR = (mobi_decode(s->ctx, s->fR, &gotR, &ap) >= 0 && gotR); free(p);
+            if (okL && okR && !elide) r3_yq_push(s, s->fL, s->fR, dpair * s->pair_dur, vts);
+        }
+    } else if (!s->is3d) {
+        if (okL && !elide) { r3_retire(s); slot = s->wr % s->NB;
+                   g_y2r_start(s->fL, &r3_texL[slot], s->W, s->H);
+                   r3_pend = slot; r3_pend_tex = &r3_texL[slot]; r3_pend_rts = dpair * s->pair_dur; r3_pend_bts = vts; }
     } else if (r3_vqc > 0) {
+        /* eye routing: normally (first,second) = (L,R); after a seek that landed on a RIGHT
+         * eye (pairs span block boundaries in some Nintendo muxes) the stream runs R,L,R,L --
+         * route the first frame to the R texture so depth stays correct. */
+        int startedA = 0;
+        C3D_Tex *tA = NULL, *tB = NULL;
+        if (okL && !elide) {             /* convert the first eye WHILE the second one decodes */
+            r3_retire(s); slot = s->wr % s->NB;
+            tA = s->eye_swap ? &r3_texR[slot] : &r3_texL[slot];
+            tB = s->eye_swap ? &r3_texL[slot] : &r3_texR[slot];
+            g_y2r_start(s->fL, tA, s->W, s->H); startedA = 1;
+        }
         int64_t vts2; p = r3_vq_pop(&n, &vts2, &kf); ap.data = p; ap.size = n;
         int gotR = 0; int okR = (mobi_decode(s->ctx, s->fR, &gotR, &ap) >= 0 && gotR); free(p);
-        if (okL && okR && !elide) {
-            /* eye routing: normally (first,second) = (L,R); after a seek that landed on a RIGHT
-             * eye (pairs span block boundaries in some Nintendo muxes) the stream runs R,L,R,L --
-             * route the first frame to the R texture so depth stays correct. */
-            C3D_Tex *tA = s->eye_swap ? &r3_texR[slot] : &r3_texL[slot];
-            C3D_Tex *tB = s->eye_swap ? &r3_texL[slot] : &r3_texR[slot];
-            g_y2r_start(s->fL, tA, s->W, s->H); g_y2r_wait(tA);
-            g_y2r_start(s->fR, tB, s->W, s->H); g_y2r_wait(tB);
-            r3_rts[slot] = dpair * s->pair_dur; r3_bts[slot] = vts;
-            __sync_synchronize(); r3_ready[slot] = 1; s->wr = s->wr + 1;   /* publish AFTER the data is ready */
+        if (startedA) {
+            g_y2r_wait(tA);
+            if (okR) {                    /* second eye: started now, retired later (overlaps the next pair) */
+                g_y2r_start(s->fR, tB, s->W, s->H);
+                r3_pend = slot; r3_pend_tex = tB; r3_pend_rts = dpair * s->pair_dur; r3_pend_bts = vts;
+            }
         }
     }
     { long long _pd = svcGetSystemTick() - _pt; s->wk_dec += _pd; if (_pd > s->wk_dmax) s->wk_dmax = _pd; s->wk_n++; }
     s->dpair = dpair + 1;
 }
 
+static volatile u32 g_st_rdmax, g_st_rdslow;   /* reader: slowest read (ms), reads > 100 ms -- ring_stats */
+static void r3_reader_thread(void *arg) {
+    R3S *s = (R3S *)arg;
+    while (s->run) {
+        if (s->paused || g_ring_susp || s->done) { svcSleepThread(5000000LL); continue; }
+        if (g_wl_req) { svcSleepThread(1000000LL); continue; }   /* a seek is waiting for the lock */
+        LightLock_Lock(&g_rdlk);
+        u64 _rt0 = svcGetSystemTick();
+        int got = s->run && !s->paused ? r3_read_some(s, 8) : 0;
+        {   u32 ms = (u32)((svcGetSystemTick() - _rt0) / (SYSCLOCK_ARM11 / 1000));   /* a read stall (network) */
+            if (ms > g_st_rdmax) g_st_rdmax = ms;
+            if (ms > 100) g_st_rdslow++; }
+        LightLock_Unlock(&g_rdlk);
+        if (!got) svcSleepThread(2000000LL);   /* queue/bank full: let the decoder and DSP catch up */
+    }
+}
+
+#define LAND_CUT ((s->land_active && s->land_cancel) || g_wl_req)
+static int r3_land(R3S *s, int64_t T, int slot, int64_t *lts_out) {
+    MfxDemux *m = s->m; AVCodecContext *ctx = s->ctx;
+    int64_t land_tgt = T;
+    do_seek(m, ctx, T);
+    {   MfxPacket pk; int direct_kf = 0;
+        for (int g = 0; g < 200 && !LAND_CUT; g++) {
+            if (mfx_next_packet(m, &pk) != 1) break;
+            if (m->streams[pk.stream_index].media_type != MFX_TYPE_VIDEO) continue;
+            direct_kf = pk.keyframe; break;
+        }
+        if (!direct_kf && !LAND_CUT) {             /* sparse keyframes: last keyframe within 20 s before T */
+            int64_t back = T - 20000000; if (back < 0) back = 0;
+            do_seek(m, ctx, back);
+            int64_t kf_marker = -1, cur_marker = m->ts;
+            for (long g = 0; g < 60000 && !LAND_CUT; g++) {
+                if (mfx_next_packet(m, &pk) != 1) break;
+                if (m->ts != cur_marker) { if (m->ts > T) break; cur_marker = m->ts; }
+                if (m->streams[pk.stream_index].media_type != MFX_TYPE_VIDEO) continue;
+                if (pk.keyframe) kf_marker = cur_marker;
+            }
+            if (kf_marker >= 0) land_tgt = kf_marker;
+        }
+    }
+    if (LAND_CUT) return 0;
+    do_seek(m, ctx, land_tgt);
+    int64_t prime_from = land_tgt;
+    s->eye_swap = 0;
+    if (s->is3d) {                                  /* 3D eye parity: see the UI-thread seek */
+        int64_t tgt = land_tgt; int rfirst = 0;
+        double eye = (double)s->pair_dur * 0.5;
+        for (int attempt = 0; ; attempt++) {
+            int64_t land_ts = m->ts;
+            MfxPacket pk; int64_t bt = m->ts; long cnt = 0; int nb = 0;
+            int okc = 1, decided = 0;
+            rfirst = 0;
+            for (long g = 0; g < 1500 && nb < 4 && !decided && okc && !LAND_CUT; g++) {
+                if (mfx_next_packet(m, &pk) != 1) break;
+                if (m->streams[pk.stream_index].media_type != MFX_TYPE_VIDEO) continue;
+                if (m->ts != bt) {
+                    double fx = (double)(m->ts - bt) / eye;
+                    long F = (long)(fx + 0.5);
+                    double d = fx - (double)F; if (d < 0) d = -d;
+                    if (d > 0.02) okc = 0;
+                    else {
+                        int step = (int)(cnt - F);
+                        if (step == 1 || step == -1) { if (step == -1) rfirst = 1; decided = 1; }
+                        else if (step != 0) okc = 0;
+                    }
+                    nb++; bt = m->ts; cnt = 0;
+                }
+                cnt++;
+            }
+            if (!rfirst || attempt >= 3 || LAND_CUT) break;
+            tgt = land_ts - 1; if (tgt < 0) tgt = 0;
+            do_seek(m, ctx, tgt);
+        }
+        if (LAND_CUT) return 0;
+        s->eye_swap = rfirst;
+        do_seek(m, ctx, tgt);
+        prime_from = tgt;
+    }
+    /* prime: the landing keyframe pair into `slot`. Its time is exact: the block ts plus the video
+     * packets before it in the block (a keyframe mid-block was stamped with the block start, and the
+     * sound -- trimmed to this time -- would then start early) */
+    MfxPacket pk; int64_t lts = T; int vseen = 0;
+    int64_t vb_ts = -1; int vb_cnt = 0, eyes = s->is3d ? 2 : 1;
+    for (int guard = 0; guard < 4000 && !LAND_CUT; guard++) {
+        if (mfx_next_packet(m, &pk) != 1) break;
+        if (m->streams[pk.stream_index].media_type != MFX_TYPE_VIDEO) continue;
+        if (m->ts != vb_ts) { vb_ts = m->ts; vb_cnt = 0; }
+        int in_blk = vb_cnt++;
+        vseen++;
+        if (s->is3d && !(vseen & 1)) continue;
+        if (!pk.keyframe && vseen < 30) continue;
+        lts = m->ts + (int64_t)(in_blk / eyes) * s->pair_dur;
+        AVPacket ap; ap.data = pk.data; ap.size = pk.size; int gL = 0;
+        if (!(mobi_decode(ctx, s->fL, &gL, &ap) >= 0 && gL)) continue;
+        if (s->is3d) {
+            int haveR = 0; MfxPacket pr;
+            for (int g2 = 0; g2 < 8; g2++) { if (mfx_next_packet(m, &pr) != 1) break;
+                if (m->streams[pr.stream_index].media_type == MFX_TYPE_VIDEO) { haveR = 1; vseen++;
+                    if (m->ts != vb_ts) { vb_ts = m->ts; vb_cnt = 0; } vb_cnt++; break; } }
+            int gR = 0;
+            if (!haveR || !(mobi_decode(ctx, s->fR, &gR, &(AVPacket){ .data = pr.data, .size = pr.size }) >= 0 && gR)) continue;
+            C3D_Tex *tA = s->eye_swap ? &r3_texR[slot] : &r3_texL[slot];
+            C3D_Tex *tB = s->eye_swap ? &r3_texL[slot] : &r3_texR[slot];
+            g_y2r_start(s->fL, tA, s->W, s->H); g_y2r_wait(tA);
+            g_y2r_start(s->fR, tB, s->W, s->H); g_y2r_wait(tB);
+        } else { g_y2r_start(s->fL, &r3_texL[slot], s->W, s->H); g_y2r_wait(&r3_texL[slot]); }
+        *lts_out = lts;
+        /* the prime skipped this block's audio packets on its way to the pair: rewind the demuxer (no
+         * decoder flush -- its references are the pair just decoded) so the reader feeds the audio
+         * from here, and have it drop the video packets the prime already used. Without this the sound
+         * started up to a block (~1 s) after the picture. */
+        mfx_seek_time(m, prime_from);
+        s->vskip = vseen;
+        return 1;
+    }
+    return 0;
+}
+/* a preview still: the keyframe pair at the target's index landing -- fast (no keyframe hunt, no
+ * eye-parity peek: those read seconds of file and made stills appear only after a long hold) */
+static void r3_preview_one(R3S *s) {
+    int seq = s->pv_req_seq; int64_t T = s->pv_req;   /* the newest target right now */
+    s->pv_handled = seq;
+    do_seek(s->m, s->ctx, T);
+    int64_t mark = s->m->ts;
+    if (mark == s->pv_mark) return;                   /* same landing as the still on screen */
+    int slot = (s->pv_slot + 1) % 3;                  /* never the slot being shown */
+    MfxPacket pk; int vseen = 0, got = 0;
+    for (int g = 0; g < 600 && !got && !g_wl_req; g++) {
+        if (mfx_next_packet(s->m, &pk) != 1) break;
+        if (s->m->streams[pk.stream_index].media_type != MFX_TYPE_VIDEO) continue;
+        vseen++;
+        if (s->is3d && !(vseen & 1)) continue;
+        if (!pk.keyframe) continue;
+        AVPacket ap; ap.data = pk.data; ap.size = pk.size; int gL = 0;
+        if (!(mobi_decode(s->ctx, s->fL, &gL, &ap) >= 0 && gL)) continue;
+        if (s->is3d) {
+            MfxPacket pr; int haveR = 0, gR = 0;
+            for (int g2 = 0; g2 < 8; g2++) { if (mfx_next_packet(s->m, &pr) != 1) break;
+                if (s->m->streams[pr.stream_index].media_type == MFX_TYPE_VIDEO) { haveR = 1; break; } }
+            if (!haveR || !(mobi_decode(s->ctx, s->fR, &gR, &(AVPacket){ .data = pr.data, .size = pr.size }) >= 0 && gR)) break;
+            g_y2r_start(s->fL, &r3_texL[slot], s->W, s->H); g_y2r_wait(&r3_texL[slot]);
+            g_y2r_start(s->fR, &r3_texR[slot], s->W, s->H); g_y2r_wait(&r3_texR[slot]);
+        } else { g_y2r_start(s->fL, &r3_texL[slot], s->W, s->H); g_y2r_wait(&r3_texL[slot]); }
+        got = 1;
+    }
+    clearerr(s->m->f); s->m->eof = 0;
+    if (got) {
+        s->pv_mark = mark; s->pv_slot = slot; s->pv_done_slot = slot; s->pv_done_T = T;
+        __sync_synchronize(); s->pv_done_seq++;
+    }
+}
 static void r3_dec_thread(void *arg) {
     R3S *s = (R3S *)arg;
     while (s->run) {
+        if (g_wl_req) { svcSleepThread(1000000LL); continue; }   /* a seek is waiting for the lock */
+        if (s->pv_mode) {                                        /* seeking: stills, not playback */
+            LightLock_Lock(&s->lock);
+            int land = s->pv_mode && s->land_handled != s->land_seq;
+            int landed = s->land_done_seq == s->land_seq && s->land_seq != 0 && !s->land_cancel;   /* waiting for main */
+            int todo = land || (s->pv_mode && !landed && s->pv_handled != s->pv_req_seq);
+            if (land) {
+                int seq = s->land_seq; s->land_handled = seq;
+                /* previews still queued from before the release are void: one running after the
+                 * landing moved the demuxer back to the drag target (the sound then started there,
+                 * seconds from the picture) and clobbered the decoder's references */
+                s->pv_handled = s->pv_req_seq;
+                int slot, ok; int64_t lts;
+                if (s->lastop_ok && s->lastop_T == s->land_T) {      /* released on the still: already landed */
+                    slot = s->lastop_slot; lts = s->lastop_lts; ok = 1;
+                } else {
+                    slot = (s->pv_slot + 1) % s->NB; lts = s->land_T;   /* the still (pv_slot) stays behind rd */
+                    s->land_active = 1;
+                    ok = r3_land(s, s->land_T, slot, &lts);
+                    s->land_active = 0;
+                    clearerr(s->m->f); s->m->eof = 0;
+                    s->lastop_ok = 0;
+                }
+                s->land_ok = ok && !s->land_cancel; s->land_slot = slot; s->land_lts = lts;
+                s->pv_handled = s->pv_req_seq;
+                __sync_synchronize(); s->land_done_seq = seq;
+            } else if (todo) r3_preview_one(s);
+            LightLock_Unlock(&s->lock);
+            if (!todo) LightEvent_Wait(&s->wake);
+            continue;
+        }
         LightLock_Lock(&s->lock);
-        int wait = s->paused || g_ring_susp || (s->wr - s->rd >= s->NB - 1) || (s->done && r3_vqc == 0);
-        if (!wait) r3_produce(s);
+        int ring_full = (s->wr + r3_inflight() - s->rd >= s->NB - 1);
+        int wait = s->paused || g_ring_susp || (ring_full && (g_yq_cap == 0 || g_yq_n >= g_yq_cap))
+                   || (s->done && r3_vqc == 0 && (g_yq_n == 0 || ring_full));
+        int conv = g_yq_n > 0 && !ring_full;                 /* a queued pair can go into the ring */
+        int starved = !wait && !conv && g_reader_on && r3_vqc < 2;    /* waiting on the reader, not on the ring */
+        if (!wait && !starved) { u64 _b0 = svcGetSystemTick(); r3_produce(s); if (!s->paused) g_st_busy += svcGetSystemTick() - _b0; }
+        else r3_retire(s);                     /* going idle: publish the in-flight frame first */
         LightLock_Unlock(&s->lock);
+        if (starved) { svcSleepThread(1000000LL); continue; }
         if (wait) LightEvent_Wait(&s->wake);   /* nothing to do -> sleep until main pokes us */
     }
 }
@@ -4164,9 +5024,21 @@ static MoflexResult moflex_play_ring(const char *path) {
     FILE *f = media_fopen(path);
     if (!f) return MOFLEX_ERROR;
     trailer_probe(f);
+    /* video version: the in-band one, or an alternate stored in the trailer (VID1). The choice
+     * survives the in-place re-open a switch does (same path), and is saved per movie. */
+    if (strcmp(g_vid_for, path)) { snprintf(g_vid_for, sizeof g_vid_for, "%s", path); g_vid_sel = vsel_peek(path); }
+    g_vid_n = g_tra.present && g_tra.tvid_n > 0 ? 1 + g_tra.tvid_n : 0;
+    if (g_vid_sel < 0 || g_vid_sel >= (g_vid_n > 0 ? g_vid_n : 1)) g_vid_sel = 0;
+    g_vid_pend = -1; g_vid_req = 0;
+    s64 vwin_base = 0, vwin_size = g_tra.payload_off;
+    if (g_vid_sel > 0) { vwin_base = g_tra.tvid[g_vid_sel - 1].off; vwin_size = g_tra.tvid[g_vid_sel - 1].len; }
     MfxDemux m;
-    int mo = g_tra.present ? mfx_open_window(&m, f, 0, g_tra.payload_off)
+    int mo = g_tra.present ? mfx_open_window(&m, f, vwin_base, vwin_size)
                            : mfx_open_auto(&m, f, path);
+    if (mo != 0 && g_vid_sel > 0) {      /* a broken alternate: fall back to the main version */
+        g_vid_sel = 0; vwin_base = 0; vwin_size = g_tra.payload_off;
+        mo = mfx_open_window(&m, f, vwin_base, vwin_size);
+    }
     if (mo != 0) { fclose(f); return MOFLEX_ERROR; }
     int vi = -1, ai = -1;
     memset(g_atrk_name, 0, sizeof g_atrk_name); g_kstrk_n = 0;
@@ -4175,7 +5047,7 @@ static MoflexResult moflex_play_ring(const char *path) {
         if (m.streams[i].media_type == MFX_TYPE_VIDEO && vi < 0) vi = i;
         if (m.streams[i].media_type == MFX_TYPE_AUDIO) {
             if (ai < 0) ai = i;
-            if (g_atrk_n < 4) g_atrk_streams[g_atrk_n++] = i;
+            if (g_atrk_n < ATRK_MAX) g_atrk_streams[g_atrk_n++] = i;
         }
     }
     if (vi < 0) { mfx_close(&m); fclose(f); return MOFLEX_ERROR; }
@@ -4185,7 +5057,7 @@ static MoflexResult moflex_play_ring(const char *path) {
     if (!g_tra.present) embsub_scan(&m);   /* consumes head packets -> reopen for a clean start */
     else g_emb_sub_found = 0;
     mfx_close(&m);
-    mo = g_tra.present ? mfx_open_window(&m, f, 0, g_tra.payload_off)
+    mo = g_tra.present ? mfx_open_window(&m, f, vwin_base, vwin_size)
                        : mfx_open_auto(&m, f, path);
     if (mo != 0) { fclose(f); return MOFLEX_ERROR; }
     int is3d = mfx_detect_stereo(&m);
@@ -4199,7 +5071,28 @@ static MoflexResult moflex_play_ring(const char *path) {
 
     AVCodecContext ctx; memset(&ctx, 0, sizeof ctx);
     ctx.width = W; ctx.height = H; ctx.priv_data = calloc(1, mobi_ctx_size());
-    if (!ctx.priv_data || mobi_init(&ctx) != 0) { free(ctx.priv_data); mfx_close(&m); fclose(f); return MOFLEX_ERROR; }
+    g_yq_cap = 0; g_yq_h = g_yq_n = 0;
+    {   bool isn = false; APT_CheckNew3DS(&isn);
+        /* A/B TEST: queue off for Big Top streams (Killer Klowns fails on Old 3DS only, curl 27 + a
+         * citro2d overflow; New 3DS -- no queue -- plays it). Local files keep the queue. */
+#ifdef LAB_AUTOPLAY
+        if (g_lab_noq) isn = true;   /* lab: run without the frame queue */
+#endif
+        if (!isn && strncmp(path, "bigtop:", 7)) {   /* Old 3DS: a frame queue in free heap, as deep as fits with room to spare */
+            int fpp = is3d ? 2 : 1, cap = is3d ? 24 : 48;
+            size_t fb = (size_t)W * H * 3 / 2 + 3 * 1024;
+            /* a Big Top stream also needs heap for curl's requests: with 6 MB spare, curl failed with
+             * CURLE_OUT_OF_MEMORY (bigtop_log) and playback starved -- streams keep 12 MB */
+            size_t spare = (size_t)(strncmp(path, "bigtop:", 7) ? 6 : 12) * 1024 * 1024;
+            while (cap >= 8) {
+                void *probe = malloc((size_t)fpp * (cap + 2) * fb + spare);
+                if (probe) { free(probe); break; }
+                cap /= 2;
+            }
+            if (cap >= 8) { g_yq_cap = cap; mobi_npic = 6 + fpp * (cap + 2); }
+        } }
+    if (!ctx.priv_data || mobi_init(&ctx) != 0) { mobi_npic = 6; g_yq_cap = 0; free(ctx.priv_data); mfx_close(&m); fclose(f); return MOFLEX_ERROR; }
+    mobi_npic = 6;                       /* read at init only; other engines keep the plain pool */
     mobi_opt = 0x1BDA5E | 0x08000000;   /* shipped fast path + missing-ref tolerance + SIMD residual (0x40) + FUSED
                              * transpose-free IDCT (0x08000000, bit-exact, ~3% faster decode -- binary-guided). NOTE: no pipeline --
                             * the decode THREAD gives the headroom the New-3DS pipeline used to, and the
@@ -4329,20 +5222,30 @@ static MoflexResult moflex_play_ring(const char *path) {
         mobi_close(&ctx); free(ctx.priv_data); mfx_close(&m); fclose(f);
         return MOFLEX_FALLBACK;
     }
-    for (int t = 0; t < g_atrk_n && t < 4; t++) snprintf(g_atrk_lbl[t], 4, "A%d", t + 1);
+    for (int t = 0; t < g_atrk_n && t < ATRK_MAX; t++) snprintf(g_atrk_lbl[t], 4, "A%d", t + 1);
     if (g_atrk_n > 0 && g_tra.lang_main[0]) snprintf(g_atrk_lbl[0], 4, "%s", g_tra.lang_main);
-    if (g_tra.present && g_tra.aud_pkts > 0 && g_atrk_n < 4) {
-        snprintf(g_atrk_lbl[g_atrk_n], 4, "%s", g_tra.lang_alt[0] ? g_tra.lang_alt : "A2");
-        g_atrk_streams[g_atrk_n++] = -1;    /* -1 = the trailer source (Audio Track N) */
+    for (int k = 0; g_tra.present && k < g_tra.taud_n && g_atrk_n < ATRK_MAX; k++) {
+        if (g_tra.taud[k].pkts == 0) continue;
+        if (g_tra.taud[k].lang[0]) snprintf(g_atrk_lbl[g_atrk_n], 4, "%s", g_tra.taud[k].lang);
+        else snprintf(g_atrk_lbl[g_atrk_n], 4, "A%d", g_atrk_n + 1);
+        g_atrk_streams[g_atrk_n++] = -1 - k;    /* -1-k = trailer track k (Audio Track 2, 3, ...) */
     }
     def_pick_audio();     /* no saved track: the viewer's preferred language, when the file has it */
-    def_apply_subs(g_atrk_n > 0 && g_atrk_sel < 4 ? g_atrk_lbl[g_atrk_sel] : g_tra.lang_main);
+    /* the builder's default audio for this video version ('VAU0'): on a file's first play and right
+     * after the viewer switches versions -- their own pick in SOUND stays free after that */
+    if ((g_cfg_fresh || g_vid_switched) && g_vid_n > 1 && g_vid_sel < g_tra.vaud_n) {
+        int t = (int)g_tra.vaud[g_vid_sel] - 1;
+        if (t >= 0 && t < g_atrk_n) g_atrk_sel = t;
+    }
+    g_vid_switched = 0;
+    def_apply_subs(g_atrk_n > 0 && g_atrk_sel < ATRK_MAX ? g_atrk_lbl[g_atrk_sel] : g_tra.lang_main);
     if (g_atrk_n > 1) {   /* dual audio: honor this movie's saved track (subcfg, loaded above) */
         if (g_atrk_sel < 0 || g_atrk_sel >= g_atrk_n) g_atrk_sel = 0;
         if (g_atrk_streams[g_atrk_sel] >= 0) {
             ai = g_atrk_streams[g_atrk_sel];
             arate = m.streams[ai].sample_rate; chn = m.streams[ai].channels;
         } else {                            /* trailer track selected: audio reads from the tail */
+            tra_aud_select(-1 - g_atrk_streams[g_atrk_sel]);
             arate = (int)g_tra.aud_rate; chn = g_tra.aud_chn;
             have_audio = 1;
         }
@@ -4376,16 +5279,36 @@ static MoflexResult moflex_play_ring(const char *path) {
      * and the stale one, which the panel interleaves as doubled lines. Every dirty repaint
      * therefore runs twice. */
     int dirty2 = 0;
-    const int PRIME = (NB >= 16) ? 8 : (NB > 2 ? NB / 2 : 1);   /* pre-roll depth, clamped to a small ring */
+    /* pre-roll depth, clamped to a small ring. A Big Top stream banks the ring nearly full first
+     * (~1 s on an Old 3DS): starting on 8 pairs (a third of a second) let the first network
+     * stalls -- up to 1.2 s in ring_stats -- show as skips until the bank caught up */
+    const int PRIME = !strncmp(path, "bigtop:", 7) && NB > 4 ? NB - 2
+                    : (NB >= 16) ? 8 : (NB > 2 ? NB / 2 : 1);
     int64_t cur_us = 0, dur_us = m.duration_us, seek_to_us = 0; int want_seek = 0, shold = 0;
     int scrubbing = 0; int64_t scrub_us = 0;   /* touch-drag on the bar: preview while held, seek on release */
+    int tseek = 0, tseek_hold = 0;             /* touch rewind (-1) / fast-forward (+1) held */
+    /* SEEK PREVIEW (the official player's feel): from the moment a seek control is touched until it is
+     * let go nothing plays -- the decoder, reader and audio are held once, and the top screen shows a
+     * still of the nearest keyframe to the target, refreshed as the target moves. The UI never waits
+     * on a seek; the real seek runs once, on release, with the threads already held. */
+    int pv_hold = 0, pv_seen = 0, landing = 0, pv_had_still = 0; int64_t pv_tgt = -1;
+    int64_t pv_disp = 0;   /* where the seek is going: the panel shows this from first touch to playback */
+    int pv_wait = 0;       /* landed, waiting for sound + picture to start: still show pv_disp */
+    /* seek sync log (sdmc:/moflex_player/seek_debug.txt): per seek, the landing and the A/V error
+     * measured ~3 s into playback -- to find a sync offset after seeks */
+    int64_t sd_lts = 0, sd_T = 0; u64 sd_at = 0; int sd_pend = 0, sd_kind = 0;
+    u64 sd_land_t = 0; long sd_shown0 = 0; int sd_stuck_logged = 0;   /* "no new frame 2 s after a landing" */
     int vol_drag = 0;                           /* touch-drag on the volume slider (applies live) */
     int resume_exact = 0;                       /* resume only: decode forward to the EXACT saved second */
     g_submenu = 0; g_sub_sel = 0;               /* subtitle menu starts closed */
+    g_kit_fmt_row = g_live_fmt >= 0;            /* live stream: VIDEO gets the Format row */
+    if (g_kit_fmt_row) { g_kit_fmt = g_live_fmt; g_kit_fmt_changed = 0; }
+    g_kit_fmt_pend = -1;
     g_touch_locked = 0; g_lock_toast = 0; g_backlight_on = 1;   /* touch unlocked, backlight on */
     int64_t rpos = resume_load(path), last_save = 0;
     if (rpos > 3000000 && (dur_us <= 0 || rpos < dur_us - 10000000)) { seek_to_us = rpos; want_seek = 1; last_save = rpos; resume_exact = 1; }
     int vol_dirty = 0, save_pend = 0, save_delay = 0;
+    float vol_applied = g_vol; u64 vol_changed_at = 0;
     char last_ts[64] = "";
     u64 r3_wall0 = 0; int r3_wallset = 0;                 /* fallback real-time clock when no audio */
     u64 pause_wall = 0;                                   /* when the pause began (clock re-anchor on resume) */
@@ -4397,6 +5320,29 @@ static MoflexResult moflex_play_ring(const char *path) {
     u64 pf_dec = 0, pf_y2r = 0, pf_gpu = 0, pf_idle = 0, pf_rd = 0, pf_dmax = 0, pf_rdmax = 0; int pf_n = 0; char pf_str[80] = "";
     #define PF_MS(t) ((double)(t) * 1000.0 / SYSCLOCK_ARM11)
     u64 cad_last = 0; int cad_v2 = 0, cad_v3 = 0, cad_vx = 0;
+    /* DISPLAY LOCK. Frames are scheduled by counting LCD refreshes (C3D_FrameCounter), not by
+     * comparing a clock to their timestamps: the clock read wobbles by the draw time (worse on Old
+     * 3DS), and the LCD runs at 59.83 Hz, so 23.976 fps is 2.4954 refreshes a frame, not 2.5 -- the
+     * 3,2 pattern slipped every ~9 s. Both showed as a hitch in long smooth pans. When the frame rate
+     * is within 0.6% of a whole or half number of refreshes, that number is used and the audio speed
+     * is trimmed to match; otherwise (25 fps) the true ratio, spread as evenly as refreshes allow.
+     * A/V sync is held by nudging the audio speed (at most +-0.4%, inaudible). */
+    const double VL_HZ = 59.8261;
+    double vl_k = VL_HZ * (double)pair_dur / 1e6, vl_vk = vl_k;
+    {   double h = floor(vl_k * 2.0 + 0.5) / 2.0;
+        if (h >= 1.0 && fabs(vl_k / h - 1.0) < 0.006) vl_vk = h; }
+    const float vl_speed = (float)(vl_k / vl_vk);   /* audio speed that matches the locked video rate */
+    if (have_audio) r3_set_aspeed(vl_speed);        /* once, before any sound: no rate change mid-play */
+    int vl_on = 0; u32 vl_base_vb = 0; int64_t vl_base_n = 0; double vl_err = 0; int vl_cnt = 0;
+    int vl_prevhold = 0; long st_slip = 0;
+    long st_drop = 0; u64 st_starve_ticks = 0, st_starve_t0 = 0; g_st_rdmax = 0; g_st_rdslow = 0;
+    g_st_elide = g_st_yqstale = g_st_skipped = 0; g_st_busy = 0;
+    g_panel_max = 0; g_upl_max = 0;
+    mb_drop(); g_mb_menu = -1;
+    g_t_pfull = g_t_pstrip = g_t_menu = g_t_rebake = g_t_vsave = 0; g_n_pfull = g_n_pstrip = g_n_menu = g_n_vsave = 0;
+    /* session totals, written to sdmc:/moflex_player/ring_stats.txt when playback ends */
+    long st_v2 = 0, st_v3 = 0, st_vx = 0, st_stut = 0, st_shown = 0, st_decn = 0; long long st_dec = 0, st_dmax = 0;
+    u64 st_maxgap = 0, st_t0 = osGetTime();
     const double VS_MS = 1000.0 / 59.834;   /* 3DS top-screen refresh period (~16.71ms) */
 
     /* ---- start the DECODE THREAD (producer). It fills the ring; this (main) thread only presents. ---- */
@@ -4416,18 +5362,36 @@ static MoflexResult moflex_play_ring(const char *path) {
     /* THREAD ONLY ON NEW-3DS. Old-3DS is memory-bandwidth-bound (proven): a second core decoding while
      * the main core presents just contends on the bus and DOUBLES decode time (d52 -> d91). So Old-3DS
      * decodes INLINE on the main thread (single-threaded, like before) -- no worker. */
-    int threaded = r3_isnew;
-    Thread dthr = 0;
-    if (threaded) {
+    /* ONE STRUCTURE FOR BOTH CONSOLES: a producer thread decodes, this thread presents + runs the UI.
+     * New-3DS: producer on the free core 2, above us. Old-3DS: producer on core 0 BELOW us -- the UI
+     * thread sleeps on the refresh between presents, so the producer gets every spare cycle on the SAME
+     * core (no second-core bus contention, the old reason Old-3DS decoded inline), and a due frame is
+     * always presented on time instead of waiting for a whole pair to decode (measured in the lab:
+     * Kung Fury 15.6 -> 24 pairs/s together with the Y2R overlap and synced draw). */
+    int threaded = 1;
+    r3_pend = -1;
+    r3_locks_init();
+    Thread dthr = 0, rthr = 0;
+    g_reader_on = 0;
+    {   /* reader on core 1 (the syscore) FIRST, so the producer never reads inline alongside it;
+         * never lower a core-1 limit the Big Top fetcher already raised */
+        u32 lim = 0; APT_GetAppCpuTimeLimit(&lim);
+        if (lim < 30) APT_SetAppCpuTimeLimit(30);
+        rthr = threadCreate(r3_reader_thread, &s, 32 * 1024, 0x18, 1, false);
+        g_reader_on = rthr ? 1 : 0;
+    }
+    {
         s32 dprio = 0x30; svcGetThreadPriority(&dprio, CUR_THREAD_HANDLE);
-        dthr = threadCreate(r3_dec_thread, &s, 128 * 1024, dprio - 1, 2, false);   /* free core 2 on New-3DS */
+        dthr = r3_isnew ? threadCreate(r3_dec_thread, &s, 128 * 1024, dprio - 1, 2, false)
+                        : threadCreate(r3_dec_thread, &s, 128 * 1024, dprio + 1, 0, false);
         if (!dthr) threaded = 0;   /* couldn't create the thread -> fall back to inline decode */
     }
     g_ring_susp = 0;
     g_ring_lock = threaded ? &s.lock : NULL;   /* the suspend hook drains the worker through these */
+    g_ring_s = &s;
     g_ring_wake = threaded ? &s.wake : NULL;
-    #define WORKER_LOCK()   do { if (threaded) LightLock_Lock(&s.lock); } while (0)   /* pause the worker for a seek */
-    #define WORKER_UNLOCK() do { if (threaded) { LightLock_Unlock(&s.lock); LightEvent_Signal(&s.wake); } } while (0)
+    #define WORKER_LOCK()   do { g_wl_req = 1; if (threaded) LightLock_Lock(&s.lock); LightLock_Lock(&g_rdlk); g_wl_req = 0; r3_retire(&s); } while (0)   /* pause the worker + reader for a seek (and finish the in-flight conversion) */
+    #define WORKER_UNLOCK() do { LightLock_Unlock(&g_rdlk); if (threaded) { LightLock_Unlock(&s.lock); LightEvent_Signal(&s.wake); } } while (0)
 
     /* paint a clean loading screen NOW: the ring build + pre-roll take a few seconds on Old 3DS, and
      * without this the freshly gfxInitDefault'd framebuffers show garbage (the "corrupt bottom, looks
@@ -4441,7 +5405,11 @@ static MoflexResult moflex_play_ring(const char *path) {
     }
 
     u32 cut_kd = 0;                       /* the press that dropped a seek, handled this frame */
+    u64 st_play_ms = 0, st_play_t = 0;   /* time actually playing (not loading/seeking/paused) */
     while (aptMainLoop()) {
+        {   u64 now_ = osGetTime();                 /* count wall time only while frames are flowing */
+            if (playing && gated && st_play_t) st_play_ms += now_ - st_play_t;
+            st_play_t = now_; }
         hidScanInput();
         u32 kd = hidKeysDown() | cut_kd, kh = hidKeysHeld();
         cut_kd = 0;
@@ -4480,7 +5448,7 @@ static MoflexResult moflex_play_ring(const char *path) {
             g_touch_locked = !g_touch_locked; g_lock_toast = 0; dirty = 1; kd = 0; kh = 0;
         }
         if (g_touch_locked) {
-            if (kd) { g_lock_toast = 90; dirty = 1; }   /* any attempt -> flash WHY nothing responds */
+            if (kd) { if (g_lock_toast == 0) dirty = 1; g_lock_toast = 90; }   /* any attempt -> flash WHY nothing responds */
             kd = 0; kh = 0;                             /* fully inert (dark screen stays dark too) */
         }
 
@@ -4494,7 +5462,7 @@ static MoflexResult moflex_play_ring(const char *path) {
             kd &= ~KEY_TOUCH; kh &= ~KEY_TOUCH;          /* touch on a dark screen drives no control */
         }
 
-        if (g_lock_toast > 0) { g_lock_toast--; dirty = 1; }
+        if (g_lock_toast > 0 && --g_lock_toast == 0) dirty = 1;   /* repaint when it goes, not every frame */
 
         /* reconcile the physical backlight: on unless the user darkened it -- and even then, briefly on
          * to show the touch-locked toast so they can read why touch isn't waking it. */
@@ -4505,26 +5473,70 @@ static MoflexResult moflex_play_ring(const char *path) {
         }
 
         if (g_submenu) {                       /* subtitle menu owns input while open; movie plays on */
+            int sm_was = g_submenu;
             submenu_input(kd, kh, tp, is3d, path);
-            dirty = 1;
+            /* repaint on input only (held arrows repeat, a finger may drag); the menu texture is
+             * reused otherwise, and new film frames still present on their own */
+            /* a resting stylus repainted the whole menu (~20 ms on an Old 3DS) every frame it stayed
+             * down: only a touch that MOVES repaints (a drag still follows the finger) */
+            static int sm_tx = -1, sm_ty = -1;
+            int tmoved = 0;
+            if (kh & KEY_TOUCH) {
+                if (sm_tx < 0 || abs(tp.px - sm_tx) > 1 || abs(tp.py - sm_ty) > 1) tmoved = 1;
+                sm_tx = tp.px; sm_ty = tp.py;
+            } else sm_tx = sm_ty = -1;
+            /* a held arrow repeats every 3rd frame (after a delay): repaint at that rhythm and once on
+             * release, not every frame -- each repaint is ~20 ms of an Old 3DS's decode thread */
+            static int arrow_n = 0; int arrow_due = 0;
+            if (kh & (KEY_LEFT | KEY_RIGHT | KEY_UP | KEY_DOWN)) { if (++arrow_n % 3 == 0) arrow_due = 1; }
+            else { if (arrow_n) arrow_due = 1; arrow_n = 0; }
+            /* playing: the menu is re-rendered in a spare refresh and the next film frame shows it --
+             * a forced pass here only re-showed the OLD menu texture, at the cost of synced frames
+             * on the decode thread (two per press: quick moves through a list stuttered the film) */
+            if (kd || arrow_due || tmoved || g_submenu != sm_was) {
+                g_sub_redraw = 1;
+                if (!playing || !g_submenu || g_submenu != sm_was) dirty = 1;   /* paused / opened / closed: now */
+            }
+            if (g_vid_req) {
+                /* Version row in VIDEO: another demux window, possibly another stream layout --
+                 * re-open in place, exactly like HQ (resume puts it back where it was) */
+                g_vid_req = 0; g_vid_switched = 1; subcfg_save(path); resume_save_us(path, cur_us);
+                result = MOFLEX_REPLAY; break;
+            }
             if (g_hq_req) {
                 /* HQ row in VIEW: the ring's texture format is fixed at init, so the film has to
                  * be re-opened for a colour-depth change to take -- resume puts it back in place. */
                 g_hq_req = 0; g_hq = !g_hq; hq_save();
                 result = MOFLEX_REPLAY; break;
             }
+            if (g_kit_fmt_changed && g_live_fmt >= 0) {
+                /* Format on a live stream: the server re-encodes in the new shape -- re-open in
+                 * place (resume puts it back where it was) */
+                g_kit_fmt_changed = 0; g_live_fmt = g_kit_fmt;
+                result = MOFLEX_REPLAY; break;
+            }
         } else {
         if (kd & KEY_B) { result = MOFLEX_QUIT_BACK; break; }
+#ifdef LAB_AUTOPLAY
+        if (g_lab_deadline && osGetTime() > g_lab_deadline) { result = MOFLEX_QUIT_BACK; break; }
+#endif
         if (kd & KEY_A) {
-            if (s.done && (s.wr - rd) == 0) { seek_to_us = 0; want_seek = 1; }   /* at the end: replay */
+            if (s.done && (s.wr - rd) == 0 && g_yq_n == 0) { seek_to_us = 0; want_seek = 1; }   /* at the end: replay */
             else { playing = !playing; if (have_audio) ndspChnSetPaused(0, !playing);
                    if (!playing) pause_wall = osGetTime();
                    else { r3_last = 0; if (r3_wallset) r3_wall0 += osGetTime() - pause_wall; }
                    s.paused = !playing; if (playing) LightEvent_Signal(&s.wake);
                    save_pend = !playing; save_delay = 30; }
         }
-        if (kd & KEY_UP)   { int s = (int)(g_vol / 0.25f + 0.0001f); g_vol = (s + 1) * 0.25f; if (g_vol > 4.0f) g_vol = 4.0f; vol_dirty = 1; }
-        if (kd & KEY_DOWN) { int s = (int)(g_vol / 0.25f + 0.9999f); g_vol = (s - 1) * 0.25f; if (g_vol < 0.25f) g_vol = 0.25f; vol_dirty = 1; }
+        {   /* volume: a press steps 25%, holding keeps stepping (d-pad repeat timing, a bit gentler) */
+            static int vhold = 0;
+            int vdir = (kh & KEY_UP) ? 1 : ((kh & KEY_DOWN) ? -1 : 0), vfire = 0;
+            if (!vdir) vhold = 0;
+            else if (kd & (KEY_UP | KEY_DOWN)) { vfire = 1; vhold = 0; }
+            else if (++vhold > 12 && vhold % 4 == 0) vfire = 1;
+            if (vfire && vdir > 0) { int s = (int)(g_vol / 0.25f + 0.0001f); g_vol = (s + 1) * 0.25f; if (g_vol > 4.0f) g_vol = 4.0f; vol_dirty = 1; }
+            if (vfire && vdir < 0) { int s = (int)(g_vol / 0.25f + 0.9999f); g_vol = (s - 1) * 0.25f; if (g_vol < 0.25f) g_vol = 0.25f; vol_dirty = 1; }
+        }
         if (kd & KEY_Y)      { g_sub_on = !g_sub_on; dirty = 1; }   /* Y: quick-toggle subtitles */
         if (kd & KEY_SELECT) { g_submenu = 1; g_sub_sel = 0; dirty = 1; }   /* SELECT: open subtitle options */
         if (kd & KEY_X && g_lcd_ok) { g_screen_off = !g_screen_off; dirty = 1; }   /* X: toggle dark screen */
@@ -4544,6 +5556,7 @@ static MoflexResult moflex_play_ring(const char *path) {
         /* if (kd & KEY_SELECT) sub_menu(...);  // <- hangs under citro2d; do not call here */
         if (kd & KEY_TOUCH) {
             int px = tp.px, py = tp.py;
+            int thit = 1;   /* a touch that hits no control repaints nothing (see "if (kd ..." below) */
             if (py >= BAR_Y - 8 && py <= BAR_Y + BAR_H + 8 && px >= BAR_X && px <= BAR_X + BAR_W) {
                 scrubbing = 1;   /* begin drag; the seek fires on release (tracked in the scrub block below) */
             } else if (px >= VOL_X - 14 && px <= VOL_X + 26 && py >= VOL_Y - 8 && py <= VOL_Y + VOL_H + 8) {
@@ -4554,9 +5567,11 @@ static MoflexResult moflex_play_ring(const char *path) {
                 else { r3_last = 0; if (r3_wallset) r3_wall0 += osGetTime() - pause_wall; }
                 s.paused = !playing; if (playing) LightEvent_Signal(&s.wake); save_pend = !playing; save_delay = 30;
             } else if (py >= PLAY_CY - 20 && py <= PLAY_CY + 20 && px >= RW_CX - 18 && px <= RW_CX + 18) {
-                seek_to_us = cur_us - 30000000; want_seek = 1;
+                tseek = -1; tseek_hold = 0;   /* held: steps like the d-pad, seeks on release */
+                seek_to_us = (want_seek ? seek_to_us : cur_us) - 30000000; want_seek = 1; dirty = 1;
             } else if (py >= PLAY_CY - 20 && py <= PLAY_CY + 20 && px >= FF_CX - 18 && px <= FF_CX + 18) {
-                seek_to_us = cur_us + 30000000; want_seek = 1;
+                tseek = 1; tseek_hold = 0;
+                seek_to_us = (want_seek ? seek_to_us : cur_us) + 30000000; want_seek = 1; dirty = 1;
             } else if (px >= AUD_X && px < AUD_X + AUD_W && py >= AUD_Y && py < AUD_Y + AUD_H) {
                 g_submenu = 4; g_snd_sel = 0; dirty = 1;    /* SOUND: track + levelling */
             } else if (px >= CC_X && px < CC_X + CC_W && py >= CC_Y && py < CC_Y + CC_H) {
@@ -4569,9 +5584,15 @@ static MoflexResult moflex_play_ring(const char *path) {
                 if      (px >= BKB_X && px < BKB_X + BKB_W) { result = MOFLEX_QUIT_OPEN; break; }   /* OPEN VIDEO */
                 else if (px >= OPB_X && px < OPB_X + OPB_W) { result = MOFLEX_QUIT_MANAGE; break; }   /* MANAGE VIDEOS */
                 else if (px >= EXB_X && px < EXB_X + EXB_W) { result = MOFLEX_QUIT_ADD; break; }   /* ADD VIDEO */
-            }
+                else thit = 0;
+            } else thit = 0;
+            if (thit) dirty = 1;
         }
 
+        if (tseek) {   /* touch rewind/fast-forward held: repeat on the d-pad's timing */
+            if (!(kh & KEY_TOUCH)) tseek = 0;
+            else if (++tseek_hold > 8 && tseek_hold % 3 == 0) { seek_to_us += (int64_t)tseek * 30000000; dirty = 1; }
+        }
         /* ---- touch-drag the progress bar: while the finger is down, track its X into scrub_us and
          *      show it as a live preview (below); the actual seek fires once, on release. ---- */
         if (scrubbing) {
@@ -4591,8 +5612,10 @@ static MoflexResult moflex_play_ring(const char *path) {
                 float f = 1.0f - (float)(tp.py - VOL_Y) / VOL_H; if (f < 0) f = 0; if (f > 1) f = 1;
                 int st = (int)(f * 4.0f / 0.25f + 0.5f); float nv = st * 0.25f;
                 if (nv < 0.25f) nv = 0.25f; if (nv > 4.0f) nv = 4.0f;
-                if (nv != g_vol) { g_vol = nv; vol_dirty = 1; }
-                dirty = 1;
+                /* playing: the spare-refresh panel update redraws just the volume strip -- marking
+                 * dirty here forced a FULL panel repaint (~20 ms on an Old 3DS) every frame the finger
+                 * stayed on the slider. Paused, nothing else repaints, so it still asks. */
+                if (nv != g_vol) { g_vol = nv; vol_dirty = 1; if (!playing) dirty = 1; }
             } else vol_drag = 0;
         }
         }   /* end transport input (skipped while the subtitle menu is open) */
@@ -4611,9 +5634,10 @@ static MoflexResult moflex_play_ring(const char *path) {
                 int newsi = g_atrk_streams[g_atrk_sel];
                 int to_tr = (newsi < 0);              /* < 0 = the CSXTRA trailer's own track */
                 int nrate = 0, nchn = 0, ok = 1;
+                int tk = to_tr ? -1 - newsi : -1;     /* which trailer track */
                 if (to_tr) {
-                    if (g_tra.present && g_tra.aud_pkts > 0 && g_tra.aud_rate)
-                        { nrate = (int)g_tra.aud_rate; nchn = (int)g_tra.aud_chn; }
+                    if (g_tra.present && tk < g_tra.taud_n && g_tra.taud[tk].pkts > 0 && g_tra.taud[tk].rate)
+                        { nrate = (int)g_tra.taud[tk].rate; nchn = (int)g_tra.taud[tk].chn; }
                     else ok = 0;
                     if (ok && !s.trf) {               /* first crossing needs its private handle */
                         s.trf = media_fopen(path);
@@ -4626,19 +5650,90 @@ static MoflexResult moflex_play_ring(const char *path) {
                     subcfg_save(path); result = MOFLEX_REPLAY; break;
                 }
                 WORKER_LOCK();
+                if (to_tr) tra_aud_select(tk);        /* the reader reads aud_*: swap it under the lock */
                 s.tr_active = to_tr;
                 s.aidx = to_tr ? -2 : newsi;          /* -2 deliberately matches no in-band stream */
                 s.audio_pre_full = 0;                 /* the old track's gate must not stick */
                 if (nrate != r3_arate || nchn != r3_achn) {
-                    r3_audio_close(); r3_audio_setup(nrate, nchn);
+                    r3_audio_close(); r3_audio_setup(nrate, nchn); r3_set_aspeed(vl_speed);
                 } else r3_audio_flush();              /* same format: just drop the old track */
                 WORKER_UNLOCK();
                 if (!r3_aok) have_audio = 0;          /* re-alloc failed: fall back to the wall clock */
                 seek_to_us = cur_us; want_seek = 1;
             }
         }
-        if (want_seek && !scrubbing && !(kh & (KEY_LEFT | KEY_RIGHT))) {
-            WORKER_LOCK();   /* blocks until the decode thread finishes its current pair and releases */
+        {   int seek_ui = scrubbing || tseek || (want_seek && (kh & (KEY_LEFT | KEY_RIGHT)));
+            if (seek_ui) pv_wait = 0;
+            if (seek_ui && !pv_hold) {          /* stop playing once: the worker switches to stills */
+                WORKER_LOCK();
+                for (int i = 0; i < NB; i++) ready[i] = 0;
+                s.wr = 0; rd = 0; s.rd = 0; s.dpair = 0; s.has_pending = 0;
+                r3_vq_clear();
+                if (have_audio) { r3_audio_flush(); ndspChnSetPaused(0, true); }
+                gated = 0; s.paused = 1;
+                s.pv_mark = -1; s.pv_mode = 1; pv_seen = s.pv_done_seq; s.lastop_ok = 0; s.vskip = 0;
+                s.land_cancel = 1;   /* the previous landing is spent: stills may run again (it held
+                                      * "landed" true forever after the first seek -> no stills) */
+                WORKER_UNLOCK();                 /* the reader idles (paused); the worker serves stills */
+                pv_hold = 1; pv_tgt = -1; pv_had_still = 0;
+            }
+            if (seek_ui && pv_hold && landing) { s.land_cancel = 1; landing = 0; pv_tgt = -1; }   /* moved again */
+            if (seek_ui && pv_hold) {
+                int64_t T = scrubbing ? scrub_us : seek_to_us;
+                if (T < 0) T = 0;
+                if (dur_us > 0 && T > dur_us - 1000000) T = dur_us - 1000000 > 0 ? dur_us - 1000000 : 0;
+                pv_disp = T;
+                if (T != pv_tgt) {               /* post the newest target; the worker skips stale ones */
+                    pv_tgt = T; s.pv_req = T; __sync_synchronize(); s.pv_req_seq++;
+                    LightEvent_Signal(&s.wake);
+                }
+            }
+            if (pv_hold && s.pv_done_seq != pv_seen) {   /* a new still is ready: show it */
+                pv_seen = s.pv_done_seq; __sync_synchronize();
+                last_shown = s.pv_done_slot; last_bts = s.pv_done_T; dirty = 1; pv_had_still = 1;
+            }
+        }
+        if (pv_hold && landing && s.land_done_seq == s.land_seq) {   /* the worker has landed */
+            landing = 0;
+            WORKER_LOCK();                       /* the worker is idle: take the ring back */
+            s.pv_mode = 0; pv_hold = 0;
+            if (s.land_ok) {
+                int sl = s.land_slot; int64_t lts = s.land_lts;
+                for (int i = 0; i < NB; i++) ready[i] = 0;
+                rd = sl; s.rd = sl; s.wr = sl + 1; ready[sl] = 1; rts[sl] = 0; bts[sl] = lts; s.dpair = 1;
+                s.skipping = 0; s.done = 0; s.has_pending = 0;
+                if (!pv_had_still) last_shown = -1;   /* no still shown: the landing pair stands in until play;
+                                                     * else the preview still stays up until sound+picture start */
+                r3_vq_clear();
+                if (have_audio) r3_audio_flush();
+                s.lastop_ok = 0; s.a_blk = -1;
+                r3_trim_from = s.tr_active ? -1 : lts;
+                if (s.tr_active && g_tra.aud_pktsamp && g_tra.aud_rate)
+                    s.tr_cur = (u32)(lts * (s64)g_tra.aud_rate / 1000000 / g_tra.aud_pktsamp);
+                gated = 0; s.audio_pre_full = 0; playing = 1; r3_wallset = 0;
+                cur_us = lts; s.cur_us = lts; s.paused = 0;
+                WORKER_UNLOCK();
+                sd_lts = lts; sd_T = s.land_T; sd_at = 0; sd_pend = 1; sd_kind = 1;
+                sd_land_t = osGetTime(); sd_shown0 = st_shown; sd_stuck_logged = 0;
+            } else {                             /* couldn't prime there: the UI-thread seek takes over */
+                WORKER_UNLOCK();
+                seek_to_us = s.land_T; want_seek = 1;
+            }
+            pv_wait = 1;
+            dirty = 1;
+        }
+        if (want_seek && pv_hold && !landing && !scrubbing && !tseek && !(kh & (KEY_LEFT | KEY_RIGHT))) {
+            /* released while previewing: the worker lands (keyframe, eye parity, prime) while the UI
+             * keeps the still up and stays live -- a new touch cancels it */
+            int64_t T = seek_to_us; if (T < 0) T = 0; if (dur_us > 0 && T > dur_us) T = dur_us;
+            s.land_cancel = 0; s.land_T = T; __sync_synchronize(); s.land_seq++;
+            pv_disp = T; cur_us = T;             /* the knob stays where it was let go */
+            LightEvent_Signal(&s.wake);
+            landing = 1; want_seek = 0;
+        }
+        if (want_seek && !pv_hold && !scrubbing && !tseek && !(kh & (KEY_LEFT | KEY_RIGHT))) {
+            WORKER_LOCK();   /* blocks until the decode thread finishes its current pair (or still) and releases */
+            s.pv_mode = 0; pv_hold = 0;    /* stills over: the seek below lands and playback resumes */
             g_seek_busy = 1; g_seek_cut = 0;     /* a slow source may drop this seek if the viewer moves on */
             if (dur_us > 0) { if (seek_to_us < 0) seek_to_us = 0; if (seek_to_us > dur_us) seek_to_us = dur_us; }
             /* Land on the last KEYFRAME at/before the target. P-frames don't decode after a flush
@@ -4652,15 +5747,17 @@ static MoflexResult moflex_play_ring(const char *path) {
             {
                 MfxPacket pk; int direct_kf = 0;
                 for (int g = 0; g < 200; g++) {
+                    if ((g & 31) == 31 && moflex_seek_wait_hook(1)) break;   /* a new press drops this seek */
                     if (mfx_next_packet(&m, &pk) != 1) break;
                     if (m.streams[pk.stream_index].media_type != MFX_TYPE_VIDEO) continue;
                     direct_kf = pk.keyframe; break;
                 }
-                if (!direct_kf) {
+                if (!direct_kf && !g_seek_cut) {
                     int64_t back = seek_to_us - 20000000; if (back < 0) back = 0;
                     do_seek(&m, &ctx, back);
                     int64_t kf_marker = -1, cur_marker = m.ts;
                     for (long g = 0; g < 60000; g++) {
+                        if ((g & 63) == 63 && moflex_seek_wait_hook(1)) break;   /* the 20 s keyframe hunt: cuttable */
                         if (mfx_next_packet(&m, &pk) != 1) break;
                         if (m.ts != cur_marker) { if (m.ts > seek_to_us) break; cur_marker = m.ts; }
                         if (m.streams[pk.stream_index].media_type != MFX_TYPE_VIDEO) continue;
@@ -4670,6 +5767,7 @@ static MoflexResult moflex_play_ring(const char *path) {
                 }
             }
             do_seek(&m, &ctx, land_tgt);
+            int64_t prime_from = land_tgt; s.vskip = 0;
             for (int i = rd; i < s.wr; i++) ready[i % NB] = 0;
             s.wr = 0; rd = 0; s.rd = 0; s.dpair = 0; s.skipping = 0; s.done = 0; s.has_pending = 0; last_shown = -1;
             r3_vq_clear();
@@ -4685,7 +5783,7 @@ static MoflexResult moflex_play_ring(const char *path) {
              * the landing's eye exactly (validated 50/50 landings, 0 wrong, on movie.moflex).
              * Peek forward counting blocks, then re-seek to the landing for the real prime. */
             s.eye_swap = 0;
-            if (is3d) {
+            if (is3d && !g_seek_cut) {
                 /* A landing that starts on a RIGHT eye would pair R(t) with L(t+1) -- eyes from
                  * ADJACENT pairs, a visible 33ms offset between the eyes (reported: "left 34L with
                  * right 35R"). Instead: detect R-first and STEP THE SEEK BACK one block (~1s) to an
@@ -4701,6 +5799,7 @@ static MoflexResult moflex_play_ring(const char *path) {
                     int okc = 1, decided = 0;
                     rfirst = 0;
                     for (long g = 0; g < 1500 && nb < 4 && !decided && okc; g++) {
+                        if ((g & 31) == 31 && moflex_seek_wait_hook(1)) break;   /* a new press drops this seek */
                         if (mfx_next_packet(&m, &pk) != 1) break;
                         if (m.streams[pk.stream_index].media_type != MFX_TYPE_VIDEO) continue;
                         if (m.ts != bt) {
@@ -4717,19 +5816,21 @@ static MoflexResult moflex_play_ring(const char *path) {
                         }
                         cnt++;
                     }
-                    if (!rfirst || attempt >= 3) break;
+                    if (!rfirst || attempt >= 3 || g_seek_cut) break;
                     tgt = land_ts - 1; if (tgt < 0) tgt = 0;      /* previous marker boundary */
                     do_seek(&m, &ctx, tgt);
                 }
                 s.eye_swap = rfirst;                              /* only if stepping found no L-first */
                 do_seek(&m, &ctx, tgt);                           /* rewind to the (final) landing */
+                prime_from = tgt;
             }
             /* FAST PRIME: decode the landing keyframe pair straight into slot 0 (bounded keyframe scan;
              * else take the next decodable frame) so the picture appears at once and audio resyncs.
              * Eye routing honors s.eye_swap (first frame -> R when the landing starts on a right eye). */
-            {
+            if (!g_seek_cut) {
                 MfxPacket pk; int64_t lts = seek_to_us; int vseen = 0;
                 for (int guard = 0; guard < 4000; guard++) {
+                    if ((guard & 15) == 15 && moflex_seek_wait_hook(1)) break;   /* a new press drops this seek */
                     if (mfx_next_packet(&m, &pk) != 1) break;
                     if (m.streams[pk.stream_index].media_type != MFX_TYPE_VIDEO) continue;
                     vseen++;
@@ -4754,6 +5855,9 @@ static MoflexResult moflex_play_ring(const char *path) {
                         g_y2r_start(fR, tB, W, H); g_y2r_wait(tB);
                     } else { g_y2r_start(fL, &r3_texL[0], W, H); g_y2r_wait(&r3_texL[0]); }
                     rts[0] = 0; bts[0] = lts; ready[0] = 1; s.wr = 1; s.dpair = 1; cur_us = lts; s.cur_us = lts;
+                    if (!resume_exact) { mfx_seek_time(&m, prime_from); s.vskip = vseen;   /* keep the block's audio */
+                                         s.a_blk = -1; r3_trim_from = s.tr_active ? -1 : lts; }
+                    sd_lts = lts; sd_T = seek_to_us; sd_at = 0; sd_pend = 1; sd_kind = 0;
                     break;
                 }
             }
@@ -4816,7 +5920,7 @@ static MoflexResult moflex_play_ring(const char *path) {
                  * keep the seek pending at its target -- the press that dropped it is handled next
                  * frame: a touch on the bar starts a new scrub (the seek waits for the release), a
                  * step moves on from this target, B leaves; anything else just seeks here again. */
-                g_seek_cut = 0;
+                g_seek_cut = 0; s.vskip = 0;
                 clearerr(m.f); m.eof = 0;
                 for (int i = 0; i < NB; i++) ready[i] = 0;
                 s.wr = 0; rd = 0; s.rd = 0; s.dpair = 0; s.done = 0; s.has_pending = 0; last_shown = -1;
@@ -4834,13 +5938,25 @@ static MoflexResult moflex_play_ring(const char *path) {
             }
         }
 
-        if (kd) dirty = 1;   /* any control input -> repaint the held frame / panel */
+        /* any button -> repaint the held frame / panel. A touch repaints only when it hit a control
+         * (above): every tap anywhere used to force a full panel repaint (~20 ms on an Old 3DS) plus
+         * two synced top-screen frames on the decode thread, so fast tapping starved playback. */
+        {   u32 rk = kd & ~KEY_TOUCH;
+            if (playing) rk &= ~(KEY_UP | KEY_DOWN);   /* volume: its strip updates on a spare refresh */
+            if (playing && g_submenu) rk = 0;          /* a menu: shown by the next film frame (above) */
+            if (rk) dirty = 1; }
         /* The 3D slider is NOT a key. Without this the strength blend only tracked it while
          * frames were arriving -- move it on a paused frame and nothing redrew. */
         if (is3d) { static float last_sl = -1.0f; float sl = osGet3DSliderState();
-                    if (sl - last_sl > 0.004f || last_sl - sl > 0.004f) { last_sl = sl; dirty = 1; } }
+                    /* playing: every present reads the slider anyway -- a repaint per frame of slider
+                     * travel forced full panel repaints on the decode thread for nothing */
+                    if (sl - last_sl > 0.004f || last_sl - sl > 0.004f) { last_sl = sl; if (!playing) dirty = 1; } }
 
         if (have_audio && playing) r3_audio_poll();   /* clock FROZEN while paused -> pause is instant */
+        if (g_vol != vol_applied) {   /* heard now: re-bake the queued audio; saved once it settles */
+            vol_applied = g_vol; vol_changed_at = osGetTime();
+        }
+        if (have_audio) r3_rebake_step(3);   /* the queue catches up in ~0.2 s, ~1 ms a loop */
 
         /* Old-3DS (not threaded): decode a pair INLINE here, once per iteration, when there's ring room.
          * (New-3DS does this on the decode thread instead.) */
@@ -4848,9 +5964,48 @@ static MoflexResult moflex_play_ring(const char *path) {
         if (!threaded && playing && !s.done && (s.wr - rd) < NB - 1) { r3_produce(&s); inline_produced = 1; }
 
         /* pre-roll: unpause audio once enough pairs are banked, or the worker's audio bank filled first */
-        if (have_audio && !gated && playing && (s.wr >= PRIME || s.audio_pre_full)) { gated = 1; ndspChnSetPaused(0, false); r3_apos = 0; }
+        /* sound and picture start together: once PRIME pairs are banked. A full audio bank starts it
+         * early only when video can't progress (the reader holds a packet for the full bank and the
+         * video backlog is dry) -- starting on the full bank alone began the sound with 1-2 pairs ready,
+         * the catch-up then dropped video to the next keyframe: stills, then a jump. */
+        /* a Big Top file: also a few seconds of the compressed stream fetched ahead (~768 KB, ~3 s at
+         * 1.5-2 Mbit/s), at most 6 s of waiting. The frame ring holds ~1 s; the Wi-Fi stalls up to
+         * 1.2 s, and the read-ahead only grows as reading goes on -- so the start skipped. */
+        int net_ok = 1;
+        {   static u64 net_t0; long long ahead = httpfile_buffered_ahead();
+            if (!gated && playing && ahead >= 0) {
+                if (!net_t0) net_t0 = osGetTime();
+                httpfile_full_ahead();
+                /* the first start waits for ~3 s of stream; after a seek ~1 s, so seeking stays quick */
+                int first = st_shown == 0;
+                net_ok = ahead >= (first ? 768 : 256) * 1024 || osGetTime() - net_t0 > (first ? 6000u : 2500u);
+            }
+            if (gated) net_t0 = 0; }
+        if (have_audio && !gated && playing && net_ok && ((s.wr - rd) >= PRIME || (s.audio_pre_full && r3_vqc < 2) || s.done)) {
+            gated = 1; ndspChnSetPaused(0, false); r3_apos = 0; }
 
+        if (sd_land_t && !sd_stuck_logged && osGetTime() - sd_land_t > 2000 && dbg_on()) {
+            if (st_shown - sd_shown0 < 5) {      /* 2 s after a landing and the picture hasn't moved */
+                int q = 0, pl = 0, dn = 0;
+                for (int i = 0; i < r3_nawb; i++) { if (r3_wb[i].status == NDSP_WBUF_QUEUED) q++;
+                    else if (r3_wb[i].status == NDSP_WBUF_PLAYING) pl++; else if (r3_wb[i].status == NDSP_WBUF_DONE) dn++; }
+                FILE *df = fopen("sdmc:/moflex_player/seek_debug.txt", "a");
+                if (df) {
+                    fprintf(df, "%s STUCK land=%lld | wr=%d rd=%d ready=%d vqc=%d done=%d paused=%d pv=%d | gated=%d playing=%d apos=%lld aplayed=%lld pre_full=%d wbuf q=%d play=%d done=%d chn_playing=%d chn_paused=%d t0=%lld av_ready=%d vl_on=%d shown+%ld tr=%d\n",
+                            BUILD_TAG, (long long)sd_lts / 1000, s.wr, rd, ready[rd % NB], r3_vqc, s.done, s.paused, s.pv_mode,
+                            gated, playing, (long long)r3_apos / 1000, (long long)r3_aplayed, s.audio_pre_full, q, pl, dn,
+                            ndspChnIsPlaying(0), ndspChnIsPaused(0), (long long)r3_audio_t0 / 1000, r3_av_ready, vl_on,
+                            st_shown - sd_shown0, s.tr_active);
+                    fclose(df);
+                }
+            }
+            sd_stuck_logged = 1;
+        }
         int wr = s.wr; __sync_synchronize();   /* snapshot the write index, then see the frame data behind it */
+        {   int dry = playing && gated && !pv_hold && !s.done && (wr - rd) == 0;   /* the buffer ran out */
+            u64 now_t = svcGetSystemTick();
+            if (dry) { if (!st_starve_t0) st_starve_t0 = now_t; }
+            else if (st_starve_t0) { st_starve_ticks += now_t - st_starve_t0; st_starve_t0 = 0; } }
         int64_t apos;
         if (have_audio) apos = r3_apos;
         else { if (!r3_wallset && wr >= PRIME) { r3_wall0 = osGetTime(); r3_wallset = 1; }
@@ -4870,18 +6025,75 @@ static MoflexResult moflex_play_ring(const char *path) {
              * constant thereafter and ignored if implausibly large (bad/absent timestamps). */
             if (have_audio && !r3_av_ready && apos >= 0 && r3_audio_t0 >= 0) {
                 int64_t sk = r3_audio_t0 - (bts[rd % NB] - rts[rd % NB]);
-                r3_av_skew = (sk < -300000 || sk > 300000) ? 0 : sk;
+                r3_av_skew = (sk < -1000000 || sk > 1000000) ? 0 : sk;
                 r3_av_ready = 1;
             }
             int64_t ae = (have_audio && apos >= 0) ? apos + r3_av_skew : apos;
-            while ((wr - rd) > 1 && ready[(rd + 1) % NB] && rts[(rd + 1) % NB] <= ae + VS_HALF) { ready[rd % NB] = 0; rd++; }
-            if (apos < 0) { if (last_shown < 0) show = rd % NB; }             /* pre-roll: show the landing pair */
-            else if (ae + VS_HALF >= rts[rd % NB]) show = rd % NB;
-        }
+            if (sd_pend && have_audio && r3_av_ready && apos >= 0 && dbg_on()) {
+                if (!sd_at) sd_at = osGetTime();
+                else if (osGetTime() - sd_at > 3000) {
+                    sd_pend = 0;
+                    FILE *df = fopen("sdmc:/moflex_player/seek_debug.txt", "a");
+                    if (df) {
+                        int64_t vpos = bts[rd % NB], arel = apos + r3_audio_t0;   /* content times */
+                        fprintf(df, "%s %s target=%lld land=%lld audio_t0=%lld skew=%lld | 3s: video=%lld audio=%lld diff=%lldms vl_err=%.0fms lock=%d speed=%.4f tr=%d\n",
+                                BUILD_TAG, sd_kind ? "worker" : "ui", (long long)sd_T / 1000, (long long)sd_lts / 1000,
+                                (long long)r3_audio_t0 / 1000, (long long)r3_av_skew / 1000,
+                                (long long)vpos / 1000, (long long)arel / 1000, (long long)(vpos - arel) / 1000,
+                                vl_err / 1000.0, vl_on, (double)r3_aspeed, s.tr_active);
+                        fclose(df);
+                    }
+                }
+            }
+            if (have_audio && apos >= 0 && r3_av_ready) {
+                /* display lock: frame n shows on refresh base + round((n - n0) * vk) */
+                u32 vb = C3D_FrameCounter(0);
+                #define VL_N(i) ((rts[(i) % NB] + pair_dur / 2) / pair_dur)
+                #define VL_DUE(n) (vl_base_vb + (u32)(int64_t)floor((double)((n) - vl_base_n) * vl_vk + 0.5))
+                if (!vl_on) {
+                    /* anchor to the AUDIO: this frame is due on the refresh when the audio reaches its
+                     * time (earlier frames are then dropped, later ones wait). Anchoring on "now" froze
+                     * whatever lag the first frame had -- after a seek the audio starts while the decoder
+                     * is still catching up, and the picture stayed that far behind the sound. */
+                    vl_on = 1; vl_base_n = VL_N(rd); vl_err = 0; vl_cnt = 0;
+                    double dv = (double)(rts[rd % NB] - ae) * VL_HZ / 1e6;   /* refreshes until it is due */
+                    vl_base_vb = vb + (u32)(s32)floor(dv + 0.5);
+                    if (r3_aspeed != vl_speed) r3_set_aspeed(vl_speed);
+                }
+                while ((wr - rd) > 1 && ready[(rd + 1) % NB] && (s32)(vb - VL_DUE(VL_N(rd + 1))) >= 0) { ready[rd % NB] = 0; rd++; st_drop++; }
+                if ((s32)(vb - VL_DUE(VL_N(rd))) >= 0) {
+                    show = rd % NB;
+                    /* sync: video content time vs the audio clock, smoothed; steer the audio speed */
+                    double e = (double)(rts[show] - ae);
+                    vl_err += (e - vl_err) / 32.0;
+                    if (vl_err > 60000.0 || vl_err < -60000.0) {     /* off by > 60 ms: re-anchor on the audio */
+                        vl_on = 0; r3_set_aspeed(vl_speed);
+                    } else if (++vl_cnt >= 24) {
+                        /* Rate changes are RARE: each one can tick in the audio (it was set every second
+                         * and testers heard a 1 s hitch, louder with the volume up). The trim is set once
+                         * at lock; only a drift past 30 ms engages a 0.2% catch-up, released at 5 ms. */
+                        vl_cnt = 0;
+                        float want = r3_aspeed;
+                        if (vl_err > 30000.0)       want = vl_speed * 1.002f;
+                        else if (vl_err < -30000.0) want = vl_speed * 0.998f;
+                        else if ((r3_aspeed > vl_speed && vl_err < 5000.0) || (r3_aspeed < vl_speed && vl_err > -5000.0)) want = vl_speed;
+                        if (want != r3_aspeed) r3_set_aspeed(want);
+                    }
+                }
+                #undef VL_DUE
+                #undef VL_N
+            } else {
+                if (vl_on) { vl_on = 0; if (have_audio && r3_aspeed != vl_speed) r3_set_aspeed(vl_speed); }
+                while ((wr - rd) > 1 && ready[(rd + 1) % NB] && rts[(rd + 1) % NB] <= ae + VS_HALF) { ready[rd % NB] = 0; rd++; if (apos >= 0) st_drop++; }
+                if (apos < 0) { if (last_shown < 0) show = rd % NB; }             /* pre-roll: show the landing pair */
+                else if (ae + VS_HALF >= rts[rd % NB]) show = rd % NB;
+            }
+        } else if (!playing && vl_on) vl_on = 0;   /* paused: re-anchor on resume */
 
         /* ---- draw: video pair (or held frame) + subtitle overlay + bottom panel, one GPU frame ---- */
-        int64_t disp_us = (show >= 0) ? bts[show] : (last_shown >= 0 ? last_bts : cur_us);
-        if (want_seek && (kh & (KEY_LEFT | KEY_RIGHT))) { disp_us = seek_to_us < 0 ? 0 : seek_to_us; dirty = 1; }  /* preview the accumulating seek target */
+        if (pv_wait && show >= 0 && apos >= 0) pv_wait = 0;   /* playing: the real position takes over */
+        int64_t disp_us = (show >= 0 && !pv_wait) ? bts[show] : (pv_hold || pv_wait) ? pv_disp : (last_shown >= 0 ? last_bts : cur_us);
+        if (want_seek && ((kh & (KEY_LEFT | KEY_RIGHT)) || tseek)) { disp_us = seek_to_us < 0 ? 0 : seek_to_us; dirty = 1; }  /* preview the accumulating seek target */
         if (scrubbing) { disp_us = scrub_us; dirty = 1; }   /* preview the dragged position while the finger is down */
         (void)pf_str;
 
@@ -4891,7 +6103,9 @@ static MoflexResult moflex_play_ring(const char *path) {
          * The subtitle/time-string PREP now lives inside this block too: it used to run every loop
          * iteration (wasted CPU while banking), so calm scenes now spend that time decoding ahead -> a
          * bigger cushion -> heavy scenes coast longer before they get choppy. */
+        int drew = 0;
         if ((show >= 0 || dirty || dirty2) && (show >= 0 || last_shown >= 0)) {
+            drew = 1;
             static SubBlock vb, vt; subs_view(disp_us, &vb, &vt);   /* empty when off / no cue now */
             char tc[16], td[16], ts[64];
             fmt_time(disp_us, tc, sizeof tc);
@@ -4916,7 +6130,8 @@ static MoflexResult moflex_play_ring(const char *path) {
             /* GATE ON !playing, not on "no frame due": show < 0 is also true on a UI repaint
              * between presents, and firing there converted the worker's LATEST frame into an
              * already-queued ring slot -- wrong frame, wrong slot, visible as a glitch. */
-            if (g_pq_redo && !playing && s.paused && show < 0 && b >= 0) {
+            if (g_pq_redo && !playing && s.paused && show < 0 && b >= 0 && !g_yq_cap) {   /* queue mode: the
+                * latest decode is ~2 s ahead of the screen; the change shows from the next converted frame */
                 g_pq_redo = 0;
                 WORKER_LOCK();
                 if (g_pq_dirty) { g_pq_dirty = 0; pq_apply(); }
@@ -4936,7 +6151,7 @@ static MoflexResult moflex_play_ring(const char *path) {
             /* a magnified picture really does have magnified disparities, so captions track it */
             int sdep = (int)((float)g_sub_depth * zm + (g_sub_depth < 0 ? -0.5f : 0.5f));
             C2D_Image imR = stereo ? r3_imgR[b] : r3_imgL[b];
-            C3D_FrameBegin(0);
+            C3D_FrameBegin(C3D_FRAME_SYNCDRAW);   /* draw on the refresh: no tearing; the producer runs meanwhile */
             C2D_TargetClear(topL, black); C2D_SceneBegin(topL);
             C2D_DrawImageAt(r3_imgL[b], zox - cv, zoy, 0, NULL, zm, zm);
             if (mix > 0.0f) C2D_DrawImageAt(imR, zox + cv, zoy, 0, &mixt, zm, zm);
@@ -4952,15 +6167,44 @@ static MoflexResult moflex_play_ring(const char *path) {
             ring_sub_draw(&rst, stereo ? sdep : 0, subcol, subout);
             ring_sub_draw(&rsb, stereo ? sdep : 0, subcol, subout);
             if (g_screen_off) { g_dark_sw(bot); g_panel_force = 1; }      /* dark: panel stale -> force on wake */
-            else if (g_submenu) { g_submenu_sw(bot, is3d); g_panel_force = 1; }  /* submenu: panel stale on exit */
-            else { if (dirty) g_panel_force = 1;                          /* UI changed -> re-render the panel */
-                   g_panel_sw(bot, title, disp_us, dur_us, playing); }   /* panel (lock toast on top) */
+            else if (g_submenu) {                                         /* submenu: panel stale on exit */
+                /* playing: redraw the menu in a spare refresh (below), not inside this frame's draw --
+                 * a menu redraw per arrow press here paused the film for a moment each time */
+                static int sm_wait = 0;   /* busy Old-3DS 3D has few spare refreshes: after 4 frames, render here */
+                if (playing && g_submenu_stale() && g_sub_last != -1 && ++sm_wait <= 4) ui_tex_blit(bot);
+                else { g_submenu_sw(bot, is3d); sm_wait = 0; }
+                g_panel_force = 1; }
+            else { if (dirty && !pv_hold) g_panel_force = 1;              /* UI changed -> re-render the panel;
+                                                                            * seeking: only the bar/time strips move */
+                   /* a film frame: reuse the panel texture (kept current between frames, below) so
+                    * the present is never late; refresh it here only on a UI change, or when no
+                    * spare refresh has come for ~2 s (60 fps material has none) */
+                   /* a volume change rides on this present as a strip update (unforced g_panel_prep
+                    * takes the cheap path): the slider follows the finger without a full repaint */
+                   static int vol_shown = -1; int vnow = (int)(g_vol * 100 + 0.5f);
+                   if (show >= 0 && !dirty && !g_panel_force && vnow == vol_shown && ++g_panel_age < 48) ui_tex_blit(bot);
+                   else { g_panel_sw(bot, title, disp_us, dur_us, playing); vol_shown = vnow; } }   /* panel (lock toast on top) */
             u64 _tg = svcGetSystemTick(); C3D_FrameEnd(0); pf_gpu += svcGetSystemTick() - _tg;
             dirty2 = dirty; dirty = 0;   /* second pass fills the other buffer (see above) */
             if (show >= 0) {
                 u64 nt = svcGetSystemTick();   /* cadence: refreshes this newly-shown frame replaced */
                 if (cad_last) { int v = (int)((double)(nt - cad_last) * 1000.0 / SYSCLOCK_ARM11 / VS_MS + 0.5);
-                                if (v == 2) cad_v2++; else if (v == 3) cad_v3++; else cad_vx++; }
+                                if (v == 2) cad_v2++; else if (v == 3) cad_v3++; else cad_vx++;
+                                /* pattern breaks: a half-refresh rate should alternate (3,2,3,2), a whole one repeat */
+                                if (playing && vl_prevhold) {
+                                    int half = (vl_vk - floor(vl_vk)) > 0.25;
+                                    if (half ? (v == vl_prevhold) : (v != (int)(vl_vk + 0.5))) st_slip++;
+                                }
+                                vl_prevhold = v;
+                                u64 gap = (nt - cad_last) / (SYSCLOCK_ARM11 / 1000);
+                                if (playing && gap > (u64)(2 * pair_dur / 1000)) { st_stut++;   /* held > 2 frames */
+#ifdef LAB_AUTOPLAY
+                                    if (g_lab_stn < 8) { g_lab_st[g_lab_stn][0] = st_shown; g_lab_st[g_lab_stn][1] = bts[show] / 1000;
+                                                         g_lab_st[g_lab_stn][2] = gap; g_lab_stn++; }
+#endif
+                                }
+                                if (playing && gap > st_maxgap && gap < 5000) st_maxgap = gap; }
+                st_shown++;
                 cad_last = nt;
                 ready[show] = 0; last_shown = show; last_bts = bts[show]; cur_us = bts[show]; rd++;
                 g_r3_last_present = (u32)osGetTime();   /* elision starving-guard: the picture actually changed */
@@ -4974,11 +6218,11 @@ static MoflexResult moflex_play_ring(const char *path) {
             if (vol_dirty) { vol_save(); vol_dirty = 0; }
             save_pend = 0;
         }
-        if (vol_dirty && !save_pend) { vol_save(); vol_dirty = 0; }
+        if (vol_dirty && !save_pend && osGetTime() - vol_changed_at > 1000) { vol_save(); vol_dirty = 0; }   /* after it settles */
 
         /* movie finished: STOP in the player (last frame held, bar parked at the end) instead of
          * exiting as if B was pressed. A replays from the start; B leaves as usual. */
-        if (s.done && (s.wr - rd) == 0 && playing) {
+        if (s.done && (s.wr - rd) == 0 && g_yq_n == 0 && playing) {
             playing = 0; s.paused = 1;
             if (have_audio) ndspChnSetPaused(0, true);
             resume_clear(path); moflex_watched_set(path, 1);   /* finished -> watched */
@@ -4989,12 +6233,25 @@ static MoflexResult moflex_play_ring(const char *path) {
         /* No banking on this thread now: when no new frame is due (and no UI change), pace to VBlank so
          * the present-due check runs once per refresh -> steady cadence. Present iterations (show>=0)
          * skip this, so C3D_FrameEnd is never double-waited. */
-        if (show < 0 && !dirty && !inline_produced) { u64 _ti = svcGetSystemTick(); gspWaitForVBlank(); pf_idle += svcGetSystemTick() - _ti; pf_n++; }
+        /* Sleep to the refresh on EVERY pass that drew nothing. (It used to also skip while `dirty`, but
+         * before the first pair exists dirty can't be drawn or cleared -- and on Old-3DS the producer
+         * runs BELOW this thread on the same core, so the spin starved it: blank screen on "restart".) */
+        if (!drew && !inline_produced) { u64 _ti = svcGetSystemTick(); gspWaitForVBlank(); pf_idle += svcGetSystemTick() - _ti; pf_n++;
+            /* a spare refresh, and the GPU is done with the last frame: update the panel texture now,
+             * for the frame that shows next, so presents only blit it */
+            if (playing && !g_screen_off && !g_submenu) {
+                int64_t nx = (pv_hold || pv_wait) ? pv_disp : ((s.wr - rd) > 0 && ready[rd % NB]) ? bts[rd % NB] : cur_us;
+                g_panel_prep(title, nx, dur_us, playing);
+            } else if (playing && !g_screen_off && g_submenu && g_submenu_stale()) {
+                g_submenu_prep(is3d);   /* shown by the next film frame (a forced pass only cost a synced frame) */
+            } }
 
         /* Roll the HUD every ~24 presented frames. CADENCE is the judder meter: v2/v3 = frames held 2/3
          * refreshes (good), bad = held 1 or 4+ (judder). d/D = worker decode avg/max ms; i = main idle. */
         if (cad_v2 + cad_v3 + cad_vx >= 24) {
             int wn = s.wk_n > 0 ? s.wk_n : 1;
+            st_v2 += cad_v2; st_v3 += cad_v3; st_vx += cad_vx;           /* session totals (ring_stats.txt) */
+            st_dec += s.wk_dec; st_decn += s.wk_n; if (s.wk_dmax > st_dmax) st_dmax = s.wk_dmax;
             snprintf(pf_str, sizeof pf_str, " v2:%d v3:%d bad:%d d%.0f D%.0f i%.0f",
                      cad_v2, cad_v3, cad_vx, PF_MS(s.wk_dec) / wn, PF_MS(s.wk_dmax), PF_MS(pf_idle) / (pf_n > 0 ? pf_n : 1));
             cad_v2 = cad_v3 = cad_vx = 0; pf_idle = 0; pf_n = 0;
@@ -5003,14 +6260,57 @@ static MoflexResult moflex_play_ring(const char *path) {
         }
     }
     if (!aptMainLoop() && result == MOFLEX_QUIT_BACK) result = MOFLEX_QUIT_EXIT;
+    if (pv_hold) { s.land_cancel = 1; s.pv_mode = 0; pv_hold = 0; }   /* left while seeking: stop a landing, back to normal */
     aptUnhook(&g_ring_apt_cookie);
+    /* Leaving: a network read the reader is blocked in must fail NOW (not after the 20 s stall limit,
+     * which also reported a false "lost the connection"). The seek hook's cut makes every pending
+     * httpfile read return at once without flagging a give-up; cleared again once the threads stop. */
+    g_seek_busy = 1; g_seek_cut = 1;
 
     /* stop + join the decode thread (New-3DS) before freeing anything it uses (demux, decoder, ring) */
     if (threaded) {
         s.run = 0; s.paused = 0; g_ring_susp = 0; LightEvent_Signal(&s.wake);
         threadJoin(dthr, UINT64_MAX); threadFree(dthr);
     }
-    g_ring_lock = NULL; g_ring_wake = NULL;   /* s.lock/s.wake go out of scope after this */
+    if (rthr) { s.run = 0; threadJoin(rthr, UINT64_MAX); threadFree(rthr); rthr = 0; }
+    g_reader_on = 0;
+    g_seek_busy = 0; g_seek_cut = 0; g_seek_cut_kd = 0;
+    r3_retire(&s);                            /* no conversion may outlive the ring textures */
+    if (dbg_on()) {   /* one line per playback, appended: how the engine actually did on this console + file */
+        {   /* keep it small: start over past 64 KB (a few hundred playbacks) */
+            struct stat sst;
+            if (stat("sdmc:/moflex_player/ring_stats.txt", &sst) == 0 && sst.st_size > 64 * 1024) remove("sdmc:/moflex_player/ring_stats.txt");
+        }
+        FILE *sf = fopen("sdmc:/moflex_player/ring_stats.txt", "a");
+        if (sf) {
+            st_v2 += cad_v2; st_v3 += cad_v3; st_vx += cad_vx; st_dec += s.wk_dec; st_decn += s.wk_n;
+            struct mallinfo mi = mallinfo();
+            fprintf(sf, "%s | %s %s | %.0fs (playing %.0fs, %.1f fps) shown=%ld stutters=%ld maxgap=%llums cadence v2=%ld v3=%ld bad=%ld slips=%ld lock=%.2f@%.4f panel=%.1fms upl=%.1fms | ui: full=%lu/%.0fms strip=%lu/%.0fms menu=%lu/%.0fms rebake=%.0fms vsave=%lu/%.0fms | drop=%ld starve=%.1fs rdmax=%lums rdslow=%lu src=%s | not-shown: elided=%lu stale=%lu skipped=%lu | busy=%.0f%% fps=%.2f | decode %.2f ms/pair max %.1f | NB=%d+q%d heap peak %lu KB, linear free %lu KB | %s\n",
+                    BUILD_TAG, r3_isnew ? "new3ds" : "old3ds", is3d ? "3D" : "2D", (osGetTime() - st_t0) / 1000.0,
+                    st_play_ms / 1000.0, st_play_ms ? st_shown * 1000.0 / st_play_ms : 0.0,
+                    st_shown, st_stut, (unsigned long long)st_maxgap, st_v2, st_v3, st_vx, st_slip, vl_vk, (double)vl_speed, PF_MS(g_panel_max), PF_MS(g_upl_max),
+                    (unsigned long)g_n_pfull, PF_MS(g_t_pfull), (unsigned long)g_n_pstrip, PF_MS(g_t_pstrip),
+                    (unsigned long)g_n_menu, PF_MS(g_t_menu), PF_MS(g_t_rebake), (unsigned long)g_n_vsave, PF_MS(g_t_vsave),
+                    st_drop, PF_MS(st_starve_ticks) / 1000.0, (unsigned long)g_st_rdmax, (unsigned long)g_st_rdslow,
+                    strncmp(path, "bigtop:", 7) ? "sd" : "bigtop",
+                    (unsigned long)g_st_elide, (unsigned long)g_st_yqstale, (unsigned long)g_st_skipped,
+                    st_play_ms ? PF_MS(g_st_busy) * 100.0 / st_play_ms : 0.0, 1e6 / (double)pair_dur,
+                    st_decn ? PF_MS(st_dec) / st_decn : 0.0, PF_MS(st_dmax), NB, g_yq_cap,
+                    (unsigned long)(mi.arena / 1024), (unsigned long)(linearSpaceFree() / 1024), title);
+#ifdef LAB_AUTOPLAY
+            {   double tk = SYSCLOCK_ARM11 / 1000.0, pl = st_play_ms ? st_play_ms : 1;
+                fprintf(sf, "LAB y2r: n=%llu start %.2f ms/s, wait %.2f ms/s, texflush %.2f ms/s (%.3f ms each) | queue convert %.1f ms/s | noq=%d noflush=%d\n",
+                        (unsigned long long)g_lt_n, g_lt_ystart / tk * 1000 / pl, g_lt_ywait / tk * 1000 / pl,
+                        g_lt_yflush / tk * 1000 / pl, g_lt_n ? g_lt_yflush / tk / g_lt_n : 0.0, g_lt_conv / tk * 1000 / pl,
+                        g_lab_noq, g_lab_noflush);
+                for (int i = 0; i < g_lab_stn; i++)
+                    fprintf(sf, "LAB stutter %d: frame #%ld  video %lld ms  gap %lld ms\n", i, (long)g_lab_st[i][0],
+                            (long long)g_lab_st[i][1], (long long)g_lab_st[i][2]); }
+#endif
+            fclose(sf);
+        }
+    }
+    g_ring_lock = NULL; g_ring_wake = NULL; g_ring_s = NULL;   /* s.lock/s.wake go out of scope after this */
 
     if (dur_us > 0 && cur_us >= dur_us - 10000000) { resume_clear(path); moflex_watched_set(path, 1); }
     else if (cur_us > 3000000) resume_save_us(path, cur_us);
@@ -5021,6 +6321,7 @@ static MoflexResult moflex_play_ring(const char *path) {
     if (result == MOFLEX_QUIT_BACK && dur_us > 0 && cur_us >= dur_us - 2000000 &&
         autonext_wanted(path)) result = MOFLEX_EOF;
     if (vol_dirty) vol_save();
+    mb_drop();
     /* release panel services (restore backlight first so we never leave the screen dark) */
     if (g_screen_off) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; }
     if (g_lcd_ok) { gspLcdExit(); g_lcd_ok = 0; }
@@ -5032,6 +6333,7 @@ static MoflexResult moflex_play_ring(const char *path) {
     for (int i = 0; i < NB; i++) { C3D_TexDelete(&r3_texL[i]); if (is3d) C3D_TexDelete(&r3_texR[i]); }
     subtex_free();
     ui_tex_free();   /* release the software-UI panel texture before C3D shuts down */
+    ui_capture(0);   /* the app draws to the real framebuffer again */
     gspWaitForVBlank(); gspWaitForVBlank();
     gpu_park_program(); C2D_Fini(); C3D_Fini(); g_y2r_exit();
     gfxSet3D(false);
@@ -5040,9 +6342,14 @@ static MoflexResult moflex_play_ring(const char *path) {
      * so skip it and let the process tear down. */
     if (result != MOFLEX_QUIT_EXIT) {
         gfxExit(); gfxInitDefault();
+        /* hand the top screen back in the app UI's own format (16-bit, single-buffered, 2D) so nothing
+         * flips format while it's on screen afterwards -- that flip was the glitch frame on exit */
+        gfxSetScreenFormat(GFX_TOP, GSP_RGB565_OES);
+        gfxSetDoubleBuffering(GFX_TOP, false);
+        gfxSet3D(false);
         for (int fb = 0; fb < 2; fb++) {   /* fresh buffers hold garbage: black them before the app repaints */
             u16 fw = 0, fh = 0; u8 *p;
-            p = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, &fw, &fh);  if (p) memset(p, 0, (size_t)fw * fh * 3);
+            p = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, &fw, &fh);  if (p) memset(p, 0, (size_t)fw * fh * 2);
             p = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, &fw, &fh); if (p) memset(p, 0, (size_t)fw * fh * 3);
             gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();   /* paced: unpaced swaps here crashed gsp */
         }
@@ -5085,6 +6392,33 @@ static void mp_apt_hook(APT_HookType hook, void *param) {
             break;
         default: break;
     }
+}
+
+/* Classic 2D pacing against the audio worker's clock. Waits until the audio reaches this frame's
+ * time (minus a small lead for the screen) and returns how late the frame is (us, <=0 = on time).
+ * The clock only steps once per audio packet (~43 ms), so it is interpolated from when it last
+ * moved -- otherwise frames would be released in clumps. While the clock is offline (start, after
+ * a seek) frames wait up to 2 s for it, then run free so a silent/odd file still plays. */
+static int64_t classic_pace(int64_t vts, int64_t *off_since) {
+    const int64_t lead = 20000;
+    const double tpus = SYSCLOCK_ARM11 / 1000000.0;
+    for (int spins = 0; spins < 400; spins++) {   /* <= ~0.8 s per frame */
+        int64_t a = g_aud_play_us;
+        if (a < 0) {
+            int64_t now = (int64_t)osGetTime();
+            if (*off_since < 0) *off_since = now;
+            if (now - *off_since > 2000) return 0;   /* audio isn't coming: don't hold the picture */
+            svcSleepThread(2000000); continue;
+        }
+        *off_since = -1;
+        if (g_aw_paused) return 0;
+        int64_t el = (int64_t)((svcGetSystemTick() - g_aud_upd_tick) / tpus);
+        if (el > 100000) el = 100000;
+        int64_t d = vts - (a + el) - lead;
+        if (d <= 0) return -d;
+        svcSleepThread(d > 4000 ? 4000000 : d * 1000);
+    }
+    return 0;
 }
 
 /* Classic audio-paced player: software framebuffer, no GPU ring. Handles 2D everywhere and is the
@@ -5175,7 +6509,29 @@ static MoflexResult moflex_play_classic(const char *path) {
     int16_t *abuf[NWB] = { 0 };
     int have_audio = (ai >= 0);
     memset(wbuf, 0, sizeof(wbuf));
+    /* Audio on its own WORKER thread (core 1, own file handle) -- the same design that keeps the
+     * 3D ring player's sound clean on the Old 3DS. Fed inline from this loop, 2D audio had only the
+     * few buffers lip-sync allowed (~130 ms), so any slow frame decode emptied it: audible stutter
+     * while the picture stayed smooth. Now audio is the clock and each frame waits for it. */
+    Thread awt = NULL;
     if (have_audio) {
+        g_aw_stop = 0; g_aw_paused = 0; g_aw_seek = 0;
+        g_aud_play_us = -1; g_aud_start = -1;
+        APT_SetAppCpuTimeLimit(30);
+        s32 aprio = 0x30; svcGetThreadPriority(&aprio, CUR_THREAD_HANDLE);
+        awt = threadCreate(audio_worker, (void *)path, 16 * 1024, aprio - 1, 1, false);
+    }
+    int64_t aw_off_since = -1;   /* ms when the audio clock went offline (start/seek) */
+    /* moflex stamps a time per BLOCK (~1 s of frames), not per frame: pacing every frame to that
+     * held the block's first frame, then let the rest go at once -- a few frames, then a pause.
+     * Per-frame time = the block's time + frames since it began x the frame duration. */
+    int64_t fdur = 40000, v_bts = -1; int v_k = 0;
+    if (m.streams[vi].tb_den > 0) {
+        int64_t pd = (int64_t)m.streams[vi].tb_num * 1000000 / m.streams[vi].tb_den;
+        if (pd >= 8000 && pd <= 100000) fdur = pd;
+    }
+    if (is3d && !m.tb_is_eye) fdur /= 2;   /* 3D: frames are eyes; the timebase may be the pair rate */
+    if (have_audio && !awt) {
         ndspChnReset(0);
         ndspChnSetInterp(0, NDSP_INTERP_POLYPHASE);
         ndspChnSetRate(0, (float)arate);
@@ -5245,7 +6601,7 @@ static MoflexResult moflex_play_classic(const char *path) {
         /* ---- controls (direct, nothing to select): A play/pause,
                Left/Right (hold) rewind/FF, Up/Down volume, B back ---- */
         if (kd & KEY_B) { result = MOFLEX_QUIT_BACK; break; }
-        if (kd & KEY_A) { playing = !playing; if (have_audio) ndspChnSetPaused(0, !playing); dirty = 1;
+        if (kd & KEY_A) { playing = !playing; if (awt) g_aw_paused = !playing; else if (have_audio) ndspChnSetPaused(0, !playing); dirty = 1;
                           save_pend = !playing; save_delay = SAVE_DELAY_FRAMES; }   /* arm only; unpausing disarms it */
         if (kd & KEY_UP)   { int s = (int)(g_vol / 0.25f + 0.0001f); g_vol = (s + 1) * 0.25f; if (g_vol > 4.0f) g_vol = 4.0f; vol_dirty = 1; dirty = 1; }   /* snap up to the 25% grid, capped at 400% */
         if (kd & KEY_DOWN) { int s = (int)(g_vol / 0.25f + 0.9999f); g_vol = (s - 1) * 0.25f; if (g_vol < 0.25f) g_vol = 0.25f; vol_dirty = 1; dirty = 1; }
@@ -5299,7 +6655,7 @@ static MoflexResult moflex_play_classic(const char *path) {
                     dirty = 1;
                     if (!playing) { want_seek = 1; seek_to_us = cur_us; }   /* re-render the frozen frame with the new subtitle */
                 } else if (py >= PLAY_CY - 20 && py <= PLAY_CY + 20) {
-                    if (px >= PLAY_CX - 20 && px <= PLAY_CX + 20) { playing = !playing; if (have_audio) ndspChnSetPaused(0, !playing); dirty = 1;
+                    if (px >= PLAY_CX - 20 && px <= PLAY_CX + 20) { playing = !playing; if (awt) g_aw_paused = !playing; else if (have_audio) ndspChnSetPaused(0, !playing); dirty = 1;
                           save_pend = !playing; save_delay = SAVE_DELAY_FRAMES; }   /* arm only (same as KEY_A) */
                     else if (px >= RW_CX - 18 && px <= RW_CX + 18) { seek_to_us = cur_us - 30000000; want_seek = 1; }
                     else if (px >= FF_CX - 18 && px <= FF_CX + 18) { seek_to_us = cur_us + 30000000; want_seek = 1; }
@@ -5317,7 +6673,8 @@ static MoflexResult moflex_play_classic(const char *path) {
             if (y2r_started) { y2r_video_drain(); y2r_started = 0; }   /* drop any in-flight Y2R */
             do_seek(&m, &ctx, seek_to_us);
             vidx = 0; left_ok = 0;          /* re-establish L/R pairing after seek */
-            if (have_audio) {
+            if (awt) g_aw_paused = 1;      /* hush the old position while the video seeks */
+            else if (have_audio) {
                 ndspChnWaveBufClear(0);
                 ndspChnSetPaused(0, !playing);   /* keep paused if we were paused (seek doesn't auto-play) */
                 for (int i = 0; i < NWB; i++) wbuf[i].status = NDSP_WBUF_DONE;
@@ -5325,13 +6682,18 @@ static MoflexResult moflex_play_classic(const char *path) {
             }
             /* show the landing frame right away; audio then resumes synced to it */
             prime_after_seek(&m, &ctx, out, W, H, &cur_us, &vidx, &left_ok, &left_vidx, is3d);
+            v_bts = -1;
+            if (awt) {   /* audio restarts where the VIDEO landed (a keyframe), not the raw target */
+                g_aud_play_us = -1; g_aw_seek_us = cur_us; g_aw_seek = 1; g_aw_paused = !playing;
+                aw_off_since = -1;
+            }
             want_seek = 0; dirty = 1;
         }
 
         /* ---- decode one packet (if playing) ---- */
         if (playing) {
             int rc = mfx_next_packet(&m, &pkt);
-            if (rc != 1) { playing = 0; dirty = 1; if (have_audio) ndspChnSetPaused(0, true); }
+            if (rc != 1) { playing = 0; dirty = 1; if (awt) g_aw_paused = 1; else if (have_audio) ndspChnSetPaused(0, true); }
             else {
                 cur_us = m.ts;
                 if (cur_us < 0) cur_us = 0;
@@ -5340,7 +6702,8 @@ static MoflexResult moflex_play_classic(const char *path) {
                  * service and hitches the video (the shared SDMC path). We checkpoint only when
                  * stopped: on pause (above) and on exit (done:), when the read loop is idle. */
                 int mt = m.streams[pkt.stream_index].media_type;
-                if (mt == MFX_TYPE_AUDIO && have_audio && pkt.stream_index != ai) { /* other track */ }
+                if (mt == MFX_TYPE_AUDIO && awt) { /* the audio worker reads its own copy */ }
+                else if (mt == MFX_TYPE_AUDIO && have_audio && pkt.stream_index != ai) { /* other track */ }
                 else if (mt == MFX_TYPE_AUDIO && have_audio) {
                     u64 ta = svcGetSystemTick();
                     ndspWaveBuf *wb = &wbuf[wb_idx];
@@ -5372,6 +6735,15 @@ static MoflexResult moflex_play_classic(const char *path) {
                     u64 t0 = svcGetSystemTick();
                     int ok = (mobi_decode(&ctx, out, &got, &ap) >= 0 && got);  /* decode every frame (keeps ref chain) */
                     dbg_dec += svcGetSystemTick() - t0; dbg_vf++;
+                    int64_t vts;
+                    if (m.ts != v_bts) { v_bts = m.ts; v_k = 0; }
+                    vts = v_bts + (int64_t)v_k++ * fdur;
+                    if (awt && ok && (!is3d || eye == 1)) {   /* pace to the audio clock */
+                        int64_t late = classic_pace(vts, &aw_off_since);
+                        if (late > 2000000 && !g_aw_paused) {   /* fell far behind: bring the audio back to the picture */
+                            g_aud_play_us = -1; g_aw_seek_us = vts; g_aw_seek = 1; aw_off_since = -1;
+                        } else if (late > 150000) ok = 0;     /* behind: decode only, skip the blit to catch up */
+                    }
                     (void)y2r_started; (void)use_y2r;
                     if (!is3d) {                           /* 2D: every frame is a full flat frame -> present it */
                         if (ok) { u64 tb = svcGetSystemTick(); blit_eye(out, GFX_LEFT, W, H); dbg_blit += svcGetSystemTick() - tb;
@@ -5439,7 +6811,8 @@ done:
      * the movie. Two seconds rather than ten so quitting near the end is still quitting. */
     if (result == MOFLEX_QUIT_BACK && dur_us > 0 && cur_us >= dur_us - 2000000 &&
         autonext_wanted(path)) result = MOFLEX_EOF;
-    if (have_audio) { ndspChnWaveBufClear(0); ndspChnSetPaused(0, false);
+    if (awt) { g_aw_stop = 1; threadJoin(awt, 2000000000LL); threadFree(awt); ndspChnSetPaused(0, false); }
+    else if (have_audio) { ndspChnWaveBufClear(0); ndspChnSetPaused(0, false);
         for (int i = 0; i < NWB; i++) if (abuf[i]) linearFree(abuf[i]); }
     if (y2r_started) y2r_video_drain();   /* let any in-flight Y2R finish before freeing frames */
     y2r_video_exit();
@@ -5794,8 +7167,11 @@ MoflexResult moflex_play(const char *path) {
      * texture into the framebuffer, a whole extra read+write of every frame, and that console is
      * memory-bandwidth-bound -- the same reason threading its decode made things WORSE (d52->d91).
      * Nothing about 2D playback needs the ring, so Old-3DS keeps the path already proven on it. */
-    int use_ring = is3d;
-    if (!use_ring) { bool isnew = false; APT_CheckNew3DS(&isnew); use_ring = isnew; }
+    /* Old-3DS 2D now takes the ring too. Classic decodes, converts and
+     * shows each frame inline with nothing banked, and it could not hold real time on an Old 3DS --
+     * it only looked smooth because the whole thing ran slow (the sound gaps were the symptom).
+     * The ring's decode-ahead bank is what lets Old-3DS 3D (the same 24 frames/s) play. */
+    int use_ring = 1;
     if (use_ring) {                                       /* New-3DS threaded, Old-3DS inline.
                                                            * Falls back to classic if the ring
                                                            * can't allocate its buffers. */
@@ -5887,7 +7263,7 @@ int moflex_defaults_preview(const MoflexDefaults *d,
         u32 kd = hidKeysDown(), kh = hidKeysHeld(), ku = hidKeysUp();
         touchPosition tp; hidTouchRead(&tp);
         int drew = 0;
-        ui_capture(1);                    /* the app's ui_present() becomes a no-op: we texture it */
+        ui_capture(1); g_panel_buf_ok = 0; /* the app's ui_present() becomes a no-op: we texture it */
         code = frame(ctx, kd, kh, ku, tp.px, tp.py, &drew);
         if (code) { closing = 0; ui_capture(0); break; }   /* ui_present() must draw again */
         g_sub_size = d->size; g_sub_pos = d->pos; g_sub_font = d->font; g_sub_depth = d->depth;
@@ -6235,7 +7611,7 @@ void kit_draw(KitGpu *g, C2D_Image L, C2D_Image R, int is3d, const char *title,
     if (g_screen_off) { g_dark_sw(g->bot); g_panel_force = 1; g_kit_tex_menu = 0; }
     else if (g_submenu) {
         if (g_kit_menu_dirty || !g_kit_tex_menu || g_lock_toast > 0) {
-            g_submenu_sw(g->bot, is3d); g_kit_menu_dirty = 0; g_kit_tex_menu = 1;
+            g_sub_redraw = 1; g_submenu_sw(g->bot, is3d); g_kit_menu_dirty = 0; g_kit_tex_menu = 1;
         } else ui_tex_blit(g->bot);       /* unchanged menu: reuse its texture */
         g_panel_force = 1;
     }
@@ -6268,6 +7644,7 @@ int moflex_subs_append_srt(const char *text) {
     return g_nsubs - before;
 }
 int moflex_fmt_load_key(const char *key) { return kit_fmt_load(key); }
+void moflex_fmt_save_key(const char *key, int fmt) { kit_fmt_save(key, fmt); }
 int moflex_subs_wanted(const char *key, const char *audio_lang) {
     subcfg_load(key);                     /* before playback: the globals are reloaded at open anyway */
     if (!g_cfg_fresh) return g_sub_on;

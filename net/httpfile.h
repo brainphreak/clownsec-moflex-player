@@ -22,4 +22,12 @@ void httpfile_reset(void);
  * the viewer has already moved on from. */
 void httpfile_set_wait_hook(int (*fn)(int poll));
 
+/* The last closed file's blocks are kept briefly for a reopen of the same URL (the player probes a
+ * video, then plays it). Free them when done with the video. */
+void httpfile_drop_cache(void);
+/* the open Big Top file (the latest): bytes fetched and waiting from the read position (-1 = none
+ * open), and a nudge to read ahead fully now that playback is starting */
+long long httpfile_buffered_ahead(void);
+void httpfile_full_ahead(void);
+
 #endif
