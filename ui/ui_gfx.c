@@ -471,11 +471,24 @@ void ui_button(int x, int y, int w, int h, const char *label, int selected, u16 
     ui_vgrad_round(x, y, w, h, r, top, bot);
     ui_frame_round(x, y, w, h, r, selected ? accent : UI_DIM, selected ? 2 : 1);
     u16 tc = selected ? accent : UI_INK;
-    const char *lbl = label; char buf[64];   /* truncate a too-long label so it can't spill the button */
+    const char *lbl = label; char buf[64];   /* a too-long label must not spill the button */
     int maxw = w - 8;
     if (ui_text_w(1, label) > maxw) {
-        int maxch = maxw / 8 - 2; if (maxch < 1) maxch = 1;
-        snprintf(buf, sizeof buf, "%.*s..", maxch, label); lbl = buf;
+        /* make room before cutting words: first squeeze the wide gaps ("Zoom:  100%   (hint)"),
+         * then drop a trailing "(hint)", and only then truncate with ".." */
+        int o = 0;
+        for (const char *p = label; *p && o < (int)sizeof buf - 1; p++)
+            if (!(*p == ' ' && o > 0 && buf[o - 1] == ' ')) buf[o++] = *p;
+        buf[o] = 0; lbl = buf;
+        if (ui_text_w(1, buf) > maxw && o > 0 && buf[o - 1] == ')') {
+            char *lp = strrchr(buf, '(');
+            if (lp && lp > buf + 1 && lp[-1] == ' ') lp[-1] = 0;
+        }
+        if (ui_text_w(1, buf) > maxw) {
+            char t[64]; snprintf(t, sizeof t, "%s", buf);
+            int maxch = maxw / 8 - 2; if (maxch < 1) maxch = 1;
+            snprintf(buf, sizeof buf, "%.*s..", maxch, t);
+        }
     }
     ui_text_center(x + w / 2, y + (h - 8) / 2, 1, tc, lbl);
 }

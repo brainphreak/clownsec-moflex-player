@@ -97,6 +97,7 @@ int moflex_seek_wait_hook(int poll) {
 /* diagnostics logs are opt-in: create sdmc:/moflex_player/debug_on.txt to turn them on. Normal use
  * never writes them -- no SD writes while a film plays, no logs that grow forever. */
 #ifdef LAB_AUTOPLAY
+static long long g_lab_st[8][3]; static int g_lab_stn;   /* lab: where each stutter happened */
 u64 g_lab_deadline;   /* lab build: playback stops on its own at this osGetTime() */
 #endif
 static int dbg_on(void) {
@@ -2801,7 +2802,7 @@ static void view_label(int row, char *r, int cap) {
     if (i == VIEW_ACT_VER) {
         int v = g_vid_pend >= 0 ? g_vid_pend : g_vid_sel;
         if (g_vid_pend >= 0 && g_vid_pend != g_vid_sel)
-            snprintf(r, cap, "Version:  < %s >   A applies", vid_label(v));
+            snprintf(r, cap, "Version:  < %s >   (A applies)", vid_label(v));
         else
             snprintf(r, cap, "Version:  < %s >  (%d/%d)", vid_label(v), v + 1, g_vid_n);
         return;
@@ -2810,7 +2811,7 @@ static void view_label(int row, char *r, int cap) {
         static const char *const F[3] = { "2D", "3D SBS", "3D Half SBS" };
         int f = g_kit_fmt_pend >= 0 ? g_kit_fmt_pend : g_kit_fmt;
         if (g_kit_fmt_pend >= 0 && g_kit_fmt_pend != g_kit_fmt)
-            snprintf(r, cap, "Format:  < %s >   A applies", F[f >= 0 && f <= 2 ? f : 0]);
+            snprintf(r, cap, "Format:  < %s >   (A applies)", F[f >= 0 && f <= 2 ? f : 0]);
         else
             snprintf(r, cap, "Format:  < %s >", F[f >= 0 && f <= 2 ? f : 0]);
         return;
@@ -6196,7 +6197,12 @@ static MoflexResult moflex_play_ring(const char *path) {
                                 }
                                 vl_prevhold = v;
                                 u64 gap = (nt - cad_last) / (SYSCLOCK_ARM11 / 1000);
-                                if (playing && gap > (u64)(2 * pair_dur / 1000)) st_stut++;   /* held > 2 frames */
+                                if (playing && gap > (u64)(2 * pair_dur / 1000)) { st_stut++;   /* held > 2 frames */
+#ifdef LAB_AUTOPLAY
+                                    if (g_lab_stn < 8) { g_lab_st[g_lab_stn][0] = st_shown; g_lab_st[g_lab_stn][1] = bts[show] / 1000;
+                                                         g_lab_st[g_lab_stn][2] = gap; g_lab_stn++; }
+#endif
+                                }
                                 if (playing && gap > st_maxgap && gap < 5000) st_maxgap = gap; }
                 st_shown++;
                 cad_last = nt;
@@ -6296,7 +6302,10 @@ static MoflexResult moflex_play_ring(const char *path) {
                 fprintf(sf, "LAB y2r: n=%llu start %.2f ms/s, wait %.2f ms/s, texflush %.2f ms/s (%.3f ms each) | queue convert %.1f ms/s | noq=%d noflush=%d\n",
                         (unsigned long long)g_lt_n, g_lt_ystart / tk * 1000 / pl, g_lt_ywait / tk * 1000 / pl,
                         g_lt_yflush / tk * 1000 / pl, g_lt_n ? g_lt_yflush / tk / g_lt_n : 0.0, g_lt_conv / tk * 1000 / pl,
-                        g_lab_noq, g_lab_noflush); }
+                        g_lab_noq, g_lab_noflush);
+                for (int i = 0; i < g_lab_stn; i++)
+                    fprintf(sf, "LAB stutter %d: frame #%ld  video %lld ms  gap %lld ms\n", i, (long)g_lab_st[i][0],
+                            (long long)g_lab_st[i][1], (long long)g_lab_st[i][2]); }
 #endif
             fclose(sf);
         }
