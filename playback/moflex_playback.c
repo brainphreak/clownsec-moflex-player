@@ -2871,7 +2871,7 @@ static int view_act(int row) {
 static void view_label(int row, char *r, int cap) {
     int i = view_act(row);
     if (i == VIEW_ACT_HQ) {
-        snprintf(r, cap, "HQ colour:  %s   (A toggles)", g_hq ? "24-bit" : "16-bit");
+        snprintf(r, cap, "HQ color:  %s   (A toggles)", g_hq ? "32-bit" : "16-bit");
         return;
     }
     if (i == VIEW_ACT_VER) {
