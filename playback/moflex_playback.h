@@ -43,6 +43,10 @@ long long moflex_resume_at(const char *path, long long off);
 void moflex_resume_clear(const char *path);
 /* Settings > Screens off after: paused playback left alone this long turns both screens off (0 = never). */
 void moflex_set_idle_off_ms(unsigned ms);
+/* A Big Top stream's first reads: B gives up (the app turns it on around the open; the engine turns
+ * it off once the film is playing). moflex_open_cancelled() = B ended the open. */
+void moflex_open_cancellable(int on);
+int  moflex_open_cancelled(void);
 
 /* ---- shared with the MP4 player: one resume/volume/subtitle system across both formats ---- */
 void  moflex_resume_save(const char *path, long long us);

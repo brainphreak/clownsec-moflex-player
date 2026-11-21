@@ -108,13 +108,32 @@ void moflex_set_open_hook(FILE *(*fn)(const char *path)) { g_open_hook = fn; }
  * goes straight to the place they meant instead of waiting out the one they didn't. */
 static volatile int g_seek_busy = 0, g_seek_cut = 0;
 static u32 g_seek_cut_kd = 0;
+static touchPosition g_seek_cut_tp;      /* where the touch that dropped a seek landed (a quick tap is
+                                          * often lifted by the time the loop looks at the screen) */
+/* Before the film starts (a Big Top stream's first reads): B gives up. The app turns this on
+ * around the open; the ring engine turns it off once its loop runs (B is its own from there). */
+static volatile int g_open_busy = 0, g_open_cut = 0;
+void moflex_open_cancellable(int on) { g_open_busy = on; g_open_cut = 0; }
+int  moflex_open_cancelled(void) { return g_open_cut; }
 int moflex_seek_wait_hook(int poll) {
+    if (g_open_busy) {
+        if (g_open_cut) return 1;
+        if (!poll) return 0;
+        hidScanInput();
+        if (hidKeysDown() & KEY_B) { g_open_cut = 1; return 1; }
+        return 0;
+    }
     if (!g_seek_busy) return 0;
     if (g_seek_cut) return 1;
     if (!poll) return 0;
     hidScanInput();
     u32 kd = hidKeysDown();
-    if (kd & (KEY_B | KEY_START | KEY_TOUCH | KEY_LEFT | KEY_RIGHT)) { g_seek_cut_kd |= kd; g_seek_cut = 1; return 1; }
+    /* SELECT and a touch (CC / AUDIO / VIDEO) drop it too: the menu opens now, and the seek waits
+     * until it closes instead of holding the controls until the video arrives */
+    if (kd & (KEY_B | KEY_START | KEY_TOUCH | KEY_LEFT | KEY_RIGHT | KEY_SELECT)) {
+        if (kd & KEY_TOUCH) hidTouchRead(&g_seek_cut_tp);
+        g_seek_cut_kd |= kd; g_seek_cut = 1; return 1;
+    }
     return 0;
 }
 /* diagnostics logs are opt-in: create sdmc:/moflex_player/debug_on.txt to turn them on. Normal use
@@ -5457,6 +5476,7 @@ static MoflexResult moflex_play_ring(const char *path) {
     }
 
     u32 cut_kd = 0;                       /* the press that dropped a seek, handled this frame */
+    g_open_busy = 0;                      /* the film is open: B is the loop's own from here */
     u64 st_play_ms = 0, st_play_t = 0;   /* time actually playing (not loading/seeking/paused) */
     while (aptMainLoop()) {
         {   u64 now_ = osGetTime();                 /* count wall time only while frames are flowing */
@@ -5464,8 +5484,9 @@ static MoflexResult moflex_play_ring(const char *path) {
             st_play_t = now_; }
         hidScanInput();
         u32 kd = hidKeysDown() | cut_kd, kh = hidKeysHeld();
-        cut_kd = 0;
         touchPosition tp; hidTouchRead(&tp);
+        if (cut_kd & KEY_TOUCH) { tp = g_seek_cut_tp; kh |= KEY_TOUCH; }   /* the tap that dropped a seek */
+        cut_kd = 0;
         /* Lid watchdog: with sleep denied (background downloads) closing the lid doesn't sleep --
          * the movie keeps playing dark -- and reopening fires NO wake event, so a missed system
          * relight leaves both LCDs black with the audio running. Force them on at closed->open. */
@@ -5774,7 +5795,7 @@ static MoflexResult moflex_play_ring(const char *path) {
             pv_wait = 1;
             dirty = 1;
         }
-        if (want_seek && pv_hold && !landing && !scrubbing && !tseek && !(kh & (KEY_LEFT | KEY_RIGHT))) {
+        if (want_seek && !g_submenu && pv_hold && !landing && !scrubbing && !tseek && !(kh & (KEY_LEFT | KEY_RIGHT))) {
             /* released while previewing: the worker lands (keyframe, eye parity, prime) while the UI
              * keeps the still up and stays live -- a new touch cancels it */
             int64_t T = seek_to_us; if (T < 0) T = 0; if (dur_us > 0 && T > dur_us) T = dur_us;
@@ -5783,7 +5804,7 @@ static MoflexResult moflex_play_ring(const char *path) {
             LightEvent_Signal(&s.wake);
             landing = 1; want_seek = 0;
         }
-        if (want_seek && !pv_hold && !scrubbing && !tseek && !(kh & (KEY_LEFT | KEY_RIGHT))) {
+        if (want_seek && !g_submenu && !pv_hold && !scrubbing && !tseek && !(kh & (KEY_LEFT | KEY_RIGHT))) {
             WORKER_LOCK();   /* blocks until the decode thread finishes its current pair (or still) and releases */
             s.pv_mode = 0; pv_hold = 0;    /* stills over: the seek below lands and playback resumes */
             g_seek_busy = 1; g_seek_cut = 0;     /* a slow source may drop this seek if the viewer moves on */

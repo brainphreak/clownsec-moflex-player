@@ -69,6 +69,18 @@ static size_t on_mem(char *p, size_t sz, size_t nm, void *u) {
     memcpy(m->p + m->n, p, k); m->n += k; m->p[m->n] = 0;
     return k;
 }
+/* B cancels a request the screen is waiting on: the app's hook says whether it was pressed. Asked
+ * only on the main thread (threadGetCurrent() == NULL there) -- progress reports from a helper
+ * thread during playback must never read the buttons. */
+static int (*g_bt_abort)(void);
+static int g_bt_cut;
+void bt_set_cancel(int (*fn)(void)) { g_bt_abort = fn; }
+int  bt_cancelled(void) { return g_bt_cut; }
+static int bt_xfer(void *p, curl_off_t a, curl_off_t b, curl_off_t c, curl_off_t d) {
+    (void)p; (void)a; (void)b; (void)c; (void)d;
+    if (g_bt_abort && g_bt_abort()) { g_bt_cut = 1; return 1; }
+    return 0;
+}
 /* GET (post=1: POST) base+path; body in *out. Returns the HTTP status, -1 when unreachable. */
 static long bt_req(const char *base, const char *client, const char *path, char **out, int post, int quick) {
     *out = NULL;
@@ -87,9 +99,20 @@ static long bt_req(const char *base, const char *client, const char *path, char 
     curl_easy_setopt(e, CURLOPT_ACCEPT_ENCODING, "");
     curl_easy_setopt(e, CURLOPT_WRITEFUNCTION, on_mem);
     curl_easy_setopt(e, CURLOPT_WRITEDATA, &m);
+    if (threadGetCurrent() == NULL) {
+        g_bt_cut = 0;
+        if (g_bt_abort) {
+            curl_easy_setopt(e, CURLOPT_NOPROGRESS, 0L);
+            curl_easy_setopt(e, CURLOPT_XFERINFOFUNCTION, bt_xfer);
+        }
+    }
     CURLcode rc = curl_easy_perform(e);
     long code = 0; curl_easy_getinfo(e, CURLINFO_RESPONSE_CODE, &code);
     curl_slist_free_all(hl); curl_easy_cleanup(e);
+    if (rc == CURLE_ABORTED_BY_CALLBACK && g_bt_cut) {
+        snprintf(g_err, sizeof g_err, "Cancelled.");
+        free(m.p); return -1;
+    }
     if (rc != CURLE_OK) {
         snprintf(g_err, sizeof g_err, "Can't reach Big Top at %s (%s).", base, curl_easy_strerror(rc));
         free(m.p); return -1;
