@@ -5387,7 +5387,7 @@ static MoflexResult play_movie(const char *path) {
       if (L > 4 && !strcasecmp(path + L - 4, ".mp4")) r = mp4_play(path);
       else r = moflex_play(path); }
     if (was_scanning) s_dt_pause = 0;   /* resume the walk now that we are back on the menu */
-    if (r == MOFLEX_ERROR) msg_screen("PLAY", "Could not play this file.\nIt does not look like a\nvalid moflex video.");
+    if (r == MOFLEX_ERROR && !moflex_open_cancelled()) msg_screen("PLAY", "Could not play this file.\nIt does not look like a\nvalid moflex video.");
     cia_clear_selection();
     consoleInit(GFX_BOTTOM, NULL);
     gfxSetDoubleBuffering(GFX_BOTTOM, false);
@@ -6826,6 +6826,12 @@ static int recent_pick(char *out, size_t cap) {
  * HTTP (moflex_set_open_hook -> bt_open_media). */
 static void bt_draw_top(int i);
 static const BtItem *s_bt_items = NULL; static int s_bt_n = 0;
+/* B during a Big Top wait (HOME keeps working too) */
+static int bt_b_pressed(void) {
+    if (!aptMainLoop()) return 1;
+    hidScanInput();
+    return (hidKeysDown() & KEY_B) != 0;
+}
 static BtCfg s_bt_cfg;
 
 /* "192.168.1.20" / "192.168.1.20:32500" / "http://..." -> a full base URL */
@@ -6870,7 +6876,7 @@ static void bt_setup(void) {
             char in[96] = "";
             if (!kbd_text("Big Top address, e.g. 192.168.1.20", in, sizeof in)) continue;
             char url[128]; bt_norm_url(in, url, sizeof url);
-            msg_screen_nowait("BIG TOP SERVER", "Connecting...");
+            msg_screen_nowait("BIG TOP SERVER", "Connecting...\n\nB: cancel");
             BtServer info;
             if (!bt_ping(url, &info)) { char m[260]; snprintf(m, sizeof m, "No Big Top at %s\n\n%s", url, bt_error()); msg_screen("BIG TOP SERVER", m); continue; }
             snprintf(c.url, sizeof c.url, "%s", url); snprintf(c.name, sizeof c.name, "%s", info.name);
@@ -6952,12 +6958,13 @@ static MoflexResult bt_stream_play(const BtCfg *c, const BtItem *it, const char 
     static BtPlay p;
     memset(&p, 0, sizeof p);
     p.c = *c; snprintf(p.id, sizeof p.id, "%s", it->id); p.audio = -1; p.burn_sel = -1;
-    msg_screen_nowait(title, "Getting the video's details...");
+    msg_screen_nowait(title, "Getting the video's details...\n\nB: cancel");
     BtItem fresh;
     long long pos_ms = bt_item(c, it->id, &fresh) ? fresh.pos : it->pos;
+    if (bt_cancelled()) return MOFLEX_QUIT_BACK;
     long long dur_ms = it->dur > 0 ? it->dur : (long long)it->runtime * 60000;
     s_bts_dur = dur_ms;
-    if (!bt_tracks(c, it->id, &p.t)) { msg_screen("BIG TOP", bt_error()); return MOFLEX_QUIT_BACK; }
+    if (!bt_tracks(c, it->id, &p.t)) { if (!bt_cancelled()) msg_screen("BIG TOP", bt_error()); return MOFLEX_QUIT_BACK; }
     if (p.t.err[0]) { msg_screen("BIG TOP", p.t.err); return MOFLEX_QUIT_BACK; }
     long long start = 0;
     if (pos_ms > 10000 && (dur_ms <= 0 || pos_ms < dur_ms - 30000)) {
@@ -7030,7 +7037,9 @@ static int bt_play(const BtCfg *c, const BtItem *it, const char *title) {
     static char path[300];
     bt_media_path(c, it, title, path, sizeof path);
     BtItem fresh;                                         /* the list may be minutes old */
+    msg_screen_nowait(title, "Getting the video's details...\n\nB: cancel");
     long long pos_ms = bt_item(c, it->id, &fresh) ? fresh.pos : it->pos;
+    if (bt_cancelled()) return 0;
     if (live) {
         int fmt = 0;                                      /* the frame's shape, the Format row's choice over it */
         if (it->is3d) fmt = !strcmp(it->layout, "fsbs") ? 1 : 2;
@@ -7081,13 +7090,17 @@ static int bt_play(const BtCfg *c, const BtItem *it, const char *title) {
         }
     }
     /* the first seconds are the player reading the start (and end) of the file over Wi-Fi */
-    msg_screen_nowait(title, "Connecting to Big Top...");
+    msg_screen_nowait(title, "Connecting to Big Top...\n\nB: cancel");
     httpfile_reset();
+    moflex_open_cancellable(1);       /* B while the first reads wait gives up (the engine clears it once playing) */
     g_play_to_browser = 1;
     moflex_watched_set(path, 0);      /* the engine sets it again when this playback finishes */
     MoflexResult r = play_movie(path);
+    int open_cut = moflex_open_cancelled();
+    moflex_open_cancellable(0);
     bt_live_disarm();
     moflex_live_fmt_set(-1);
+    if (open_cut) { httpfile_drop_cache(); return 0; }   /* B before the video started: just back */
     if (live && r == MOFLEX_ERROR) {
         msg_screen("BIG TOP", "Big Top couldn't stream this video\nto an Old 3DS.\n\nOld 3DS streaming of MP4/MKV needs\na Big Top with the moflex encoder.");
         return 0;
@@ -7184,9 +7197,10 @@ static int bt_browse(void) {
     path[0][0] = 0;                                       /* level 0: the libraries */
     for (;;) {
         if (!lst[depth]) {
-            msg_screen_nowait(ttl[depth], "Loading...");
+            msg_screen_nowait(ttl[depth], "Loading...\n\nB: cancel");
             BtItem *got = NULL;
             int k = depth == 0 ? bt_libraries(&c, &got) : bt_list(&c, path[depth], &got);
+            if (k < 0 && bt_cancelled()) { free(got); if (depth == 0) BT_DONE(0); BT_UP(); continue; }   /* B: back out */
             if (k < 0) {
                 free(got);
                 if (depth == 0 && prompt2("BIG TOP", bt_error(), "CHANGE SERVER", "BACK") == 0) {
@@ -7598,7 +7612,8 @@ int main(void) {
     gfxInitDefault();
     romfsInit();                /* files shipped inside the app (the store's song) */
     moflex_set_open_hook(bt_open_media);   /* "bigtop:" videos stream from a Big Top server */
-    httpfile_set_wait_hook(moflex_seek_wait_hook);   /* ...and a seek over Wi-Fi can be changed mid-way */
+    httpfile_set_wait_hook(moflex_seek_wait_hook);
+    bt_set_cancel(bt_b_pressed);                       /* B cancels a Big Top request the screen waits on */   /* ...and a seek over Wi-Fi can be changed mid-way */
     ndspInit();
     theme_load();               /* restore the saved theme before anything draws */
 

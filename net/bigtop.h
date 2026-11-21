@@ -50,6 +50,10 @@ typedef struct { char url[128]; char name[64]; char id[24]; char version[24]; } 
 int  bt_discover(BtServer *out, int max, int wait_ms);
 /* Is there a Big Top at url? Fills info. 1 = yes. */
 int  bt_ping(const char *url, BtServer *info);
+/* B cancels a request the screen is waiting on: fn returns 1 when it was pressed (main thread only).
+ * bt_cancelled() says whether the last request on the main thread ended that way. */
+void bt_set_cancel(int (*fn)(void));
+int  bt_cancelled(void);
 
 int  bt_libraries(const BtCfg *c, BtItem **out);                 /* count, or -1 (bt_error) */
 /* path: "/api/libraries/<id>", "/api/shows/<id>" (its seasons), "/api/shows/<id>/seasons/<n>" */
