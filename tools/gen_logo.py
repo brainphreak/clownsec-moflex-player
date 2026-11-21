@@ -45,12 +45,37 @@ FG_D = int(vals[cnt.argmax()])                              # the logo: the comm
 bgm = (disp > 3) & (disp < 16)
 BG_A, BG_B = np.polyfit(np.nonzero(bgm)[1], disp[bgm], 1)    # the background plane
 
-# 2. the logo's mask: matches better at the logo's shift than at the background's
-efg = box5(np.abs(shifted(R, X + FG_D) - L).sum(2))
-ebg = box5(np.abs(shifted(R, X + BG_A * X + BG_B) - L).sum(2))
-lab, n = nd.label(efg + 50 < ebg)
-fg = lab == (np.argmax(nd.sum(lab > 0, lab, range(1, n + 1))) + 1)   # the one big shape
-fg = nd.binary_fill_holes(nd.binary_closing(nd.binary_fill_holes(fg), iterations=2))
+# 2. the logo's mask. At the logo's depth in the banner is the logo AND its dark drop-shadow, with
+#    the circuit traces under it -- carried along with the face, that shadow read as a block of
+#    background cut out with the logo. So: what sits at the logo's depth, narrowed to the logo itself
+#    -- its bright parts, its black outline (3 px), and its black areas (the hat; the shadow is
+#    lighter) -- small gaps filled, stray dots dropped. The shadow stays on the background, behind.
+def box3(e):
+    return sw(np.pad(e, 1, mode='edge'), (3, 3)).sum((2, 3))
+
+
+def drop_small(m, n):
+    lab, k = nd.label(m)
+    return np.isin(lab, 1 + np.nonzero(nd.sum(m, lab, range(1, k + 1)) >= n)[0])
+
+
+def fill_small(m, n):
+    holes = nd.binary_fill_holes(m) & ~m
+    hl, k = nd.label(holes)
+    return m | np.isin(hl, 1 + np.nonzero(nd.sum(holes, hl, range(1, k + 1)) <= n)[0])
+
+
+efg = box3(np.abs(shifted(R, X + FG_D) - L).sum(2))
+ebg = box3(np.abs(shifted(R, X + BG_A * X + BG_B) - L).sum(2))
+depth = nd.binary_dilation(fill_small(drop_small(efg + 30 < ebg, 40), 25), iterations=1)
+lum = L @ [0.299, 0.587, 0.114]
+seed = drop_small(depth & (lum > 60), 6)                     # the logo's bright parts
+fg = nd.binary_dilation(seed, iterations=3) & depth          # + the black outline
+dark = depth & (lum < 12)                                    # + black areas joined to it
+lab, _ = nd.label(dark | fg)
+touch = np.unique(lab[fg])
+fg = np.isin(lab, touch[touch > 0]) & (dark | fg)
+fg = drop_small(fill_small(fg, 60), 150)
 
 # 3. the background plate: the left eye, and behind the logo what the right eye sees there
 plate = L.copy(); have = ~fg
