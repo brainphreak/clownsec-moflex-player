@@ -729,17 +729,28 @@ static void upload_screen(void) {
 
 static char g_dl_name[NAMELEN];
 static u64  g_last_prog;
+/* why dl_progress stopped a transfer: the user (B / CANCEL), or -- when s_dl_slow_kbs is set --
+ * because it ran slower than that for 20 s (the updater then tries its other source) */
+static int s_dl_cancelled, s_dl_too_slow, s_dl_slow_kbs;
+static u64 s_dl_win_t; static u32 s_dl_win_d;
 
 static bool dl_progress(void *u, u32 d, u32 t) {
     (void)u;
     /* main thread only (the background downloader has dlw_progress): keep HOME / sleep / power
      * working while a download runs or waits -- the downloader now calls back during stalls too */
-    if (!aptMainLoop()) return false;
+    if (!aptMainLoop()) { s_dl_cancelled = 1; return false; }
     hidScanInput();
-    if (hidKeysDown() & KEY_B) return false;   /* cancel */
+    if (hidKeysDown() & KEY_B) { s_dl_cancelled = 1; return false; }   /* cancel */
     if (hidKeysHeld() & KEY_TOUCH) { touchPosition tp; hidTouchRead(&tp);   /* tap CANCEL */
-        if (tp.py >= 206 && tp.py < 234 && tp.px >= 110 && tp.px < 210) return false; }
+        if (tp.py >= 206 && tp.py < 234 && tp.px >= 110 && tp.px < 210) { s_dl_cancelled = 1; return false; } }
     u64 now = osGetTime();
+    if (s_dl_slow_kbs) {                                 /* too slow to be worth waiting on? */
+        if (!s_dl_win_t || d < s_dl_win_d) { s_dl_win_t = now; s_dl_win_d = d; }
+        else if (now - s_dl_win_t >= 20000) {
+            if ((d - s_dl_win_d) / 20 < (u32)s_dl_slow_kbs * 1024) { s_dl_too_slow = 1; return false; }
+            s_dl_win_t = now; s_dl_win_d = d;
+        }
+    }
     /* live speed: bytes since the last redraw over the elapsed ms (smoothed a little) */
     static u64 sp_t = 0; static u32 sp_b = 0; static double sp_mbps = 0;
     if (sp_t == 0) { sp_t = now; sp_b = d; }
@@ -4647,18 +4658,31 @@ static int self_update(void) {
      * one MD5 from latest.txt checks either. */
     bool got = false; int md5_bad = 0;
     long http = 0;
+    /* A source crawling below 16 KB/s for 20 s (the whole file would take 7+ minutes) gives way to
+     * the other one; the last source is never cut off for speed. CANCEL stops the update outright
+     * -- it used to just move on to the next source, so it looked like it did nothing. */
+    int cancelled = 0;
     for (int k = 0; k < UPD_SOURCES && !got; k++) {
         int src = (s_upd_src + k) % UPD_SOURCES;
         upd_asset_url(url, sizeof url, hbl ? ".3dsx" : ".cia", src);
         remove(tmp);
         download_discard_partial(url);   /* same URL every release: never resume an older build's bytes */
         g_last_prog = 0;
+        s_dl_cancelled = s_dl_too_slow = 0; s_dl_win_t = 0;
+        s_dl_slow_kbs = k + 1 < UPD_SOURCES ? 16 : 0;
         got = download_to_file(url, tmp, dl_progress, NULL);
+        s_dl_slow_kbs = 0;
+        if (!got && s_dl_cancelled) { cancelled = 1; download_discard_partial(url); break; }
         if (!got) { http = download_last_http(); download_discard_partial(url); continue; }
         upd_screen("CHECKING", "Clownsec Player", -1);
         if (!upd_md5_ok(tmp, s_upd_md5)) { got = false; md5_bad = 1; remove(tmp); }
     }
     dl_wifi_hold(0);
+    if (cancelled) {
+        remove(tmp); sleep_reallow();
+        msg_screen("UPDATE", "Update cancelled.\nNothing was changed.");
+        return 0;
+    }
     if (!got && md5_bad) {
         sleep_reallow();
         msg_screen("UPDATE", "The download was damaged.\nNothing was changed. Try again.");
@@ -7506,9 +7530,31 @@ static void lab_libtest(const char *dir) {
     fclose(o);
     aptSetChainloader(0x000400000F8A4000ULL, MEDIATYPE_SD);
 }
+/* dltest=<url>: the app's own download path (download_to_file) on this console: speed, and the
+ * longest the progress callback (= the screen, B / CANCEL and HOME) went without a turn */
+static u64 s_dlt_last, s_dlt_gap, s_dlt_n; static u32 s_dlt_d;
+static bool lab_dlt_cb(void *u, u32 d, u32 t) {
+    (void)u; (void)t; u64 now = osGetTime();
+    if (s_dlt_last && now - s_dlt_last > s_dlt_gap) s_dlt_gap = now - s_dlt_last;
+    s_dlt_last = now; s_dlt_n++; s_dlt_d = d; return true;
+}
+static void lab_dltest(const char *url) {
+    FILE *o = fopen("sdmc:/lab/last.log", "a");
+    if (!o) return;
+    s_dlt_last = 0; s_dlt_gap = 0; s_dlt_n = 0; s_dlt_d = 0;
+    download_discard_partial(url);
+    u64 t0 = osGetTime();
+    bool ok = download_to_file(url, "sdmc:/lab/dltest.bin", lab_dlt_cb, NULL);
+    u64 ms = osGetTime() - t0;
+    fprintf(o, "DLTEST %s ok=%d http=%ld bytes=%lu in %llu ms (%.1f KB/s) callbacks=%llu maxgap=%llu ms\n",
+            url, ok, download_last_http(), (unsigned long)s_dlt_d, (unsigned long long)ms,
+            ms ? s_dlt_d / 1.024 / ms : 0.0, (unsigned long long)s_dlt_n, (unsigned long long)s_dlt_gap);
+    fclose(o);
+    remove("sdmc:/lab/dltest.bin");
+}
 static void lab_autoplay(void) {
     char prm[1024] = "", file[512] = "sdmc:/lab/office_head.moflex";
-    int start = 0, secs = 60;
+    int start = 0, secs = 60, dlt = 0;
     FILE *p = fopen("sdmc:/lab/params.txt", "r");
     if (p) { size_t n = fread(prm, 1, sizeof prm - 1, p); prm[n] = 0; fclose(p); }
     for (char *l = strtok(prm, "\r\n"); l; l = strtok(NULL, "\r\n")) {
@@ -7519,7 +7565,9 @@ static void lab_autoplay(void) {
         else if (!strncmp(l, "noflush=", 8)) g_lab_noflush = atoi(l + 8);
         else if (!strncmp(l, "noov=", 5)) g_lab_noov = atoi(l + 5);
         else if (!strncmp(l, "libtest=", 8)) { lab_libtest(l + 8); return; }
+        else if (!strncmp(l, "dltest=", 7)) { lab_dltest(l + 7); dlt = 1; }
     }
+    if (dlt) { aptSetChainloader(0x000400000F8A4000ULL, MEDIATYPE_SD); return; }
     if (secs < 5) secs = 5;
     if (secs > 600) secs = 600;
     remove("sdmc:/moflex_player/ring_stats.txt");
