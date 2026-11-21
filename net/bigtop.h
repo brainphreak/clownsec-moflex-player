@@ -28,6 +28,7 @@ typedef struct {
     long long dur;                /* stream: length in ms */
     char layout[8];               /* stream 3D: "hsbs" / "fsbs" */
     char fmt[8];                  /* the file's container: "MOFLEX", "MP4", "MKV", ... */
+    char kind[16];                /* a movie's type: "movie" / "short" / "musicvideo" (shows: type "show") */
 } BtItem;
 
 /* a streamed video's tracks (GET /api/items/<id>) */

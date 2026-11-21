@@ -136,7 +136,7 @@ static void fill(BtItem *it, cJSON *e) {
     memset(it, 0, sizeof *it);
     js(e, "type", it->type, sizeof it->type); js(e, "id", it->id, sizeof it->id);
     js(e, "title", it->title, sizeof it->title); js(e, "genres", it->genres, sizeof it->genres);
-    js(e, "summary", it->summary, sizeof it->summary);
+    js(e, "summary", it->summary, sizeof it->summary); js(e, "kind", it->kind, sizeof it->kind);
     it->year = (int)jn(e, "year"); it->runtime = (int)jn(e, "runtime"); it->is3d = (int)jn(e, "is3d");
     it->poster = (int)jn(e, "poster"); it->season = (int)jn(e, "season"); it->episode = (int)jn(e, "episode");
     it->episodes = (int)jn(e, "episodes"); it->seen = (int)jn(e, "seen"); it->watched = (int)jn(e, "watched");
