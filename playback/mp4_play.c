@@ -974,7 +974,12 @@ static void stream_audio_reset(void) {
 
 static char g_stream_err[300] = "";
 const char *stream_last_error(void) { return g_stream_err; }
-MoflexResult stream_play(const StreamSrc *src) {
+/* restart_at: set (>= 0) when the viewer switched 2D <-> 3D. That stream is another size, and the
+ * hardware decoder and the textures were set up for the first one's -- fed the new one it showed
+ * nothing ("The video decoder produced no picture") until the video was opened again. So the
+ * switch ends this run quietly and stream_play opens the video again from there, at the new size. */
+static MoflexResult stream_play_once(const StreamSrc *src, long long *restart_at) {
+    *restart_at = -1;
     g_stream_err[0] = 0;
     bool isnew = false; APT_CheckNew3DS(&isnew);
     if (!isnew) { mp4_msg("Streaming needs a New 3DS (hardware H.264)."); return MOFLEX_QUIT_BACK; }
@@ -1130,8 +1135,13 @@ MoflexResult stream_play(const StreamSrc *src) {
                 fmt = nf; is3d = (fmt != 0);
                 gfxSet3D(is3d); kit_set_view3d(is3d);
                 kit_fmt_save(src->key, fmt);
-                if (was3d != is3d) { seek_to = cur_us; want_seek = 1; }   /* re-request at the new size */
-                else if (shown_slot >= 0 && !g_playing) SHOW_SLOT(shown_slot);
+                if (was3d != is3d) {      /* another size: start over from here (see restart_at) */
+                    *restart_at = want_seek ? seek_to : cur_us;
+                    if (*restart_at < 0) *restart_at = 0;
+                    plex_log("stream: format changed to %d, reopening at %lld ms", fmt, *restart_at / 1000);
+                    break;
+                }
+                if (shown_slot >= 0 && !g_playing) SHOW_SLOT(shown_slot);
                 dirty = 1;
             } }
         kit_input(&kd, &kh, &dirty);
@@ -1367,6 +1377,7 @@ MoflexResult stream_play(const StreamSrc *src) {
              g_sv.n, g_sa.n, g_pq_n);
     if (vol_dirty) kit_vol_save();
     kit_flush_saves(src->key);
+    if (*restart_at >= 0) goto teardown_early;   /* not stopped: reopening at the new size */
     if (src->report) src->report(src->ctx, "stopped", result == MOFLEX_EOF ? dur_us : cur_us);
     /* a local resume point too, under the stream's key: the home screen's RESUME reads it */
     if (result == MOFLEX_EOF || (dur_us > 0 && cur_us >= dur_us - 10000000)) moflex_resume_clear(src->key);
@@ -1394,4 +1405,14 @@ teardown_early:
      * failed stream crashed the system's graphics service (gsp, invalid handle) */
     if (why[0]) snprintf(g_stream_err, sizeof g_stream_err, "%s\n\nDetails: moflex_player/plex_log.txt", why);
     return result;
+}
+
+MoflexResult stream_play(const StreamSrc *src) {
+    StreamSrc s = *src;
+    for (int n = 0; ; n++) {
+        long long at;
+        MoflexResult r = stream_play_once(&s, &at);
+        if (at < 0 || n >= 8 || !aptMainLoop()) return r;
+        s.start_us = at;                  /* the format is saved; the new run reads it */
+    }
 }

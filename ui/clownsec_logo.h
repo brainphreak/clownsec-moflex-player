@@ -7,7 +7,7 @@
 #define CLOWNSEC_LOGO_W     400
 #define CLOWNSEC_LOGO_H     240
 #define CLOWNSEC_LOGO_BYTES (400 * 240 * 2)   /* one eye, RGB565 */
-#define CLOWNSEC_LOGO_RUNS  310
+#define CLOWNSEC_LOGO_RUNS  396
 /* full depth: right-eye x = x + BG_A * x + BG_B (background), x + FG_D (the logo) */
 #define CLOWNSEC_LOGO_BG_A  0.018244f
 #define CLOWNSEC_LOGO_BG_B  5.9533f
