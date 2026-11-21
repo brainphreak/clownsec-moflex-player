@@ -1827,19 +1827,25 @@ static int g_panel_cheap = 0;   /* Old-3DS: skip the CPU-heavy full-screen gradi
  * once-a-second update can redraw just those strips (panel_update_partial) -- a full redraw takes
  * ~35 ms on Old 3DS, two refreshes, and pushed a film frame late every second. */
 static int panel_title_scrolls(const char *title) { return ui_text_w(1, title) > VOL_X - 12 - 10; }
+/* A long title's scroll position now: 1.5 s still at the start, a steady 30 px/s to the end, 1.5 s
+ * still there, then back to the start. The panel repaints just the title strip whenever this moves
+ * (g_panel_prep) -- it used to ride on the once-a-second clock update, so it jumped 25 px at a time. */
+static int panel_title_off(const char *title) {
+    int tw = ui_text_w(1, title), avail = VOL_X - 12 - 10;
+    if (tw <= avail) return 0;
+    static u64 t0; static const char *last;
+    u64 now = osGetTime();
+    if (last != title) { last = title; t0 = now; }
+    int span = tw - avail + 8;
+    u64 run = (u64)span * 1000 / 30;                  /* ms to scroll the whole span */
+    u64 cyc = 1500 + run + 1500, t = (now - t0) % cyc;
+    if (t < 1500) return 0;
+    if (t >= 1500 + run) return span;
+    return (int)((t - 1500) * 30 / 1000);
+}
 static void panel_title_row(const char *title) {
-    {   /* title: marquee-scroll when it overflows so the episode name is readable */
-        int tw = ui_text_w(1, title), avail = VOL_X - 12 - 10;
-        if (tw <= avail) ui_text(10, 8, 1, UI_NEON, title);
-        else {
-            static u64 t0; static const char *last;
-            if (last != title) { last = title; t0 = osGetTime(); }
-            int span = tw - avail + 24;                       /* extra pause room */
-            int off = (int)(((osGetTime() - t0) / 40) % (span + 60)) - 30;   /* pause, scroll, pause */
-            if (off < 0) off = 0; if (off > span) off = span;
-            ui_text_clipped(10 - off, 8, 1, UI_NEON, title, 10, VOL_X - 12);
-        }
-    }
+    if (!panel_title_scrolls(title)) ui_text(10, 8, 1, UI_NEON, title);
+    else ui_text_clipped(10 - panel_title_off(title), 8, 1, UI_NEON, title, 10, VOL_X - 12);
 }
 static void panel_time_row(int64_t cur, int64_t dur) {
     char tc[16], td[16], line[40];
@@ -2679,7 +2685,8 @@ static void g_panel_prep(const char *title, int64_t cur, int64_t dur, int playin
     if (!ui_tex_init()) return;
     g_panel_age = 0;
     static int64_t l_sec = -1; static int l_bar = -1, l_play = -1, l_vol = -1, l_batt = -2, l_chg = -1, l_zm = -1;
-    static const char *l_title; static int l_lock = -1, l_toast = -1, l_seek = 0;
+    static const char *l_title; static int l_lock = -1, l_toast = -1, l_seek = 0, l_toff = -1;
+    int tscroll = panel_title_scrolls(title), toff = tscroll ? panel_title_off(title) : 0;
     int seek = g_seek_dir * 8 + g_seek_lvl;     /* the arrows' colour / step label */
     int vw = g_zoom * 1000 + (g_conv + CONV_MAX) * 32 + g_ghost + (g_autolvl ? 1 << 20 : 0);   /* any VIEW change repaints */
     int sec = (int)(cur / 1000000);
@@ -2694,7 +2701,7 @@ static void g_panel_prep(const char *title, int64_t cur, int64_t dur, int playin
      * Old 3DS, so every tap on a locked screen dropped frames */
     static u16 toast_under[TOAST_W * TOAST_H];
     int toast_chg = toast != l_toast;
-    if (!full && !toast_chg && sec == l_sec && bar == l_bar && vol == l_vol) return;
+    if (!full && !toast_chg && sec == l_sec && bar == l_bar && vol == l_vol && toff == l_toff) return;
     u64 pt0 = svcGetSystemTick();
     ui_capture(1);
     int wasfull = full || !g_panel_cheap;
@@ -2710,10 +2717,12 @@ static void g_panel_prep(const char *title, int64_t cur, int64_t dur, int playin
     } else {
         /* only the clock/bar moved: redraw those strips (and a scrolling title) and upload their tiles */
         ui_begin(GFX_BOTTOM);
-        ui_fill(8, PT_TIME_Y0, PT_TIME_X1 - 8, 12, UI_BG);   panel_time_row(cur, dur);
-        ui_fill(0, PT_BAR_Y0, UI_W, 20, UI_BG);              panel_bar(cur, dur);   /* y 56-75: the volume label starts at 76 */
-        ui_tex_upload_rect(0, PT_TIME_Y0, PT_TIME_X1, PT_TIME_Y1);
-        ui_tex_upload_rect(0, PT_BAR_Y0, UI_W, PT_BAR_Y1);
+        if (sec != l_sec || bar != l_bar || vol != l_vol || toast_chg) {   /* not for a title step alone */
+            ui_fill(8, PT_TIME_Y0, PT_TIME_X1 - 8, 12, UI_BG);   panel_time_row(cur, dur);
+            ui_fill(0, PT_BAR_Y0, UI_W, 20, UI_BG);              panel_bar(cur, dur);   /* y 56-75: the volume label starts at 76 */
+            ui_tex_upload_rect(0, PT_TIME_Y0, PT_TIME_X1, PT_TIME_Y1);
+            ui_tex_upload_rect(0, PT_BAR_Y0, UI_W, PT_BAR_Y1);
+        }
         if (vol != l_vol) {   /* volume: its label + slider strips */
             ui_fill(PT_VLBL_X0, PT_VLBL_Y0, UI_W - PT_VLBL_X0, PT_VLBL_Y1 - PT_VLBL_Y0, UI_BG);
             ui_fill(PT_VSL_X0, PT_VSL_Y0, UI_W - PT_VSL_X0, PT_VSL_Y1 - PT_VSL_Y0, UI_BG);
@@ -2721,7 +2730,7 @@ static void g_panel_prep(const char *title, int64_t cur, int64_t dur, int playin
             ui_tex_upload_rect(PT_VLBL_X0, 72, UI_W, PT_VLBL_Y1 + 2);
             ui_tex_upload_rect(PT_VSL_X0, PT_VSL_Y0, UI_W, PT_VSL_Y1 + 4);
         }
-        if (panel_title_scrolls(title)) {
+        if (tscroll && toff != l_toff) {
             ui_fill(8, 6, VOL_X - 12 - 8 + 2, 12, UI_BG);   panel_title_row(title);
             ui_tex_upload_rect(0, PT_TITLE_Y0, VOL_X - 8, PT_TITLE_Y1);
         }
@@ -2734,7 +2743,7 @@ static void g_panel_prep(const char *title, int64_t cur, int64_t dur, int playin
         ui_capture(0);   /* as ui_tex_upload does: left on, the app's ui_present() stays a no-op after
                           * playback and its screens never appear (looked like a hang on exit) */
     }
-    g_panel_force = 0; l_sec = sec; l_bar = bar; l_play = playing; l_vol = vol; l_batt = g_batt_pct; l_chg = g_batt_chg; l_zm = vw; l_title = title; l_lock = g_touch_locked; l_toast = g_lock_toast > 0; l_seek = seek;
+    g_panel_force = 0; l_sec = sec; l_bar = bar; l_play = playing; l_vol = vol; l_batt = g_batt_pct; l_chg = g_batt_chg; l_zm = vw; l_title = title; l_lock = g_touch_locked; l_toast = g_lock_toast > 0; l_seek = seek; l_toff = toff;
     { u64 dt = svcGetSystemTick() - pt0; if (dt > g_panel_max) g_panel_max = dt;
       if (wasfull) { g_t_pfull += dt; g_n_pfull++; } else { g_t_pstrip += dt; g_n_pstrip++; } }
     g_sub_redraw = 1;                           /* the shared UI texture no longer holds the menu */
@@ -5090,6 +5099,28 @@ static void embsub_scan(MfxDemux *m) {
     }
 }
 
+/* Rewind to the start of the block timestamped `blk` and say how many video packets to skip from
+ * there to stand right after the `vin`-th video packet of that block. A seek by time can land a block
+ * early (Nintendo muxes round block times) -- the packets of the blocks before it are counted in --
+ * or late, then it starts further back. 0 = couldn't (the reader is left at blk's landing). */
+static int rb_rewind(MfxDemux *m, int64_t blk, int vin, int *skip) {
+    static const int64_t back[3] = { 0, 2000000, 6000000 };
+    for (int a = 0; a < 3; a++) {
+        int64_t from = blk - back[a]; if (from < 0) from = 0;
+        mfx_seek_time(m, from);
+        MfxPacket q; int pre = 0, ok = 0;
+        for (int g = 0; g < 20000; g++) {
+            if (mfx_next_packet(m, &q) != 1) break;
+            if (m->ts == blk) { ok = 1; break; }        /* the block's first packet */
+            if (m->ts > blk) break;                      /* landed past it */
+            if (m->streams[q.stream_index].media_type == MFX_TYPE_VIDEO) pre++;
+        }
+        if (ok) { mfx_seek_time(m, from); *skip = pre + vin; return 1; }   /* the same landing again */
+    }
+    mfx_seek_time(m, blk); *skip = vin;
+    return 0;
+}
+
 static MoflexResult moflex_play_ring(const char *path) {
     vol_load();
     FILE *f = media_fopen(path);
@@ -5663,7 +5694,13 @@ static MoflexResult moflex_play_ring(const char *path) {
             int sdir = (kh & KEY_RIGHT) ? 1 : (kh & KEY_LEFT) ? -1 : tseek;
             int64_t st = seek_hold(&sr, sdir, (kd & (KEY_RIGHT | KEY_LEFT)) || tseek_hold);
             tseek_hold = 0;
-            if (st) { seek_to_us = (want_seek ? seek_to_us : cur_us) + st; want_seek = 1; dirty = 1; }
+            if (st) {
+                seek_to_us = (want_seek ? seek_to_us : cur_us) + st; want_seek = 1; dirty = 1;
+                /* stop at the ends while held: past them the target ran on, and letting go (or turning
+                 * back) had to unwind all of it */
+                if (seek_to_us < 0) seek_to_us = 0;
+                if (dur_us > 3000000 && seek_to_us > dur_us - 3000000) seek_to_us = dur_us - 3000000;
+            }
             if (g_seek_dir * 8 + g_seek_lvl != was) dirty = 1;   /* the arrows' colour changed */
         }
         /* ---- touch-drag the progress bar: while the finger is down, track its X into scrub_us and
@@ -5805,6 +5842,7 @@ static MoflexResult moflex_play_ring(const char *path) {
             landing = 1; want_seek = 0;
         }
         if (want_seek && !g_submenu && !pv_hold && !scrubbing && !tseek && !(kh & (KEY_LEFT | KEY_RIGHT))) {
+            int stay_paused = !playing;      /* paused when the seek began: land, show it, stay paused */
             WORKER_LOCK();   /* blocks until the decode thread finishes its current pair (or still) and releases */
             s.pv_mode = 0; pv_hold = 0;    /* stills over: the seek below lands and playback resumes */
             g_seek_busy = 1; g_seek_cut = 0;     /* a slow source may drop this seek if the viewer moves on */
@@ -5900,11 +5938,16 @@ static MoflexResult moflex_play_ring(const char *path) {
             /* FAST PRIME: decode the landing keyframe pair straight into slot 0 (bounded keyframe scan;
              * else take the next decodable frame) so the picture appears at once and audio resyncs.
              * Eye routing honors s.eye_swap (first frame -> R when the landing starts on a right eye). */
+            /* where the reading stands inside its block: the block's timestamp and the video packets
+             * read in it -- RESUME rewinds there afterwards (see below) so the block's audio isn't lost */
+            int64_t rb_ts = m.ts; int rb_vin = 0; int primed = 0;
+            #define RB_NOTE(isvid) do { if (m.ts != rb_ts) { rb_ts = m.ts; rb_vin = 0; } if (isvid) rb_vin++; } while (0)
             if (!g_seek_cut) {
                 MfxPacket pk; int64_t lts = seek_to_us; int vseen = 0;
                 for (int guard = 0; guard < 4000; guard++) {
                     if ((guard & 15) == 15 && moflex_seek_wait_hook(1)) break;   /* a new press drops this seek */
                     if (mfx_next_packet(&m, &pk) != 1) break;
+                    RB_NOTE(m.streams[pk.stream_index].media_type == MFX_TYPE_VIDEO);
                     if (m.streams[pk.stream_index].media_type != MFX_TYPE_VIDEO) continue;
                     vseen++;
                     /* 3D: a pair may only START at an EVEN offset from the landing -- that keeps the
@@ -5919,6 +5962,7 @@ static MoflexResult moflex_play_ring(const char *path) {
                     if (is3d) {
                         int haveR = 0; MfxPacket pr;
                         for (int g2 = 0; g2 < 8; g2++) { if (mfx_next_packet(&m, &pr) != 1) break;
+                            RB_NOTE(m.streams[pr.stream_index].media_type == MFX_TYPE_VIDEO);
                             if (m.streams[pr.stream_index].media_type == MFX_TYPE_VIDEO) { haveR = 1; vseen++; break; } }
                         int gR = 0;
                         if (!haveR || !(mobi_decode(&ctx, fR, &gR, &(AVPacket){ .data = pr.data, .size = pr.size }) >= 0 && gR)) continue;
@@ -5928,6 +5972,7 @@ static MoflexResult moflex_play_ring(const char *path) {
                         g_y2r_start(fR, tB, W, H); g_y2r_wait(tB);
                     } else { g_y2r_start(fL, &r3_texL[0], W, H); g_y2r_wait(&r3_texL[0]); }
                     rts[0] = 0; bts[0] = lts; ready[0] = 1; s.wr = 1; s.dpair = 1; cur_us = lts; s.cur_us = lts;
+                    primed = 1;
                     if (!resume_exact) { mfx_seek_time(&m, prime_from); s.vskip = vseen;   /* keep the block's audio */
                                          s.a_blk = -1; r3_trim_from = s.tr_active ? -1 : lts; }
                     sd_lts = lts; sd_T = seek_to_us; sd_at = 0; sd_pend = 1; sd_kind = 0;
@@ -5939,6 +5984,7 @@ static MoflexResult moflex_play_ring(const char *path) {
              * repainting the panel's bar as it advances. Capped at 30s of content. */
             if (resume_exact) {
                 resume_exact = 0;
+                int rb_ok = primed;
                 if (s.wr == 1 && cur_us < seek_to_us && seek_to_us - cur_us <= 30000000) {
                     MfxPacket pk2; int64_t cts = cur_us, last_paint = cur_us; int aborted = 0;
                     u64 rf_start = osGetTime();   /* bound resume decode by REAL time: Old-3DS ~25ms/frame,
@@ -5950,6 +5996,7 @@ static MoflexResult moflex_play_ring(const char *path) {
                         for (int e = 0; e < need && !aborted; e++) {
                             for (;;) {
                                 if (mfx_next_packet(&m, &pk2) != 1) { aborted = 1; break; }
+                                RB_NOTE(m.streams[pk2.stream_index].media_type == MFX_TYPE_VIDEO);
                                 if (m.streams[pk2.stream_index].media_type != MFX_TYPE_VIDEO) continue;
                                 AVPacket ap2; ap2.data = pk2.data; ap2.size = pk2.size;
                                 int gotf = 0;
@@ -5976,9 +6023,20 @@ static MoflexResult moflex_play_ring(const char *path) {
                             g_y2r_start(fR, tB, W, H); g_y2r_wait(tB);
                         } else { g_y2r_start(fL, &r3_texL[0], W, H); g_y2r_wait(&r3_texL[0]); }
                         bts[0] = cts; cur_us = cts; s.cur_us = cts;
-                    }
+                    } else rb_ok = 0;
+                }
+                /* RESUME AUDIO: the forward decode read straight on, dropping the audio stored earlier
+                 * in the block it stopped in -- the sound then started with the NEXT block, up to a
+                 * second ahead of the picture, and stayed ahead (reported: "audio a sec ahead after
+                 * Resume, until you go back to the start"). Do what a seek does: back to that block's
+                 * start, the worker skips the video packets already decoded, the block's audio plays,
+                 * trimmed to the picture's time. */
+                if (rb_ok && !g_seek_cut) {
+                    int skip = rb_vin; rb_rewind(&m, rb_ts, rb_vin, &skip); s.vskip = skip;
+                    s.a_blk = -1; r3_trim_from = s.tr_active ? -1 : cur_us;
                 }
             }
+            #undef RB_NOTE
             /* TRAILER AUDIO: re-anchor on the position we ACTUALLY landed on, not the one we asked
              * for. The keyframe landing runs seconds early on sparse-keyframe encodes, 3D parity
              * steps another block back, and resume-exact walks forward again -- in-band audio rides
@@ -6003,6 +6061,13 @@ static MoflexResult moflex_play_ring(const char *path) {
                 WORKER_UNLOCK();
                 cut_kd = g_seek_cut_kd; g_seek_cut_kd = 0;
                 dirty = 1;
+            } else if (stay_paused) {
+                /* seeking while paused keeps it paused: the landing picture shows as a still, the
+                 * sound and the decode thread wait for A like any pause */
+                playing = 0; pause_wall = osGetTime(); s.paused = 1;
+                if (have_audio) ndspChnSetPaused(0, true);
+                WORKER_UNLOCK();
+                want_seek = 0;
             } else {
                 s.paused = 0;
                 WORKER_UNLOCK();   /* resume the decode thread from the new position */
@@ -6161,7 +6226,10 @@ static MoflexResult moflex_play_ring(const char *path) {
                 if (apos < 0) { if (last_shown < 0) show = rd % NB; }             /* pre-roll: show the landing pair */
                 else if (ae + VS_HALF >= rts[rd % NB]) show = rd % NB;
             }
-        } else if (!playing && vl_on) vl_on = 0;   /* paused: re-anchor on resume */
+        } else if (!playing) {
+            if (vl_on) vl_on = 0;                  /* paused: re-anchor on resume */
+            if (last_shown < 0 && (wr - rd) > 0 && ready[rd % NB]) show = rd % NB;   /* a seek landed while paused */
+        }
 
         /* ---- draw: video pair (or held frame) + subtitle overlay + bottom panel, one GPU frame ---- */
         if (pv_wait && show >= 0 && apos >= 0) pv_wait = 0;   /* playing: the real position takes over */

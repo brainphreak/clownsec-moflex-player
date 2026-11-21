@@ -678,7 +678,9 @@ MoflexResult mp4_play(const char *path) {
                 int sdir = (kh & KEY_RIGHT) ? 1 : (kh & KEY_LEFT) ? -1 : tseek;
                 int64_t st = kit_seek_hold(sdir, (kd & (KEY_RIGHT | KEY_LEFT)) || tpress, &dirty);
                 tpress = 0;
-                if (st) { seek_to = (want_seek ? seek_to : cur_us) + st; want_seek = 1; dirty = 1; }
+                if (st) { seek_to = (want_seek ? seek_to : cur_us) + st; want_seek = 1; dirty = 1;
+                          if (seek_to < 0) seek_to = 0;   /* stop at the ends while held */
+                          if (dur_us > 3000000 && seek_to > dur_us - 3000000) seek_to = dur_us - 3000000; }
             }
             if (toggle) { g_playing = !g_playing; dirty = 1; }
             if (scrubbing) {              /* drag previews, release seeks */
@@ -1183,7 +1185,9 @@ static MoflexResult stream_play_once(const StreamSrc *src, long long *restart_at
                 int sdir = (kh & KEY_RIGHT) ? 1 : (kh & KEY_LEFT) ? -1 : tseek;
                 int64_t st = kit_seek_hold(sdir, (kd & (KEY_RIGHT | KEY_LEFT)) || tpress, &dirty);
                 tpress = 0;
-                if (st) { seek_to = (want_seek ? seek_to : cur_us) + st; want_seek = 1; dirty = 1; }
+                if (st) { seek_to = (want_seek ? seek_to : cur_us) + st; want_seek = 1; dirty = 1;
+                          if (seek_to < 0) seek_to = 0;   /* stop at the ends while held */
+                          if (dur_us > 3000000 && seek_to > dur_us - 3000000) seek_to = dur_us - 3000000; }
             }
             if (toggle) { g_playing = !g_playing; dirty = 1; }
             if (scrubbing) {
