@@ -7638,7 +7638,7 @@ static void lab_dltest(const char *url) {
 }
 static void lab_autoplay(void) {
     char prm[1024] = "", file[512] = "sdmc:/lab/office_head.moflex";
-    int start = 0, secs = 60, dlt = 0, plays = 1, btfmt = 2;
+    int start = 0, secs = 60, dlt = 0, plays = 1, btfmt = 2, nocancel = 0;
     char bturl[128] = "", btitem[40] = "";   /* bt= + btitem=: a live Big Top stream instead of a file */
     FILE *p = fopen("sdmc:/lab/params.txt", "r");
     if (p) { size_t n = fread(prm, 1, sizeof prm - 1, p); prm[n] = 0; fclose(p); }
@@ -7650,6 +7650,7 @@ static void lab_autoplay(void) {
         else if (!strncmp(l, "bt=", 3)) snprintf(bturl, sizeof bturl, "%s", l + 3);
         else if (!strncmp(l, "btitem=", 7)) snprintf(btitem, sizeof btitem, "%s", l + 7);
         else if (!strncmp(l, "btfmt=", 6)) btfmt = atoi(l + 6);
+        else if (!strncmp(l, "nocancel=", 9)) nocancel = atoi(l + 9);
         else if (!strncmp(l, "nettest=", 8)) {
             BtNet r; bt_nettest_run(l + 8, &r, 0);
             FILE *o = fopen("sdmc:/lab/last.log", "w");
@@ -7685,15 +7686,16 @@ static void lab_autoplay(void) {
     FILE *o = fopen("sdmc:/lab/last.log", "w");
     for (int k = 0; k < plays; k++) {        /* plays=N: the same video N times in one session */
         remove("sdmc:/moflex_player/ring_stats.txt");
-        if (bturl[0] && btitem[0]) {
+        if (bturl[0] && btitem[0] && btfmt >= 0) {   /* btfmt=-1: a moflex, read as a file */
             bt_live_arm(btitem, btfmt, 0, (long long)start * 1000);
             moflex_live_fmt_set(btfmt);
         }
+        if (bturl[0] && btitem[0]) { httpfile_reset(); if (!nocancel) moflex_open_cancellable(1); }   /* as bt_play does */
         if (start > 0) moflex_resume_save(file, (long long)start * 1000000LL); else moflex_resume_clear(file);
         g_lab_deadline = osGetTime() + (u64)secs * 1000 + 2000;
         u64 t0 = osGetTime();
         int r = (int)moflex_play(file);
-        if (bturl[0] && btitem[0]) { bt_live_disarm(); moflex_live_fmt_set(-1); }
+        if (bturl[0] && btitem[0]) { moflex_open_cancellable(0); bt_live_disarm(); moflex_live_fmt_set(-1); }
         if (o) {
             fprintf(o, "REAL play %d/%d file=%s start=%d secs=%d result=%d wall=%.1fs heap_free=%u linear_free=%u\n", k + 1, plays,
                     file, start, secs, r, (osGetTime() - t0) / 1000.0, (unsigned)(osGetMemRegionFree(MEMREGION_APPLICATION) / 1024),
