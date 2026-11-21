@@ -331,12 +331,18 @@ static int name_has_token(const char *name, const char *tok) {
     }
     return 0;
 }
+/* The same words Big Top reads (internal/library/filename.go NameLayout), so a file is 3D or not
+ * the same way from the SD card and through Big Top. */
 static int fmt_from_name(const char *path) {
     const char *b = strrchr(path, '/'); b = b ? b + 1 : path;
-    static const char *const HALF[] = { "hsbs", "h-sbs", "h.sbs", "h_sbs", "halfsbs", "half-sbs",
+    static const char *const HALF[] = { "hsbs", "h-sbs", "h.sbs", "h_sbs", "h sbs", "halfsbs", "half-sbs",
                                         "half.sbs", "half_sbs", "half sbs" };
+    static const char *const FULL[] = { "fsbs", "f-sbs", "f.sbs", "f_sbs", "f sbs", "fullsbs", "full-sbs",
+                                        "full.sbs", "full_sbs", "full sbs" };
     for (size_t i = 0; i < sizeof HALF / sizeof HALF[0]; i++) if (name_has_token(b, HALF[i])) return 2;
+    for (size_t i = 0; i < sizeof FULL / sizeof FULL[0]; i++) if (name_has_token(b, FULL[i])) return 1;
     if (name_has_token(b, "sbs") || name_has_token(b, "lr")) return 2;   /* a 16:9 SBS frame is half */
+    if (name_has_token(b, "3d")) return 2;                               /* "3D" alone: the common half SBS rip */
     return 0;
 }
 
