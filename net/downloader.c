@@ -333,8 +333,22 @@ static int httpc_fetch(const char *url, DlFile *df, Prog *pr) {
         u32 got_total = 0;
         int ret = HF_OK;
         Result r; s64 stalled = 0;
+        /* How much to ask for per call. httpcReceiveDataTimeout's timeout only fires when NOTHING
+         * arrives: while bytes trickle in it keeps going until the whole buffer is full -- at 1 KB/s a
+         * 64 KB read sat ~1 minute, and for that minute the screen, B / CANCEL and even HOME were dead
+         * (an update on an Old 3DS over weak Wi-Fi looked hung). So ask for about a quarter second's
+         * worth at the speed it is actually going: small reads when slow, full ones when fast. */
+        u32 ask = 4096;
         do {
-            r = httpcReceiveDataTimeout(&c, buf, HF_CHUNK, HF_SLICE_NS);
+            u64 rt0 = osGetTime(); u32 rb0 = got_total;
+            r = httpcReceiveDataTimeout(&c, buf, ask, HF_SLICE_NS);
+            {   u64 ms = osGetTime() - rt0; u32 nb = 0; httpcGetDownloadSizeState(&c, &nb, NULL);
+                u32 bytes = nb - rb0;
+                u64 rate = ms ? (u64)bytes * 1000 / ms : (u64)bytes * 4;   /* bytes/s this call */
+                u64 next = rate / 4;                                       /* ~250 ms' worth */
+                if (next < 2048) next = 2048;
+                if (next > HF_CHUNK) next = HF_CHUNK;
+                ask = (u32)next & ~1023u; }
             int pending = (r == (Result)HTTPC_RESULTCODE_DOWNLOADPENDING);
             if (r == (Result)HTTPC_RESULTCODE_TIMEDOUT) {   /* nothing for a slice: keep the UI alive */
                 u32 now = 0; httpcGetDownloadSizeState(&c, &now, NULL);
