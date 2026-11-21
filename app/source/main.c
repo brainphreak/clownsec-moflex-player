@@ -6842,14 +6842,84 @@ static void bt_norm_url(const char *in, char *out, int cap) {
     snprintf(out, (size_t)cap, strchr(host, ':') ? "http://%s" : "http://%s:32500", host);
 }
 
+/* TEST CONNECTION: 8 MB from Big Top through the same reader a live video uses -- how fast and
+ * how steadily the computer's data reaches this console. A live video keeps about a second of
+ * pictures in hand, so a pause longer than that shows as a stutter however fast the rest is. */
+typedef struct { int ok, cancelled; long http; unsigned long long bytes; u64 connect_ms, ms, maxgap_ms; int gaps500; } BtNet;
+static void bt_nettest_run(const char *base, BtNet *r, int show) {
+    memset(r, 0, sizeof *r);
+    char url[200]; snprintf(url, sizeof url, "%s/api/nettest?kb=8192", base);
+    HttpStream *hs = hs_open_core(url, NULL, 1024 * 1024, 1);
+    if (!hs) return;
+    static uint8_t buf[64 * 1024];
+    u64 t0 = osGetTime(), first = 0, last = 0, shown = 0;
+    while (aptMainLoop()) {
+        size_t n = hs_read(hs, buf, sizeof buf);
+        u64 now = osGetTime();
+        if (n) {
+            if (!first) first = now;
+            else {
+                u64 gap = now - last;
+                if (gap > r->maxgap_ms) r->maxgap_ms = gap;
+                if (gap > 500) r->gaps500++;
+            }
+            last = now; r->bytes += n;
+        }
+        if (hs_done(hs) && !hs_buffered(hs)) break;
+        if (now - t0 > 30000) break;
+        if (show && now - shown > 300) {
+            shown = now;
+            char m[160]; snprintf(m, sizeof m, "Testing the connection to Big Top...\n\n%llu of 8192 KB\n\nB: cancel", r->bytes / 1024);
+            msg_screen_nowait("TEST CONNECTION", m);
+        }
+        hidScanInput();
+        if (show && (hidKeysDown() & KEY_B)) { r->cancelled = 1; break; }
+        if (!n) svcSleepThread(2 * 1000 * 1000);
+    }
+    r->http = hs_http(hs);
+    hs_close(hs);
+    r->connect_ms = first ? first - t0 : 0;
+    r->ms = (first && last > first) ? last - first : 0;
+    r->ok = r->bytes > 256 * 1024 && r->ms > 0;
+}
+static void bt_nettest(const BtCfg *c) {
+    BtNet r; bt_nettest_run(c->url, &r, 1);
+    if (r.cancelled) return;
+    if (!r.ok) {
+        char m[300];
+        snprintf(m, sizeof m, "The test didn't get through.\n\n%s\n\nIs Big Top running, and is it version\n261121 or newer (Settings > Update)?",
+                 r.http >= 400 ? "Big Top answered with an error." : "Big Top sent nothing.");
+        msg_screen("TEST CONNECTION", m);
+        return;
+    }
+    unsigned kbs = (unsigned)(r.bytes / 1024 * 1000 / r.ms);
+    /* what a live Old 3DS stream averages (busy scenes more): 3D ~150-250 KB/s, 2D ~half */
+    const char *v3 = kbs >= 400 ? "plenty of room" : kbs >= 250 ? "enough; very busy scenes may be tight" : "too slow: it will stutter";
+    const char *v2 = kbs >= 200 ? "plenty of room" : kbs >= 125 ? "enough" : "too slow: it will stutter";
+    char steady[160];
+    if (r.maxgap_ms >= 1000)
+        snprintf(steady, sizeof steady, "Pauses: up to %.1f s (%d over half a second).\nPauses over a second stutter, whatever\nthe speed: move closer to the router.",
+                 r.maxgap_ms / 1000.0, r.gaps500);
+    else if (r.maxgap_ms >= 500)
+        snprintf(steady, sizeof steady, "Pauses: up to %.1f s -- close to the limit.", r.maxgap_ms / 1000.0);
+    else
+        snprintf(steady, sizeof steady, "Steady: no pause over half a second.");
+    char m[600];
+    snprintf(m, sizeof m, "%s\n\nSpeed: %u KB/s\n%s\n\n3D video: %s\n2D video: %s", c->name[0] ? c->name : c->url, kbs, steady, v3, v2);
+    msg_screen("TEST CONNECTION", m);
+}
+
 static void bt_setup(void) {
     for (;;) {
         BtCfg c; int have = bt_cfg_load(&c);
         char sub[120];
         snprintf(sub, sizeof sub, "%s", have ? (c.name[0] ? c.name : c.url) : "No server chosen yet");
-        const char *rows[4] = { "FIND SERVERS ON THIS WI-FI", "ENTER ADDRESS", have ? "FORGET THIS SERVER" : "DONE", "DONE" };
-        int k = ui_menu("BIG TOP SERVER", sub, rows, have ? 4 : 3);
-        if (k < 0 || (!have && k == 2) || k == 3) return;
+        const char *rows[5] = { "FIND SERVERS ON THIS WI-FI", "ENTER ADDRESS", "TEST CONNECTION", "FORGET THIS SERVER", "DONE" };
+        const char *rows0[3] = { "FIND SERVERS ON THIS WI-FI", "ENTER ADDRESS", "DONE" };
+        int k = have ? ui_menu("BIG TOP SERVER", sub, rows, 5) : ui_menu("BIG TOP SERVER", sub, rows0, 3);
+        if (k < 0 || (!have && k == 2) || (have && k == 4)) return;
+        if (have && k == 2) { bt_nettest(&c); continue; }
+        if (have && k == 3) k = 2;                 /* FORGET, below */
         if (k == 0) {
             msg_screen_nowait("BIG TOP SERVER", "Looking for Big Top on this Wi-Fi...");
             BtServer sv[8]; int n = bt_discover(sv, 8, 2500);
@@ -7568,13 +7638,29 @@ static void lab_dltest(const char *url) {
 }
 static void lab_autoplay(void) {
     char prm[1024] = "", file[512] = "sdmc:/lab/office_head.moflex";
-    int start = 0, secs = 60, dlt = 0;
+    int start = 0, secs = 60, dlt = 0, plays = 1, btfmt = 2;
+    char bturl[128] = "", btitem[40] = "";   /* bt= + btitem=: a live Big Top stream instead of a file */
     FILE *p = fopen("sdmc:/lab/params.txt", "r");
     if (p) { size_t n = fread(prm, 1, sizeof prm - 1, p); prm[n] = 0; fclose(p); }
     for (char *l = strtok(prm, "\r\n"); l; l = strtok(NULL, "\r\n")) {
         if (!strncmp(l, "file=", 5)) snprintf(file, sizeof file, "%s", l + 5);
         else if (!strncmp(l, "start=", 6)) start = atoi(l + 6);
         else if (!strncmp(l, "secs=", 5)) secs = atoi(l + 5);
+        else if (!strncmp(l, "plays=", 6)) plays = atoi(l + 6);
+        else if (!strncmp(l, "bt=", 3)) snprintf(bturl, sizeof bturl, "%s", l + 3);
+        else if (!strncmp(l, "btitem=", 7)) snprintf(btitem, sizeof btitem, "%s", l + 7);
+        else if (!strncmp(l, "btfmt=", 6)) btfmt = atoi(l + 6);
+        else if (!strncmp(l, "nettest=", 8)) {
+            BtNet r; bt_nettest_run(l + 8, &r, 0);
+            FILE *o = fopen("sdmc:/lab/last.log", "w");
+            if (o) {
+                fprintf(o, "NETTEST %s ok=%d http=%ld bytes=%llu connect=%llu ms transfer=%llu ms speed=%llu KB/s maxgap=%llu ms gaps>500ms=%d\n",
+                        l + 8, r.ok, r.http, r.bytes, r.connect_ms, r.ms, r.ms ? r.bytes / 1024 * 1000 / r.ms : 0ULL, r.maxgap_ms, r.gaps500);
+                fclose(o);
+            }
+            aptSetChainloader(0x000400000F8A4000ULL, MEDIATYPE_SD);
+            return;
+        }
         else if (!strncmp(l, "noq=", 4)) g_lab_noq = atoi(l + 4);
         else if (!strncmp(l, "noflush=", 8)) g_lab_noflush = atoi(l + 8);
         else if (!strncmp(l, "noov=", 5)) g_lab_noov = atoi(l + 5);
@@ -7584,19 +7670,42 @@ static void lab_autoplay(void) {
     if (dlt) { aptSetChainloader(0x000400000F8A4000ULL, MEDIATYPE_SD); return; }
     if (secs < 5) secs = 5;
     if (secs > 600) secs = 600;
-    remove("sdmc:/moflex_player/ring_stats.txt");
-    if (start > 0) moflex_resume_save(file, (long long)start * 1000000LL); else moflex_resume_clear(file);
-    g_lab_deadline = osGetTime() + (u64)secs * 1000 + 2000;
-    u64 t0 = osGetTime();
-    int r = (int)moflex_play(file);
-    FILE *o = fopen("sdmc:/lab/last.log", "w");
-    if (o) {
-        fprintf(o, "REAL file=%s start=%d secs=%d result=%d wall=%.1fs\n", file, start, secs, r, (osGetTime() - t0) / 1000.0);
-        FILE *rs = fopen("sdmc:/moflex_player/ring_stats.txt", "r");
-        if (rs) { char ln[4096]; while (fgets(ln, sizeof ln, rs)) fputs(ln, o); fclose(rs); }
-        else fputs("(no ring_stats)\n", o);
-        fclose(o);
+    if (plays < 1) plays = 1;
+    if (plays > 5) plays = 5;
+    BtCfg btc;
+    if (bturl[0] && btitem[0]) {             /* as bt_play does it: the path, and the live encoder armed */
+        memset(&btc, 0, sizeof btc);
+        snprintf(btc.url, sizeof btc.url, "%s", bturl);
+        snprintf(btc.id, sizeof btc.id, "lab");
+        snprintf(btc.client, sizeof btc.client, "lab3ds");
+        BtItem it; memset(&it, 0, sizeof it);
+        snprintf(it.id, sizeof it.id, "%s", btitem);
+        bt_media_path(&btc, &it, "labtest", file, sizeof file);
     }
+    FILE *o = fopen("sdmc:/lab/last.log", "w");
+    for (int k = 0; k < plays; k++) {        /* plays=N: the same video N times in one session */
+        remove("sdmc:/moflex_player/ring_stats.txt");
+        if (bturl[0] && btitem[0]) {
+            bt_live_arm(btitem, btfmt, 0, (long long)start * 1000);
+            moflex_live_fmt_set(btfmt);
+        }
+        if (start > 0) moflex_resume_save(file, (long long)start * 1000000LL); else moflex_resume_clear(file);
+        g_lab_deadline = osGetTime() + (u64)secs * 1000 + 2000;
+        u64 t0 = osGetTime();
+        int r = (int)moflex_play(file);
+        if (bturl[0] && btitem[0]) { bt_live_disarm(); moflex_live_fmt_set(-1); }
+        if (o) {
+            fprintf(o, "REAL play %d/%d file=%s start=%d secs=%d result=%d wall=%.1fs heap_free=%u linear_free=%u\n", k + 1, plays,
+                    file, start, secs, r, (osGetTime() - t0) / 1000.0, (unsigned)(osGetMemRegionFree(MEMREGION_APPLICATION) / 1024),
+                    (unsigned)(linearSpaceFree() / 1024));
+            FILE *rs = fopen("sdmc:/moflex_player/ring_stats.txt", "r");
+            if (rs) { char ln[4096]; while (fgets(ln, sizeof ln, rs)) fputs(ln, o); fclose(rs); }
+            else fputs("(no ring_stats)\n", o);
+            fflush(o);
+        }
+        if (!aptMainLoop()) break;
+    }
+    if (o) fclose(o);
     moflex_resume_clear(file);
     aptSetChainloader(0x000400000F8A4000ULL, MEDIATYPE_SD);   /* back to the lab host */
 }
