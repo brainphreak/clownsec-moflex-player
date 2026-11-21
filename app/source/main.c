@@ -7248,6 +7248,83 @@ static void bt_draw_top(int i) {
 }
 
 /* OPEN VIDEO -> BIG TOP: libraries -> movies and shows -> seasons -> episodes. 1 = exit app. */
+/* ---- a Big Top library: CATEGORY -> VIEW ALL / PICK A GENRE -> GENRE, as the card's library ---- */
+static const char *const k_bt_cat[4] = { "Movies", "TV Shows", "Shorts", "Music Videos" };
+static int bt_cat_of(const BtItem *e) {
+    if (!strcmp(e->type, "show")) return 1;
+    if (!strcmp(e->kind, "short")) return 2;
+    if (!strcmp(e->kind, "musicvideo")) return 3;
+    return 0;
+}
+/* the distinct genres of category cat (-1 = all), sorted; returns how many */
+static int bt_genres(const BtItem *it, int n, int cat, char (*out)[32], int cap) {
+    int ng = 0;
+    for (int i = 0; i < n; i++) {
+        if (cat >= 0 && bt_cat_of(&it[i]) != cat) continue;
+        char g[96]; snprintf(g, sizeof g, "%s", it[i].genres);
+        char *save = NULL;
+        for (char *t = strtok_r(g, ",", &save); t; t = strtok_r(NULL, ",", &save)) {
+            while (*t == ' ') t++;
+            size_t L = strlen(t); while (L && t[L - 1] == ' ') t[--L] = 0;
+            if (!L || !strcasecmp(t, "Moflex")) continue;   /* a format, not a genre */
+            int dup = 0; for (int k = 0; k < ng; k++) if (!strcasecmp(out[k], t)) { dup = 1; break; }
+            if (!dup && ng < cap) snprintf(out[ng++], 32, "%s", t);
+        }
+    }
+    qsort(out, ng, 32, strrow_cmp);
+    return ng;
+}
+/* The filter for a library's titles. start: 0 = the categories, 1 = cat's genre list, 2 = cat's
+ * VIEW ALL / PICK A GENRE (where B from a list of titles comes back to). Returns 1 with *cat
+ * (-1 = everything) and gen ("" = all genres), 0 = B out of the library. */
+static int bt_filter_pick(const char *lib, const BtItem *it, int n, int *cat, char *gen, int gencap, int start) {
+    int cnt[4] = { 0 };
+    for (int i = 0; i < n; i++) cnt[bt_cat_of(&it[i])]++;
+    int idx[4], nc = 0;
+    for (int c = 0; c < 4; c++) if (cnt[c]) idx[nc++] = c;
+    static char gens[64][32];
+    if (start != 0 && *cat < 0) start = 0;
+    for (;;) {
+        if (start == 0) {
+            if (nc <= 1 && bt_genres(it, n, -1, gens, 64) == 0) { *cat = -1; gen[0] = 0; return 1; }   /* nothing to choose */
+            static char cdisp[4][64];
+            for (int k = 0; k < nc; k++) snprintf(cdisp[k], 64, "%s (%d)", k_bt_cat[idx[k]], cnt[idx[k]]);
+            char sub[32]; snprintf(sub, sizeof sub, "%d titles", n);
+            s_pick_init = 0; for (int k = 0; k < nc; k++) if (idx[k] == *cat) s_pick_init = k;
+            gfxSet3D(false);
+            int k = catalog_pick(lib, sub, cdisp, nc, 1, NULL);
+            if (k == -1) return 0;                                   /* B: out of the library */
+            if (k == -2) { *cat = -1; gen[0] = 0; return 1; }        /* Show All */
+            if (k < 0 || k >= nc) continue;
+            *cat = idx[k]; gen[0] = 0;
+            start = 2;
+        }
+        int ng = bt_genres(it, n, *cat, gens, 64);
+        if (ng == 0) { gen[0] = 0; return 1; }                        /* no genres: its titles */
+        if (start == 2) {
+            const char *mi[2] = { "VIEW ALL", "PICK A GENRE" };
+            int mm = ui_menu(k_bt_cat[*cat], NULL, mi, 2);
+            if (mm < 0) { start = 0; continue; }                     /* B: the categories */
+            if (mm == 0) { gen[0] = 0; return 1; }
+            start = 1;
+        }
+        static char gdisp[64][64];
+        int pre = 0;
+        for (int k = 0; k < ng; k++) {
+            int c = 0;
+            for (int i = 0; i < n; i++) if (bt_cat_of(&it[i]) == *cat && genre_match(it[i].genres, gens[k])) c++;
+            snprintf(gdisp[k], 64, "%.48s (%d)", gens[k], c);
+            if (!strcasecmp(gens[k], gen)) pre = k;
+        }
+        s_pick_init = pre;
+        gfxSet3D(false);
+        int g = catalog_pick("GENRE", k_bt_cat[*cat], gdisp, ng, 0, NULL);
+        if (g < 0 || g >= ng) { start = 2; continue; }               /* B: VIEW ALL / PICK A GENRE */
+        snprintf(gen, (size_t)gencap, "%s", gens[g]);
+        return 1;
+    }
+}
+
 static int bt_browse(void) {
     BtCfg c;
     if (!bt_cfg_load(&c)) {
@@ -7261,6 +7338,11 @@ static int bt_browse(void) {
     int depth = 0, presel[6] = { 0 };
     BtItem *lst[6] = { 0 }; int lstn[6] = { 0 };
     for (int d = 0; d < 6; d++) filt[d][0] = 0;
+    /* a library's level: its category / genre filter, and whether it was picked yet (0 = pick, from
+     * fstart: 0 categories, 1 genres, 2 view all / pick a genre) */
+    int fcat[6], fset[6] = { 0 }, fstart[6] = { 0 }; static char fgen[6][32];
+    for (int d = 0; d < 6; d++) { fcat[d] = -1; fgen[d][0] = 0; }
+    #define BT_IS_LIB(d) (!strncmp(path[d], "/api/libraries/", 15))
     #define BT_DONE(rv) do { for (int d_ = 0; d_ < 6; d_++) free(lst[d_]); return (rv); } while (0)
     #define BT_UP() do { free(lst[depth]); lst[depth] = NULL; if (depth == 0) BT_DONE(0); depth--; } while (0)
     snprintf(ttl[0], sizeof ttl[0], "%s", c.name[0] ? c.name : "BIG TOP");
@@ -7291,12 +7373,21 @@ static int bt_browse(void) {
             lst[depth] = got; lstn[depth] = k;
         }
         BtItem *it = lst[depth]; int n = lstn[depth];
+        if (BT_IS_LIB(depth) && !fset[depth]) {
+            if (!bt_filter_pick(ttl[depth], it, n, &fcat[depth], fgen[depth], sizeof fgen[depth], fstart[depth])) {
+                fstart[depth] = 0; BT_UP(); continue;
+            }
+            fset[depth] = 1; presel[depth] = -1;
+        }
+        int lib_f = BT_IS_LIB(depth) && fset[depth] && (fcat[depth] >= 0 || fgen[depth][0]);
         char (*names)[64] = (char (*)[64])malloc((size_t)n * 64);
         int *map = (int *)malloc((size_t)n * sizeof(int));
         if (!names || !map) { free(names); free(map); BT_DONE(0); }
         int shown = 0;
         for (int i = 0; i < n; i++) {
             if (filt[depth][0] && !ci_contains(it[i].title, filt[depth])) continue;
+            if (lib_f && fcat[depth] >= 0 && bt_cat_of(&it[i]) != fcat[depth]) continue;
+            if (lib_f && fgen[depth][0] && !genre_match(it[i].genres, fgen[depth])) continue;
             map[shown] = i; bt_row(&it[i], names[shown]); shown++;
         }
         if (filt[depth][0] && shown == 0) {
@@ -7308,6 +7399,8 @@ static int bt_browse(void) {
         for (int r = 0; r < shown; r++) if (map[r] == presel[depth]) { s_pick_init = r; break; }
         char sub[80] = "";
         if (filt[depth][0]) snprintf(sub, sizeof sub, "Search: %s  (B clears)", filt[depth]);
+        else if (lib_f) snprintf(sub, sizeof sub, "%s%s%s", fcat[depth] >= 0 ? k_bt_cat[fcat[depth]] : "All",
+                                 fgen[depth][0] ? " - " : "", fgen[depth]);
         BtItem *view = it;
         if (filt[depth][0]) {
             view = (BtItem *)malloc((size_t)shown * sizeof(BtItem));
@@ -7331,6 +7424,11 @@ static int bt_browse(void) {
         if (sel < 0 || sel >= shown) {
             free(map);
             if (filt[depth][0]) { filt[depth][0] = 0; continue; }
+            if (BT_IS_LIB(depth) && fset[depth]) {               /* B: back to the genre / category it came from */
+                fset[depth] = 0;
+                fstart[depth] = fgen[depth][0] ? 1 : fcat[depth] >= 0 ? 2 : 0;
+                continue;
+            }
             BT_UP(); continue;
         }
         sel = map[sel]; free(map);
@@ -7345,6 +7443,7 @@ static int bt_browse(void) {
             free(lst[depth]); lst[depth] = NULL;                   /* reload: watched marks, resume points */
         } else if (depth < 5) {
             depth++; presel[depth] = 0; filt[depth][0] = 0;
+            fset[depth] = 0; fstart[depth] = 0; fcat[depth] = -1; fgen[depth][0] = 0;
             free(lst[depth]); lst[depth] = NULL;
             if (!strcmp(pick.type, "lib")) snprintf(path[depth], sizeof path[depth], "/api/libraries/%s", pick.id);
             else if (!strcmp(pick.type, "show")) snprintf(path[depth], sizeof path[depth], "/api/shows/%s", pick.id);
@@ -7366,6 +7465,7 @@ static int bt_browse(void) {
         }
     }
     #undef BT_UP
+    #undef BT_IS_LIB
     #undef BT_DONE
 }
 
