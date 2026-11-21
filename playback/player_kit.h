@@ -56,6 +56,8 @@ int  kit_take_redraw(void);
 /* One frame of the ring's pre-input rules: lid watchdog, L+R lock, dark-screen wake, lock toast,
  * backlight reconcile. May clear *kd / *kh; sets *dirty when the screen needs a repaint. */
 void kit_input(u32 *kd, u32 *kh, int *dirty);
+/* After kit_input: paused and left alone for the Settings time, both screens go off (a press wakes them). */
+void kit_idle(int playing, u32 kd, u32 kh, int *dirty);
 
 /* The CC / AUDIO / VIDEO menus. While one is open it owns input (the film plays on). */
 int  kit_menu_open(void);
@@ -80,6 +82,11 @@ typedef enum {
 } KitTouch;
 KitTouch kit_touch(int px, int py, int is3d);
 int64_t  kit_scrub_us(int px, int64_t dur_us);   /* bar x -> time */
+/* Rewind / fast-forward held (d-pad or the touch arrows): the jump to add now, in us (0 = none) --
+ * a tap 10 s, held it repeats and grows to 30 s, 1 min, 2 min, the panel's arrows showing which.
+ * dir = direction held now (0 = none), pressed = it went down this frame; sets *dirty when the
+ * arrows change colour. */
+int64_t  kit_seek_hold(int dir, int pressed, int *dirty);
 int      kit_vol_drag(int py);                   /* slider y -> volume; 1 when it changed */
 void     kit_vol_step(int dir);                  /* Up / Down */
 void     kit_vol_save(void);

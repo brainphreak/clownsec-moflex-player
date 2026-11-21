@@ -41,6 +41,8 @@ long long moflex_resume_at(const char *path, long long off);
 
 /* Forget the saved position (used by the "start from beginning" choice). */
 void moflex_resume_clear(const char *path);
+/* Settings > Screens off after: paused playback left alone this long turns both screens off (0 = never). */
+void moflex_set_idle_off_ms(unsigned ms);
 
 /* ---- shared with the MP4 player: one resume/volume/subtitle system across both formats ---- */
 void  moflex_resume_save(const char *path, long long us);

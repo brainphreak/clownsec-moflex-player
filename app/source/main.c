@@ -44,7 +44,31 @@
  * Playback never runs these loops (it manages its own screens in moflex_playback.c). gsp::Lcd
  * is held only for the instant of the toggle -- holding it across a HOME suspend locks the GSP.
  * Cost: one osGetTime + a few compares per frame; nothing on the hot paths. */
-#define IDLE_OFF_MS (5 * 60 * 1000)
+/* Settings > SCREENS OFF AFTER: the time, one of these (0 = never). Paused playback uses it too. */
+static const unsigned k_idle_secs[] = { 15, 30, 60, 120, 300, 600, 0 };
+#define IDLE_N   ((int)(sizeof k_idle_secs / sizeof k_idle_secs[0]))
+#define IDLE_DEF 4                                   /* 5 minutes */
+#define IDLE_CFG "sdmc:/moflex_player/screens_off.txt"
+static int s_idle_sel = -1;
+static unsigned idle_off_ms(void) { return k_idle_secs[s_idle_sel < 0 ? IDLE_DEF : s_idle_sel] * 1000u; }
+static const char *idle_name(int i) {
+    static const char *const n[] = { "15 SEC", "30 SEC", "1 MIN", "2 MIN", "5 MIN", "10 MIN", "NEVER" };
+    return n[i];
+}
+static void idle_cfg_load(void) {
+    s_idle_sel = IDLE_DEF;
+    FILE *f = fopen(IDLE_CFG, "r");
+    if (f) { int v = -1; if (fscanf(f, "%d", &v) == 1 && v >= 0 && v < IDLE_N) s_idle_sel = v; fclose(f); }
+    moflex_set_idle_off_ms(idle_off_ms());
+}
+static void idle_cfg_set(int i) {
+    s_idle_sel = i;
+    mkdir("sdmc:/moflex_player", 0777);
+    FILE *f = fopen(IDLE_CFG, "w");
+    if (f) { fprintf(f, "%d\n", i); fclose(f); }
+    moflex_set_idle_off_ms(idle_off_ms());
+}
+#define IDLE_OFF_MS idle_off_ms()
 static u64 s_idle_last, s_idle_prevscan;
 static int s_idle_off, s_idle_swallow, s_idle_hooked;
 static aptHookCookie s_idle_cookie;
@@ -95,8 +119,9 @@ static void sleep_reallow(void) {
 #define IDLE_ANALOG (KEY_CPAD_UP | KEY_CPAD_DOWN | KEY_CPAD_LEFT | KEY_CPAD_RIGHT | \
                      KEY_CSTICK_UP | KEY_CSTICK_DOWN | KEY_CSTICK_LEFT | KEY_CSTICK_RIGHT)
 static void idle_scan(void) {
-    if (!s_idle_hooked) { aptHook(&s_idle_cookie, idle_apt_hook, NULL); s_idle_hooked = 1; }
+    if (!s_idle_hooked) { aptHook(&s_idle_cookie, idle_apt_hook, NULL); s_idle_hooked = 1; idle_cfg_load(); }
     hidScanInput();
+    branding_tick();                                 /* the 3D logo's depth follows the slider */
     u64 now = osGetTime();
     if (now - s_idle_prevscan > 2000) s_idle_last = now;   /* back from playback/extract/applet */
     s_idle_prevscan = now;
@@ -139,10 +164,10 @@ static void idle_scan(void) {
      * legitimate while the timer is expired and the lid isn't closed. Any timer reset (edge,
      * major stick move, watchdog, APT hook, queue event) relights here, and a failed attempt
      * (transient gsp::Lcd refusal) retries every frame until it lands. */
-    if (s_idle_off && s_shell_closed != 1 && now - s_idle_last < IDLE_OFF_MS) idle_backlight(1);
+    if (s_idle_off && s_shell_closed != 1 && (!IDLE_OFF_MS || now - s_idle_last < IDLE_OFF_MS)) idle_backlight(1);
     if (s_idle_swallow && !((hidKeysHeld() | hidKeysDown()) & ~IDLE_ANALOG))
         s_idle_swallow = 0;                                         /* real keys released -> live */
-    if (!s_idle_off && now - s_idle_last >= IDLE_OFF_MS) idle_backlight(0);
+    if (!s_idle_off && IDLE_OFF_MS && now - s_idle_last >= IDLE_OFF_MS) idle_backlight(0);
 }
 static u32 idle_kdown(void) { return s_idle_swallow ? 0 : hidKeysDown(); }
 static u32 idle_kheld(void) { return s_idle_swallow ? 0 : hidKeysHeld(); }
@@ -572,6 +597,7 @@ static int prompt2(const char *title, const char *body, const char *lbl0, const 
  * Returns 1 = resume, 0 = start over, -1 = back to the previous screen. */
 static int resume_prompt(const char *name, long long rp_us) {
     int redraw = 1, tdown = 0, tx0 = 0, ty0 = 0, sel = 0;   /* 0 = RESUME, 1 = START OVER */
+    branding_show();   /* the browser's top info panel is 2D: put the 3D logo up, the name is on this screen */
     int bw = 116, bh = 36, by = 158, resx = 30, begx = UI_W - 30 - bw;
     int s = (int)(rp_us / 1000000);
     char tbuf[16];
@@ -3724,8 +3750,11 @@ static void download_screen(void) {
 
 /* Reusable neon menu page: title (+ optional subtitle) + vertical touch buttons.
  * Returns the chosen index, or -1 on B/cancel. Draws the bottom screen only. */
+static int s_menu_start;   /* the row ui_menu opens on (once; back to 0 after) -- a menu re-opened
+                            * after a row that cycles a value stays on that row */
 static int ui_menu(const char *title, const char *subtitle, const char *const *items, int n) {
-    int sel = 0, redraw = 1, tdown = 0, tx0 = 0, ty0 = 0, tmoved = 0;
+    int sel = s_menu_start > 0 && s_menu_start < n ? s_menu_start : 0, redraw = 1, tdown = 0, tx0 = 0, ty0 = 0, tmoved = 0;
+    s_menu_start = 0;
     int bx = 24, bw = UI_W - 48, y0 = subtitle ? 74 : 62;
     /* adaptive pitch: every item must fit on screen (6+ items overflowed the fixed 40px rows) */
     int avail = 234 - y0;
@@ -6530,8 +6559,10 @@ static void bt_setup(void);   /* the Big Top server screen (defined with BIG TOP
 /* X on home: everything that is a setting rather than a video */
 static void settings_menu(void) {
     for (;;) {
-        char r1[40]; const char *rows[6]; int act[6], n = 0;
+        char r1[40], r2[40]; const char *rows[7]; int act[7], n = 0;
         rows[n] = "PLAYBACK DEFAULTS"; act[n++] = 0;
+        if (s_idle_sel < 0) idle_cfg_load();
+        snprintf(r2, sizeof r2, "SCREENS OFF AFTER: %s", idle_name(s_idle_sel)); rows[n] = r2; act[n++] = 4;
         {   bool isnew = false; APT_CheckNew3DS(&isnew);   /* Plex needs a New 3DS (H.264) */
             if (isnew) { rows[n] = "PLEX SERVER"; act[n++] = 2; } }
         rows[n] = "BIG TOP SERVER"; act[n++] = 3;
@@ -6542,6 +6573,7 @@ static void settings_menu(void) {
         if (act[c] == 0) playback_defaults_screen();
         else if (act[c] == 2) plex_setup();
         else if (act[c] == 3) bt_setup();
+        else if (act[c] == 4) { idle_cfg_set((s_idle_sel + 1) % IDLE_N); s_menu_start = c; }   /* each press: the next time */
         else extplay_choose();
     }
 }
@@ -6641,13 +6673,14 @@ static void whatsnew_maybe_show(void) {
         total += plines[i] + (i + 1 < np ? 1 : 0);   /* a blank line between paragraphs */
     }
     int scroll = 0, maxscroll = total > WN_LINES ? total - WN_LINES : 0;
-    int redraw = 1, tdown = 0, tx0 = 0, ty0 = 0;
+    int redraw = 1, tdown = 0, tx0 = 0, ty0 = 0, hd = 0, hu = 0;
     while (aptMainLoop()) {
         hidScanInput();
         u32 k = hidKeysDown(), ku = hidKeysUp();
         if (k & (KEY_A | KEY_B)) break;
-        if ((k & KEY_DOWN) && scroll < maxscroll) { scroll++; redraw = 1; }
-        if ((k & KEY_UP) && scroll > 0) { scroll--; redraw = 1; }
+        u32 kh = hidKeysHeld();   /* hold to scroll, as the file lists */
+        if (nav_repeat(k, kh, NAV_DOWN, &hd) && scroll < maxscroll) { scroll++; redraw = 1; }
+        if (nav_repeat(k, kh, NAV_UP, &hu) && scroll > 0) { scroll--; redraw = 1; }
         touchPosition tp; hidTouchRead(&tp);
         if (k & KEY_TOUCH) { tdown = 1; tx0 = tp.px; ty0 = tp.py; }
         else if ((ku & KEY_TOUCH) && tdown) { tdown = 0; if (ty0 >= 206 && ty0 < 234 && tx0 >= 110 && tx0 < 210) break; }
