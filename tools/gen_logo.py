@@ -1,38 +1,135 @@
 #!/usr/bin/env python3
-"""Convert an 800x240 parallel stereo PNG into the top-screen RGB565 rotated
-framebuffer layout and emit app/source/clownsec_logo.c.
-Usage: python3 tools/gen_logo.py <banner.png>"""
+"""Convert an 800x240 parallel stereo PNG into the top screen's 3D logo: app/source/clownsec_logo.c.
+
+The banner has two depths: the logo in front (the same shift everywhere) and the circuit
+background behind it, on a tilted plane (its shift grows across the screen). Instead of a baked
+right eye this emits the two layers, so the player can rebuild the right eye at whatever depth the
+3D slider asks for (ui/branding.c):
+  clownsec_logo_left   the left eye as it is (RGB565, the top screen's rotated layout)
+  clownsec_logo_plate  the background alone, the logo's hidden part filled in
+  clownsec_logo_runs   where the logo is: {column, first row, length} runs, copied from the left eye
+and the depths: right-eye x = x + s * (BG_A * x + BG_B) for the background, x + s * FG_D for the
+logo, s = 0 (flat) .. 1 (the banner's own depth).
+Needs numpy, scipy and Pillow.  Usage: python3 tools/gen_logo.py <banner-parallel.png>"""
 import sys
+import numpy as np
 from PIL import Image
+from scipy import ndimage as nd
+from numpy.lib.stride_tricks import sliding_window_view as sw
 
 W, H = 400, 240
 src = sys.argv[1] if len(sys.argv) > 1 else \
     '/Users/brainphreak/Downloads/clownsec-banner-3d-parallel.png'
-im = Image.open(src).convert('RGB')
-assert im.size == (2 * W, H), im.size
-px = im.load()
+im = np.asarray(Image.open(src).convert('RGB')).astype(float)
+assert im.shape == (H, 2 * W, 3), im.shape
+L, R = im[:, :W], im[:, W:]
+X = np.tile(np.arange(W, dtype=float), (H, 1))
 
-def eye_bytes(xoff):
-    buf = bytearray(W * H * 2)
-    for x in range(W):
-        for y in range(H):
-            r, g, b = px[x + xoff, y]
-            v = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)   # RGB565
-            idx = (x * H + (H - 1 - y)) * 2                        # rotated fb, LE
-            buf[idx] = v & 0xFF
-            buf[idx + 1] = (v >> 8) & 0xFF
-    return buf
 
-def emit(name, data, f):
-    f.write("const unsigned char %s[%d] = {\n" % (name, len(data)))
+def shifted(img, xf):                       # img sampled at x = xf (linear)
+    x0 = np.floor(xf).astype(int); t = (xf - x0)[..., None]
+    rows = np.arange(H)[:, None]
+    return img[rows, np.clip(x0, 0, W - 1)] * (1 - t) + img[rows, np.clip(x0 + 1, 0, W - 1)] * t
+
+
+def box5(e):
+    return sw(np.pad(e, 2, mode='edge'), (5, 5)).sum((2, 3))
+
+
+# 1. per-pixel shift by block matching, then the two depths
+cands = np.arange(-16, 17)
+errs = np.stack([box5(np.abs(shifted(R, X + d) - L).sum(2)) for d in cands])
+disp = cands[errs.argmin(0)]
+vals, cnt = np.unique(disp[(disp > -16) & (disp < 0)], return_counts=True)
+FG_D = int(vals[cnt.argmax()])                              # the logo: the commonest negative shift
+bgm = (disp > 3) & (disp < 16)
+BG_A, BG_B = np.polyfit(np.nonzero(bgm)[1], disp[bgm], 1)    # the background plane
+
+# 2. the logo's mask: matches better at the logo's shift than at the background's
+efg = box5(np.abs(shifted(R, X + FG_D) - L).sum(2))
+ebg = box5(np.abs(shifted(R, X + BG_A * X + BG_B) - L).sum(2))
+lab, n = nd.label(efg + 50 < ebg)
+fg = lab == (np.argmax(nd.sum(lab > 0, lab, range(1, n + 1))) + 1)   # the one big shape
+fg = nd.binary_fill_holes(nd.binary_closing(nd.binary_fill_holes(fg), iterations=2))
+
+# 3. the background plate: the left eye, and behind the logo what the right eye sees there
+plate = L.copy(); have = ~fg
+rfg = np.zeros_like(fg); rfg[:, :W + FG_D] = fg[:, -FG_D:]    # the logo's place in the right eye
+for y in range(H):
+    for x in np.nonzero(fg[y])[0]:
+        xi = int(round(x + BG_A * x + BG_B))
+        if 0 <= xi < W and not rfg[y, xi]:
+            plate[y, x] = R[y, xi]; have[y, x] = True
+    hv = np.nonzero(have[y])[0]
+    for x in np.nonzero(~have[y])[0]:                         # never visible at full depth: nearest
+        plate[y, x] = plate[y, hv[np.argmin(np.abs(hv - x))]]
+
+# 4. check: the rebuilt right eye at full depth against the real one
+out = shifted(plate, (X - BG_B) / (1 + BG_A))
+for y in range(H):
+    xx = np.nonzero(fg[y])[0]; xd = xx + FG_D; ok = (xd >= 0) & (xd < W)
+    out[y, xd[ok]] = L[y, xx[ok]]
+err = np.abs(out - R).mean()
+print(f'logo shift {FG_D}, background {BG_A:.4f}*x + {BG_B:.3f}; rebuilt right eye error {err:.2f} '
+      f'(the two eyes differ by {np.abs(L - R).mean():.2f})')
+assert err < 4, 'the two-layer model does not fit this banner'
+
+
+def rgb565_rot(img):                        # top screen's rotated framebuffer layout, little-endian
+    a = np.clip(img, 0, 255).astype(np.uint16)
+    v = ((a[..., 0] & 0xF8) << 8) | ((a[..., 1] & 0xFC) << 3) | (a[..., 2] >> 3)
+    return v.T[:, ::-1].astype('<u2').tobytes()              # [x][H-1-y]
+
+
+runs = []                                   # rotated layout: column x, index H-1-y, contiguous in y
+for x in range(W):
+    col = fg[::-1, x]                       # index i = H-1-y
+    i = 0
+    while i < H:
+        if col[i]:
+            j = i
+            while j < H and col[j]: j += 1
+            runs.append((x, i, j - i)); i = j
+        else:
+            i += 1
+
+
+def emit(f, name, data):
+    f.write('const unsigned char %s[%d] = {\n' % (name, len(data)))
     for i in range(0, len(data), 24):
-        f.write(",".join(str(b) for b in data[i:i + 24]) + ",\n")
-    f.write("};\n")
+        f.write(','.join(str(b) for b in data[i:i + 24]) + ',\n')
+    f.write('};\n')
 
-out = 'app/source/clownsec_logo.c'
-with open(out, 'w') as f:
+
+with open('app/source/clownsec_logo.c', 'w') as f:
     f.write('/* Generated by tools/gen_logo.py. Top-screen RGB565, rotated fb layout. */\n')
     f.write('#include "clownsec_logo.h"\n')
-    emit('clownsec_logo_left', eye_bytes(0), f)
-    emit('clownsec_logo_right', eye_bytes(W), f)
-print("wrote", out)
+    emit(f, 'clownsec_logo_left', rgb565_rot(L))
+    emit(f, 'clownsec_logo_plate', rgb565_rot(plate))
+    f.write('const unsigned short clownsec_logo_runs[%d][3] = {\n' % len(runs))
+    for r in runs:
+        f.write('{%d,%d,%d},\n' % r)
+    f.write('};\n')
+with open('ui/clownsec_logo.h', 'w') as f:
+    f.write(f'''/* Stereo branding image for the top screen (RGB565, rotated framebuffer layout), as two layers
+ * so the right eye can be rebuilt at any depth (ui/branding.c).
+ * Generated from clownsec-banner-3d-parallel.png by tools/gen_logo.py. */
+#ifndef CLOWNSEC_LOGO_H_INCLUDED
+#define CLOWNSEC_LOGO_H_INCLUDED
+
+#define CLOWNSEC_LOGO_W     400
+#define CLOWNSEC_LOGO_H     240
+#define CLOWNSEC_LOGO_BYTES (400 * 240 * 2)   /* one eye, RGB565 */
+#define CLOWNSEC_LOGO_RUNS  {len(runs)}
+/* full depth: right-eye x = x + BG_A * x + BG_B (background), x + FG_D (the logo) */
+#define CLOWNSEC_LOGO_BG_A  {BG_A:.6f}f
+#define CLOWNSEC_LOGO_BG_B  {BG_B:.4f}f
+#define CLOWNSEC_LOGO_FG_D  ({FG_D})
+
+extern const unsigned char clownsec_logo_left[CLOWNSEC_LOGO_BYTES];
+extern const unsigned char clownsec_logo_plate[CLOWNSEC_LOGO_BYTES];
+extern const unsigned short clownsec_logo_runs[CLOWNSEC_LOGO_RUNS][3];   /* column, first index, length */
+
+#endif
+''')
+print('wrote app/source/clownsec_logo.c (%d logo runs)' % len(runs))

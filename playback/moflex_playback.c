@@ -41,6 +41,29 @@ static int   g_screen_off = 0;   /* bottom backlight is currently off (movie kee
 static int   g_touch_locked = 0; /* touch lock: L toggles it; buttons still work; touch shows a toast */
 static int   g_lock_toast = 0;   /* frames left to show the "touch locked" toast after a locked touch */
 static int   g_backlight_on = 1; /* actual bottom backlight state (reconciled from g_screen_off + toast) */
+/* Paused and left alone for the Settings time ("Screens off after"): both screens go dark -- the
+ * bottom through the dark-screen state above, so any button or touch wakes it (and that press does
+ * nothing else), and the top with it. Never while a film plays. */
+static u32   g_idle_off_ms = 5 * 60 * 1000;   /* 0 = never (set by the app: moflex_set_idle_off_ms) */
+static int   g_idle_dark = 0;    /* the dark screen is the idle one: the top is off too */
+static int   g_top_on = 1;       /* actual top backlight state */
+void moflex_set_idle_off_ms(unsigned ms) { g_idle_off_ms = ms; }
+static void play_idle(int playing, u32 kd, u32 kh, int *dirty) {
+    static u64 last, prev;
+    u64 now = osGetTime();
+    if (now - prev > 2000) last = now;              /* a new film, or back from HOME */
+    prev = now;
+    if (g_idle_dark && !g_screen_off) { g_idle_dark = 0; last = now; }   /* woken */
+    if (playing || kd || (kh & KEY_TOUCH)) last = now;
+    if (g_lcd_ok && g_idle_off_ms && !playing && !g_screen_off && now - last >= g_idle_off_ms) {
+        g_screen_off = 1; g_idle_dark = 1; *dirty = 1;
+    }
+    int top = !(g_idle_dark && g_screen_off) || g_lock_toast > 0;
+    if (g_lcd_ok && top != g_top_on) {
+        if (top) GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_TOP); else GSPLCD_PowerOffBacklight(GSPLCD_SCREEN_TOP);
+        g_top_on = top;
+    }
+}
 static int   g_hq = 0;           /* Old-3DS: 24-bit HQ color on? default OFF (fast 16-bit); HQ button toggles */
 static int   g_hq_avail = 0;     /* HQ button shown this playback? (Old-3DS only -- New-3DS is always 24-bit) */
 static int   g_autolvl = 0;      /* 0 = off, 1 = LOW, 2 = HIGH (see al_update) -- global pref */
@@ -413,6 +436,37 @@ static void bw_exit(void) {
     threadJoin(bw_thread, UINT64_MAX);
     threadFree(bw_thread);
     bw_thread = NULL;
+}
+
+/* ---- rewind / fast-forward: a tap jumps 10 s. Held, it repeats on the file lists' delay and the jump
+ * grows the longer it is held -- 10 s, 30 s, 1 min, 2 min -- with the << / >> arrows changing colour
+ * and showing the step, so you can see how fast you are going. The target only accumulates while
+ * held; the seek lands once, on release. ---- */
+#define SEEK_TAP_US 10000000LL
+static const int64_t k_seek_step[5] = { 0, 10000000LL, 30000000LL, 60000000LL, 120000000LL };
+static const char *const k_seek_lbl[5] = { "", "10s", "30s", "1m", "2m" };
+static int g_seek_dir, g_seek_lvl;         /* while held: -1 / +1 and 1..4; 0 = not seeking */
+typedef struct { u64 t0, next; int dir; } SeekRep;
+/* The jump to add this call (signed us, 0 = none). dir = the direction held now (0 = none),
+ * pressed = it went down this frame. */
+static int64_t seek_hold(SeekRep *h, int dir, int pressed) {
+    u64 now = osGetTime();
+    if (!dir) { h->t0 = 0; g_seek_dir = 0; g_seek_lvl = 0; return 0; }
+    if (pressed || !h->t0 || dir != h->dir) {
+        h->t0 = now; h->dir = dir; h->next = now + 267;   /* the lists' first-repeat delay */
+        g_seek_dir = dir; g_seek_lvl = 1;
+        return dir * SEEK_TAP_US;
+    }
+    if (now < h->next) return 0;
+    h->next = now + 100;
+    u64 held = now - h->t0;
+    g_seek_lvl = held < 1500 ? 1 : held < 3000 ? 2 : held < 5000 ? 3 : 4;
+    return dir * k_seek_step[g_seek_lvl];
+}
+static u16 seek_col(int side) {             /* an arrow's colour: the theme's, or how fast it is going */
+    if (g_seek_dir != side || !g_seek_lvl) return UI_NEONC;
+    return g_seek_lvl == 1 ? UI_NEON : g_seek_lvl == 2 ? UI_RGB(255, 220, 60)
+         : g_seek_lvl == 3 ? UI_RGB(255, 150, 40) : UI_RED;
 }
 
 /* ---- control panel layout (bottom screen, 320x240) ---- */
@@ -1843,8 +1897,12 @@ static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing)
     panel_bar(cur, dur);
 
     /* transport: RW (<<)   glowing play/pause   FF (>>) */
-    ui_play_l(RW_CX - 5, PLAY_CY, 14, UI_NEONC); ui_play_l(RW_CX + 6, PLAY_CY, 14, UI_NEONC);
-    ui_play(FF_CX - 6, PLAY_CY, 14, UI_NEONC);   ui_play(FF_CX + 5, PLAY_CY, 14, UI_NEONC);
+    ui_play_l(RW_CX - 5, PLAY_CY, 14, seek_col(-1)); ui_play_l(RW_CX + 6, PLAY_CY, 14, seek_col(-1));
+    ui_play(FF_CX - 6, PLAY_CY, 14, seek_col(1));    ui_play(FF_CX + 5, PLAY_CY, 14, seek_col(1));
+    if (g_seek_lvl) {                       /* the step under the arrow being held */
+        int cx = g_seek_dir < 0 ? RW_CX : FF_CX; const char *l = k_seek_lbl[g_seek_lvl];
+        ui_text(cx - ui_text_w(1, l) / 2, PLAY_CY + 14, 1, seek_col(g_seek_dir), l);
+    }
     int R = 24;
     if (!g_panel_cheap) ui_glow_round(PLAY_CX - R, PLAY_CY - R, 2 * R, 2 * R, R, UI_NEON, 6, 22);
     if (g_panel_cheap) ui_fill_round(PLAY_CX - R, PLAY_CY - R, 2 * R, 2 * R, R, UI_BG2);
@@ -1895,7 +1953,8 @@ static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing)
 static int sub_modal(const char *title, const char *const *items, int n, int start) {
     int sel = (start >= 0 && start < n) ? start : 0;
     const int VIS_MAX = 7;                                /* rows on screen; longer lists scroll */
-    int vis = n < VIS_MAX ? n : VIS_MAX, off = 0, rep = 0;
+    int vis = n < VIS_MAX ? n : VIS_MAX, off = 0;
+    UiRep ru = {0}, rd = {0};
     int top = 40, step = (218 - top) / (vis > 0 ? vis : 1);
     if (step > 30) step = 30;
     int bh = step - 4; if (bh > 26) bh = 26; if (bh < 15) bh = 15;
@@ -1903,11 +1962,7 @@ static int sub_modal(const char *title, const char *const *items, int n, int sta
         hidScanInput();
         u32 k = hidKeysDown(), kh = hidKeysHeld();
         if (k & KEY_B) return -1;
-        {   int dir = (kh & KEY_DOWN) ? 1 : (kh & KEY_UP) ? -1 : 0;   /* hold to repeat */
-            if (!dir) rep = 0;
-            else { int fire = (k & (KEY_UP | KEY_DOWN)) ? 1 : 0;
-                   if (!fire) { rep++; if (rep > 12 && rep % 3 == 0) fire = 1; }
-                   if (fire) sel = (sel + n + dir) % n; } }
+        sel = ui_list_nav(&ru, &rd, k, kh, sel, n);        /* hold to repeat, as the file lists */
         if (sel < off) off = sel;
         if (sel >= off + vis) off = sel - vis + 1;
         if (k & KEY_A) return sel;
@@ -2069,14 +2124,14 @@ static void sub_position_menu(int topblk) {
 #define VSW_ROWS 3
 static void view_menu_sw(void) {
     int sel = 0, hrep = 0;
+    UiRep ru = {0}, rd = {0};
     u64 dbl_ms = 0; int dbl_row = -1;
     pq_load();
     while (aptMainLoop()) {
         hidScanInput();
         u32 k = hidKeysDown(), kh = hidKeysHeld();
         if (k & (KEY_B | KEY_SELECT)) break;
-        if (k & KEY_DOWN) sel = (sel + 1) % VSW_ROWS;
-        if (k & KEY_UP)   sel = (sel + VSW_ROWS - 1) % VSW_ROWS;
+        sel = ui_list_nav(&ru, &rd, k, kh, sel, VSW_ROWS);
         int lr = (kh & KEY_RIGHT) ? 1 : (kh & KEY_LEFT) ? -1 : 0;
         touchPosition tp; hidTouchRead(&tp);
         int top = 54, step = 34, bh = 28;
@@ -2605,7 +2660,8 @@ static void g_panel_prep(const char *title, int64_t cur, int64_t dur, int playin
     if (!ui_tex_init()) return;
     g_panel_age = 0;
     static int64_t l_sec = -1; static int l_bar = -1, l_play = -1, l_vol = -1, l_batt = -2, l_chg = -1, l_zm = -1;
-    static const char *l_title; static int l_lock = -1, l_toast = -1;
+    static const char *l_title; static int l_lock = -1, l_toast = -1, l_seek = 0;
+    int seek = g_seek_dir * 8 + g_seek_lvl;     /* the arrows' colour / step label */
     int vw = g_zoom * 1000 + (g_conv + CONV_MAX) * 32 + g_ghost + (g_autolvl ? 1 << 20 : 0);   /* any VIEW change repaints */
     int sec = (int)(cur / 1000000);
     int bar = dur > 0 ? (int)((double)BAR_W * (double)cur / (double)dur) : 0;
@@ -2613,7 +2669,7 @@ static void g_panel_prep(const char *title, int64_t cur, int64_t dur, int playin
     batt_refresh();                             /* throttled inside; the partial path below skips panel_draw */
     int toast = g_lock_toast > 0;
     int full = g_panel_force || !g_panel_buf_ok || playing != l_play || g_batt_pct != l_batt
-               || g_batt_chg != l_chg || vw != l_zm || title != l_title || g_touch_locked != l_lock;
+               || g_batt_chg != l_chg || vw != l_zm || title != l_title || g_touch_locked != l_lock || seek != l_seek;
     /* the "screen is locked" popup is a patch: the panel under it is kept and put back, two small
      * uploads -- it used to repaint the whole panel when it came AND when it went, ~20 ms each on an
      * Old 3DS, so every tap on a locked screen dropped frames */
@@ -2659,7 +2715,7 @@ static void g_panel_prep(const char *title, int64_t cur, int64_t dur, int playin
         ui_capture(0);   /* as ui_tex_upload does: left on, the app's ui_present() stays a no-op after
                           * playback and its screens never appear (looked like a hang on exit) */
     }
-    g_panel_force = 0; l_sec = sec; l_bar = bar; l_play = playing; l_vol = vol; l_batt = g_batt_pct; l_chg = g_batt_chg; l_zm = vw; l_title = title; l_lock = g_touch_locked; l_toast = g_lock_toast > 0;
+    g_panel_force = 0; l_sec = sec; l_bar = bar; l_play = playing; l_vol = vol; l_batt = g_batt_pct; l_chg = g_batt_chg; l_zm = vw; l_title = title; l_lock = g_touch_locked; l_toast = g_lock_toast > 0; l_seek = seek;
     { u64 dt = svcGetSystemTick() - pt0; if (dt > g_panel_max) g_panel_max = dt;
       if (wasfull) { g_t_pfull += dt; g_n_pfull++; } else { g_t_pstrip += dt; g_n_pstrip++; } }
     g_sub_redraw = 1;                           /* the shared UI texture no longer holds the menu */
@@ -2865,8 +2921,8 @@ static int view_input(u32 kd, u32 kh, touchPosition tp) {
         g_vid_pend = -1;       /* same for a Version */
         return 1;
     }
-    if (kd & KEY_DOWN) g_view_sel = (g_view_sel + 1) % VIEW_ROWS;
-    if (kd & KEY_UP)   g_view_sel = (g_view_sel + VIEW_ROWS - 1) % VIEW_ROWS;
+    {   static UiRep ru, rd;   /* hold to repeat, as the file lists */
+        g_view_sel = ui_list_nav(&ru, &rd, kd, kh, g_view_sel, VIEW_ROWS); }
     int t_side = 0, t_row = (kd & KEY_TOUCH) ? submenu_hit(tp.px, tp.py, VIEW_ROWS, &t_side) : -1;
     if (t_row >= 0) g_view_sel = t_row;
     int i = view_act(g_view_sel);
@@ -3054,8 +3110,8 @@ static int snd_input(u32 kd, u32 kh, touchPosition tp) {
     if (g_snd_sel >= n) g_snd_sel = n - 1;
     if (g_snd_sel < 0) g_snd_sel = 0;
     if (kd & (KEY_B | KEY_SELECT)) return 1;
-    if (kd & KEY_DOWN) g_snd_sel = (g_snd_sel + 1) % n;
-    if (kd & KEY_UP)   g_snd_sel = (g_snd_sel + n - 1) % n;
+    {   static UiRep ru, rd;
+        g_snd_sel = ui_list_nav(&ru, &rd, kd, kh, g_snd_sel, n); }
     int side = 0, row = (kd & KEY_TOUCH) ? submenu_hit(tp.px, tp.py, n, &side) : -1;
     if (row >= 0) g_snd_sel = row;
     int press = (kd & (KEY_A | KEY_LEFT | KEY_RIGHT)) ? 1 : (row >= 0 ? 1 : 0);
@@ -3231,12 +3287,8 @@ static int submenu_input(u32 kd, u32 kh, touchPosition tp, int is3d, const char 
     if (g_submenu == 2) {   /* SRT file picker (scrolls: SRT_VIS rows of up to SRT_MAX files) */
         if (kd & KEY_B) { g_submenu = 1; return 0; }
         if (g_srt_n > 0) {
-            static int rep;   /* hold to repeat through long episode lists */
-            int dir = (kh & KEY_DOWN) ? 1 : (kh & KEY_UP) ? -1 : 0;
-            if (!dir) rep = 0;
-            else { int fire = (kd & (KEY_UP | KEY_DOWN)) ? 1 : 0;
-                   if (!fire) { rep++; if (rep > 12 && rep % 3 == 0) fire = 1; }
-                   if (fire) g_srt_sel = (g_srt_sel + g_srt_n + dir) % g_srt_n; }
+            static UiRep ru, rd;   /* hold to repeat through long episode lists */
+            g_srt_sel = ui_list_nav(&ru, &rd, kd, kh, g_srt_sel, g_srt_n);
             int vis = g_srt_n < SRT_VIS ? g_srt_n : SRT_VIS;
             if (g_srt_sel < g_srt_off) g_srt_off = g_srt_sel;
             if (g_srt_sel >= g_srt_off + vis) g_srt_off = g_srt_sel - vis + 1;
@@ -3250,8 +3302,8 @@ static int submenu_input(u32 kd, u32 kh, touchPosition tp, int is3d, const char 
     if (g_sub_sel >= n) g_sub_sel = n - 1;
     if (g_sub_sel < 0)  g_sub_sel = 0;
     if (kd & KEY_B) { subcfg_save(moviepath); g_submenu = 0; return 1; }
-    if (kd & KEY_DOWN) g_sub_sel = (g_sub_sel + 1) % n;
-    if (kd & KEY_UP)   g_sub_sel = (g_sub_sel + n - 1) % n;
+    {   static UiRep ru, rd;
+        g_sub_sel = ui_list_nav(&ru, &rd, kd, kh, g_sub_sel, n); }
 
     int t_side = 0, t_row = (kd & KEY_TOUCH) ? submenu_hit(tp.px, tp.py, n, &t_side) : -1;
     if (t_row >= 0) g_sub_sel = t_row;
@@ -3517,7 +3569,7 @@ static MoflexResult moflex_play_gpu(const char *path) {
           if (!sdir) shold = 0;
           else { int fire = (kd & (KEY_RIGHT | KEY_LEFT)) ? 1 : 0;
                  if (!fire) { shold++; if (shold > 14 && (shold % 6 == 0)) fire = 1; }
-                 if (fire) { seek_to_us = cur_us + (int64_t)sdir * 30000000; want_seek = 1; } } }
+                 if (fire) { seek_to_us = cur_us + (int64_t)sdir * SEEK_TAP_US; want_seek = 1; } } }
         if ((kd | kh) & KEY_TOUCH) {
             int px = tp.px, py = tp.py;
             if (py >= BAR_Y - 8 && py <= BAR_Y + BAR_H + 8 && px >= BAR_X && px <= BAR_X + BAR_W) {
@@ -3528,8 +3580,8 @@ static MoflexResult moflex_play_gpu(const char *path) {
             } else if (kd & KEY_TOUCH) {
                 if (py >= PLAY_CY - 20 && py <= PLAY_CY + 20) {
                     if (px >= PLAY_CX - 20 && px <= PLAY_CX + 20) { playing = !playing; if (have_audio) g_aw_paused = !playing; t0_wall = 0; dirty = 1; }
-                    else if (px >= RW_CX - 18 && px <= RW_CX + 18) { seek_to_us = cur_us - 30000000; want_seek = 1; }
-                    else if (px >= FF_CX - 18 && px <= FF_CX + 18) { seek_to_us = cur_us + 30000000; want_seek = 1; }
+                    else if (px >= RW_CX - 18 && px <= RW_CX + 18) { seek_to_us = cur_us - SEEK_TAP_US; want_seek = 1; }
+                    else if (px >= FF_CX - 18 && px <= FF_CX + 18) { seek_to_us = cur_us + SEEK_TAP_US; want_seek = 1; }
                 } else if (py >= BTN_Y && py < BTN_Y + BTN_H) {   /* BACK / OPEN / EXIT */
                     if      (px >= BKB_X && px < BKB_X + BKB_W) { result = MOFLEX_QUIT_OPEN; break; }   /* OPEN VIDEO */
                     else if (px >= OPB_X && px < OPB_X + OPB_W) { result = MOFLEX_QUIT_MANAGE; break; }   /* MANAGE VIDEOS */
@@ -4478,7 +4530,7 @@ static void mp_ring_apt_hook(APT_HookType hook, void *param) {
             g_ring_susp = 1;                            /* stop the worker from starting a new Y2R... */
             if (g_ring_lock) { LightLock_Lock(g_ring_lock); r3_retire_any(); LightLock_Unlock(g_ring_lock); }  /* ...and drain any in flight */
             else r3_retire_any();
-            if (g_screen_off) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; } g_backlight_on = 1;
+            if (g_screen_off) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTH); g_screen_off = 0; g_idle_dark = 0; g_top_on = 1; } g_backlight_on = 1;
             if (g_lcd_ok) gspLcdExit();                 /* release gsp::Lcd (else HOME hard-locks) */
             if (g_ring_apt_w) g_y2r_exit();             /* release Y2R + its event (only if it's up yet) */
             gfxSet3D(false);
@@ -5284,7 +5336,7 @@ static MoflexResult moflex_play_ring(const char *path) {
      * stalls -- up to 1.2 s in ring_stats -- show as skips until the bank caught up */
     const int PRIME = !strncmp(path, "bigtop:", 7) && NB > 4 ? NB - 2
                     : (NB >= 16) ? 8 : (NB > 2 ? NB / 2 : 1);
-    int64_t cur_us = 0, dur_us = m.duration_us, seek_to_us = 0; int want_seek = 0, shold = 0;
+    int64_t cur_us = 0, dur_us = m.duration_us, seek_to_us = 0; int want_seek = 0;
     int scrubbing = 0; int64_t scrub_us = 0;   /* touch-drag on the bar: preview while held, seek on release */
     int tseek = 0, tseek_hold = 0;             /* touch rewind (-1) / fast-forward (+1) held */
     /* SEEK PREVIEW (the official player's feel): from the moment a seek control is touched until it is
@@ -5427,7 +5479,7 @@ static MoflexResult moflex_play_ring(const char *path) {
                 if (s_lid_closed == 1 && shell != 0) {
                     if (g_lcd_ok) GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTH);
                     else if (R_SUCCEEDED(gspLcdInit())) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTH); gspLcdExit(); }
-                    g_screen_off = 0; g_backlight_on = 1; dirty = 1;
+                    g_screen_off = 0; g_backlight_on = 1; g_idle_dark = 0; g_top_on = 1; dirty = 1;
                 }
                 s_lid_closed = (shell == 0) ? 1 : 0;
             }
@@ -5463,6 +5515,8 @@ static MoflexResult moflex_play_ring(const char *path) {
         }
 
         if (g_lock_toast > 0 && --g_lock_toast == 0) dirty = 1;   /* repaint when it goes, not every frame */
+
+        play_idle(playing, kd, kh, &dirty);   /* paused and left alone: both screens off */
 
         /* reconcile the physical backlight: on unless the user darkened it -- and even then, briefly on
          * to show the touch-locked toast so they can read why touch isn't waking it. */
@@ -5540,15 +5594,6 @@ static MoflexResult moflex_play_ring(const char *path) {
         if (kd & KEY_Y)      { g_sub_on = !g_sub_on; dirty = 1; }   /* Y: quick-toggle subtitles */
         if (kd & KEY_SELECT) { g_submenu = 1; g_sub_sel = 0; dirty = 1; }   /* SELECT: open subtitle options */
         if (kd & KEY_X && g_lcd_ok) { g_screen_off = !g_screen_off; dirty = 1; }   /* X: toggle dark screen */
-        {   int sdir = (kh & KEY_RIGHT) ? 1 : ((kh & KEY_LEFT) ? -1 : 0);
-            if (sdir == 0) shold = 0;
-            else { int fire = (kd & (KEY_RIGHT | KEY_LEFT)) ? 1 : 0;
-                   if (!fire) { shold++; if (shold > 8 && (shold % 3 == 0)) fire = 1; }
-                   /* ACCUMULATE the target while held (relative to the pending seek, not the playing
-                    * cur_us) -- the actual seek fires on RELEASE below, so holding flies backward in
-                    * 30s steps and lands once instead of oscillating (seek->play->seek). */
-                   if (fire) { seek_to_us = (want_seek ? seek_to_us : cur_us) + (int64_t)sdir * 30000000;
-                               want_seek = 1; } } }
         /* NOTE: sub_menu() renders via the app's SOFTWARE framebuffer UI (ui_begin/ui_present ->
          * gfxSwapBuffers), which deadlocks against citro2d owning the GPU here -> the app hangs.
          * Disabled in the ring path for now; subtitles still auto-load and draw (r3_draw_sub). A
@@ -5567,11 +5612,9 @@ static MoflexResult moflex_play_ring(const char *path) {
                 else { r3_last = 0; if (r3_wallset) r3_wall0 += osGetTime() - pause_wall; }
                 s.paused = !playing; if (playing) LightEvent_Signal(&s.wake); save_pend = !playing; save_delay = 30;
             } else if (py >= PLAY_CY - 20 && py <= PLAY_CY + 20 && px >= RW_CX - 18 && px <= RW_CX + 18) {
-                tseek = -1; tseek_hold = 0;   /* held: steps like the d-pad, seeks on release */
-                seek_to_us = (want_seek ? seek_to_us : cur_us) - 30000000; want_seek = 1; dirty = 1;
+                tseek = -1; tseek_hold = 1;   /* held: steps like the d-pad, seeks on release */
             } else if (py >= PLAY_CY - 20 && py <= PLAY_CY + 20 && px >= FF_CX - 18 && px <= FF_CX + 18) {
-                tseek = 1; tseek_hold = 0;
-                seek_to_us = (want_seek ? seek_to_us : cur_us) + 30000000; want_seek = 1; dirty = 1;
+                tseek = 1; tseek_hold = 1;
             } else if (px >= AUD_X && px < AUD_X + AUD_W && py >= AUD_Y && py < AUD_Y + AUD_H) {
                 g_submenu = 4; g_snd_sel = 0; dirty = 1;    /* SOUND: track + levelling */
             } else if (px >= CC_X && px < CC_X + CC_W && py >= CC_Y && py < CC_Y + CC_H) {
@@ -5589,9 +5632,18 @@ static MoflexResult moflex_play_ring(const char *path) {
             if (thit) dirty = 1;
         }
 
-        if (tseek) {   /* touch rewind/fast-forward held: repeat on the d-pad's timing */
-            if (!(kh & KEY_TOUCH)) tseek = 0;
-            else if (++tseek_hold > 8 && tseek_hold % 3 == 0) { seek_to_us += (int64_t)tseek * 30000000; dirty = 1; }
+        if (tseek && !(kh & KEY_TOUCH)) tseek = 0;
+        {   /* rewind / fast-forward, d-pad or the touch arrows (see seek_hold). ACCUMULATE the target
+             * while held (relative to the pending seek, not the playing cur_us) -- the actual seek
+             * fires on RELEASE below, so holding flies along and lands once instead of oscillating
+             * (seek->play->seek). */
+            static SeekRep sr;
+            int was = g_seek_dir * 8 + g_seek_lvl;
+            int sdir = (kh & KEY_RIGHT) ? 1 : (kh & KEY_LEFT) ? -1 : tseek;
+            int64_t st = seek_hold(&sr, sdir, (kd & (KEY_RIGHT | KEY_LEFT)) || tseek_hold);
+            tseek_hold = 0;
+            if (st) { seek_to_us = (want_seek ? seek_to_us : cur_us) + st; want_seek = 1; dirty = 1; }
+            if (g_seek_dir * 8 + g_seek_lvl != was) dirty = 1;   /* the arrows' colour changed */
         }
         /* ---- touch-drag the progress bar: while the finger is down, track its X into scrub_us and
          *      show it as a live preview (below); the actual seek fires once, on release. ---- */
@@ -6323,7 +6375,7 @@ static MoflexResult moflex_play_ring(const char *path) {
     if (vol_dirty) vol_save();
     mb_drop();
     /* release panel services (restore backlight first so we never leave the screen dark) */
-    if (g_screen_off) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; }
+    if (g_screen_off) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTH); g_screen_off = 0; g_idle_dark = 0; g_top_on = 1; }
     if (g_lcd_ok) { gspLcdExit(); g_lcd_ok = 0; }
     if (g_mcu_ok) { mcuHwcExit(); g_mcu_ok = 0; }
     ptmuExit();
@@ -6378,7 +6430,7 @@ static void mp_apt_hook(APT_HookType hook, void *param) {
              * GPU. Menus don't hold Y2R or gsp::Lcd; keeping them open across the transition
              * hard-locks the GSP (needs a power-off). Release them here, re-acquire on restore. */
             if (g_apt_have_audio) ndspChnSetPaused(0, true);                 /* silence while suspended */
-            if (g_screen_off) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; }
+            if (g_screen_off) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTH); g_screen_off = 0; g_idle_dark = 0; g_top_on = 1; }
             if (g_lcd_ok) gspLcdExit();                                      /* release gsp::Lcd */
             if (g_apt_y2r) { y2r_video_drain(); y2r_video_exit(); }          /* release Y2R */
             gfxSet3D(false);                                                 /* the HOME menu is 2D */
@@ -6594,7 +6646,7 @@ static MoflexResult moflex_play_classic(const char *path) {
         touchPosition tp; hidTouchRead(&tp);
 
         if (g_screen_off) {   /* bottom screen is dark: the first input just wakes it (no action) */
-            if (kd) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; dirty = 1; }
+            if (kd) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTH); g_screen_off = 0; g_idle_dark = 0; g_top_on = 1; dirty = 1; }
             goto after_input;
         }
 
@@ -6613,7 +6665,7 @@ static MoflexResult moflex_play_classic(const char *path) {
             else {
                 int fire = (kd & (KEY_RIGHT | KEY_LEFT)) ? 1 : 0;   /* initial press */
                 if (!fire) { shold++; if (shold > 8 && (shold % 3 == 0)) fire = 1; }  /* repeat while held */
-                if (fire) { seek_to_us = (want_seek ? seek_to_us : cur_us) + (int64_t)sdir * 30000000;
+                if (fire) { seek_to_us = (want_seek ? seek_to_us : cur_us) + (int64_t)sdir * SEEK_TAP_US;
                             if (seek_to_us < 0) seek_to_us = 0;
                             if (dur_us > 0 && seek_to_us > dur_us) seek_to_us = dur_us;
                             want_seek = 1; dirty = 1; }
@@ -6657,8 +6709,8 @@ static MoflexResult moflex_play_classic(const char *path) {
                 } else if (py >= PLAY_CY - 20 && py <= PLAY_CY + 20) {
                     if (px >= PLAY_CX - 20 && px <= PLAY_CX + 20) { playing = !playing; if (awt) g_aw_paused = !playing; else if (have_audio) ndspChnSetPaused(0, !playing); dirty = 1;
                           save_pend = !playing; save_delay = SAVE_DELAY_FRAMES; }   /* arm only (same as KEY_A) */
-                    else if (px >= RW_CX - 18 && px <= RW_CX + 18) { seek_to_us = cur_us - 30000000; want_seek = 1; }
-                    else if (px >= FF_CX - 18 && px <= FF_CX + 18) { seek_to_us = cur_us + 30000000; want_seek = 1; }
+                    else if (px >= RW_CX - 18 && px <= RW_CX + 18) { seek_to_us = cur_us - SEEK_TAP_US; want_seek = 1; }
+                    else if (px >= FF_CX - 18 && px <= FF_CX + 18) { seek_to_us = cur_us + SEEK_TAP_US; want_seek = 1; }
                 } else if (py >= BTN_Y && py < BTN_Y + BTN_H) {   /* BACK / OPEN / EXIT */
                     if      (px >= BKB_X && px < BKB_X + BKB_W) { result = MOFLEX_QUIT_OPEN; break; }   /* OPEN VIDEO */
                     else if (px >= OPB_X && px < OPB_X + OPB_W) { result = MOFLEX_QUIT_MANAGE; break; }   /* MANAGE VIDEOS */
@@ -6796,7 +6848,7 @@ static MoflexResult moflex_play_classic(const char *path) {
 
 done:
     aptUnhook(&g_apt_cookie);
-    if (g_screen_off) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; }   /* never leave it dark */
+    if (g_screen_off) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTH); g_screen_off = 0; g_idle_dark = 0; g_top_on = 1; }   /* never leave it dark */
     if (g_lcd_ok) { gspLcdExit(); g_lcd_ok = 0; }
     if (g_mcu_ok) { mcuHwcExit(); g_mcu_ok = 0; }
     ptmuExit();
@@ -6951,7 +7003,7 @@ static MoflexResult moflex_play_soft(const char *path) {
         u32 kd = hidKeysDown(), kh = hidKeysHeld();
         touchPosition tp; hidTouchRead(&tp);
 
-        if (g_screen_off) { if (kd) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; dirty = 1; } goto sr_after_input; }
+        if (g_screen_off) { if (kd) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTH); g_screen_off = 0; g_idle_dark = 0; g_top_on = 1; dirty = 1; } goto sr_after_input; }
 
         if (kd & KEY_B) { result = MOFLEX_QUIT_BACK; break; }
         if (kd & KEY_A) {
@@ -6966,7 +7018,7 @@ static MoflexResult moflex_play_soft(const char *path) {
             if (!sdir) shold = 0;
             else { int fire = (kd & (KEY_RIGHT | KEY_LEFT)) ? 1 : 0;
                    if (!fire) { shold++; if (shold > 14 && (shold % 6 == 0)) fire = 1; }
-                   if (fire) { seek_to_us = cur_us + (int64_t)sdir * 30000000; want_seek = 1; } } }
+                   if (fire) { seek_to_us = cur_us + (int64_t)sdir * SEEK_TAP_US; want_seek = 1; } } }
         if (kd & KEY_SELECT) { if (have_audio) ndspChnSetPaused(0, true); sub_menu(path, is3d);
                                if (have_audio) ndspChnSetPaused(0, !playing); dirty = 1;
                                if (!playing) { want_seek = 1; seek_to_us = cur_us; } }
@@ -6995,8 +7047,8 @@ static MoflexResult moflex_play_soft(const char *path) {
                     if (px >= PLAY_CX - 20 && px <= PLAY_CX + 20) { playing = !playing; if (have_audio) ndspChnSetPaused(0, !playing); dirty = 1; save_pend = !playing; save_delay = 30;
                     if (!playing) pause_wall = osGetTime();
                     else { r3_last = 0; if (r3_wallset) r3_wall0 += osGetTime() - pause_wall; } }
-                    else if (px >= RW_CX - 18 && px <= RW_CX + 18) { seek_to_us = cur_us - 30000000; want_seek = 1; }
-                    else if (px >= FF_CX - 18 && px <= FF_CX + 18) { seek_to_us = cur_us + 30000000; want_seek = 1; }
+                    else if (px >= RW_CX - 18 && px <= RW_CX + 18) { seek_to_us = cur_us - SEEK_TAP_US; want_seek = 1; }
+                    else if (px >= FF_CX - 18 && px <= FF_CX + 18) { seek_to_us = cur_us + SEEK_TAP_US; want_seek = 1; }
                 } else if (py >= BTN_Y && py < BTN_Y + BTN_H) {
                     if      (px >= BKB_X && px < BKB_X + BKB_W) { result = MOFLEX_QUIT_OPEN; break; }   /* OPEN VIDEO */
                     else if (px >= OPB_X && px < OPB_X + OPB_W) { result = MOFLEX_QUIT_MANAGE; break; }   /* MANAGE VIDEOS */
@@ -7114,7 +7166,7 @@ static MoflexResult moflex_play_soft(const char *path) {
     if (!aptMainLoop() && result == MOFLEX_QUIT_BACK) result = MOFLEX_QUIT_EXIT;
 
     aptUnhook(&g_apt_cookie);
-    if (g_screen_off) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; }
+    if (g_screen_off) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTH); g_screen_off = 0; g_idle_dark = 0; g_top_on = 1; }
     if (g_lcd_ok) { gspLcdExit(); g_lcd_ok = 0; }
     if (g_mcu_ok) { mcuHwcExit(); g_mcu_ok = 0; }
     ptmuExit(); g_old3d_warn = 0; g_sw_bank = -1;
@@ -7451,14 +7503,14 @@ void kit_film_end(void) {
     g_kit_subs_any = 0;
     g_kit_defer = 0;                      /* (the caller flushed before this) */
     g_kit_fmt_row = 0;                    /* the moflex VIDEO menu never shows the Format row */
-    if (g_screen_off) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; }
+    if (g_screen_off) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTH); g_screen_off = 0; g_idle_dark = 0; g_top_on = 1; }
     if (g_lcd_ok) { gspLcdExit(); g_lcd_ok = 0; }
     if (g_mcu_ok) { mcuHwcExit(); g_mcu_ok = 0; }
     ptmuExit();
     g_backlight_on = 1;
 }
 void kit_suspend(void) {   /* the gsp::Lcd half of mp_ring_apt_hook */
-    if (g_screen_off) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM); g_screen_off = 0; } g_backlight_on = 1;
+    if (g_screen_off) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTH); g_screen_off = 0; g_idle_dark = 0; g_top_on = 1; } g_backlight_on = 1;
     if (g_lcd_ok) gspLcdExit();
     gfxSet3D(false);
 }
@@ -7469,6 +7521,7 @@ void kit_restore(void) {
 }
 int kit_take_redraw(void) { int r = g_kit_redraw; g_kit_redraw = 0; return r; }
 
+void kit_idle(int playing, u32 kd, u32 kh, int *dirty) { play_idle(playing, kd, kh, dirty); }
 void kit_input(u32 *pkd, u32 *pkh, int *dirty) {
     u32 kd = *pkd, kh = *pkh;
     {   /* lid watchdog (ring): force the backlights on at closed->open */
@@ -7481,7 +7534,7 @@ void kit_input(u32 *pkd, u32 *pkh, int *dirty) {
             if (s_lid_closed == 1 && shell != 0) {
                 if (g_lcd_ok) GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTH);
                 else if (R_SUCCEEDED(gspLcdInit())) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTH); gspLcdExit(); }
-                g_screen_off = 0; g_backlight_on = 1; *dirty = 1;
+                g_screen_off = 0; g_backlight_on = 1; g_idle_dark = 0; g_top_on = 1; *dirty = 1;
             }
             s_lid_closed = (shell == 0) ? 1 : 0;
         }
@@ -7537,6 +7590,13 @@ KitTouch kit_touch(int px, int py, int is3d) {
         if (px >= EXB_X && px < EXB_X + EXB_W) return KIT_T_ADD;
     }
     return KIT_T_NONE;
+}
+int64_t kit_seek_hold(int dir, int pressed, int *dirty) {
+    static SeekRep sr;
+    int was = g_seek_dir * 8 + g_seek_lvl;
+    int64_t st = seek_hold(&sr, dir, pressed);
+    if (g_seek_dir * 8 + g_seek_lvl != was) *dirty = 1;
+    return st;
 }
 int64_t kit_scrub_us(int px, int64_t dur_us) {
     if (px < BAR_X) px = BAR_X; if (px > BAR_X + BAR_W) px = BAR_X + BAR_W;

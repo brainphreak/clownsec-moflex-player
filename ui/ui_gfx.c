@@ -492,3 +492,27 @@ void ui_button(int x, int y, int w, int h, const char *label, int selected, u16 
     }
     ui_text_center(x + w / 2, y + (h - 8) / 2, 1, tc, lbl);
 }
+
+/* ---- hold-to-repeat (see ui_gfx.h): the lists' nav_repeat timing in milliseconds -- first repeat
+ * after 267 ms, then every 83 ms, every 33 ms after another half second, every frame after 1.25 s ---- */
+int ui_rep(UiRep *r, u32 kd, u32 kh, u32 mask) {
+    if (!(kh & mask)) { r->t0 = 0; return 0; }
+    u64 now = osGetTime();
+    if (kd & mask) { r->t0 = now; r->next = now + 267; return 2; }
+    if (!r->t0) { r->t0 = now; r->next = now + 267; return 0; }   /* held from before: no press seen */
+    if (now < r->next) return 0;
+    u64 held = now - r->t0;
+    r->next = now + (held > 1517 ? 17 : held > 767 ? 33 : 83);
+    return 1;
+}
+u32 ui_rep_held(const UiRep *r) { return r->t0 ? (u32)(osGetTime() - r->t0) : 0; }
+int ui_list_step(int sel, int n, int dir, int how) {
+    if (!how || n <= 0) return sel;
+    int t = sel + dir;
+    if (how == 2) return (t % n + n) % n;
+    return t < 0 ? 0 : t >= n ? n - 1 : t;
+}
+int ui_list_nav(UiRep *up, UiRep *down, u32 kd, u32 kh, int sel, int n) {
+    sel = ui_list_step(sel, n, 1, ui_rep(down, kd, kh, KEY_DOWN));
+    return ui_list_step(sel, n, -1, ui_rep(up, kd, kh, KEY_UP));
+}

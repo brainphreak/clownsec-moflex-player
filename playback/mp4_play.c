@@ -22,7 +22,6 @@
 
 #define NWB          16
 #define AAC_MAXSAMP  2048
-#define SEEK_STEP_US (30LL * 1000000)   /* the moflex player's step */
 
 /* ---- audio state (ndsp channel 0) ---- */
 static Mp4Aac      g_aac;
@@ -617,7 +616,7 @@ MoflexResult mp4_play(const char *path) {
     GATE_ARM();
 
     int video_failed = 0;                 /* the watchdog already tore the screens down */
-    int quit = 0, was_paused = 0, vol_dirty = 0, shold = 0;
+    int quit = 0, was_paused = 0, vol_dirty = 0, tseek = 0, tpress = 0;
     int scrubbing = 0, vol_drag = 0; int64_t scrub_us = 0;
     int want_seek = 0; int64_t seek_to = 0;
     int dirty = 1, dirty2 = 0, last_sec = -1, drops = 0;
@@ -639,6 +638,7 @@ MoflexResult mp4_play(const char *path) {
                 dirty = 1;
             } }
         kit_input(&kd, &kh, &dirty);
+        kit_idle(g_playing, kd, kh, &dirty);
 
         if (kit_menu_open()) {            /* CC / AUDIO / VIDEO own input; the film plays on */
             kit_menu_input(kd, kh, tp, is3d, path);
@@ -652,26 +652,27 @@ MoflexResult mp4_play(const char *path) {
             if (kd & KEY_Y)      { kit_toggle_subs(); dirty = 1; }
             if (kd & KEY_SELECT) { kit_open_subs_menu(); dirty = 1; }
             if (kd & KEY_X)      { kit_toggle_dark(); dirty = 1; }
-            {   /* D-pad seek: accumulate while held, land once on release (the ring's rule) */
-                int sdir = (kh & KEY_RIGHT) ? 1 : ((kh & KEY_LEFT) ? -1 : 0);
-                if (sdir == 0) shold = 0;
-                else { int fire = (kd & (KEY_RIGHT | KEY_LEFT)) ? 1 : 0;
-                       if (!fire) { shold++; if (shold > 8 && (shold % 3 == 0)) fire = 1; }
-                       if (fire) { seek_to = (want_seek ? seek_to : cur_us) + (int64_t)sdir * SEEK_STEP_US;
-                                   want_seek = 1; dirty = 1; } } }
             if (kd & KEY_TOUCH) {
                 switch (kit_touch(tp.px, tp.py, is3d)) {
                     case KIT_T_SCRUB:   scrubbing = 1; break;
                     case KIT_T_VOL:     vol_drag = 1; break;
                     case KIT_T_PLAY:    toggle = 1; break;
-                    case KIT_T_RW:      seek_to = cur_us - SEEK_STEP_US; want_seek = 1; break;
-                    case KIT_T_FF:      seek_to = cur_us + SEEK_STEP_US; want_seek = 1; break;
+                    case KIT_T_RW:      tseek = -1; tpress = 1; break;   /* held: steps like the d-pad */
+                    case KIT_T_FF:      tseek = 1; tpress = 1; break;
                     case KIT_T_OPEN:    result = MOFLEX_QUIT_OPEN;   quit = 1; break;
                     case KIT_T_MANAGE:  result = MOFLEX_QUIT_MANAGE; quit = 1; break;
                     case KIT_T_ADD:     result = MOFLEX_QUIT_ADD;    quit = 1; break;
                     default: break;
                 }
                 dirty = 1;
+            }
+            if (tseek && !(kh & KEY_TOUCH)) tseek = 0;
+            {   /* rewind / fast-forward, d-pad or the touch arrows: the ring's rule (kit_seek_hold) --
+                 * accumulate while held, land once on release */
+                int sdir = (kh & KEY_RIGHT) ? 1 : (kh & KEY_LEFT) ? -1 : tseek;
+                int64_t st = kit_seek_hold(sdir, (kd & (KEY_RIGHT | KEY_LEFT)) || tpress, &dirty);
+                tpress = 0;
+                if (st) { seek_to = (want_seek ? seek_to : cur_us) + st; want_seek = 1; dirty = 1; }
             }
             if (toggle) { g_playing = !g_playing; dirty = 1; }
             if (scrubbing) {              /* drag previews, release seeks */
@@ -685,7 +686,7 @@ MoflexResult mp4_play(const char *path) {
         }
         if (quit) break;
 
-        if (want_seek && !scrubbing && !(kh & (KEY_LEFT | KEY_RIGHT))) {
+        if (want_seek && !scrubbing && !tseek && !(kh & (KEY_LEFT | KEY_RIGHT))) {
             if (seek_to < 0) seek_to = 0;
             if (dur_us > 0 && seek_to > dur_us) seek_to = dur_us;
             if (was_paused) { g_playing = 1; }   /* a seek resumes, as on moflex */
@@ -1112,7 +1113,7 @@ MoflexResult stream_play(const StreamSrc *src) {
     #define REBUF_US   1500000
     #define GATE_ARM() do { gate = 1; gate_fed = 0; if (g_have_audio) ndspChnSetPaused(0, true); clk_pause(); } while (0)
     GATE_ARM();
-    int quit = 0, was_paused = 0, vol_dirty = 0, shold = 0;
+    int quit = 0, was_paused = 0, vol_dirty = 0, tseek = 0, tpress = 0;
     int scrubbing = 0, vol_drag = 0; int64_t scrub_us = 0;
     int want_seek = 0; int64_t seek_to = 0;
     int dirty = 1, dirty2 = 0, last_sec = -1, drops = 0;
@@ -1134,6 +1135,7 @@ MoflexResult stream_play(const StreamSrc *src) {
                 dirty = 1;
             } }
         kit_input(&kd, &kh, &dirty);
+        kit_idle(g_playing, kd, kh, &dirty);
         if (kit_menu_open()) {
             kit_menu_input(kd, kh, tp, is3d, src->key);
             if (kd || (kh & (KEY_TOUCH | KEY_LEFT | KEY_RIGHT | KEY_UP | KEY_DOWN))) dirty = 1;
@@ -1145,25 +1147,27 @@ MoflexResult stream_play(const StreamSrc *src) {
             if (kd & KEY_Y)      { kit_toggle_subs(); dirty = 1; }
             if (kd & KEY_SELECT) { kit_open_subs_menu(); dirty = 1; }
             if (kd & KEY_X)      { kit_toggle_dark(); dirty = 1; }
-            {   int sdir = (kh & KEY_RIGHT) ? 1 : ((kh & KEY_LEFT) ? -1 : 0);
-                if (sdir == 0) shold = 0;
-                else { int fire = (kd & (KEY_RIGHT | KEY_LEFT)) ? 1 : 0;
-                       if (!fire) { shold++; if (shold > 8 && (shold % 3 == 0)) fire = 1; }
-                       if (fire) { seek_to = (want_seek ? seek_to : cur_us) + (int64_t)sdir * SEEK_STEP_US;
-                                   want_seek = 1; dirty = 1; } } }
             if (kd & KEY_TOUCH) {
                 switch (kit_touch(tp.px, tp.py, is3d)) {
                     case KIT_T_SCRUB:   scrubbing = 1; break;
                     case KIT_T_VOL:     vol_drag = 1; break;
                     case KIT_T_PLAY:    toggle = 1; break;
-                    case KIT_T_RW:      seek_to = cur_us - SEEK_STEP_US; want_seek = 1; break;
-                    case KIT_T_FF:      seek_to = cur_us + SEEK_STEP_US; want_seek = 1; break;
+                    case KIT_T_RW:      tseek = -1; tpress = 1; break;   /* held: steps like the d-pad */
+                    case KIT_T_FF:      tseek = 1; tpress = 1; break;
                     case KIT_T_OPEN:    result = MOFLEX_QUIT_OPEN;   quit = 1; break;
                     case KIT_T_MANAGE:  result = MOFLEX_QUIT_MANAGE; quit = 1; break;
                     case KIT_T_ADD:     result = MOFLEX_QUIT_ADD;    quit = 1; break;
                     default: break;
                 }
                 dirty = 1;
+            }
+            if (tseek && !(kh & KEY_TOUCH)) tseek = 0;
+            {   /* rewind / fast-forward, d-pad or the touch arrows: the ring's rule (kit_seek_hold) --
+                 * accumulate while held, land once on release */
+                int sdir = (kh & KEY_RIGHT) ? 1 : (kh & KEY_LEFT) ? -1 : tseek;
+                int64_t st = kit_seek_hold(sdir, (kd & (KEY_RIGHT | KEY_LEFT)) || tpress, &dirty);
+                tpress = 0;
+                if (st) { seek_to = (want_seek ? seek_to : cur_us) + st; want_seek = 1; dirty = 1; }
             }
             if (toggle) { g_playing = !g_playing; dirty = 1; }
             if (scrubbing) {
@@ -1222,7 +1226,7 @@ MoflexResult stream_play(const StreamSrc *src) {
         }
 
         /* ---- seek = a new stream from the server at the target ---- */
-        if (want_seek && !scrubbing && !(kh & (KEY_LEFT | KEY_RIGHT))) {
+        if (want_seek && !scrubbing && !tseek && !(kh & (KEY_LEFT | KEY_RIGHT))) {
             if (seek_to < 0) seek_to = 0;
             if (dur_us > 0 && seek_to > dur_us - 1000000) seek_to = dur_us - 1000000;
             src->close(src->ctx, hs); hs = NULL;

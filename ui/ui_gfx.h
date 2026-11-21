@@ -95,4 +95,18 @@ void ui_glow_round(int x, int y, int w, int h, int r, u16 c, int spread, int alp
 /* a themed button: rounded gradient fill + border + centered label, brighter when selected */
 void ui_button(int x, int y, int w, int h, const char *label, int selected, u16 accent);
 
+/* Hold-to-repeat, timed like the file lists: a press moves once; held, it repeats after ~0.27 s and
+ * speeds up the longer it is held. Timed by the clock, not by frames, so a menu over a playing film
+ * (whose loop does not run at 60 fps) feels the same as one on its own. Zero-initialise. */
+typedef struct { u64 t0, next; } UiRep;
+/* 1 when the held direction in mask should move this call: 2 for the press itself, 1 for a repeat
+ * (so a list can wrap on a press but stop at its ends while held). */
+int ui_rep(UiRep *r, u32 kd, u32 kh, u32 mask);
+/* ms the direction in r has been held (0 when it is not) */
+u32 ui_rep_held(const UiRep *r);
+/* One step of a list cursor for ui_rep's answer: a press wraps round the ends, a repeat stops at them. */
+int ui_list_step(int sel, int n, int dir, int how);
+/* Up/down on a list in one call: returns the new cursor. */
+int ui_list_nav(UiRep *up, UiRep *down, u32 kd, u32 kh, int sel, int n);
+
 #endif
