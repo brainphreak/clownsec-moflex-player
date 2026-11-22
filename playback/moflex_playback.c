@@ -49,6 +49,20 @@ static u32   g_idle_off_ms = 5 * 60 * 1000;   /* 0 = never (set by the app: mofl
 static int   g_idle_dark = 0;    /* the dark screen is the idle one: the top is off too */
 static int   g_top_on = 1;       /* actual top backlight state */
 void moflex_set_idle_off_ms(unsigned ms) { g_idle_off_ms = ms; }
+/* HOME / sleep: the screens are lit on the way out (else the HOME Menu comes up dark). A dark
+ * screen the viewer CHOSE (X / the moon, not the paused-idle one) is put back on the way in, and
+ * the press that brought them back (A, a tap on Resume) is swallowed until released -- it would
+ * otherwise wake the screen again at once, or flash the lock message. */
+static int g_dark_resume = 0, g_wake_swallow = 0;
+static void dark_on_suspend(void) { g_dark_resume = g_screen_off && !g_idle_dark; }
+static void dark_on_restore(void) {
+    if (g_dark_resume) { g_screen_off = 1; g_idle_dark = 0; g_wake_swallow = 1; }
+    g_dark_resume = 0;
+}
+static void wake_swallow(u32 *kd, u32 *kh) {
+    if (!g_wake_swallow) return;
+    if (*kd | *kh) { *kd = 0; *kh = 0; } else g_wake_swallow = 0;
+}
 static const char *(*g_idle_step)(int dir) = NULL;   /* the app's Screens-off setting (battery menu) */
 void moflex_set_idle_step_hook(const char *(*fn)(int dir)) { g_idle_step = fn; }
 static void batt_refresh(void);
@@ -4697,6 +4711,7 @@ static void mp_ring_apt_hook(APT_HookType hook, void *param) {
             g_ring_susp = 1;                            /* stop the worker from starting a new Y2R... */
             if (g_ring_lock) { LightLock_Lock(g_ring_lock); r3_retire_any(); LightLock_Unlock(g_ring_lock); }  /* ...and drain any in flight */
             else r3_retire_any();
+            dark_on_suspend();
             if (g_screen_off) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTH); g_screen_off = 0; g_idle_dark = 0; g_top_on = 1; } g_backlight_on = 1;
             if (g_lcd_ok) gspLcdExit();                 /* release gsp::Lcd (else HOME hard-locks) */
             if (g_ring_apt_w) g_y2r_exit();             /* release Y2R + its event (only if it's up yet) */
@@ -4707,6 +4722,7 @@ static void mp_ring_apt_hook(APT_HookType hook, void *param) {
             if (g_ring_apt_w) g_y2r_init(g_ring_apt_w, g_ring_apt_h, g_ring_apt_bpp);   /* re-acquire Y2R */
             if (g_lcd_ok) gspLcdInit();                                  /* re-acquire gsp::Lcd */
             g_backlight_on = 1;                                          /* applet left the backlight on */
+            dark_on_restore();                                           /* the loop's reconcile darkens it */
             if (g_ring_apt_audio && g_ring_apt_playing) ndspChnSetPaused(0, false);
             g_ring_susp = 0;                            /* let the worker produce again */
             if (g_ring_wake) LightEvent_Signal(g_ring_wake);
@@ -5706,6 +5722,7 @@ static MoflexResult moflex_play_ring(const char *path) {
         /* L+R together toggles the FULL lock: touch AND every button are dead while locked; only
          * pressing L+R again unlocks. (L alone used to lock touch-only, but stray button presses
          * were just as much of a problem in a pocket/bag.) */
+        wake_swallow(&kd, &kh);                 /* back from HOME: the returning press does nothing */
         if ((kh & KEY_L) && (kh & KEY_R) && (kd & (KEY_L | KEY_R))) {
             g_touch_locked = !g_touch_locked; g_lock_toast = 0; dirty = 1; kd = 0; kh = 0;
         }
@@ -7783,6 +7800,7 @@ void kit_film_end(void) {
     g_backlight_on = 1;
 }
 void kit_suspend(void) {   /* the gsp::Lcd half of mp_ring_apt_hook */
+    dark_on_suspend();
     if (g_screen_off) { GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTH); g_screen_off = 0; g_idle_dark = 0; g_top_on = 1; } g_backlight_on = 1;
     if (g_lcd_ok) gspLcdExit();
     gfxSet3D(false);
@@ -7790,6 +7808,7 @@ void kit_suspend(void) {   /* the gsp::Lcd half of mp_ring_apt_hook */
 void kit_restore(void) {
     if (g_lcd_ok) gspLcdInit();
     g_backlight_on = 1;
+    dark_on_restore();                    /* kit_input's reconcile darkens it */
     g_kit_redraw = 1;
 }
 int kit_take_redraw(void) { int r = g_kit_redraw; g_kit_redraw = 0; return r; }
@@ -7812,6 +7831,7 @@ void kit_input(u32 *pkd, u32 *pkh, int *dirty) {
             s_lid_closed = (shell == 0) ? 1 : 0;
         }
     }
+    wake_swallow(&kd, &kh);               /* back from HOME: the returning press does nothing */
     if ((kh & KEY_L) && (kh & KEY_R) && (kd & (KEY_L | KEY_R))) {   /* L+R: full lock */
         g_touch_locked = !g_touch_locked; g_lock_toast = 0; *dirty = 1; kd = 0; kh = 0;
     }
