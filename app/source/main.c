@@ -7519,8 +7519,11 @@ static int bt_browse(void) {
         if (filt[depth][0]) snprintf(sub, sizeof sub, "Search: %s  (B clears)", filt[depth]);
         else if (lib_f) snprintf(sub, sizeof sub, "%s%s%s", fcat[depth] >= 0 ? k_bt_cat[fcat[depth]] : "All",
                                  fgen[depth][0] ? " - " : "", fgen[depth]);
+        /* the top screen reads row r as view[r]: any filter (a search, a category, a genre) needs the
+         * shown rows' own list -- with only the search one built, a category or genre list showed
+         * another item's info on top (playing used `map`, so the right film still played) */
         BtItem *view = it;
-        if (filt[depth][0]) {
+        if (shown != n) {
             view = (BtItem *)malloc((size_t)shown * sizeof(BtItem));
             if (view) for (int r = 0; r < shown; r++) view[r] = it[map[r]]; else view = it;
         }
