@@ -141,6 +141,13 @@ int moflex_seek_wait_hook(int poll) {
 #ifdef LAB_AUTOPLAY
 static long long g_lab_st[8][3]; static int g_lab_stn;   /* lab: where each stutter happened */
 u64 g_lab_deadline;   /* lab build: playback stops on its own at this osGetTime() */
+/* SYNC PROBE (sync=1, for the flash+click test clip): the true A/V offset on the console. Each click
+ * is found in the decoded audio as it is queued (its sample number since the last flush); each flash
+ * in the decoded picture. When a flash frame is put on screen, the DSP's real position is compared
+ * with the nearest click: + = the sound came first. fskip=N forces a catch-up skip every N s. */
+int g_lab_sync, g_lab_fskip;
+static long long sp_fed, sp_click[16]; static int sp_nc, sp_quiet = 1;
+static int64_t sp_flash[16]; static volatile int sp_nf; static int64_t sp_last = -1;
 #endif
 static int dbg_on(void) {
 #ifdef LAB_AUTOPLAY
@@ -3813,6 +3820,13 @@ static volatile u32 g_r3_last_present;   /* osGetTime() of the last shown frame 
  * Captured once (never re-derived from the drifting bts-rts) so it can't grow -> no runaway. */
 static int64_t r3_audio_t0 = -1;   /* content ts of the first audio sample after (re)start */
 static int64_t r3_av_skew = 0;     /* constant apos offset = audio_origin - video_origin */
+/* VIDEO ORIGIN: the content time of the pair with rts 0 (the landing, or the film's first pair),
+ * set where that pair is placed; -1 = not known yet (the worker sets it from pair 0's timestamp).
+ * It was derived as bts - rts of whichever pair was up when the sound started -- but bts is the
+ * BLOCK's timestamp, carried over every pair in a block, so that was late by the pair's place in
+ * its block: one pair (~42 ms) at the very start, up to a second after some landings, and the
+ * picture ran that far ahead of the sound until the next seek (lab sync probe: -30 ms from 0:00). */
+static int64_t r3_vorigin = -1;
 static int     r3_av_ready = 0;    /* r3_av_skew has been captured for this segment */
 static u64 r3_last;   /* last poll tick, for the phase-locked clock */
 /* DISPLAY LOCK: the audio's playback speed (1.0 = as recorded). The present loop trims it a hair
@@ -3837,6 +3851,9 @@ static void r3_audio_close(void);   /* used by the setup failure path below */
 static void r3_audio_setup(int arate, int chn) {
     r3_arate = arate; r3_achn = chn; r3_awi = 0; r3_aplayed = 0; r3_apos = -1; r3_last = 0;
     r3_audio_t0 = -1; r3_av_skew = 0; r3_av_ready = 0; r3_aspeed = 1.0f;
+#ifdef LAB_AUTOPLAY
+    sp_fed = 0; sp_nc = 0; sp_quiet = 1;
+#endif
     ndspChnReset(0); ndspChnSetInterp(0, NDSP_INTERP_POLYPHASE); ndspChnSetRate(0, (float)arate);
     ndspChnSetFormat(0, chn == 2 ? NDSP_FORMAT_STEREO_PCM16 : NDSP_FORMAT_MONO_PCM16);
     float mix[12]; memset(mix, 0, sizeof mix); mix[0] = mix[1] = 1.0f; ndspChnSetMix(0, mix);
@@ -3992,6 +4009,12 @@ static int r3_audio_feed_raw(const uint8_t *data, int size) {
         r3_trim_from = -1;
         if (r3_audio_t0 < 0) r3_audio_t0 = st;               /* the exact origin */
     }
+#ifdef LAB_AUTOPLAY
+    if (g_lab_sync) { const int16_t *q = r3_ab[r3_awi]; int hit = -1;
+        for (int i = 0; i < fr; i++) { int v = q[i * r3_achn]; if (v > 12000 || v < -12000) { hit = i; break; } }
+        if (hit >= 0 && sp_quiet) { sp_click[sp_nc % 16] = sp_fed + hit; sp_nc++; }
+        sp_quiet = hit < 0; sp_fed += fr; }
+#endif
     { int16_t *s = r3_ab[r3_awi]; int ns = fr * r3_achn;
       float al = (g_autolvl > 0 && g_autolvl <= 2) ? al_update(s, ns) : 1.0f;
       LightLock_Lock(&g_alk);
@@ -4013,6 +4036,9 @@ static void r3_audio_flush(void) {   /* on seek: drop everything queued, clock o
     r3_awi = 0; r3_aplayed = 0; r3_apos = -1; r3_last = 0;
     r3_audio_t0 = -1; r3_av_skew = 0; r3_av_ready = 0;   /* re-anchor A/V on the next lock */
     r3_trim_from = -1;
+#ifdef LAB_AUTOPLAY
+    sp_fed = 0; sp_nc = 0; sp_quiet = 1;
+#endif
     ndspChnSetPaused(0, true);
 }
 static void r3_audio_close(void) {   /* safe to call in ANY state: frees partial allocations too */
@@ -4035,7 +4061,8 @@ static uint8_t *r3_vq[R3_VQ]; static int r3_vqn[R3_VQ]; static int64_t r3_vqts[R
 static int r3_vqh, r3_vqt, r3_vqc;
 #define R3_KFPN 256
 static int r3_kfp[R3_KFPN]; static int r3_kfph, r3_kfpt, r3_kfpc;   /* buffered keyframe PAIR positions */
-static int r3_pushv;                                                /* video packets pushed (pair = /2) */
+static int r3_pushv;                                                /* video packets pushed (pair = /r3_vq_pair) */
+static int r3_vq_pair = 2;                                          /* video packets per displayed pair: 2 = 3D, 1 = 2D */
 static void r3_kfp_enq(int pos) {
     if (r3_kfpc >= R3_KFPN) { r3_kfph = (r3_kfph + 1) % R3_KFPN; r3_kfpc--; }
     r3_kfp[r3_kfpt] = pos; r3_kfpt = (r3_kfpt + 1) % R3_KFPN; r3_kfpc++;
@@ -4047,7 +4074,7 @@ static int r3_vq_push(const uint8_t *d, int n, int64_t ts, int kf) {
     LightLock_Lock(&g_vqlk);
     r3_vq[r3_vqt] = p; r3_vqn[r3_vqt] = n; r3_vqts[r3_vqt] = ts; r3_vqkf[r3_vqt] = (uint8_t)kf;
     r3_vqt = (r3_vqt + 1) % R3_VQ; r3_vqc++;
-    if (kf && (r3_pushv & 1) == 0) r3_kfp_enq(r3_pushv / 2);   /* keyframe on a left eye -> its pair pos */
+    if (kf && (r3_pushv % r3_vq_pair) == 0) r3_kfp_enq(r3_pushv / r3_vq_pair);   /* keyframe on a left eye (3D) -> its pair pos */
     r3_pushv++;
     LightLock_Unlock(&g_vqlk);
     return 1;
@@ -4729,11 +4756,12 @@ static int r3_read_some(R3S *s, int maxpk) {
             s->has_pending = 0;   /* a NON-selected audio track (dual audio): skip it entirely --
                                    * feeding every audio stream to one DSP channel garbles both */
         } else if (mt == MFX_TYPE_AUDIO && s->have_audio) {
-            if (s->m->ts != s->a_blk) { s->a_blk = s->m->ts; s->a_acc = s->m->ts; }
+            if (s->m->ts != s->a_blk) { s->a_blk = s->m->ts;   /* where this block's audio REALLY starts (mfx_detect_stereo) */
+                                        s->a_acc = mfx_audio_start(s->m, s->m->ts); }
             r3_pkt_start = s->a_acc;
             if (r3_audio_feed(&s->pending)) {
                 if (r3_last_fr > 0 && r3_arate > 0) s->a_acc += (int64_t)r3_last_fr * 1000000 / r3_arate;
-                if (r3_audio_t0 < 0) { int64_t at = s->m->ts; r3_audio_t0 = at < 0 ? 0 : at; }  /* audio origin */
+                if (r3_audio_t0 < 0) { int64_t at = r3_pkt_start; r3_audio_t0 = at < 0 ? 0 : at; }  /* audio origin */
                 s->has_pending = 0;
             }
             else { s->audio_pre_full = 1; break; }        /* bank full: hold packet, let main unpause audio */
@@ -4800,6 +4828,11 @@ static void r3_produce(R3S *s) {
     const int DRIFT_MAX = s->old3ds ? 6 : 20;   /* Old-3DS: resync early+often (short ghost, avtest's value).
                                  * New-3DS: let the present drop-loop absorb spikes (it rarely skips anyway). */
     if (!s->skipping && canskip && drift > DRIFT_MAX) s->skipping = 1;
+#ifdef LAB_AUTOPLAY
+    { static u64 fs_t; if (g_lab_fskip > 0 && !s->skipping && r3_apos > 0 && r3_vqc > 2) {
+        u64 now = osGetTime(); if (!fs_t) fs_t = now;
+        if (now - fs_t > (u64)g_lab_fskip * 1000) { fs_t = now; s->skipping = 1; } } }
+#endif
     if (s->skipping) {
         /* CLEAN catch-up: discard packets WITHOUT decoding until the queue head is a KEYFRAME, then
          * flush and resume decoding there. Never decode a P-frame against references we skipped --
@@ -4810,7 +4843,9 @@ static void r3_produce(R3S *s) {
                              * "looked best": clean picture + rare freezes, vs no-flush's persistent ghosting on
                              * this keyframe-sparse content). Matches the avtest degradation the user prefers. */
         else {
-            int n, kf; int64_t ts; free(r3_vq_pop(&n, &ts, &kf)); if (r3_vqc > 0) free(r3_vq_pop(&n, &ts, &kf));
+            /* one PAIR per step: two packets in 3D, one in 2D (2D dropped two frames per step but
+             * counted one, so after a catch-up the picture ran ahead of its timestamps -- and of the sound) */
+            int n, kf; int64_t ts; free(r3_vq_pop(&n, &ts, &kf)); if (s->is3d && r3_vqc > 0) free(r3_vq_pop(&n, &ts, &kf));
             s->dpair = dpair + 1; g_st_skipped++;
             return;
         }
@@ -4822,6 +4857,12 @@ static void r3_produce(R3S *s) {
     AVPacket ap;
     uint8_t *p = r3_vq_pop(&n, &vts, &kf); ap.data = p; ap.size = n;
     int okL = (mobi_decode(s->ctx, s->fL, &gotL, &ap) >= 0 && gotL); free(p);
+    if (dpair == 0 && r3_vorigin < 0) r3_vorigin = vts;
+#ifdef LAB_AUTOPLAY
+    if (g_lab_sync && okL) { const uint8_t *y = s->fL->data[0]; int ls = s->fL->linesize[0], sum = 0;
+        for (int k = 0; k < 8; k++) sum += y[(20 + k * 25) * ls + 30 + k * 40];
+        if (sum > 8 * 200) { sp_flash[sp_nf % 16] = vts; sp_nf = sp_nf + 1; } }
+#endif
     if (g_yq_lf) r3_yq_mid();                     /* left eye converted meanwhile: the right converts during eye 2 */
     s->cur_us = vts;
     /* Old-3DS catch-up ELISION: a pair already behind the audio clock will be discarded unseen by
@@ -5450,6 +5491,7 @@ static MoflexResult moflex_play_ring(const char *path) {
     /* ---- start the DECODE THREAD (producer). It fills the ring; this (main) thread only presents. ---- */
     R3S s; memset(&s, 0, sizeof s);
     s.m = &m; s.ctx = &ctx; s.fL = fL; s.fR = fR;
+    r3_vq_pair = is3d ? 2 : 1; r3_vorigin = -1;
     s.W = W; s.H = H; s.is3d = is3d; s.NB = NB; s.have_audio = have_audio; s.old3ds = !r3_isnew;
     s.aidx = ai;
     s.trf = NULL; s.tr_cur = 0; s.tr_active = 0;
@@ -5777,7 +5819,7 @@ static MoflexResult moflex_play_ring(const char *path) {
             if (seek_ui && !pv_hold) {          /* stop playing once: the worker switches to stills */
                 WORKER_LOCK();
                 for (int i = 0; i < NB; i++) ready[i] = 0;
-                s.wr = 0; rd = 0; s.rd = 0; s.dpair = 0; s.has_pending = 0;
+                s.wr = 0; rd = 0; s.rd = 0; s.dpair = 0; s.has_pending = 0; r3_vorigin = -1;
                 r3_vq_clear();
                 if (have_audio) { r3_audio_flush(); ndspChnSetPaused(0, true); }
                 gated = 0; s.paused = 1;
@@ -5810,7 +5852,7 @@ static MoflexResult moflex_play_ring(const char *path) {
             if (s.land_ok) {
                 int sl = s.land_slot; int64_t lts = s.land_lts;
                 for (int i = 0; i < NB; i++) ready[i] = 0;
-                rd = sl; s.rd = sl; s.wr = sl + 1; ready[sl] = 1; rts[sl] = 0; bts[sl] = lts; s.dpair = 1;
+                rd = sl; s.rd = sl; s.wr = sl + 1; ready[sl] = 1; rts[sl] = 0; bts[sl] = lts; s.dpair = 1; r3_vorigin = lts;
                 s.skipping = 0; s.done = 0; s.has_pending = 0;
                 if (!pv_had_still) last_shown = -1;   /* no still shown: the landing pair stands in until play;
                                                      * else the preview still stays up until sound+picture start */
@@ -5880,7 +5922,7 @@ static MoflexResult moflex_play_ring(const char *path) {
             do_seek(&m, &ctx, land_tgt);
             int64_t prime_from = land_tgt; s.vskip = 0;
             for (int i = rd; i < s.wr; i++) ready[i % NB] = 0;
-            s.wr = 0; rd = 0; s.rd = 0; s.dpair = 0; s.skipping = 0; s.done = 0; s.has_pending = 0; last_shown = -1;
+            s.wr = 0; rd = 0; s.rd = 0; s.dpair = 0; s.skipping = 0; s.done = 0; s.has_pending = 0; last_shown = -1; r3_vorigin = -1;
             r3_vq_clear();
             if (have_audio) r3_audio_flush();
             if (s.tr_active && g_tra.aud_pktsamp)   /* trailer audio: cursor = pure arithmetic */
@@ -5971,7 +6013,7 @@ static MoflexResult moflex_play_ring(const char *path) {
                         g_y2r_start(fL, tA, W, H); g_y2r_wait(tA);
                         g_y2r_start(fR, tB, W, H); g_y2r_wait(tB);
                     } else { g_y2r_start(fL, &r3_texL[0], W, H); g_y2r_wait(&r3_texL[0]); }
-                    rts[0] = 0; bts[0] = lts; ready[0] = 1; s.wr = 1; s.dpair = 1; cur_us = lts; s.cur_us = lts;
+                    rts[0] = 0; bts[0] = lts; ready[0] = 1; s.wr = 1; s.dpair = 1; cur_us = lts; s.cur_us = lts; r3_vorigin = lts;
                     primed = 1;
                     if (!resume_exact) { mfx_seek_time(&m, prime_from); s.vskip = vseen;   /* keep the block's audio */
                                          s.a_blk = -1; r3_trim_from = s.tr_active ? -1 : lts; }
@@ -6022,7 +6064,7 @@ static MoflexResult moflex_play_ring(const char *path) {
                             g_y2r_start(fL, tA, W, H); g_y2r_wait(tA);
                             g_y2r_start(fR, tB, W, H); g_y2r_wait(tB);
                         } else { g_y2r_start(fL, &r3_texL[0], W, H); g_y2r_wait(&r3_texL[0]); }
-                        bts[0] = cts; cur_us = cts; s.cur_us = cts;
+                        bts[0] = cts; cur_us = cts; s.cur_us = cts; r3_vorigin = cts;
                     } else rb_ok = 0;
                 }
                 /* RESUME AUDIO: the forward decode read straight on, dropping the audio stored earlier
@@ -6054,7 +6096,7 @@ static MoflexResult moflex_play_ring(const char *path) {
                 g_seek_cut = 0; s.vskip = 0;
                 clearerr(m.f); m.eof = 0;
                 for (int i = 0; i < NB; i++) ready[i] = 0;
-                s.wr = 0; rd = 0; s.rd = 0; s.dpair = 0; s.done = 0; s.has_pending = 0; last_shown = -1;
+                s.wr = 0; rd = 0; s.rd = 0; s.dpair = 0; s.done = 0; s.has_pending = 0; last_shown = -1; r3_vorigin = -1;
                 r3_vq_clear();
                 if (have_audio) { r3_audio_flush(); ndspChnSetPaused(0, true); }
                 gated = 0; s.paused = 1;
@@ -6162,7 +6204,8 @@ static MoflexResult moflex_play_ring(const char *path) {
              * the true video origin (before any cadence drift). skew = audio_origin - video_origin, held
              * constant thereafter and ignored if implausibly large (bad/absent timestamps). */
             if (have_audio && !r3_av_ready && apos >= 0 && r3_audio_t0 >= 0) {
-                int64_t sk = r3_audio_t0 - (bts[rd % NB] - rts[rd % NB]);
+                int64_t vo = r3_vorigin >= 0 ? r3_vorigin : bts[rd % NB] - rts[rd % NB];
+                int64_t sk = r3_audio_t0 - vo;
                 r3_av_skew = (sk < -1000000 || sk > 1000000) ? 0 : sk;
                 r3_av_ready = 1;
             }
@@ -6348,7 +6391,25 @@ static MoflexResult moflex_play_ring(const char *path) {
                 st_shown++;
                 cad_last = nt;
                 ready[show] = 0; last_shown = show; last_bts = bts[show]; cur_us = bts[show]; rd++;
-                g_r3_last_present = (u32)osGetTime();   /* elision starving-guard: the picture actually changed */
+                g_r3_last_present = (u32)osGetTime();
+#ifdef LAB_AUTOPLAY
+                if (g_lab_sync && have_audio && sp_nc > 0 && r3_arate > 0) {
+                    int isf = 0; for (int k = 0; k < 16 && k < sp_nf; k++) if (sp_flash[k] == last_bts) isf = 1;
+                    if (isf && last_bts != sp_last) {
+                        sp_last = last_bts;
+                        LightLock_Lock(&g_alk); long long tp = r3_aplayed;
+                        for (int i = 0; i < r3_nawb; i++) if (r3_wb[i].status == NDSP_WBUF_DONE && !r3_acnt[i]) tp += r3_wb[i].nsamples;
+                        LightLock_Unlock(&g_alk); tp += ndspChnGetSamplePos(0);
+                        long long best = 0, bd = -1;
+                        for (int k = 0; k < 16 && k < sp_nc; k++) { long long d = tp - sp_click[k]; long long ad = d < 0 ? -d : d; if (bd < 0 || ad < bd) { bd = ad; best = d; } }
+                        FILE *sf = fopen("sdmc:/moflex_player/sync_probe.txt", "a");
+                        if (sf) { fprintf(sf, "SYNC flash@%lldms offset=%+lldms (rts=%lld ae=%lld t0=%lld skew=%lld skips=%lu)\n",
+                                          (long long)last_bts / 1000, best * 1000 / r3_arate, (long long)rts[show] / 1000,
+                                          (long long)(r3_apos + r3_av_skew) / 1000, (long long)r3_audio_t0 / 1000, (long long)r3_av_skew / 1000,
+                                          (unsigned long)g_st_skipped); fclose(sf); }
+                    }
+                }
+#endif   /* elision starving-guard: the picture actually changed */
             }
         }
         if (s.rd != rd) { s.rd = rd; LightEvent_Signal(&s.wake); }   /* freed slot(s) -> wake the decode thread */

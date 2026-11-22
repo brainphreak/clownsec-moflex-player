@@ -60,6 +60,15 @@ typedef struct {
     int      tb_is_eye;     /* 3D: the declared timebase is the EYE-frame period (Nintendo files
                                declare ~48-60 = the L+R packet rate), so a display PAIR lasts 2x it */
     int      audio_only;    /* if set, mfx_next_packet skips (seeks past) non-audio chunks */
+    int64_t  av_off;        /* (mfx_detect_stereo) how much earlier a block's AUDIO really starts than its
+                               timestamp says, relative to its video, in us: content start of a block's
+                               first audio packet = ts - av_off. 0 = exact or unknown */
+    double   av_drift;      /* Nintendo's muxer clocks audio packets in whole microseconds, rounded DOWN
+                               (a 1024-sample packet at 44.1 kHz = 23219.95 us -> 23219): its audio runs
+                               ahead of the timestamps by this fraction of the time (44.1 kHz: 46 ppm,
+                               ~0.15 s by minute 45). Offset at time t = av_off - av_drift * (t - av_tref) */
+    int64_t  av_tref;
+    /* the offset (us) of a block's audio vs its timestamp, at content time t (see av_off) */
 
     unsigned br_last, br_pos;  /* bit reader */
 
@@ -100,6 +109,8 @@ int  mfx_next_packet(MfxDemux *m, MfxPacket *pkt);
 /* Detect frame-interleaved 3D (1) vs 2D (0) by the delivered-vs-timebase frame-rate ratio.
  * Pre-scans ~2s then rewinds to the start. Call right after mfx_open, before playback. */
 int  mfx_detect_stereo(MfxDemux *m);
+/* where a block's first audio sample really is, for a block stamped ts (see av_off / av_drift) */
+int64_t mfx_audio_start(const MfxDemux *m, int64_t ts);
 
 /* Seek to ~fraction (0..1) of the file, realign to the next sync marker.
  * Approximate (nearest block); caller should flush the decoder and decode

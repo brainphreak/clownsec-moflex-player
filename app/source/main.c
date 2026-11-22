@@ -7678,7 +7678,7 @@ static int play_and_handle(const char *path, int origin) {
  * the engine's ring_stats line to sdmc:/lab/last.log, and chain-load back to the Moflex Lab Host --
  * so it never strands the console in the HOME Menu. */
 extern u64 g_lab_deadline;
-extern int g_lab_noq, g_lab_noflush, g_lab_noov;
+extern int g_lab_noq, g_lab_noflush, g_lab_noov, g_lab_sync, g_lab_fskip;
 /* libtest=<folder>: the REAL library code on a folder -- which files are episodes, how they group
  * into shows, their order, labels and the next-episode chain -- written to sdmc:/lab/last.log */
 static void lab_libtest(const char *dir) {
@@ -7765,6 +7765,8 @@ static void lab_autoplay(void) {
         else if (!strncmp(l, "noq=", 4)) g_lab_noq = atoi(l + 4);
         else if (!strncmp(l, "noflush=", 8)) g_lab_noflush = atoi(l + 8);
         else if (!strncmp(l, "noov=", 5)) g_lab_noov = atoi(l + 5);
+        else if (!strncmp(l, "sync=", 5)) g_lab_sync = atoi(l + 5);
+        else if (!strncmp(l, "fskip=", 6)) g_lab_fskip = atoi(l + 6);
         else if (!strncmp(l, "libtest=", 8)) { lab_libtest(l + 8); return; }
         else if (!strncmp(l, "dltest=", 7)) { lab_dltest(l + 7); dlt = 1; }
     }
@@ -7785,7 +7787,7 @@ static void lab_autoplay(void) {
     }
     FILE *o = fopen("sdmc:/lab/last.log", "w");
     for (int k = 0; k < plays; k++) {        /* plays=N: the same video N times in one session */
-        remove("sdmc:/moflex_player/ring_stats.txt");
+        remove("sdmc:/moflex_player/ring_stats.txt"); remove("sdmc:/moflex_player/sync_probe.txt");
         if (bturl[0] && btitem[0] && btfmt >= 0) {   /* btfmt=-1: a moflex, read as a file */
             bt_live_arm(btitem, btfmt, 0, (long long)start * 1000);
             moflex_live_fmt_set(btfmt);
@@ -7803,6 +7805,8 @@ static void lab_autoplay(void) {
             FILE *rs = fopen("sdmc:/moflex_player/ring_stats.txt", "r");
             if (rs) { char ln[4096]; while (fgets(ln, sizeof ln, rs)) fputs(ln, o); fclose(rs); }
             else fputs("(no ring_stats)\n", o);
+            FILE *sp = fopen("sdmc:/moflex_player/sync_probe.txt", "r");
+            if (sp) { char ln[512]; while (fgets(ln, sizeof ln, sp)) fputs(ln, o); fclose(sp); }
             fflush(o);
         }
         if (!aptMainLoop()) break;
