@@ -7318,6 +7318,10 @@ static void bt_row(const BtItem *e, char *out) {
     else if (!strcmp(e->type, "episode")) snprintf(out, 64, "%s%d. %s", mark, e->episode, e->title);
     else if (!strcmp(e->type, "season")) snprintf(out, 64, "%s  (%d/%d)", e->title, e->seen, e->episodes);
     else if (!strcmp(e->type, "show")) snprintf(out, 64, "%s%s%.0d%s", e->title, e->year ? " (" : "", e->year, e->year ? ")" : "");
+    else if (!strcmp(e->type, "group")) {   /* a film and its extras */
+        char yr[12] = ""; if (e->year) snprintf(yr, sizeof yr, " (%d)", e->year);
+        snprintf(out, 64, "%s%.40s%s  +%d", mark, e->title, yr, e->episodes);
+    }
     else if (e->year) snprintf(out, 64, "%s%s (%d)", mark, e->title, e->year);
     else snprintf(out, 64, "%s%s", mark, e->title);
 }
@@ -7340,7 +7344,10 @@ static void bt_draw_top(int i) {
     snprintf(m.title, sizeof m.title, "%s", e->title);
     snprintf(m.genres, sizeof m.genres, "%s", e->genres);
     snprintf(m.desc, sizeof m.desc, "%s", e->summary);
-    if (!m.desc[0] && e->episodes) snprintf(m.desc, sizeof m.desc, "%d episodes, %d watched", e->episodes, e->seen);
+    if (!strcmp(e->type, "group")) {      /* say there are extras, under the film's own summary */
+        char x[48]; snprintf(x, sizeof x, "[%d extra%s inside]", e->episodes, e->episodes == 1 ? "" : "s");
+        snprintf(m.desc, sizeof m.desc, "%s%s%.380s", x, e->summary[0] ? " " : "", e->summary);   /* the wrap has no line breaks */
+    } else if (!m.desc[0] && e->episodes) snprintf(m.desc, sizeof m.desc, "%d episodes, %d watched", e->episodes, e->seen);
     snprintf(m.category, sizeof m.category, "Big Top");
     m.year = e->year; m.runtime = e->runtime; m.is3d = e->is3d;
     if (e->fmt[0]) {   /* what the file is, and how it reaches this console */
@@ -7568,6 +7575,7 @@ static int bt_browse(void) {
             free(lst[depth]); lst[depth] = NULL;
             if (!strcmp(pick.type, "lib")) snprintf(path[depth], sizeof path[depth], "/api/libraries/%s", pick.id);
             else if (!strcmp(pick.type, "show")) snprintf(path[depth], sizeof path[depth], "/api/shows/%s", pick.id);
+            else if (!strcmp(pick.type, "group")) snprintf(path[depth], sizeof path[depth], "/api/groups/%s", pick.id);
             else if (!strcmp(pick.type, "season")) {               /* id is "<show>/<n>" */
                 char sid[40]; snprintf(sid, sizeof sid, "%s", pick.id);
                 char *sl = strchr(sid, '/'); if (sl) *sl = 0;

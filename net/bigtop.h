@@ -17,7 +17,8 @@ void bt_cfg_save(const BtCfg *c);
 
 /* one row of a list: library, movie, show, season or episode */
 typedef struct {
-    char type[8];        /* "lib" "movie" "show" "season" "episode" */
+    char type[8];        /* "lib" "movie" "show" "season" "episode" "group" (a film + its extras;
+                          * episodes = how many extras) */
     char id[40];
     char title[96];
     int  year, runtime, is3d, poster, season, episode, episodes, seen, watched, super;
@@ -57,7 +58,8 @@ void bt_set_cancel(int (*fn)(void));
 int  bt_cancelled(void);
 
 int  bt_libraries(const BtCfg *c, BtItem **out);                 /* count, or -1 (bt_error) */
-/* path: "/api/libraries/<id>", "/api/shows/<id>" (its seasons), "/api/shows/<id>/seasons/<n>" */
+/* path: "/api/libraries/<id>", "/api/shows/<id>" (its seasons), "/api/shows/<id>/seasons/<n>",
+ * "/api/groups/<id>" (a film and its extras) */
 int  bt_list(const BtCfg *c, const char *path, BtItem **out);
 int  bt_item(const BtCfg *c, const char *id, BtItem *out);       /* fresh details (resume point) */
 const char *bt_error(void);
