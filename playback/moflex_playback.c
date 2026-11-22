@@ -3411,10 +3411,11 @@ static void batt_render(void) {
         ui_button(18, top + i * step, UI_W - 36, bh, r, i == g_batt_sel, UI_NEONC);
     }
     int y = top + BATT_ROWS * step + 10;
-    ui_text_center(UI_W / 2, y,      1, UI_DIM, "Time left is measured as the level drops;");
-    ui_text_center(UI_W / 2, y + 12, 1, UI_DIM, "it takes a few minutes on battery.");
-    ui_text_center(UI_W / 2, y + 32, 1, UI_DIM, "Screens off: no input this long (paused,");
-    ui_text_center(UI_W / 2, y + 44, 1, UI_DIM, "or in the menus) turns the screens off.");
+    /* 8 px a character: 36 at most, with a margin */
+    ui_text_center(UI_W / 2, y,      1, UI_DIM, "Time left is measured as the");
+    ui_text_center(UI_W / 2, y + 12, 1, UI_DIM, "level drops (a few minutes).");
+    ui_text_center(UI_W / 2, y + 32, 1, UI_DIM, "Screens off: no input this long");
+    ui_text_center(UI_W / 2, y + 44, 1, UI_DIM, "while paused or in the menus.");
     ui_text(8, 226, 1, UI_DIM, "B - back");
     g_batt_sig_drawn = batt_sig();
 }
