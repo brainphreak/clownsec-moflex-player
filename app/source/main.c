@@ -13,6 +13,7 @@
 #include <time.h>
 #include <locale.h>
 #include <unistd.h>
+#include <math.h>
 #include <mbedtls/md5.h>
 
 #include "moflex_playback.h"
@@ -45,32 +46,48 @@
  * is held only for the instant of the toggle -- holding it across a HOME suspend locks the GSP.
  * Cost: one osGetTime + a few compares per frame; nothing on the hot paths. */
 /* Settings > SCREENS OFF AFTER: the time, one of these (0 = never). Paused playback uses it too. */
-static const unsigned k_idle_secs[] = { 15, 30, 60, 120, 300, 600, 0 };
+static const unsigned k_idle_secs[] = { 5, 15, 30, 60, 120, 300, 600, 0 };
 #define IDLE_N   ((int)(sizeof k_idle_secs / sizeof k_idle_secs[0]))
-#define IDLE_DEF 4                                   /* 5 minutes */
-#define IDLE_CFG "sdmc:/moflex_player/screens_off.txt"
+#define IDLE_DEF 5                                   /* 5 minutes */
+/* the file holds SECONDS (0 = never); the older one held a place in the list before 5 SEC */
+#define IDLE_CFG "sdmc:/moflex_player/screens_off_s.txt"
+#define IDLE_CFG_V1 "sdmc:/moflex_player/screens_off.txt"
 static int s_idle_sel = -1;
 static unsigned idle_off_ms(void) { return k_idle_secs[s_idle_sel < 0 ? IDLE_DEF : s_idle_sel] * 1000u; }
 static const char *idle_name(int i) {
-    static const char *const n[] = { "15 SEC", "30 SEC", "1 MIN", "2 MIN", "5 MIN", "10 MIN", "NEVER" };
-    return n[i];
+    static const char *const n[] = { "5 SEC", "15 SEC", "30 SEC", "1 MIN", "2 MIN", "5 MIN", "10 MIN", "NEVER" };
+    return n[i < 0 ? IDLE_DEF : i];
 }
 static void idle_cfg_load(void) {
     s_idle_sel = IDLE_DEF;
+    int v = -1;
     FILE *f = fopen(IDLE_CFG, "r");
-    if (f) { int v = -1; if (fscanf(f, "%d", &v) == 1 && v >= 0 && v < IDLE_N) s_idle_sel = v; fclose(f); }
+    if (f) {
+        if (fscanf(f, "%d", &v) == 1) for (int i = 0; i < IDLE_N; i++) if ((int)k_idle_secs[i] == v) s_idle_sel = i;
+        fclose(f);
+    } else if ((f = fopen(IDLE_CFG_V1, "r"))) {
+        if (fscanf(f, "%d", &v) == 1 && v >= 0 && v < IDLE_N - 1) s_idle_sel = v + 1;
+        fclose(f);
+    }
     moflex_set_idle_off_ms(idle_off_ms());
 }
 static void idle_cfg_set(int i) {
     s_idle_sel = i;
     mkdir("sdmc:/moflex_player", 0777);
     FILE *f = fopen(IDLE_CFG, "w");
-    if (f) { fprintf(f, "%d\n", i); fclose(f); }
+    if (f) { fprintf(f, "%u\n", k_idle_secs[i]); fclose(f); }
     moflex_set_idle_off_ms(idle_off_ms());
+}
+/* the player's battery menu changes the same setting: step it, and name it */
+static const char *idle_step_cb(int dir) {
+    if (s_idle_sel < 0) idle_cfg_load();
+    if (dir) idle_cfg_set((s_idle_sel + IDLE_N + (dir > 0 ? 1 : -1)) % IDLE_N);
+    return idle_name(s_idle_sel);
 }
 #define IDLE_OFF_MS idle_off_ms()
 static u64 s_idle_last, s_idle_prevscan;
 static int s_idle_off, s_idle_swallow, s_idle_hooked;
+static int s_idle_hold;   /* an update is running: the screens stay on (the timer never runs out) */
 static aptHookCookie s_idle_cookie;
 static int dl_lid_closed(void);                      /* defined with the download helpers below */
 static void idle_backlight(int on) {
@@ -125,6 +142,13 @@ static void idle_scan(void) {
     u64 now = osGetTime();
     if (now - s_idle_prevscan > 2000) s_idle_last = now;   /* back from playback/extract/applet */
     s_idle_prevscan = now;
+    if (s_idle_hold) s_idle_last = now;
+    {   /* the 3D slider counts as being here: a real move restarts the timer. It never wakes dark
+         * screens (only buttons and touch do), and a tiny wobble doesn't count. */
+        static float s_sl = -1.0f;
+        float sl = osGet3DSliderState();
+        if (s_sl < 0.0f || fabsf(sl - s_sl) >= 0.04f) { if (s_sl >= 0.0f && !s_idle_off) s_idle_last = now; s_sl = sl; }
+    }
     /* Lid watchdog: with sleep denied (background downloads) a lid close/reopen fires NO wake
      * event -- if anything left the LCDs dark, nothing would ever relight them. A closed->open
      * transition always forces the backlights on. A ptmu failure counts as "no reading", never
@@ -4633,7 +4657,14 @@ static int upd_cia_install(const char *path) {
     return ok;
 }
 /* Returns 1 when the new build is on the card and the app should exit (it relaunches itself). */
+static int self_update_(void);
 static int self_update(void) {
+    s_idle_hold = 1;                 /* no screens-off while it downloads, checks and installs */
+    int r = self_update_();
+    s_idle_hold = 0;
+    return r;
+}
+static int self_update_(void) {
     int hbl = envIsHomebrew();
     const char *self = (hbl && __system_argc > 0 && __system_argv && __system_argv[0] &&
                         !strncmp(__system_argv[0], "sdmc:/", 6)) ? __system_argv[0] : NULL;
@@ -4713,7 +4744,21 @@ static int self_update(void) {
     if (!ok) { msg_screen("UPDATE", "The install failed.\nThe current version is unchanged."); return 0; }
     char m[96];
     if (hbl) snprintf(m, sizeof m, "Updated to %s.\nStart it again from the\nHomebrew Launcher.", s_upd);
-    else { snprintf(m, sizeof m, "Updated to %s.\nThe player will now restart.", s_upd); aptSetChainloaderToSelf(); }
+    else {   /* a CIA relaunches itself: a short countdown (A restarts now), no button to press */
+        aptSetChainloaderToSelf();
+        for (int left = 3; left > 0 && aptMainLoop(); left--) {
+            snprintf(m, sizeof m, "Updated to %s. Restarting in %d...", s_upd, left);
+            msg_screen_nowait("UPDATE INSTALLED", m);
+            int a = 0;
+            for (int f = 0; f < 60 && aptMainLoop(); f++) {
+                hidScanInput();
+                if (hidKeysDown() & KEY_A) { a = 1; break; }
+                gspWaitForVBlank();
+            }
+            if (a) break;
+        }
+        return 1;
+    }
     msg_screen_btn("UPDATE INSTALLED", m, "OKAY");
     return 1;
 }
@@ -5647,22 +5692,58 @@ static HomeBtn g_btns[3] = {
 #define THSW_W 54
 #define THSW_H 16
 
-/* CUSTOM colour editor. Its own chrome is fixed (stays readable whatever colours
- * you pick); a small preview panel shows the live theme. Selecting Custom is
- * implied on entry, and everything is saved on the way out. */
-static void custom_editor(void) {
-    theme_set(theme_custom_index());        /* activate Custom so the preview is live */
+/* What the theme looks like on a whole screen: a menu, a list with one row picked, a progress
+ * bar and a dialog's buttons, all in the live palette. Any button or a tap closes it. */
+static void theme_full_preview(void) {
+    ui_begin(GFX_BOTTOM);
+    ui_vgrad_round(0, 0, UI_W, UI_H, 0, TH_BG1, UI_BG);
+    ui_text_center(UI_W / 2, 12, 2, UI_NEON, "PREVIEW");
+    ui_glow_round(28, 38, UI_W - 56, 2, 1, UI_NEON, 3, 30);
+    ui_fill_round(28, 38, UI_W - 56, 2, 1, UI_NEON);
+    static const char *const rows[3] = { "Movies", "TV Shows", "Settings" };
+    for (int i = 0; i < 3; i++) ui_button(24, 50 + i * 32, UI_W - 48, 26, rows[i], i == 0, UI_NEONC);
+    ui_text(24, 152, 1, UI_INK, "Playing  0:42:10");
+    ui_text(UI_W - 24 - ui_text_w(1, "1:38:00"), 152, 1, UI_DIM, "1:38:00");
+    ui_fill_round(24, 166, UI_W - 48, 8, 4, TH_TRACK);
+    ui_fill_round(24, 166, (UI_W - 48) * 43 / 100, 8, 4, UI_NEON);
+    ui_button(24, 190, 128, 30, "PLAY", 1, UI_NEON);
+    ui_button(UI_W - 152, 190, 128, 30, "CANCEL", 0, UI_NEONP);
+    ui_text_center(UI_W / 2, 228, 1, UI_DIM, "any button - back");
+    ui_present();
+    for (int f = 0; aptMainLoop(); f++) {
+        hidScanInput();
+        if (f > 10 && (hidKeysDown() & (KEY_A | KEY_B | KEY_X | KEY_Y | KEY_START | KEY_SELECT | KEY_TOUCH))) break;
+        gspWaitForVBlank();
+    }
+}
+
+/* CUSTOM colour editor. Its own chrome is fixed (stays readable whatever colours you pick); a
+ * small preview panel shows the live theme, and its PLAY button (or SELECT) opens a full-screen
+ * preview. A (or SAVE) keeps the colours and makes Custom the theme; B (or CANCEL) puts back the
+ * colours and the theme from before -- asking first when something was changed.
+ * Returns 1 when the colours were saved. */
+static int custom_editor(void) {
+    int prev = theme_current();
     int ne = theme_elem_count();
-    int elem = 0, ch = 0, redraw = 1;
+    u8 snap[16][3];                         /* the colours on the way in (ELEM_N is 8) */
+    for (int e = 0; e < ne && e < 16; e++) for (int c = 0; c < 3; c++) snap[e][c] = (u8)theme_custom_get(e, c);
+    theme_set(theme_custom_index());        /* activate Custom so the preview is live */
+    int elem = 0, ch = 0, redraw = 1, saved = 0;
     /* fixed editor chrome (deliberately NOT themed) */
     const u16 CBG = UI_RGB(14,15,20), CFG = UI_RGB(232,236,244), CMUT = UI_RGB(120,128,145),
               CACC = UI_RGB(70,210,255), CTRK = UI_RGB(40,42,52);
     const u16 chcol[3] = { UI_RGB(255,90,90), UI_RGB(90,220,110), UI_RGB(96,150,255) };
     const int TKX = 44, TKW = 208, ROWY = 60, ROWH = 32;
+    const int PVY = ROWY + 3 * ROWH + 14;                 /* preview panel; its PLAY button: */
+    const int PBX = UI_W - 116, PBY = PVY + 4, PBW = 92, PBH = 26;
+    const int BTY = 208, BTH = 26, CNX = 12, SVX = UI_W - 12 - 96, BTW = 96;
     while (aptMainLoop()) {
         hidScanInput();
         u32 kd = hidKeysDown(), kr = hidKeysDownRepeat();
-        if (kd & (KEY_B | KEY_START | KEY_X)) break;
+        int act = 0;                                      /* 1 save, -1 cancel, 2 full preview */
+        if (kd & (KEY_A | KEY_START)) act = 1;
+        if (kd & KEY_B) act = -1;
+        if (kd & KEY_SELECT) act = 2;
         if (kd & KEY_L) { elem = (elem + ne - 1) % ne; redraw = 1; }
         if (kd & KEY_R) { elem = (elem + 1) % ne;      redraw = 1; }
         if (kd & KEY_UP)   { ch = (ch + 2) % 3; redraw = 1; }
@@ -5672,17 +5753,33 @@ static void custom_editor(void) {
         if (kd & KEY_Y) { theme_custom_reset(); redraw = 1; }
         if (kd & KEY_TOUCH) {
             touchPosition t; hidTouchRead(&t);
-            if (t.py < 52) {                              /* element arrows */
-                if (t.px < 60)       { elem = (elem + ne - 1) % ne; redraw = 1; }
-                else if (t.px > 260) { elem = (elem + 1) % ne;      redraw = 1; }
+            int tx = t.px, ty = t.py;
+            if (ty < 52) {                                /* element arrows */
+                if (tx < 60)       { elem = (elem + ne - 1) % ne; redraw = 1; }
+                else if (tx > 260) { elem = (elem + 1) % ne;      redraw = 1; }
             }
             for (int c = 0; c < 3; c++) {                 /* tap a slider track to set it */
                 int y = ROWY + c * ROWH;
-                if ((int)t.py >= y - 4 && (int)t.py < y + 22) {
-                    int v = ((int)t.px - TKX) * 255 / TKW;
+                if (ty >= y - 4 && ty < y + 22) {
+                    int v = (tx - TKX) * 255 / TKW;
                     ch = c; theme_custom_set(elem, c, v); redraw = 1;
                 }
             }
+            if (tx >= PBX && tx < PBX + PBW && ty >= PBY && ty < PBY + PBH) act = 2;
+            if (ty >= BTY && ty < BTY + BTH) {
+                if (tx >= CNX && tx < CNX + BTW) act = -1;
+                else if (tx >= SVX && tx < SVX + BTW) act = 1;
+            }
+        }
+        if (act == 2) { theme_full_preview(); redraw = 1; }
+        if (act == 1) { saved = 1; break; }
+        if (act == -1) {
+            int changed = 0;
+            for (int e = 0; e < ne && e < 16; e++) for (int c = 0; c < 3; c++)
+                if (theme_custom_get(e, c) != snap[e][c]) changed = 1;
+            /* A leaves without the changes; B goes back to editing */
+            if (!changed || prompt2("LEAVE?", "Your color changes will not\nbe saved.", "LEAVE", "KEEP EDITING") == 0) break;
+            redraw = 1;
         }
         if (redraw) {
             ui_begin(GFX_BOTTOM);
@@ -5707,42 +5804,61 @@ static void custom_editor(void) {
                 char vb[8]; snprintf(vb, sizeof vb, "%d", val);
                 ui_text(TKX + TKW + 8, y, 2, CFG, vb);
             }
-            /* live preview panel (uses the actual theme) */
-            ui_text(20, ROWY + 3 * ROWH + 2, 1, CMUT, "PREVIEW");
-            int py = ROWY + 3 * ROWH + 14;
-            ui_fill_round(16, py, UI_W - 32, 34, 8, UI_BG2);
-            ui_frame_round(16, py, UI_W - 32, 34, 8, TH_LINE, 1);
-            ui_text(26, py + 6, 1, UI_INK, "Sample");
-            ui_fill_round(26, py + 20, 8, 8, 3, UI_NEON);
-            ui_fill_round(38, py + 20, 8, 8, 3, UI_NEONP);
-            ui_fill_round(50, py + 20, 8, 8, 3, UI_NEONC);
-            ui_button(UI_W - 116, py + 4, 92, 26, "PLAY", 1, UI_NEON);
-            ui_text_center(UI_W / 2, 228, 1, CMUT, "L/R item  dpad adjust  Y reset  B done");
+            /* live preview panel (uses the actual theme); PLAY opens the full-screen preview */
+            ui_text(20, ROWY + 3 * ROWH + 2, 1, CMUT, "PREVIEW  (tap PLAY or SELECT)");
+            ui_fill_round(16, PVY, UI_W - 32, 34, 8, UI_BG2);
+            ui_frame_round(16, PVY, UI_W - 32, 34, 8, TH_LINE, 1);
+            ui_text(26, PVY + 6, 1, UI_INK, "Sample");
+            ui_fill_round(26, PVY + 20, 8, 8, 3, UI_NEON);
+            ui_fill_round(38, PVY + 20, 8, 8, 3, UI_NEONP);
+            ui_fill_round(50, PVY + 20, 8, 8, 3, UI_NEONC);
+            ui_button(PBX, PBY, PBW, PBH, "PLAY", 1, UI_NEON);
+            /* SAVE / CANCEL in the editor's own colours, so they read on any palette */
+            ui_fill_round(CNX, BTY, BTW, BTH, 6, CTRK); ui_frame_round(CNX, BTY, BTW, BTH, 6, CMUT, 1);
+            ui_text_center(CNX + BTW / 2, BTY + 9, 1, CFG, "B CANCEL");
+            ui_fill_round(SVX, BTY, BTW, BTH, 6, CTRK); ui_frame_round(SVX, BTY, BTW, BTH, 6, CACC, 1);
+            ui_text_center(SVX + BTW / 2, BTY + 9, 1, CACC, "A SAVE");
+            ui_text_center(UI_W / 2, BTY + 2, 1, CMUT, "L/R item");
+            ui_text_center(UI_W / 2, BTY + 15, 1, CMUT, "Y reset");
             ui_present(); redraw = 0;
         }
         gspWaitForVBlank();
     }
-    theme_save();
+    if (saved) { theme_save(); return 1; }
+    for (int e = 0; e < ne && e < 16; e++) for (int c = 0; c < 3; c++) theme_custom_set(e, c, snap[e][c]);
+    theme_set(prev);                                      /* cancelled: the theme from before */
+    return 0;
 }
 
-/* THEMES picker: a live-previewing list -- moving the selection recolors the
- * whole UI instantly, and the choice is saved to SD on the way out. */
+/* THEMES picker: a live-previewing list -- moving the selection recolors the whole UI. A (or a
+ * second tap on the picked row) keeps it and saves; B puts back the theme from before, so
+ * themes can be looked at without changing anything. X edits Custom. */
 static void themes_screen(void) {
     int n = theme_count();
-    int sel = theme_current();
+    int orig = theme_current();
+    int sel = orig;
     int redraw = 1;
-    const int ROW_Y0 = 46, ROW_H = 24;
+    const int ROW_Y0 = 44, ROW_H = 21;
     while (aptMainLoop()) {
         hidScanInput();
         u32 k = hidKeysDown();
-        if (k & (KEY_A | KEY_B | KEY_START | KEY_Y)) break;
-        if (k & KEY_X) { custom_editor(); sel = theme_current(); redraw = 1; }   /* jump to + edit Custom */
+        if (k & (KEY_A | KEY_START)) { theme_save(); return; }
+        if (k & KEY_B) break;
+        if (k & KEY_X) {                                   /* edit Custom: SAVE there applies it */
+            theme_set(sel);
+            if (custom_editor()) { orig = theme_current(); sel = orig; }
+            else sel = theme_current();
+            redraw = 1;
+        }
         if (k & KEY_DOWN) { sel = (sel + 1) % n;     theme_set(sel); redraw = 1; }
         if (k & KEY_UP)   { sel = (sel + n - 1) % n; theme_set(sel); redraw = 1; }
         if (k & KEY_TOUCH) {
             touchPosition t; hidTouchRead(&t);
             int i = ((int)t.py - ROW_Y0) / ROW_H;
-            if (i >= 0 && i < n) { sel = i; theme_set(sel); redraw = 1; }
+            if ((int)t.py >= ROW_Y0 && i >= 0 && i < n) {
+                if (i == sel) { theme_save(); return; }   /* tap the picked one again: apply */
+                sel = i; theme_set(sel); redraw = 1;
+            }
         }
         if (redraw) {
             ui_begin(GFX_BOTTOM);
@@ -5751,25 +5867,27 @@ static void themes_screen(void) {
             for (int i = 0; i < n; i++) {
                 int ry = ROW_Y0 + i * ROW_H;
                 if (i == sel) {
-                    ui_fill_round(10, ry, UI_W - 20, ROW_H - 4, 6, TH_SEL);
-                    ui_frame_round(10, ry, UI_W - 20, ROW_H - 4, 6, UI_NEON, 1);
+                    ui_fill_round(10, ry, UI_W - 20, ROW_H - 3, 6, TH_SEL);
+                    ui_frame_round(10, ry, UI_W - 20, ROW_H - 3, 6, UI_NEON, 1);
                 }
                 u16 a, a2, a3, bg;
                 theme_preview(i, &a, &a2, &a3, &bg);
-                int sx = 18, sy = ry + 3, sw = 30, sh = ROW_H - 10;
+                int sx = 18, sy = ry + 3, sw = 30, sh = ROW_H - 9;
                 ui_fill_round(sx, sy, sw, sh, 3, bg);
                 ui_frame_round(sx, sy, sw, sh, 3, TH_LINE, 1);
                 ui_fill_round(sx + 4,  sy + sh / 2 - 2, 5, 5, 2, a);
                 ui_fill_round(sx + 12, sy + sh / 2 - 2, 5, 5, 2, a2);
                 ui_fill_round(sx + 20, sy + sh / 2 - 2, 5, 5, 2, a3);
-                ui_text(58, ry + 6, 1, i == sel ? UI_WHITE : UI_INK, theme_name(i));
+                char nm[40];
+                snprintf(nm, sizeof nm, "%s%s", theme_name(i), i == orig ? "  (current)" : "");
+                ui_text(58, ry + 5, 1, i == sel ? UI_WHITE : UI_INK, nm);
             }
-            ui_text_center(UI_W / 2, 224, 1, UI_DIM, "up/dn preview   A/B apply   X custom");
+            ui_text_center(UI_W / 2, 224, 1, UI_DIM, "A apply   B cancel   X edit custom");
             ui_present(); redraw = 0;
         }
         gspWaitForVBlank();
     }
-    theme_save();
+    theme_set(orig);                                       /* B: nothing changes */
 }
 
 /* ---------- PLAYBACK DEFAULTS (X on home -> SETTINGS) ----------
@@ -7200,6 +7318,10 @@ static void bt_row(const BtItem *e, char *out) {
     else if (!strcmp(e->type, "episode")) snprintf(out, 64, "%s%d. %s", mark, e->episode, e->title);
     else if (!strcmp(e->type, "season")) snprintf(out, 64, "%s  (%d/%d)", e->title, e->seen, e->episodes);
     else if (!strcmp(e->type, "show")) snprintf(out, 64, "%s%s%.0d%s", e->title, e->year ? " (" : "", e->year, e->year ? ")" : "");
+    else if (!strcmp(e->type, "group")) {   /* a film and its extras */
+        char yr[12] = ""; if (e->year) snprintf(yr, sizeof yr, " (%d)", e->year);
+        snprintf(out, 64, "%s%.40s%s  +%d", mark, e->title, yr, e->episodes);
+    }
     else if (e->year) snprintf(out, 64, "%s%s (%d)", mark, e->title, e->year);
     else snprintf(out, 64, "%s%s", mark, e->title);
 }
@@ -7222,7 +7344,10 @@ static void bt_draw_top(int i) {
     snprintf(m.title, sizeof m.title, "%s", e->title);
     snprintf(m.genres, sizeof m.genres, "%s", e->genres);
     snprintf(m.desc, sizeof m.desc, "%s", e->summary);
-    if (!m.desc[0] && e->episodes) snprintf(m.desc, sizeof m.desc, "%d episodes, %d watched", e->episodes, e->seen);
+    if (!strcmp(e->type, "group")) {      /* say there are extras, under the film's own summary */
+        char x[48]; snprintf(x, sizeof x, "[%d extra%s inside]", e->episodes, e->episodes == 1 ? "" : "s");
+        snprintf(m.desc, sizeof m.desc, "%s%s%.380s", x, e->summary[0] ? " " : "", e->summary);   /* the wrap has no line breaks */
+    } else if (!m.desc[0] && e->episodes) snprintf(m.desc, sizeof m.desc, "%d episodes, %d watched", e->episodes, e->seen);
     snprintf(m.category, sizeof m.category, "Big Top");
     m.year = e->year; m.runtime = e->runtime; m.is3d = e->is3d;
     if (e->fmt[0]) {   /* what the file is, and how it reaches this console */
@@ -7401,8 +7526,11 @@ static int bt_browse(void) {
         if (filt[depth][0]) snprintf(sub, sizeof sub, "Search: %s  (B clears)", filt[depth]);
         else if (lib_f) snprintf(sub, sizeof sub, "%s%s%s", fcat[depth] >= 0 ? k_bt_cat[fcat[depth]] : "All",
                                  fgen[depth][0] ? " - " : "", fgen[depth]);
+        /* the top screen reads row r as view[r]: any filter (a search, a category, a genre) needs the
+         * shown rows' own list -- with only the search one built, a category or genre list showed
+         * another item's info on top (playing used `map`, so the right film still played) */
         BtItem *view = it;
-        if (filt[depth][0]) {
+        if (shown != n) {
             view = (BtItem *)malloc((size_t)shown * sizeof(BtItem));
             if (view) for (int r = 0; r < shown; r++) view[r] = it[map[r]]; else view = it;
         }
@@ -7447,6 +7575,7 @@ static int bt_browse(void) {
             free(lst[depth]); lst[depth] = NULL;
             if (!strcmp(pick.type, "lib")) snprintf(path[depth], sizeof path[depth], "/api/libraries/%s", pick.id);
             else if (!strcmp(pick.type, "show")) snprintf(path[depth], sizeof path[depth], "/api/shows/%s", pick.id);
+            else if (!strcmp(pick.type, "group")) snprintf(path[depth], sizeof path[depth], "/api/groups/%s", pick.id);
             else if (!strcmp(pick.type, "season")) {               /* id is "<show>/<n>" */
                 char sid[40]; snprintf(sid, sizeof sid, "%s", pick.id);
                 char *sl = strchr(sid, '/'); if (sl) *sl = 0;
@@ -7834,6 +7963,7 @@ int main(void) {
     bt_set_cancel(bt_b_pressed);                       /* B cancels a Big Top request the screen waits on */   /* ...and a seek over Wi-Fi can be changed mid-way */
     ndspInit();
     theme_load();               /* restore the saved theme before anything draws */
+    moflex_set_idle_step_hook(idle_step_cb);   /* the player's battery menu sets Screens off after */
 
     /* sockets: init once, shared by the web server (UPLOAD) and curl (DOWNLOAD) */
     u32 *soc_buf = (u32 *)memalign(0x1000, SOC_BUF_SZ);

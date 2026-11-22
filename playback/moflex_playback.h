@@ -43,6 +43,9 @@ long long moflex_resume_at(const char *path, long long off);
 void moflex_resume_clear(const char *path);
 /* Settings > Screens off after: paused playback left alone this long turns both screens off (0 = never). */
 void moflex_set_idle_off_ms(unsigned ms);
+/* The player's battery menu changes that same setting through this: dir -1/+1 steps it (and saves
+ * it), 0 only asks; returns the setting's name ("5 MIN", "NEVER"). */
+void moflex_set_idle_step_hook(const char *(*fn)(int dir));
 /* A Big Top stream's first reads: B gives up (the app turns it on around the open; the engine turns
  * it off once the film is playing). moflex_open_cancelled() = B ended the open. */
 void moflex_open_cancellable(int on);

@@ -89,6 +89,7 @@ static long bt_req(const char *base, const char *client, const char *path, char 
     char url[512]; snprintf(url, sizeof url, "%s%s", base, path);
     char ch[64]; snprintf(ch, sizeof ch, "X-BigTop-Client: %s", client ? client : "");
     struct curl_slist *hl = curl_slist_append(NULL, ch);
+    hl = curl_slist_append(hl, "X-BigTop-Features: groups");   /* a film with extras: one "group" row */
     Mem m = { 0 };
     curl_easy_setopt(e, CURLOPT_URL, url);
     curl_easy_setopt(e, CURLOPT_HTTPHEADER, hl);

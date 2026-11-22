@@ -5,6 +5,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
+#include <stdlib.h>
 #include <sys/stat.h>
 
 /* decode one UTF-8 codepoint and advance; 8x8 glyph for any codepoint (falls back to '?') */
@@ -52,7 +53,11 @@ static const ThemePreset g_presets[] = {
     {"Light",    UI_RGB( 60, 60, 58), UI_RGB(100, 98, 94), UI_RGB( 78, 78, 74), UI_RGB(176, 58, 50), UI_RGB( 14, 14, 16), UI_RGB( 34, 35, 38), UI_RGB( 92, 92, 88), UI_RGB(176,173,162)},
     {"Amber",    UI_RGB(255,176,  0), UI_RGB(255,120,  0), UI_RGB(255,210,120), UI_RGB(255, 70, 50), UI_RGB(255,232,175), UI_RGB(255,190, 90), UI_RGB(150,100, 20), UI_RGB( 16, 11,  3)},
     {"Ice",      UI_RGB(120,220,255), UI_RGB(160,180,255), UI_RGB(200,240,255), UI_RGB(255, 90,110), UI_RGB(240,250,255), UI_RGB(200,225,245), UI_RGB( 90,120,160), UI_RGB(  6, 12, 26)},
+    /* the system apps' look: light grey, dark grey text, one blue accent */
+    {"3DS Grey", UI_RGB( 30,110,200), UI_RGB( 92, 98,110), UI_RGB( 20, 88,170), UI_RGB(190, 36, 36), UI_RGB( 10, 10, 14), UI_RGB( 30, 32, 38), UI_RGB( 78, 84, 96), UI_RGB(168,174,186)},
 };
+/* the presets before "3DS Grey" was added: an old theme.cfg's number 6 meant Custom */
+#define THEME_N_V1 6
 #define THEME_N ((int)(sizeof(g_presets)/sizeof(g_presets[0])))
 #define CUSTOM_I THEME_N            /* the editable "Custom" theme sits after the presets */
 static int g_theme_i = 0;
@@ -158,15 +163,25 @@ static void custom_load(void) {
 }
 void theme_load(void) {
     custom_load();
+    /* theme.cfg holds the theme's NAME (adding a preset can't move a saved choice); an older
+     * file holds its number from the original 6 presets + Custom */
     int i = 0;
     FILE *f = fopen(THEME_CFG, "rb");
-    if (f) { if (fscanf(f, "%d", &i) != 1) i = 0; fclose(f); }
+    if (f) {
+        char ln[40] = "";
+        if (fgets(ln, sizeof ln, f)) {
+            ln[strcspn(ln, "\r\n")] = 0;
+            if (ln[0] >= '0' && ln[0] <= '9') { i = atoi(ln); if (i == THEME_N_V1) i = CUSTOM_I; }
+            else for (int k = 0; k <= CUSTOM_I; k++) if (!strcmp(ln, theme_name(k))) i = k;
+        }
+        fclose(f);
+    }
     theme_set(i);
 }
 void theme_save(void) {
     mkdir("sdmc:/moflex_player", 0777);   /* may not exist yet on a fresh card */
     FILE *f = fopen(THEME_CFG, "wb");
-    if (f) { fprintf(f, "%d\n", g_theme_i); fclose(f); }
+    if (f) { fprintf(f, "%s\n", theme_name(g_theme_i)); fclose(f); }
     FILE *g = fopen(CUST_CFG, "wb");
     if (g) { for (int e=0; e<ELEM_N; e++) fprintf(g, "%d %d %d\n", g_cust[e][0], g_cust[e][1], g_cust[e][2]); fclose(g); }
 }
