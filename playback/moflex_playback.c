@@ -9,6 +9,7 @@
 #include <strings.h>
 #include <sys/stat.h>
 #include <dirent.h>
+#include <math.h>
 
 #include "moflex_demux.h"
 #include "cia_moflex.h"
@@ -48,6 +49,9 @@ static u32   g_idle_off_ms = 5 * 60 * 1000;   /* 0 = never (set by the app: mofl
 static int   g_idle_dark = 0;    /* the dark screen is the idle one: the top is off too */
 static int   g_top_on = 1;       /* actual top backlight state */
 void moflex_set_idle_off_ms(unsigned ms) { g_idle_off_ms = ms; }
+static const char *(*g_idle_step)(int dir) = NULL;   /* the app's Screens-off setting (battery menu) */
+void moflex_set_idle_step_hook(const char *(*fn)(int dir)) { g_idle_step = fn; }
+static void batt_refresh(void);
 static void play_idle(int playing, u32 kd, u32 kh, int *dirty) {
     static u64 last, prev;
     u64 now = osGetTime();
@@ -55,6 +59,13 @@ static void play_idle(int playing, u32 kd, u32 kh, int *dirty) {
     prev = now;
     if (g_idle_dark && !g_screen_off) { g_idle_dark = 0; last = now; }   /* woken */
     if (playing || kd || (kh & KEY_TOUCH)) last = now;
+    {   /* the 3D slider counts as being here: a real move restarts the timer (it doesn't wake a
+         * dark screen -- buttons and touch do that) */
+        static float sl0 = -1.0f;
+        float sl = osGet3DSliderState();
+        if (sl0 < 0.0f || fabsf(sl - sl0) >= 0.04f) { if (sl0 >= 0.0f && !g_screen_off) last = now; sl0 = sl; }
+    }
+    batt_refresh();                                 /* throttled: feeds the time-left estimate */
     if (g_lcd_ok && g_idle_off_ms && !playing && !g_screen_off && now - last >= g_idle_off_ms) {
         g_screen_off = 1; g_idle_dark = 1; *dirty = 1;
     }
@@ -75,6 +86,33 @@ static int   g_mcu_ok = 0;       /* mcu::HWC available -> exact 0-100% */
 static int   g_batt_pct = -1;    /* cached level (-1 = unknown) */
 static int   g_batt_chg = 0;     /* charging / plugged in */
 static u64   g_batt_next = 0;    /* next refresh time (osGetTime ms) */
+/* Time left on battery, measured: the level is a whole percent, so the clock starts the moment it
+ * first ticks down and the rate is (percents dropped) / (time between those ticks) -- a count from
+ * an exact edge, not from wherever inside a percent we happened to start. Needs the exact level
+ * (mcu::HWC) and 2 percents over 4+ minutes; charging, a rising level, or a long gap in the
+ * readings (sleep, a long stay in the menus) starts it over. */
+static int be_seen = -1, be_p0 = -1, be_p1 = -1;
+static u64 be_t0, be_t1, be_last;
+static void batt_est_feed(u64 now) {
+    if (be_last && now - be_last > 10 * 60 * 1000) be_seen = be_p0 = be_p1 = -1;
+    be_last = now;
+    if (!g_mcu_ok || g_batt_pct < 0 || g_batt_chg) { be_seen = be_p0 = be_p1 = -1; return; }
+    int p = g_batt_pct;
+    if (be_seen < 0 || p > be_seen) { be_seen = p; be_p0 = be_p1 = -1; return; }
+    if (p == be_seen) return;
+    be_seen = p;                                   /* it just ticked down: an exact edge */
+    if (be_p0 < 0) { be_p0 = p; be_t0 = now; }
+    else { be_p1 = p; be_t1 = now; }
+}
+/* minutes left, or -1 while still measuring (-2 charging, -3 no exact level) */
+static int batt_minutes_left(void) {
+    if (g_batt_chg) return -2;
+    if (!g_mcu_ok) return -3;
+    if (be_p0 < 0 || be_p1 < 0 || be_p0 - be_p1 < 2 || be_t1 - be_t0 < 4 * 60 * 1000) return -1;
+    double ms_pp = (double)(be_t1 - be_t0) / (be_p0 - be_p1);
+    double left = (be_p1 + 0.5) * ms_pp - (double)(osGetTime() - be_t1);
+    return left > 0 ? (int)(left / 60000.0) : 0;
+}
 static void batt_refresh(void) {
     u64 now = osGetTime();
     if (g_batt_pct >= 0 && now < g_batt_next) return;   /* throttle: read every few seconds */
@@ -83,6 +121,7 @@ static void batt_refresh(void) {
     if (g_mcu_ok && R_SUCCEEDED(MCUHWC_GetBatteryLevel(&v))) g_batt_pct = v > 100 ? 100 : v;
     else { u8 lvl = 0; if (R_SUCCEEDED(PTMU_GetBatteryLevel(&lvl))) g_batt_pct = lvl * 20; }   /* 0-5 -> % */
     u8 c = 0; if (R_SUCCEEDED(PTMU_GetBatteryChargeState(&c))) g_batt_chg = c;
+    batt_est_feed(now);
 }
 static void vol_load(void) {
     FILE *f = fopen("sdmc:/moflex_player/volume.txt", "rb");
@@ -543,6 +582,8 @@ static u16 seek_col(int side) {             /* an arrow's colour: the theme's, o
 #define ZM_W 48
 #define ZM_H 28
 /* DIM (bottom-screen-off) button -- below CC */
+/* the battery on the panel's time row (icon at x 292, its % to the left): a tap opens BATTERY */
+#define BATT_HIT(px, py) ((px) >= 250 && (py) >= 18 && (py) < 42)
 #define DIM_X 244
 #define DIM_Y 138
 #define DIM_W 48
@@ -3170,7 +3211,16 @@ static int snd_input(u32 kd, u32 kh, touchPosition tp) {
  * decoder and starved it: the film went choppy with the CC menu open, and the drained ring kept it
  * choppy for a while after closing. */
 static int g_sub_toast = -1;
-static int g_submenu_stale(void) { return g_sub_redraw || g_submenu != g_sub_last || (g_lock_toast > 0) != g_sub_toast; }
+#define BATT_ROWS 3
+static void batt_label(int row, char *r, int cap);
+static void batt_render(void);
+static u32  batt_sig(void);
+static u32  g_batt_sig_drawn = 0;
+static int  g_batt_sel = 0;
+static int g_submenu_stale(void) {
+    return g_sub_redraw || g_submenu != g_sub_last || (g_lock_toast > 0) != g_sub_toast
+        || (g_submenu == 5 && batt_sig() != g_batt_sig_drawn);   /* the level / time left moved on */
+}
 /* ---- menu band cache ----
  * Moving the highlight changes only the rows next to the old and new one, so those rows' bands are
  * redrawn under a vertical clip (ui_clip_y: pixel-identical to a full redraw, proven on the host)
@@ -3198,6 +3248,10 @@ static int mb_rows(int is3d, int *sel, u32 *sig) {
         int act[SND_ROWS_MAX]; n = snd_rows(act);
         for (int i = 0; i < n; i++) { snd_label(act[i], lab, sizeof lab); MB_HS(lab); }
         MB_H(g_autolvl); *sel = g_snd_sel;
+    } else if (g_submenu == 5) {
+        n = BATT_ROWS;
+        for (int i = 0; i < n; i++) { batt_label(i, lab, sizeof lab); MB_HS(lab); }
+        *sel = g_batt_sel;
     } else if (g_submenu == 3) {
         n = VIEW_ROWS;
         for (int i = 0; i < n; i++) { view_label(i, lab, sizeof lab); MB_HS(lab); }
@@ -3214,7 +3268,7 @@ static int mb_rows(int is3d, int *sel, u32 *sig) {
     return n;
 }
 static void mb_render(int is3d) {
-    if (g_submenu == 4) snd_render(); else if (g_submenu == 3) view_render(); else if (g_submenu == 2) srtpicker_render(); else submenu_render(is3d);
+    if (g_submenu == 5) batt_render(); else if (g_submenu == 4) snd_render(); else if (g_submenu == 3) view_render(); else if (g_submenu == 2) srtpicker_render(); else submenu_render(is3d);
 }
 static void g_submenu_prep(int is3d) {
     if (!ui_tex_init() || !g_submenu_stale()) return;
@@ -3309,8 +3363,66 @@ static int submenu_hit(int px, int py, int n, int *side) {
         if (py >= by && py < by + bh && px >= 18 && px < UI_W - 18) { *side = px < UI_W / 2 ? -1 : 1; return i; } }
     return -1;
 }
+/* ---- BATTERY: tap the battery on the panel. The level, the time it should last, and the
+ * Screens-off timer (the app's setting, through g_idle_step) ---- */
+static void batt_label(int row, char *r, int cap) {
+    batt_refresh();
+    if (row == 0) {
+        if (g_batt_pct < 0) snprintf(r, cap, "Battery:  unknown");
+        else snprintf(r, cap, "Battery:  %d%%%s", g_batt_pct, g_batt_chg ? "   (charging)" : "");
+    } else if (row == 1) {
+        int m = batt_minutes_left();
+        if (m >= 0)       snprintf(r, cap, "Time left:  about %dh %dm", m / 60, m % 60);
+        else if (m == -2) snprintf(r, cap, "Time left:  charging");
+        else if (m == -3) snprintf(r, cap, "Time left:  not available");
+        else              snprintf(r, cap, "Time left:  measuring...");
+    } else
+        snprintf(r, cap, "Screens off after:  < %s >", g_idle_step ? g_idle_step(0) : "5 MIN");
+}
+static u32 batt_sig(void) {
+    char a[48], b[48];
+    batt_label(0, a, sizeof a); batt_label(1, b, sizeof b);
+    u32 h = 2166136261u;
+    for (const char *q = a; *q; q++) h = (h ^ (u8)*q) * 16777619u;
+    for (const char *q = b; *q; q++) h = (h ^ (u8)*q) * 16777619u;
+    return h;
+}
+static void batt_render(void) {
+    int top, step, bh; submenu_layout(BATT_ROWS, &top, &step, &bh);
+    ui_begin(GFX_BOTTOM);
+    menu_bg();
+    ui_text_center(UI_W / 2, 14, 2, UI_NEON, "BATTERY");
+    for (int i = 0; i < BATT_ROWS; i++) {
+        char r[48]; batt_label(i, r, sizeof r);
+        ui_button(18, top + i * step, UI_W - 36, bh, r, i == g_batt_sel, UI_NEONC);
+    }
+    int y = top + BATT_ROWS * step + 10;
+    ui_text_center(UI_W / 2, y,      1, UI_DIM, "Time left is measured as the level drops;");
+    ui_text_center(UI_W / 2, y + 12, 1, UI_DIM, "it takes a few minutes on battery.");
+    ui_text_center(UI_W / 2, y + 32, 1, UI_DIM, "Screens off: no input this long (paused,");
+    ui_text_center(UI_W / 2, y + 44, 1, UI_DIM, "or in the menus) turns the screens off.");
+    ui_text(8, 226, 1, UI_DIM, "B - back");
+    g_batt_sig_drawn = batt_sig();
+}
+/* one frame of BATTERY input; 1 = close */
+static int batt_input(u32 kd, u32 kh, touchPosition tp) {
+    if (kd & (KEY_B | KEY_SELECT)) return 1;
+    {   static UiRep ru, rd;
+        g_batt_sel = ui_list_nav(&ru, &rd, kd, kh, g_batt_sel, BATT_ROWS); }
+    int t_side = 0, t_row = (kd & KEY_TOUCH) ? submenu_hit(tp.px, tp.py, BATT_ROWS, &t_side) : -1;
+    if (t_row >= 0) g_batt_sel = t_row;
+    if (g_batt_sel == 2 && g_idle_step) {
+        int d = (kd & KEY_LEFT) ? -1 : (kd & (KEY_RIGHT | KEY_A)) ? 1 : t_row == 2 ? t_side : 0;
+        if (d) g_idle_step(d);
+    }
+    return 0;
+}
 /* one frame of menu input; returns 1 when the whole menu should close (config persisted). */
 static int submenu_input(u32 kd, u32 kh, touchPosition tp, int is3d, const char *moviepath) {
+    if (g_submenu == 5) {   /* BATTERY */
+        if (batt_input(kd, kh, tp)) { g_submenu = 0; return 1; }
+        return 0;
+    }
     if (g_submenu == 4) {   /* SOUND screen */
         if (snd_input(kd, kh, tp)) { subcfg_save(moviepath); g_submenu = 0; return 1; }
         return 0;
@@ -5721,6 +5833,8 @@ static MoflexResult moflex_play_ring(const char *path) {
                 g_submenu = 3; g_view_sel = 0; g_view_is3d = is3d; dirty = 1;   /* VIEW: film plays on */
             } else if (g_lcd_ok && px >= DIM_X && px < DIM_X + DIM_W && py >= DIM_Y && py < DIM_Y + DIM_H) {
                 g_screen_off = 1; dirty = 1;   /* moon: darken (a button or touch wakes it; reconcile handles backlight) */
+            } else if (BATT_HIT(px, py)) {
+                g_submenu = 5; g_batt_sel = 0; dirty = 1;    /* the battery: level, time left, screens off */
             } else if (py >= BTN_Y && py < BTN_Y + BTN_H) {
                 if      (px >= BKB_X && px < BKB_X + BKB_W) { result = MOFLEX_QUIT_OPEN; break; }   /* OPEN VIDEO */
                 else if (px >= OPB_X && px < OPB_X + OPB_W) { result = MOFLEX_QUIT_MANAGE; break; }   /* MANAGE VIDEOS */
@@ -7743,6 +7857,7 @@ KitTouch kit_touch(int px, int py, int is3d) {
         g_submenu = 3; g_view_sel = 0; g_view_is3d = is3d; g_kit_menu_dirty = 1; return KIT_T_HANDLED; }
     if (g_lcd_ok && px >= DIM_X && px < DIM_X + DIM_W && py >= DIM_Y && py < DIM_Y + DIM_H) {
         g_screen_off = 1; return KIT_T_HANDLED; }
+    if (BATT_HIT(px, py)) { g_submenu = 5; g_batt_sel = 0; g_kit_menu_dirty = 1; return KIT_T_HANDLED; }
     if (py >= BTN_Y && py < BTN_Y + BTN_H) {
         if (px >= BKB_X && px < BKB_X + BKB_W) return KIT_T_OPEN;
         if (px >= OPB_X && px < OPB_X + OPB_W) return KIT_T_MANAGE;
@@ -7829,7 +7944,7 @@ void kit_draw(KitGpu *g, C2D_Image L, C2D_Image R, int is3d, const char *title,
     ring_sub_draw(&g_kit_rsb, stereo ? sdep : 0, subcol, subout);
     if (g_screen_off) { g_dark_sw(g->bot); g_panel_force = 1; g_kit_tex_menu = 0; }
     else if (g_submenu) {
-        if (g_kit_menu_dirty || !g_kit_tex_menu || g_lock_toast > 0) {
+        if (g_kit_menu_dirty || !g_kit_tex_menu || g_lock_toast > 0 || (g_submenu == 5 && batt_sig() != g_batt_sig_drawn)) {
             g_sub_redraw = 1; g_submenu_sw(g->bot, is3d); g_kit_menu_dirty = 0; g_kit_tex_menu = 1;
         } else ui_tex_blit(g->bot);       /* unchanged menu: reuse its texture */
         g_panel_force = 1;
