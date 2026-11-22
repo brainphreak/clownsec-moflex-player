@@ -379,9 +379,39 @@ int mfx_detect_stereo(MfxDemux *m) {
     if (vi < 0 || m->streams[vi].tb_den <= 0 || m->streams[vi].tb_num <= 0) return 1;   /* default 3D */
 
     double tbfps = (double)m->streams[vi].tb_den / (double)m->streams[vi].tb_num;
+    /* A/V interleave: a block's timestamp is (about) its first video frame's time, but muxers put
+     * the audio a little ahead or behind -- Nintendo's by 25-65 ms, varying block to block. From the
+     * file start both are known EXACTLY (frames and samples counted from 0), so measure each block's
+     * audio-vs-video offset here; a seek or resume, which starts mid-file where nothing can be
+     * counted, then places its audio with the average instead of trusting the timestamp (which left
+     * the sound up to ~60 ms early after a seek -- "audio a moment sooner" on resumed 3D films). */
+    int ai = -1;
+    for (int i = 0; i < m->nb_streams; i++)
+        if (m->streams[i].media_type == MFX_TYPE_AUDIO) { ai = i; break; }
+    int afr_ok = ai >= 0 && m->streams[ai].sample_rate > 0 && m->streams[ai].channels > 0 &&
+                 (m->streams[ai].codec_id == MFX_ACODEC_ADPCM_IMA || m->streams[ai].codec_id == MFX_ACODEC_PCM_S16LE);
+    /* which muxer: Nintendo's header carries 0x07 at byte 12 (ours 0x0f, which clocks audio exactly) */
+    io_seek(m, 12, SEEK_SET); int hdr12 = io_r8(m);
+    io_seek(m, 0, SEEK_SET); m->in_block = 0; m->eof = 0;
+    for (int i = 0; i < m->nb_streams; i++) m->streams[i].acc_size = 0;
+    double trf = 0, tdu = 0;   /* microsecond truncation: lost fractions / packet durations */
+#define AVB 8
+    int64_t bts_[AVB]; long bv_[AVB]; long long ba_[AVB]; int bvs_[AVB], bas_[AVB]; int nbk = 0;
+    long long asmp = 0; int64_t blk = -1;
     long vc = 0; int64_t t0 = -1; MfxPacket p;
     while (mfx_next_packet(m, &p) == 1) {
-        if (m->streams[p.stream_index].media_type != MFX_TYPE_VIDEO) continue;
+        if (m->ts != blk) { blk = m->ts; if (nbk < AVB) { bts_[nbk] = blk; bvs_[nbk] = bas_[nbk] = 0; } nbk++; }
+        int mt = m->streams[p.stream_index].media_type;
+        if (afr_ok && p.stream_index == ai) {
+            if (nbk <= AVB && !bas_[nbk - 1]) { ba_[nbk - 1] = asmp; bas_[nbk - 1] = 1; }
+            int ch = m->streams[ai].channels;
+            long ns = m->streams[ai].codec_id == MFX_ACODEC_ADPCM_IMA ? (p.size > 4 * ch ? (long)(p.size - 4 * ch) * 2 / ch : 0)
+                                                                      : p.size / (2 * ch);
+            asmp += ns;
+            { double d = (double)ns * 1e6 / m->streams[ai].sample_rate; trf += d - (double)(long long)d; tdu += d; }
+        }
+        if (mt != MFX_TYPE_VIDEO) continue;
+        if (nbk <= AVB && !bvs_[nbk - 1]) { bv_[nbk - 1] = vc; bvs_[nbk - 1] = 1; }
         if (t0 < 0) t0 = m->ts;
         vc++;
         if (m->ts - t0 >= 2000000) break;   /* 2s of content is plenty to see the 1x vs 2x ratio */
@@ -400,12 +430,35 @@ int mfx_detect_stereo(MfxDemux *m) {
         else if (tbfps >= 47.0 && dfps / tbfps > 0.75) { stereo = 1; m->tb_is_eye = 1; }
         else stereo = 0;
     }
+    /* the A/V offset, averaged over the blocks after the first (block 0 is exact by definition) */
+    m->av_off = 0; m->av_drift = 0; m->av_tref = 0;
+    if (afr_ok && !m->live_seek && nbk >= 2) {
+        if (hdr12 == 0x07 && tdu > 0) m->av_drift = trf / tdu;
+        double tsum = 0;
+        double vper = (double)m->streams[vi].tb_num / m->streams[vi].tb_den * 1e6;   /* one video packet */
+        if (stereo && !m->tb_is_eye) vper /= 2;                                     /* (pair-rate timebase) */
+        double sum = 0; int n = 0;
+        for (int k = 1; k < nbk && k < AVB; k++) {
+            if (!bvs_[k] || !bas_[k]) continue;
+            double vt = bv_[k] * vper, at = ba_[k] * 1e6 / m->streams[ai].sample_rate;
+            sum += (double)(bts_[k] - at) - (double)(bts_[k] - vt); tsum += (double)bts_[k]; n++;
+        }
+        if (n) { double o = sum / n; if (o > -150000 && o < 150000) { m->av_off = (int64_t)o; m->av_tref = (int64_t)(tsum / n); } }
+        if (!m->av_off && !m->av_tref) m->av_drift = 0;
+    }
+#undef AVB
     /* rewind demux to the start for playback */
     io_seek(m, 0, SEEK_SET);
     m->in_block = 0;
     for (int i = 0; i < m->nb_streams; i++) m->streams[i].acc_size = 0;
     m->eof = 0;
     return stereo;
+}
+
+int64_t mfx_audio_start(const MfxDemux *m, int64_t ts) {
+    if (ts <= 1000) return ts;                         /* the first block: exact by definition */
+    double off = (double)m->av_off - m->av_drift * (double)(ts - m->av_tref);
+    return ts - (int64_t)off;
 }
 
 void mfx_close(MfxDemux *m) {
