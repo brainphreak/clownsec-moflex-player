@@ -7738,13 +7738,14 @@ static void lab_dltest(const char *url) {
 }
 static void lab_autoplay(void) {
     char prm[1024] = "", file[512] = "sdmc:/lab/office_head.moflex";
-    int start = 0, secs = 60, dlt = 0, plays = 1, btfmt = 2, nocancel = 0;
+    int startms = -1; int start = 0, secs = 60, dlt = 0, plays = 1, btfmt = 2, nocancel = 0;
     char bturl[128] = "", btitem[40] = "";   /* bt= + btitem=: a live Big Top stream instead of a file */
     FILE *p = fopen("sdmc:/lab/params.txt", "r");
     if (p) { size_t n = fread(prm, 1, sizeof prm - 1, p); prm[n] = 0; fclose(p); }
     for (char *l = strtok(prm, "\r\n"); l; l = strtok(NULL, "\r\n")) {
         if (!strncmp(l, "file=", 5)) snprintf(file, sizeof file, "%s", l + 5);
         else if (!strncmp(l, "start=", 6)) start = atoi(l + 6);
+        else if (!strncmp(l, "startms=", 8)) startms = atoi(l + 8);
         else if (!strncmp(l, "secs=", 5)) secs = atoi(l + 5);
         else if (!strncmp(l, "plays=", 6)) plays = atoi(l + 6);
         else if (!strncmp(l, "bt=", 3)) snprintf(bturl, sizeof bturl, "%s", l + 3);
@@ -7787,13 +7788,13 @@ static void lab_autoplay(void) {
     }
     FILE *o = fopen("sdmc:/lab/last.log", "w");
     for (int k = 0; k < plays; k++) {        /* plays=N: the same video N times in one session */
-        remove("sdmc:/moflex_player/ring_stats.txt"); remove("sdmc:/moflex_player/sync_probe.txt");
+        remove("sdmc:/moflex_player/ring_stats.txt"); remove("sdmc:/moflex_player/sync_probe.txt"); remove("sdmc:/moflex_player/seek_debug.txt");
         if (bturl[0] && btitem[0] && btfmt >= 0) {   /* btfmt=-1: a moflex, read as a file */
             bt_live_arm(btitem, btfmt, 0, (long long)start * 1000);
             moflex_live_fmt_set(btfmt);
         }
         if (bturl[0] && btitem[0]) { httpfile_reset(); if (!nocancel) moflex_open_cancellable(1); }   /* as bt_play does */
-        if (start > 0) moflex_resume_save(file, (long long)start * 1000000LL); else moflex_resume_clear(file);
+        if (startms > 0) moflex_resume_save(file, (long long)startms * 1000LL); else if (start > 0) moflex_resume_save(file, (long long)start * 1000000LL); else moflex_resume_clear(file);
         g_lab_deadline = osGetTime() + (u64)secs * 1000 + 2000;
         u64 t0 = osGetTime();
         int r = (int)moflex_play(file);
@@ -7805,6 +7806,8 @@ static void lab_autoplay(void) {
             FILE *rs = fopen("sdmc:/moflex_player/ring_stats.txt", "r");
             if (rs) { char ln[4096]; while (fgets(ln, sizeof ln, rs)) fputs(ln, o); fclose(rs); }
             else fputs("(no ring_stats)\n", o);
+            FILE *sq = fopen("sdmc:/moflex_player/seek_debug.txt", "r");
+            if (sq) { char ln[512]; while (fgets(ln, sizeof ln, sq)) fputs(ln, o); fclose(sq); }
             FILE *sp = fopen("sdmc:/moflex_player/sync_probe.txt", "r");
             if (sp) { char ln[512]; while (fgets(ln, sizeof ln, sp)) fputs(ln, o); fclose(sp); }
             fflush(o);

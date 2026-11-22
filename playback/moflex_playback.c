@@ -4761,7 +4761,11 @@ static int r3_read_some(R3S *s, int maxpk) {
             r3_pkt_start = s->a_acc;
             if (r3_audio_feed(&s->pending)) {
                 if (r3_last_fr > 0 && r3_arate > 0) s->a_acc += (int64_t)r3_last_fr * 1000000 / r3_arate;
-                if (r3_audio_t0 < 0) { int64_t at = r3_pkt_start; r3_audio_t0 = at < 0 ? 0 : at; }  /* audio origin */
+                /* audio origin -- unless a trim is pending: packets wholly before it are consumed
+                 * unplayed, and taking THEIR start as the origin put it at the block's start, up to
+                 * a second before the sound really began (a resume stops mid-block: the picture then
+                 * ran ~0.4 s behind the sound until a seek). The trim sets the exact origin itself. */
+                if (r3_audio_t0 < 0 && r3_trim_from < 0) { int64_t at = r3_pkt_start; r3_audio_t0 = at < 0 ? 0 : at; }
                 s->has_pending = 0;
             }
             else { s->audio_pre_full = 1; break; }        /* bank full: hold packet, let main unpause audio */
@@ -6074,9 +6078,14 @@ static MoflexResult moflex_play_ring(const char *path) {
                  * start, the worker skips the video packets already decoded, the block's audio plays,
                  * trimmed to the picture's time. */
                 if (rb_ok && !g_seek_cut) {
-                    int skip = rb_vin; rb_rewind(&m, rb_ts, rb_vin, &skip); s.vskip = skip;
+                    int skip = rb_vin; int rr = rb_rewind(&m, rb_ts, rb_vin, &skip); s.vskip = skip;
                     s.a_blk = -1; r3_trim_from = s.tr_active ? -1 : cur_us;
-                }
+                    if (dbg_on()) { FILE *df = fopen("sdmc:/moflex_player/seek_debug.txt", "a");
+                        if (df) { fprintf(df, "%s RESUME target=%lld land=%lld cts=%lld rb_ts=%lld rb_vin=%d skip=%d rewind_ok=%d rb_ok=%d av_off=%lld drift=%.1fppm\n",
+                                          BUILD_TAG, (long long)seek_to_us / 1000, (long long)sd_lts / 1000, (long long)cur_us / 1000, (long long)rb_ts / 1000,
+                                          rb_vin, skip, rr, rb_ok, (long long)m.av_off / 1000, m.av_drift * 1e6); fclose(df); } }
+                } else if (dbg_on()) { FILE *df = fopen("sdmc:/moflex_player/seek_debug.txt", "a");
+                    if (df) { fprintf(df, "%s RESUME no-rewind rb_ok=%d cut=%d cts=%lld\n", BUILD_TAG, rb_ok, g_seek_cut, (long long)cur_us / 1000); fclose(df); } }
             }
             #undef RB_NOTE
             /* TRAILER AUDIO: re-anchor on the position we ACTUALLY landed on, not the one we asked
