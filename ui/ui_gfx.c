@@ -54,7 +54,7 @@ static const ThemePreset g_presets[] = {
     {"Amber",    UI_RGB(255,176,  0), UI_RGB(255,120,  0), UI_RGB(255,210,120), UI_RGB(255, 70, 50), UI_RGB(255,232,175), UI_RGB(255,190, 90), UI_RGB(150,100, 20), UI_RGB( 16, 11,  3)},
     {"Ice",      UI_RGB(120,220,255), UI_RGB(160,180,255), UI_RGB(200,240,255), UI_RGB(255, 90,110), UI_RGB(240,250,255), UI_RGB(200,225,245), UI_RGB( 90,120,160), UI_RGB(  6, 12, 26)},
     /* the system apps' look: light grey, dark grey text, one blue accent */
-    {"3DS Grey", UI_RGB(  0,118,214), UI_RGB( 96,100,108), UI_RGB(  0, 96,180), UI_RGB(206, 40, 40), UI_RGB( 16, 16, 20), UI_RGB( 46, 48, 54), UI_RGB(118,122,130), UI_RGB(222,224,228)},
+    {"3DS Grey", UI_RGB( 30,110,200), UI_RGB( 92, 98,110), UI_RGB( 20, 88,170), UI_RGB(190, 36, 36), UI_RGB( 10, 10, 14), UI_RGB( 30, 32, 38), UI_RGB( 78, 84, 96), UI_RGB(168,174,186)},
 };
 /* the presets before "3DS Grey" was added: an old theme.cfg's number 6 meant Custom */
 #define THEME_N_V1 6
