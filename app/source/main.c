@@ -7174,7 +7174,7 @@ static MoflexResult bt_stream_play(const BtCfg *c, const BtItem *it, const char 
                 if (moflex_lang_match(p.t.alang[i], d.alang)) { asel = i; p.audio = i; break; }
     }
     const char *alang = p.t.n_audio > 0 ? p.t.alang[asel] : "";
-    {   int saved = moflex_fmt_load_key(key); if (saved >= 0) fmt = saved; }
+    {   int saved = moflex_fmt_load_key(key); if (saved >= 0 && (saved != 3 || moflex_conv3d_get())) fmt = saved; }
     p.is3d = fmt != 0;
     /* subtitles: the text tracks (sidecar files + the file's own), then the picture ones */
     msg_screen_nowait(title, "Getting subtitles...");
@@ -7215,7 +7215,32 @@ static MoflexResult bt_stream_play(const BtCfg *c, const BtItem *it, const char 
     return r;
 }
 
+/* 2D to 3D: what the Big Top being browsed says it can do (/api/server), read when BIG TOP opens */
+static BtServer s_bt_srv; static int s_bt_srv_ok;
+/* for this video on this 3DS: 0 = not offered, 1 = offered (the server's test showed it keeps up),
+ * 2 = it can be turned on in VIDEO > Format, with a warning (the test said too slow) */
+static int bt_conv_level(const BtItem *it) {
+    if (!s_bt_srv_ok || !s_bt_srv.conv3d || !it->conv3d || it->is3d) return 0;
+    bool isn = false; APT_CheckNew3DS(&isn);
+    return (isn ? s_bt_srv.conv3d_new : s_bt_srv.conv3d_old) ? 1 : 2;
+}
+static int bt_play_(const BtCfg *c, const BtItem *it, const char *title);
 static int bt_play(const BtCfg *c, const BtItem *it, const char *title) {
+    int cl = bt_conv_level(it);
+    if (cl == 1) {   /* offered: ask once per video (VIDEO > Format changes it later) */
+        char key[48]; snprintf(key, sizeof key, "bigtop:%s", it->id);
+        if (moflex_fmt_load_key(key) < 0) {
+            int a = prompt2(title, "Big Top can turn this 2D video\ninto 3D while it plays.", "PLAY IN 3D", "PLAY IN 2D");
+            if (a < 0) return 0;
+            moflex_fmt_save_key(key, a == 0 ? 3 : 0);
+        }
+    }
+    moflex_conv3d_set(cl);
+    int r = bt_play_(c, it, title);
+    moflex_conv3d_set(0);
+    return r;
+}
+static int bt_play_(const BtCfg *c, const BtItem *it, const char *title) {
     int live = 0;
     if (it->stream) {
         bool isn = false; APT_CheckNew3DS(&isn);
@@ -7232,7 +7257,7 @@ static int bt_play(const BtCfg *c, const BtItem *it, const char *title) {
         int fmt = 0;                                      /* the frame's shape, the Format row's choice over it */
         if (it->is3d) fmt = !strcmp(it->layout, "fsbs") ? 1 : 2;
         char key[48]; snprintf(key, sizeof key, "bigtop:%s", it->id);
-        { int saved = moflex_fmt_load_key(key); if (saved >= 0) fmt = saved; }
+        { int saved = moflex_fmt_load_key(key); if (saved >= 0 && (saved != 3 || moflex_conv3d_get())) fmt = saved; }
         long long dur_ms = it->dur > 0 ? it->dur : (long long)it->runtime * 60000;
         /* the stream starts where playback will: the resume point, so the engine's resume seek
          * lands on the stream's own start instead of restarting the encoder */
@@ -7459,6 +7484,7 @@ static int bt_browse(void) {
         if (!bt_cfg_load(&c)) return 0;
     }
     s_bt_cfg = c;
+    s_bt_srv_ok = bt_ping(c.url, &s_bt_srv);   /* what it can do (2D to 3D); quick */
     static char path[6][128], ttl[6][96], filt[6][64];
     int depth = 0, presel[6] = { 0 };
     BtItem *lst[6] = { 0 }; int lstn[6] = { 0 };

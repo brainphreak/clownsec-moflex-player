@@ -2921,6 +2921,11 @@ static int g_kit_fmt_pend = -1;
  * shows the Format row too, and a change re-opens the film in place in the new shape. -1 = none */
 static int g_live_fmt = -1;
 void moflex_live_fmt_set(int fmt) { g_live_fmt = fmt; }
+/* 2D to 3D (a Big Top that converts as it plays): the Format row's 4th choice, fmt 3. 0 = not
+ * offered, 1 = offered, 2 = offered but the server's test said it is too slow (a warning) */
+static int g_fmt_conv = 0;
+void moflex_conv3d_set(int v) { g_fmt_conv = v; }
+int  moflex_conv3d_get(void) { return g_fmt_conv; }
 int  moflex_live_fmt_get(void) { return g_live_fmt; }
 static int g_view_sel = 0, g_view_rep = 0;
 static int g_hq_req = 0;
@@ -2954,12 +2959,14 @@ static void view_label(int row, char *r, int cap) {
         return;
     }
     if (i == VIEW_ACT_FMT) {
-        static const char *const F[3] = { "2D", "3D SBS", "3D Half SBS" };
+        static const char *const F[4] = { "2D", "3D SBS", "3D Half SBS", "2D -> 3D" };
         int f = g_kit_fmt_pend >= 0 ? g_kit_fmt_pend : g_kit_fmt;
+        if (f < 0 || f > 3 || (f == 3 && !g_fmt_conv)) f = 0;
+        const char *warn = f == 3 && g_fmt_conv == 2 ? " (may stutter)" : "";
         if (g_kit_fmt_pend >= 0 && g_kit_fmt_pend != g_kit_fmt)
-            snprintf(r, cap, "Format:  < %s >   (A applies)", F[f >= 0 && f <= 2 ? f : 0]);
+            snprintf(r, cap, "Format:  < %s >%s  (A)", F[f], warn);
         else
-            snprintf(r, cap, "Format:  < %s >", F[f >= 0 && f <= 2 ? f : 0]);
+            snprintf(r, cap, "Format:  < %s >%s", F[f], warn);
         return;
     }
     switch (i) {
@@ -3030,7 +3037,8 @@ static int view_input(u32 kd, u32 kh, touchPosition tp) {
               : (t_row >= 0 && t_row == g_view_sel && (kd & KEY_TOUCH)) ? t_side : 0;
         if (d) {
             int f = g_kit_fmt_pend >= 0 ? g_kit_fmt_pend : g_kit_fmt;
-            g_kit_fmt_pend = (f + 3 + d) % 3;
+            int nf = g_fmt_conv ? 4 : 3;   /* 2D -> 3D only where Big Top can convert */
+            g_kit_fmt_pend = (f + nf + d) % nf;
         }
         if (press && g_kit_fmt_pend >= 0) {
             if (g_kit_fmt_pend != g_kit_fmt) { g_kit_fmt = g_kit_fmt_pend; g_kit_fmt_changed = 1; }

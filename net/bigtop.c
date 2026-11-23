@@ -144,6 +144,7 @@ static void fill(BtItem *it, cJSON *e) {
     it->super = (int)jn(e, "super"); it->pos = jn(e, "pos"); it->size = jn(e, "size");
     it->stream = (int)jn(e, "stream"); it->dur = jn(e, "dur"); js(e, "layout", it->layout, sizeof it->layout);
     js(e, "fmt", it->fmt, sizeof it->fmt);
+    it->conv3d = (int)jn(e, "conv3d");
 }
 static int fill_array(cJSON *arr, BtItem **out, const char *force_type) {
     int n = cJSON_GetArraySize(arr);
@@ -174,6 +175,8 @@ int bt_ping(const char *url, BtServer *info) {
                 snprintf(info->url, sizeof info->url, "%s", url);
                 js(r, "name", info->name, sizeof info->name); js(r, "id", info->id, sizeof info->id);
                 js(r, "version", info->version, sizeof info->version);
+                info->conv3d = (int)jn(r, "conv3d");
+                info->conv3d_old = (int)jn(r, "conv3dOld"); info->conv3d_new = (int)jn(r, "conv3dNew");
             }
         } else if (code == 200) snprintf(g_err, sizeof g_err, "That address isn't a Big Top server.");
         cJSON_Delete(r);
@@ -382,8 +385,10 @@ FILE *bt_open_media(const char *path) {
             g_live.fmt = lf;
         }
         char url[320];
-        snprintf(url, sizeof url, "%s/api/items/%s/stream.moflex?fmt=%d&client=%s",
-                 g_play_cfg.url, id, g_live.fmt, g_play_cfg.client);
+        /* fmt 3 = 2D to 3D: Big Top converts the 2D video and sends a 3D moflex */
+        snprintf(url, sizeof url, "%s/api/items/%s/stream.moflex?fmt=%d%s&client=%s",
+                 g_play_cfg.url, id, g_live.fmt == 3 ? 0 : g_live.fmt, g_live.fmt == 3 ? "&conv3d=1" : "",
+                 g_play_cfg.client);
         /* start where playback will: the resume point as it is NOW -- after the Resume / Start over
          * prompt, which clears it on Start over (arming with the old point made Start over resume).
          * The same rule as the engine's: past 3 s and not in the last 10 s. */
@@ -428,8 +433,9 @@ int bt_tracks(const BtCfg *c, const char *id, BtTracks *t) {
 
 HttpStream *bt_stream_open(const BtCfg *c, const char *id, long long at_ms, int fmt, int audio, int burn) {
     char url[320];
-    snprintf(url, sizeof url, "%s/api/items/%s/stream.ts?t=%lld&fmt=%d&audio=%d&burn=%d&client=%s",
-             c->url, id, at_ms > 0 ? at_ms : 0, fmt, audio, burn, c->client);
+    /* fmt 3 = 2D to 3D: Big Top converts the 2D video to full side-by-side (drawn as fmt 1) */
+    snprintf(url, sizeof url, "%s/api/items/%s/stream.ts?t=%lld&fmt=%d%s&audio=%d&burn=%d&client=%s",
+             c->url, id, at_ms > 0 ? at_ms : 0, fmt == 3 ? 1 : fmt, fmt == 3 ? "&conv3d=1" : "", audio, burn, c->client);
     HttpStream *s = hs_open(url, NULL, 2u << 20);
     if (!s) snprintf(g_err, sizeof g_err, "Could not start the stream.");
     return s;
