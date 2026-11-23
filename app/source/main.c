@@ -40,6 +40,7 @@
 #define BUILD_TAG "dev"      /* set by the Makefile: date +%y%m%d.%H%M of the build */
 #endif
 
+static int sd_space_mb(u32 *free_mb, u32 *total_mb);   /* the SD card's room (SYSTEM INFO, below) */
 /* ---- MENU IDLE SCREEN-OFF: 5 minutes with no input on any menu screen turns both backlights
  * off (the console keeps running -- e.g. the download queue); any button/touch wakes them, and
  * the waking press is swallowed until released so it can't invisibly activate something.
@@ -4678,6 +4679,15 @@ static int self_update_(void) {
         if (R_SUCCEEDED(ptmuInit())) { PTMU_GetBatteryLevel(&lvl); PTMU_GetBatteryChargeState(&chg); ptmuExit(); }
         if (lvl < 2 && !chg) { msg_screen("UPDATE", "Battery is low.\nPlug in the charger and try again."); return 0; }
     }
+    {   /* room for the download, and for the system to install it */
+        u32 fr, tot;
+        if (sd_space_mb(&fr, &tot) && fr < 40) {
+            char m[160];
+            snprintf(m, sizeof m, "The SD card is too full to update:\n%lu MB free (about 40 MB needed).\n\nDelete a video or two, then try\nagain.", (unsigned long)fr);
+            msg_screen("UPDATE", m);
+            return 0;
+        }
+    }
     char url[256];
     const char *tmp = hbl ? UPD_3DSX_TMP : UPD_CIA_TMP;
     mkdir("sdmc:/moflex_player", 0777);
@@ -6707,9 +6717,62 @@ static int plex_browse(void) {
 
 static void bt_setup(void);   /* the Big Top server screen (defined with BIG TOP below) */
 /* X on home: everything that is a setting rather than a video */
+/* ---- the SD card's space, and SYSTEM INFO ----
+ * A full card stalls the 3DS's file system on every write (the poster cache, resume points, an
+ * update's download), which looked like the player hanging: say so instead. */
+static int sd_space_mb(u32 *free_mb, u32 *total_mb) {
+    FS_ArchiveResource r;
+    if (R_FAILED(FSUSER_GetSdmcArchiveResource(&r))) return 0;
+    u64 cl = (u64)r.clusterSize;
+    *free_mb = (u32)(((u64)r.freeClusters * cl) >> 20);
+    *total_mb = (u32)(((u64)r.totalClusters * cl) >> 20);
+    return 1;
+}
+#define SD_LOW_MB 300
+/* once per run, from the home screen: a card this full makes everything that writes crawl */
+static void sd_space_warn_once(void) {
+    static int done = 0;
+    if (done) return;
+    done = 1;
+    u32 fr, tot;
+    if (!sd_space_mb(&fr, &tot) || fr >= SD_LOW_MB) return;
+    char m[200];
+    snprintf(m, sizeof m, "The SD card is almost full:\n%lu MB free of %lu MB.\n\nPosters, resume points and updates\nneed room -- with too little, the\nplayer slows to a crawl. Delete a\nvideo or two.",
+             (unsigned long)fr, (unsigned long)tot);
+    msg_screen("SD CARD ALMOST FULL", m);
+}
+
+static void bt_cfg_load_name(char *out, int cap) {   /* "NAME\n  http://addr:port" */
+    BtCfg c;
+    if (bt_cfg_load(&c)) snprintf(out, cap, "%.26s\n  %.34s", c.name[0] ? c.name : "?", c.url);
+    else snprintf(out, cap, "none");
+}
+
+/* Settings > SYSTEM INFO */
+static void system_info_screen(void) {
+    char m[700], ip[32] = "not connected", sd[64] = "unknown", bt[96], bat[32] = "unknown";
+    bool isnew = false; APT_CheckNew3DS(&isnew);
+    u32 addr = (u32)gethostid();
+    if (addr && osGetWifiStrength() > 0)
+        snprintf(ip, sizeof ip, "%lu.%lu.%lu.%lu", (unsigned long)(addr & 255), (unsigned long)((addr >> 8) & 255),
+                 (unsigned long)((addr >> 16) & 255), (unsigned long)(addr >> 24));
+    u32 fr, tot;
+    if (sd_space_mb(&fr, &tot))
+        snprintf(sd, sizeof sd, "%lu of %lu MB free%s", (unsigned long)fr, (unsigned long)tot, fr < SD_LOW_MB ? " LOW" : "");
+    {   u8 lvl = 0, chg = 0;
+        if (R_SUCCEEDED(ptmuInit())) {
+            PTMU_GetBatteryLevel(&lvl); PTMU_GetBatteryChargeState(&chg); ptmuExit();
+            snprintf(bat, sizeof bat, "%d/5%s", lvl, chg ? ", charging" : "");
+        } }
+    bt_cfg_load_name(bt, sizeof bt);
+    snprintf(m, sizeof m, "Player: %s\n3DS: %s\nIP address: %s\nWi-Fi: %d/3 bars\nSD card: %s\nBattery: %s\nBig Top: %s",
+             BUILD_TAG, isnew ? "New 3DS" : "Old 3DS", ip, osGetWifiStrength(), sd, bat, bt);
+    msg_screen("SYSTEM INFO", m);
+}
+
 static void settings_menu(void) {
     for (;;) {
-        char r1[40], r2[40]; const char *rows[7]; int act[7], n = 0;
+        char r1[40], r2[40]; const char *rows[8]; int act[8], n = 0;
         rows[n] = "PLAYBACK DEFAULTS"; act[n++] = 0;
         if (s_idle_sel < 0) idle_cfg_load();
         snprintf(r2, sizeof r2, "SCREENS OFF AFTER: %s", idle_name(s_idle_sel)); rows[n] = r2; act[n++] = 4;
@@ -6717,6 +6780,7 @@ static void settings_menu(void) {
             if (isnew) { rows[n] = "PLEX SERVER"; act[n++] = 2; } }
         rows[n] = "BIG TOP SERVER"; act[n++] = 3;
         if (g_extplay_ok) { snprintf(r1, sizeof r1, "OLD 3DS: PLAY MOVIES WITH..."); rows[n] = r1; act[n++] = 1; }
+        rows[n] = "SYSTEM INFO"; act[n++] = 5;
         rows[n] = "DONE"; act[n++] = -1;
         int c = ui_menu("SETTINGS", g_extplay_ok ? "Audio, subtitles and players" : "Audio and subtitles", rows, n);
         if (c < 0 || act[c] < 0) return;
@@ -6724,6 +6788,7 @@ static void settings_menu(void) {
         else if (act[c] == 2) plex_setup();
         else if (act[c] == 3) bt_setup();
         else if (act[c] == 4) { idle_cfg_set((s_idle_sel + 1) % IDLE_N); s_menu_start = c; }   /* each press: the next time */
+        else if (act[c] == 5) system_info_screen();
         else extplay_choose();
     }
 }
@@ -6867,6 +6932,7 @@ static int home_gui(void) {
     static int bsel = 0;   /* remember the highlighted button across screens (B back keeps it) */
     static int s_whatsnew_done = 0;
     if (!s_whatsnew_done) { s_whatsnew_done = 1; whatsnew_maybe_show(); }
+    sd_space_warn_once();   /* a nearly full card makes every write crawl: say so once */
     int redraw = 1;
     if (startup_detect_poll()) redraw = 1;   /* background new-video check landed while we were away */
     /* read the resume position ONCE (not every frame -- that hammered the SD card) */
