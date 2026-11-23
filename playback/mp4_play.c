@@ -992,7 +992,9 @@ static MoflexResult stream_play_once(const StreamSrc *src, long long *restart_at
     bool isnew = false; APT_CheckNew3DS(&isnew);
     if (!isnew) { mp4_msg("Streaming needs a New 3DS (hardware H.264)."); return MOFLEX_QUIT_BACK; }
     int fmt = src->fmt;
-    { int saved = kit_fmt_load(src->key); if (saved >= 0) fmt = saved; }
+    {   /* a saved 2D -> 3D only while the server can convert (else a 2D stream would be split) */
+        int saved = kit_fmt_load(src->key);
+        if (saved >= 0 && (saved != 3 || moflex_conv3d_get())) fmt = saved; }
     int is3d = (fmt != 0);
     const char *title = src->title ? src->title : "Stream";
     int64_t dur_us = src->dur_us;
@@ -1114,7 +1116,8 @@ static MoflexResult stream_play_once(const StreamSrc *src, long long *restart_at
     {
     int64_t cur_us = g_s_base;
     int shown = -1, shown_slot = -1;
-    #define SHOW_SLOT(sl) do { int ns_ = shown < 0 ? 0 : 1 - shown; frame_to_tex((sl), fmt, ns_); \
+    /* fmt 3 (Big Top 2D -> 3D) arrives as full side-by-side: drawn as fmt 1 */
+    #define SHOW_SLOT(sl) do { int ns_ = shown < 0 ? 0 : 1 - shown; frame_to_tex((sl), fmt == 3 ? 1 : fmt, ns_); \
                                shown = ns_; shown_slot = (sl); } while (0)
     int gate = 1, gate_fed = 0, need_key = 1;
     /* STREAM BUFFERING. A cold start (the server seeking into a big 1080p HEVC film to transcode
@@ -1139,11 +1142,12 @@ static MoflexResult stream_play_once(const StreamSrc *src, long long *restart_at
         if (kit_take_redraw()) { gfxSet3D(is3d); dirty = 1; }
         {   int nf;                       /* Format row: 2D <-> 3D needs a differently sized stream */
             if (kit_fmt_take_change(&nf)) {
-                int was3d = is3d;
+                int was3d = is3d, wasconv = (fmt == 3);
                 fmt = nf; is3d = (fmt != 0);
                 gfxSet3D(is3d); kit_set_view3d(is3d);
                 kit_fmt_save(src->key, fmt);
-                if (was3d != is3d) {      /* another size: start over from here (see restart_at) */
+                /* another size, or into / out of 2D -> 3D (another stream): start over from here */
+                if (was3d != is3d || wasconv != (fmt == 3)) {
                     *restart_at = want_seek ? seek_to : cur_us;
                     if (*restart_at < 0) *restart_at = 0;
                     plex_log("stream: format changed to %d, reopening at %lld ms", fmt, *restart_at / 1000);

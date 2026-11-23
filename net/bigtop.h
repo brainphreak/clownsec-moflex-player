@@ -30,6 +30,7 @@ typedef struct {
     char layout[8];               /* stream 3D: "hsbs" / "fsbs" */
     char fmt[8];                  /* the file's container: "MOFLEX", "MP4", "MKV", ... */
     char kind[16];                /* a movie's type: "movie" / "short" / "musicvideo" (shows: type "show") */
+    int  conv3d;                  /* a 2D stream Big Top can convert to 3D as it plays (fmt 3) */
 } BtItem;
 
 /* a streamed video's tracks (GET /api/items/<id>) */
@@ -46,7 +47,9 @@ int  bt_tracks(const BtCfg *c, const char *id, BtTracks *t);     /* 1 = read */
 #include "httpstream.h"
 HttpStream *bt_stream_open(const BtCfg *c, const char *id, long long at_ms, int fmt, int audio, int burn);
 
-typedef struct { char url[128]; char name[64]; char id[24]; char version[24]; } BtServer;
+typedef struct { char url[128]; char name[64]; char id[24]; char version[24];
+                 int conv3d, conv3d_old, conv3d_new; /* 2D to 3D: can be asked for / recommended per 3DS kind */
+} BtServer;
 
 /* Ask the network who runs Big Top (UDP broadcast); answers collected for wait_ms. */
 int  bt_discover(BtServer *out, int max, int wait_ms);

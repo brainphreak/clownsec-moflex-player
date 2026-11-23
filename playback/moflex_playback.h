@@ -46,6 +46,10 @@ void moflex_set_idle_off_ms(unsigned ms);
 /* The player's battery menu changes that same setting through this: dir -1/+1 steps it (and saves
  * it), 0 only asks; returns the setting's name ("5 MIN", "NEVER"). */
 void moflex_set_idle_step_hook(const char *(*fn)(int dir));
+/* Big Top 2D to 3D: VIDEO > Format offers "2D -> 3D" (fmt 3). 0 = not, 1 = yes, 2 = yes but the
+ * server tested too slow (shown with a warning). Set before playing a Big Top video, 0 after. */
+void moflex_conv3d_set(int v);
+int  moflex_conv3d_get(void);   /* a saved "2D -> 3D" counts only while this is non-zero */
 /* A Big Top stream's first reads: B gives up (the app turns it on around the open; the engine turns
  * it off once the film is playing). moflex_open_cancelled() = B ended the open. */
 void moflex_open_cancellable(int on);
