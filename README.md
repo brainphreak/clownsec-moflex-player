@@ -138,10 +138,16 @@ This is the short tour — the complete list of everything the player does lives
 - **Old 3DS: Nintendo Player hand-off** — play any `.moflex` in the console's own 3D Movie
   Player for smooth 3D, per 2D/3D or asked each time. See
   [Old 3DS: play in the Nintendo Player](#old-3ds-play-in-the-nintendo-player).
+- **Big Top (any 3DS)** — stream your whole library from a computer running
+  [Clownsec Big Top](https://github.com/brainphreak/clownsec-bigtop): moflex as it is, MP4 / MKV /
+  AVI converted as they play (H.264 on a New 3DS, moflex on an Old 3DS), with posters and info,
+  extras inside their movie, watch progress shared with the computer — and **2D to 3D**: **PLAY IN
+  3D** turns a 2D video into 3D as it plays. See [Big Top](#big-top-stream-from-your-computer).
 - **Plex streaming (BETA, New 3DS)** — browse your Plex server's libraries and stream movies
   and episodes, with resume, seeking, subtitles and SBS 3D. See
   [Plex streaming (beta)](#plex-streaming-beta).
-- **Updates itself** — offers new builds and installs them in place. See [Updating](#updating).
+- **Updates itself** — offers new builds and installs them in place, then restarts by itself (a
+  CIA); tries GitHub and the clownsec.com mirror in turn on a bad connection. See [Updating](#updating).
 - **Catalog browser** — browse the Clownsec / Zackk archives from `catalog.json`, with a
   top-screen info panel (poster art, year, runtime, genres, file size, description, and a
   3D/2D badge).
@@ -159,9 +165,16 @@ This is the short tour — the complete list of everything the player does lives
   screens just turn off). When everything finishes, the **notification LED breathes green**
   (red if something failed) and the console **goes to sleep** — or **powers off**, your choice
   on the queue screen. See [Background downloads](#background-downloads-close-the-lid-and-walk-away).
-- **Idle screen-off** — sitting in the menus untouched for 5 minutes (downloads or not) turns
-  both backlights off to save battery; any button or touch wakes them, and the waking press
-  isn't acted on. Video playback is never interrupted.
+- **Idle screen-off** — sitting in the menus (or paused) untouched for 5 minutes (downloads or not)
+  turns both backlights off to save battery; any button or touch wakes them, and the waking press
+  isn't acted on. Moving the 3D slider counts as being there. The time (5 seconds to never) is in
+  **Settings → SCREENS OFF AFTER** and the player's battery menu. Video playback is never
+  interrupted, and an update in progress keeps the screens on.
+- **Battery menu** — tap the battery on the player: the level, a measured **time left** (once
+  it has watched the level drop for a few minutes), and the screens-off time.
+- **SD card space** — a card that is nearly full makes everything that writes (posters, resume
+  points, updates) crawl, so under 300 MB free the player says so; **Settings → SYSTEM INFO**
+  shows the build, Old / New 3DS, IP address, Wi-Fi, SD space, battery and the Big Top server.
 - **Built-in web server** — upload any files to the console from a browser over Wi-Fi, with
   live speed and ETA; an interrupted upload resumes, and uploaded movies join the library.
   Every file in the page's folder list also has a **download** button, to copy files off the
@@ -175,14 +188,15 @@ This is the short tour — the complete list of everything the player does lives
   default; **Y** reveals them. **The Library never scans them — a movie inside one will not show
   up.** See [Where to keep your movies](#where-to-keep-your-movies).
 - **Themes** — recolor the whole UI. Pick from built-in themes (Clownsec, Matrix, Nintendo,
-  Light, Amber, Ice) or build your own with the **Custom** color editor (R/G/B sliders for each
+  Light, Amber, Ice, 3DS Grey) or build your own with the **Custom** color editor (R/G/B sliders for each
   of the accents, text, and background). Open it from the swatch chip on the home screen or press
   **Y**; your choice is saved and applied everywhere. See [Themes](#themes).
 - **Walk the Aisle** — browse your library as a walkable 3D video store, with a jukebox you can
   fill with your own songs. See [Walk the Aisle](#walk-the-aisle--adding-your-own-music).
-- **Turn off the bottom screen** during playback — tap the **moon** button on the player to power
+- **Turn off the bottom screen** during playback — tap the **moon** button (or **X**) to power
   off the bottom backlight while the movie keeps playing up top (saves battery / kills the glow in
-  the dark). Any button press wakes it back up.
+  the dark). Any button press wakes it back up; it stays dark after a trip to the HOME Menu.
+  **L+R** locks every button and the touch screen (L+R again unlocks).
 - **3D branding** on the top screen while idle.
 
 ## Screenshots
@@ -295,6 +309,25 @@ which simply ignores them:
 
 They are built from an encode plus the original video with the
 [SUPER MOFLEX Builder](https://github.com/brainphreak/3ds-super-moflex).
+
+## Big Top: stream from your computer
+
+[Clownsec Big Top](https://github.com/brainphreak/clownsec-bigtop) is a small media server for
+Windows, macOS and Linux that streams your library to the player over your home Wi-Fi. Start it on
+the computer, then on the 3DS: **Open Video → BIG TOP** → *FIND SERVERS ON THIS WI-FI* (or *ENTER
+ADDRESS*, the one Big Top's page shows). Change or forget the server in **Settings → BIG TOP SERVER**,
+where **TEST CONNECTION** measures how fast and how steadily the computer's data reaches the 3DS.
+
+- **Browse** libraries → movies and shows (by category and genre) → seasons → episodes; **X**
+  searches. A movie with extras is one row (*Angel (1983) +2*): open it for the movie and its
+  trailers, featurettes and interviews.
+- **Plays** moflex as it is, and MP4 / MKV / AVI as they are converted: H.264 on a New 3DS, a moflex
+  Big Top makes as it plays on an Old 3DS. Seeking, resume (shared with the computer), audio tracks,
+  subtitles and 3D all work; **B** while a stream is starting gives up.
+- **2D to 3D** — when Big Top has 2D to 3D set up and its speed test showed the computer keeps up,
+  opening a 2D video asks **PLAY IN 3D / PLAY IN 2D** (remembered per video). **VIDEO → Format →
+  2D → 3D** switches it while it plays — also where the test said the computer may be too slow (it
+  says *may stutter*).
 
 ## Plex streaming (beta)
 
@@ -702,8 +735,9 @@ screen, or press **Y**.
 </p>
 
 In the picker, move up/down (or tap a row) to **preview a theme live** — the whole UI recolors
-instantly — then press **A** or **B** to apply. Your choice is saved to the SD card and restored on
-next launch. Built-in themes:
+instantly — then press **A** (or tap the highlighted row again) to apply it, or **B** to leave with
+your previous theme: browsing themes changes nothing until you choose one. Your choice is saved to
+the SD card and restored on next launch. Built-in themes:
 
 | Theme | Look |
 |-------|------|
@@ -713,6 +747,7 @@ next launch. Built-in themes:
 | **Light** | dark text on a near-white background |
 | **Amber** | retro amber / orange terminal |
 | **Ice** | cyan / white on deep blue |
+| **3DS Grey** | the system apps' look — cool grey, dark text, a blue accent |
 
 ### Custom colors
 
@@ -726,7 +761,10 @@ Select **Custom** and press **X** to open the color editor:
 
 - **L / R** — cycle the palette item: *Accent 1/2/3, Danger, Bright text, Text, Muted, Background*
 - **D-pad** — pick and adjust the **R / G / B** channel (or tap a slider to set it directly)
-- **Y** — reset to defaults · **B** — save and exit
+- **Y** — reset to defaults
+- **A** (or **SAVE**) — keep the colors and use Custom · **B** (or **CANCEL**) — put back the colors
+  and theme from before; if you changed anything it asks first (A leaves, B goes back to editing)
+- **SELECT** (or the preview's **PLAY** button) — a full-screen preview of the theme
 
 The editor's own chrome stays a fixed, readable dark scheme no matter what you pick, and a live
 **preview** panel shows the themed result. Panel, row, and border shades are derived from your base
