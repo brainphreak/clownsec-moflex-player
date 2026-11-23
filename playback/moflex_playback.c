@@ -7759,7 +7759,7 @@ static void kit_fmt_path(const char *movie, char *out, size_t cap) {
 int kit_fmt_load(const char *movie) {
     char p[256]; kit_fmt_path(movie, p, sizeof p);
     FILE *f = fopen(p, "rb"); if (!f) return -1;
-    int v = -1; if (fscanf(f, "%d", &v) != 1 || v < 0 || v > 2) v = -1;
+    int v = -1; if (fscanf(f, "%d", &v) != 1 || v < 0 || v > 3) v = -1;   /* 3 = Big Top 2D -> 3D */
     fclose(f); return v;
 }
 void kit_fmt_save(const char *movie, int fmt) {
