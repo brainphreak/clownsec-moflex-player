@@ -82,6 +82,7 @@ static int bt_xfer(void *p, curl_off_t a, curl_off_t b, curl_off_t c, curl_off_t
     return 0;
 }
 /* GET (post=1: POST) base+path; body in *out. Returns the HTTP status, -1 when unreachable. */
+static long g_req_timeout;               /* seconds for the next bt_req (0 = its quick/normal default) */
 static long bt_req(const char *base, const char *client, const char *path, char **out, int post, int quick) {
     *out = NULL;
     if (!downloader_init()) { snprintf(g_err, sizeof g_err, "Network is not available."); return -1; }
@@ -96,7 +97,8 @@ static long bt_req(const char *base, const char *client, const char *path, char 
     if (post) curl_easy_setopt(e, CURLOPT_POSTFIELDS, "");
     curl_easy_setopt(e, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(e, CURLOPT_CONNECTTIMEOUT, quick ? 4L : 8L);
-    curl_easy_setopt(e, CURLOPT_TIMEOUT, quick ? 8L : 60L);
+    curl_easy_setopt(e, CURLOPT_TIMEOUT, g_req_timeout > 0 ? g_req_timeout : quick ? 8L : 60L);
+    g_req_timeout = 0;
     curl_easy_setopt(e, CURLOPT_ACCEPT_ENCODING, "");
     curl_easy_setopt(e, CURLOPT_WRITEFUNCTION, on_mem);
     curl_easy_setopt(e, CURLOPT_WRITEDATA, &m);
@@ -324,6 +326,9 @@ int bt_subs(const BtCfg *c, const char *item_id, BtSub *out, int max) {
 int bt_sub_download(const BtCfg *c, const char *item_id, int n, const char *dest) {
     char path[112], *body = NULL;
     snprintf(path, sizeof path, "/api/items/%s/subs/%d", item_id, n);
+    /* a track inside a big video can take Big Top minutes to read (newer Big Tops answer 503 after a
+     * few seconds and keep reading): never hold the film back for it -- 15 s, then without */
+    g_req_timeout = 15;
     long code = bt_req(c->url, c->client, path, &body, 0, 0);
     int ok = 0;
     if (code == 200 && body) {
