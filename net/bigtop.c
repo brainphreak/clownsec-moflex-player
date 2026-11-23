@@ -256,17 +256,44 @@ int bt_libraries(const BtCfg *c, BtItem **out) {
     return n;
 }
 
+/* A list, in pages of BT_PAGE: a big library (thousands of films, each with its summary) was one JSON
+ * document of several MB, and its parse tree alone -- ~15 small allocations per film -- ran a New 3DS
+ * out of memory ("Not enough memory for the list"). Paged, only one page is ever parsed at once; the
+ * items go into one array sized from the server's "total". A server without paging (or a list that
+ * isn't paged: a show's seasons) answers everything at once, as before. */
+#define BT_PAGE 1000
 int bt_list(const BtCfg *c, const char *path, BtItem **out) {
     *out = NULL;
-    char *body = NULL;
-    long code = bt_req(c->url, c->client, path, &body, 0, 0);
-    if (code != 200 || !body) { free(body); return -1; }
-    cJSON *r = cJSON_Parse(body); free(body);
-    if (!r) { snprintf(g_err, sizeof g_err, "Big Top sent something unreadable."); return -1; }
-    cJSON *arr = cJSON_GetObjectItemCaseSensitive(r, "items");
-    if (!arr) arr = cJSON_GetObjectItemCaseSensitive(r, "seasons");   /* a show: its seasons */
-    int n = arr ? fill_array(arr, out, NULL) : 0;
-    cJSON_Delete(r);
+    BtItem *v = NULL; int n = 0, cap = 0, total = -1;
+    for (int start = 0; ; ) {
+        char p2[400];
+        snprintf(p2, sizeof p2, "%s%sstart=%d&size=%d", path, strchr(path, '?') ? "&" : "?", start, BT_PAGE);
+        char *body = NULL;
+        long code = bt_req(c->url, c->client, p2, &body, 0, 0);
+        if (code != 200 || !body) { free(body); free(v); return -1; }
+        cJSON *r = cJSON_Parse(body); free(body);
+        if (!r) { snprintf(g_err, sizeof g_err, "Big Top sent something unreadable."); free(v); return -1; }
+        cJSON *arr = cJSON_GetObjectItemCaseSensitive(r, "items");
+        if (!arr) arr = cJSON_GetObjectItemCaseSensitive(r, "seasons");   /* a show: its seasons */
+        cJSON *tj = cJSON_GetObjectItemCaseSensitive(r, "total");
+        int got = arr ? cJSON_GetArraySize(arr) : 0;
+        int paged = cJSON_IsNumber(tj);              /* read now: r is freed below */
+        if (total < 0) total = paged ? (int)tj->valuedouble : got;
+        if (total < n + got) total = n + got;        /* never smaller than what came */
+        if (cap < total) {
+            BtItem *nv = (BtItem *)realloc(v, (size_t)(total ? total : 1) * sizeof(BtItem));
+            if (!nv) { cJSON_Delete(r); free(v); snprintf(g_err, sizeof g_err, "Not enough memory for the list."); return -1; }
+            v = nv; cap = total;
+        }
+        cJSON *e;
+        if (arr) cJSON_ArrayForEach(e, arr) { if (n < cap) fill(&v[n++], e); }
+        cJSON_Delete(r);
+        /* done: everything came, a page came short, or this server doesn't page (no "total") */
+        if (!paged || got == 0 || n >= total || got < BT_PAGE) break;
+        start = n;
+    }
+    if (!v) v = (BtItem *)calloc(1, sizeof(BtItem));
+    *out = v;
     return n;
 }
 
