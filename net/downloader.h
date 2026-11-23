@@ -21,6 +21,8 @@ void downloader_exit(void);
  * restarts, and it resumes even if you later pick a DIFFERENT destination folder. A user cancel
  * keeps the partial for a later resume. */
 bool download_to_file(const char *url, const char *dest, dl_progress_cb cb, void *user);
+/* attempts per download_to_file (0 = the default 5): fewer when there is another source to try */
+void download_set_tries(int n);
 
 /* Bytes already downloaded for `url` (size of its leftover central partial), 0 if none.
  * Keyed by URL, so it finds the partial regardless of destination folder. */

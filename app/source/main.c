@@ -4692,15 +4692,21 @@ static int self_update_(void) {
     /* A source crawling below 16 KB/s for 20 s (the whole file would take 7+ minutes) gives way to
      * the other one; the last source is never cut off for speed. CANCEL stops the update outright
      * -- it used to just move on to the next source, so it looked like it did nothing. */
+    /* Each source gets 2 attempts, then the other one, twice round (GitHub, mirror, GitHub,
+     * mirror): a bad connection to one moves on in seconds instead of 5 attempts with backoff --
+     * minutes on one server, which looked like a hang. The screen says which server it is. */
     int cancelled = 0;
-    for (int k = 0; k < UPD_SOURCES && !got; k++) {
+    const int tries = 2 * UPD_SOURCES;
+    download_set_tries(2);
+    for (int k = 0; k < tries && !got; k++) {
         int src = (s_upd_src + k) % UPD_SOURCES;
         upd_asset_url(url, sizeof url, hbl ? ".3dsx" : ".cia", src);
         remove(tmp);
         download_discard_partial(url);   /* same URL every release: never resume an older build's bytes */
         g_last_prog = 0;
         s_dl_cancelled = s_dl_too_slow = 0; s_dl_win_t = 0;
-        s_dl_slow_kbs = k + 1 < UPD_SOURCES ? 16 : 0;
+        snprintf(g_dl_name, sizeof g_dl_name, "Clownsec Player %s (from %s)", s_upd, src == 0 ? "GitHub" : "clownsec.com");
+        s_dl_slow_kbs = k + 1 < tries ? 16 : 0;   /* only the very last try is never cut off for speed */
         got = download_to_file(url, tmp, dl_progress, NULL);
         s_dl_slow_kbs = 0;
         if (!got && s_dl_cancelled) { cancelled = 1; download_discard_partial(url); break; }
@@ -4708,6 +4714,7 @@ static int self_update_(void) {
         upd_screen("CHECKING", "Clownsec Player", -1);
         if (!upd_md5_ok(tmp, s_upd_md5)) { got = false; md5_bad = 1; remove(tmp); }
     }
+    download_set_tries(0);
     dl_wifi_hold(0);
     if (cancelled) {
         remove(tmp); sleep_reallow();
