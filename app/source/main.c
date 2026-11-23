@@ -7300,6 +7300,9 @@ static int bt_conv_level(const BtItem *it) {
 }
 static int bt_play_(const BtCfg *c, const BtItem *it, const char *title);
 static int bt_play(const BtCfg *c, const BtItem *it, const char *title) {
+    /* the server's abilities are read when BIG TOP opens; if that check didn't get through (busy
+     * server, a network hiccup), 2D -> 3D was hidden for the whole visit: ask again before playing */
+    if (!s_bt_srv_ok && it->conv3d && !it->is3d) s_bt_srv_ok = bt_ping(c->url, &s_bt_srv);
     int cl = bt_conv_level(it);
     if (cl == 1) {   /* offered: ask once per video (VIDEO > Format changes it later) */
         char key[48]; snprintf(key, sizeof key, "bigtop:%s", it->id);
