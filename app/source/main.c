@@ -7251,7 +7251,7 @@ static MoflexResult bt_stream_play(const BtCfg *c, const BtItem *it, const char 
     {   int saved = moflex_fmt_load_key(key); if (saved >= 0 && (saved != 3 || moflex_conv3d_get())) fmt = saved; }
     p.is3d = fmt != 0;
     /* subtitles: the text tracks (sidecar files + the file's own), then the picture ones */
-    msg_screen_nowait(title, "Getting subtitles...");
+    msg_screen_nowait(title, "Getting subtitles...\n(B: start without them)");
     int ns = bt_subs(c, it->id, p.subs, 16);
     p.ntext = ns > 0 ? ns : 0;
     for (int i = 0; i < p.ntext; i++)
@@ -7348,7 +7348,7 @@ static int bt_play_(const BtCfg *c, const BtItem *it, const char *title) {
      * as "<name>.srt" so it loads by itself, the rest labelled for CC > Load subtitle file... */
     {   BtSub subs[16]; int ns = bt_subs(c, it->id, subs, 16);
         if (ns > 0) {
-            msg_screen_nowait(title, "Getting subtitles...");
+            msg_screen_nowait(title, "Getting subtitles...\n(B: start without them)");
             const char *bn = strrchr(path, '/'); bn = bn ? bn + 1 : path;
             char stem[200]; snprintf(stem, sizeof stem, "%s", bn);
             char *dot = strrchr(stem, '.'); if (dot) *dot = 0;
@@ -7375,7 +7375,7 @@ static int bt_play_(const BtCfg *c, const BtItem *it, const char *title) {
                     for (char *q = lab; *q; q++) if (strchr("/\\:*?\"<>|", *q)) *q = '-';
                     snprintf(fn, sizeof fn, "sdmc:/moflex_player/moviedata/%s.%s.%s", stem, lab[0] ? lab : "track", subs[i].ext);
                 }
-                bt_sub_download(c, it->id, subs[i].n, fn);
+                if (!bt_sub_download(c, it->id, subs[i].n, fn) && bt_cancelled()) break;   /* B: the rest too */
             }
         }
     }
