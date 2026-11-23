@@ -12,6 +12,8 @@ typedef struct LiveMoflex LiveMoflex;
 
 /* Open url (the server adds the start time from "at=<ms>") as a stream starting at t_us. *fp gets
  * the FILE* to hand to mfx_open_live (closing it with fclose closes the stream). NULL on failure. */
+/* the player's wait hook (moflex_seek_wait_hook): B / a dropped seek ends a waiting read */
+void live_set_wait_hook(int (*fn)(int poll));
 LiveMoflex *live_open(const char *url, int64_t t_us, FILE **fp);
 /* the same, for a title lasting dur_us (0 = unknown): mfx_open on the FILE then needs nothing else
  * (live_install_hook) */

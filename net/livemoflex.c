@@ -23,6 +23,12 @@ struct LiveMoflex {
     unsigned wait_max, reopens;
 };
 
+/* B (before the film starts) or a dropped seek, as for the Big Top file reader (httpfile): a read
+ * waiting on a slow or stalled live stream gives up at once instead of holding the screen for up
+ * to LIVE_STALL_MS per read */
+static int (*g_lm_hook)(int poll) = NULL;
+void live_set_wait_hook(int (*fn)(int poll)) { g_lm_hook = fn; }
+
 static int start(LiveMoflex *lm, int64_t t_us) {
     if (lm->hs) { hs_close(lm->hs); lm->hs = NULL; }
     char u[600];
@@ -48,6 +54,7 @@ static int pull(LiveMoflex *lm) {
 static ssize_t lm_read(void *c, char *buf, size_t n) {
     LiveMoflex *lm = (LiveMoflex *)c;
     if (!lm->hs || lm->pos < lm->base) return -1;           /* before the kept window: lost */
+    if (g_lm_hook && g_lm_hook(0)) return -1;               /* B / a dropped seek: fail fast */
     u64 t0 = osGetTime();
     while (lm->pos >= lm->base + (int64_t)lm->len) {
         int r = pull(lm);
@@ -55,6 +62,7 @@ static ssize_t lm_read(void *c, char *buf, size_t n) {
         if (r == 0) {
             u64 w = osGetTime() - t0;
             if (w > LIVE_STALL_MS) return 0;
+            if (g_lm_hook && w > 100 && (w / 30) % 2 == 0 && g_lm_hook(1)) return -1;   /* B pressed */
             svcSleepThread(2 * 1000 * 1000LL);
         }
     }

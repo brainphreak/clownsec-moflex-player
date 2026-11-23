@@ -33,6 +33,7 @@
 #include "plex.h"
 #include "bigtop.h"
 #include "httpfile.h"
+#include "livemoflex.h"   /* live_set_wait_hook */
 
 #define APP_VERSION "v1.0"
 #ifndef BUILD_TAG
@@ -7993,6 +7994,7 @@ int main(void) {
     romfsInit();                /* files shipped inside the app (the store's song) */
     moflex_set_open_hook(bt_open_media);   /* "bigtop:" videos stream from a Big Top server */
     httpfile_set_wait_hook(moflex_seek_wait_hook);
+    live_set_wait_hook(moflex_seek_wait_hook);   /* an Old 3DS's live stream: B while it waits too */
     bt_set_cancel(bt_b_pressed);                       /* B cancels a Big Top request the screen waits on */   /* ...and a seek over Wi-Fi can be changed mid-way */
     ndspInit();
     theme_load();               /* restore the saved theme before anything draws */
