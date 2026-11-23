@@ -7436,7 +7436,7 @@ static int bt_filter_pick(const char *lib, const BtItem *it, int n, int *cat, ch
     if (start != 0 && *cat < 0) start = 0;
     for (;;) {
         if (start == 0) {
-            if (nc <= 1 && bt_genres(it, n, -1, gens, 64) == 0) { *cat = -1; gen[0] = 0; return 1; }   /* nothing to choose */
+            if (nc <= 1 && bt_genres(it, n, -1, gens, 64) == 0) { *cat = -1; gen[0] = 0; return 2; }   /* nothing to choose: skipped */
             static char cdisp[4][64];
             for (int k = 0; k < nc; k++) snprintf(cdisp[k], 64, "%s (%d)", k_bt_cat[idx[k]], cnt[idx[k]]);
             char sub[32]; snprintf(sub, sizeof sub, "%d titles", n);
@@ -7492,6 +7492,7 @@ static int bt_browse(void) {
     /* a library's level: its category / genre filter, and whether it was picked yet (0 = pick, from
      * fstart: 0 categories, 1 genres, 2 view all / pick a genre) */
     int fcat[6], fset[6] = { 0 }, fstart[6] = { 0 }; static char fgen[6][32];
+    int fauto[6] = { 0 };   /* the picker had nothing to choose (skipped): B leaves the library */
     for (int d = 0; d < 6; d++) { fcat[d] = -1; fgen[d][0] = 0; }
     #define BT_IS_LIB(d) (!strncmp(path[d], "/api/libraries/", 15))
     #define BT_DONE(rv) do { for (int d_ = 0; d_ < 6; d_++) free(lst[d_]); return (rv); } while (0)
@@ -7525,10 +7526,9 @@ static int bt_browse(void) {
         }
         BtItem *it = lst[depth]; int n = lstn[depth];
         if (BT_IS_LIB(depth) && !fset[depth]) {
-            if (!bt_filter_pick(ttl[depth], it, n, &fcat[depth], fgen[depth], sizeof fgen[depth], fstart[depth])) {
-                fstart[depth] = 0; BT_UP(); continue;
-            }
-            fset[depth] = 1; presel[depth] = -1;
+            int fr = bt_filter_pick(ttl[depth], it, n, &fcat[depth], fgen[depth], sizeof fgen[depth], fstart[depth]);
+            if (!fr) { fstart[depth] = 0; BT_UP(); continue; }
+            fset[depth] = 1; fauto[depth] = (fr == 2); presel[depth] = -1;
         }
         int lib_f = BT_IS_LIB(depth) && fset[depth] && (fcat[depth] >= 0 || fgen[depth][0]);
         char (*names)[64] = (char (*)[64])malloc((size_t)n * 64);
@@ -7578,7 +7578,7 @@ static int bt_browse(void) {
         if (sel < 0 || sel >= shown) {
             free(map);
             if (filt[depth][0]) { filt[depth][0] = 0; continue; }
-            if (BT_IS_LIB(depth) && fset[depth]) {               /* B: back to the genre / category it came from */
+            if (BT_IS_LIB(depth) && fset[depth] && !fauto[depth]) {   /* B: back to the genre / category it came from */
                 fset[depth] = 0;
                 fstart[depth] = fgen[depth][0] ? 1 : fcat[depth] >= 0 ? 2 : 0;
                 continue;
@@ -7597,7 +7597,7 @@ static int bt_browse(void) {
             free(lst[depth]); lst[depth] = NULL;                   /* reload: watched marks, resume points */
         } else if (depth < 5) {
             depth++; presel[depth] = 0; filt[depth][0] = 0;
-            fset[depth] = 0; fstart[depth] = 0; fcat[depth] = -1; fgen[depth][0] = 0;
+            fset[depth] = 0; fauto[depth] = 0; fstart[depth] = 0; fcat[depth] = -1; fgen[depth][0] = 0;
             free(lst[depth]); lst[depth] = NULL;
             if (!strcmp(pick.type, "lib")) snprintf(path[depth], sizeof path[depth], "/api/libraries/%s", pick.id);
             else if (!strcmp(pick.type, "show")) snprintf(path[depth], sizeof path[depth], "/api/shows/%s", pick.id);
