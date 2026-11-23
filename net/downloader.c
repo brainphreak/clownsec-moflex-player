@@ -267,22 +267,35 @@ static void url_enc(const char *in, char *out, size_t cap) {
 /* httpcBeginRequest (connect + TLS + request) has no timeout: against a silent server it sat for a
  * long time with the screen, CANCEL, B and even HOME dead. It runs on a helper thread now while
  * the caller keeps checking for a cancel, which httpcCancelConnection turns into an early return. */
-typedef struct { httpcContext *c; volatile int done; Result r; } HfBegin;
-static void hf_begin_thread(void *a) { HfBegin *b = (HfBegin *)a; b->r = httpcBeginRequest(b->c); b->done = 1; }
+/* After a cancel, httpcCancelConnection doesn't always make httpcBeginRequest give up at once (a
+ * stalled TLS handshake on weak Wi-Fi): waiting for it with no limit froze the screen, CANCEL and
+ * HOME until the 3DS was powered off. So the wait after a cancel is bounded: past HF_GIVEUP_MS the
+ * helper is left to finish on its own (detached, with its own copy of the context and its state on
+ * the heap -- both deliberately left behind) and the caller is answered at once. */
+typedef struct { httpcContext c; volatile int done; Result r; } HfBegin;
+static void hf_begin_thread(void *a) { HfBegin *b = (HfBegin *)a; b->r = httpcBeginRequest(&b->c); b->done = 1; }
 #define HF_SLICE_NS (250LL * 1000 * 1000)   /* waits are sliced so a cancel lands within ~1/4 s */
-static int hf_begin(httpcContext *c, Prog *pr) {   /* 0 ok, HF_ABORT, HF_USE_CURL */
-    HfBegin b = { c, 0, 0 };
+#define HF_GIVEUP_MS 2000
+/* 0 ok, HF_ABORT, HF_USE_CURL. *abandoned = 1: the helper still holds the connection -- the caller
+ * must not close it (it is cancelled; the helper's copy goes with the helper) */
+static int hf_begin(httpcContext *c, Prog *pr, int *abandoned) {
+    *abandoned = 0;
+    HfBegin *b = (HfBegin *)malloc(sizeof *b);
+    if (!b) return R_FAILED(httpcBeginRequest(c)) ? HF_USE_CURL : 0;
+    b->c = *c; b->done = 0; b->r = 0;
     s32 prio = 0x30; svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
-    Thread t = threadCreate(hf_begin_thread, &b, 16 * 1024, prio, -2, false);
-    if (!t) return R_FAILED(httpcBeginRequest(c)) ? HF_USE_CURL : 0;   /* no thread: the old way */
-    int cancelled = 0;
-    while (!b.done) {
+    Thread t = threadCreate(hf_begin_thread, b, 16 * 1024, prio, -2, true);   /* detached */
+    if (!t) { free(b); return R_FAILED(httpcBeginRequest(c)) ? HF_USE_CURL : 0; }   /* the old way */
+    int cancelled = 0; u64 since = 0;
+    while (!b->done) {
         svcSleepThread(100 * 1000 * 1000LL);
-        if (!cancelled && dl_cancelled(pr)) { cancelled = 1; httpcCancelConnection(c); }
+        if (!cancelled && dl_cancelled(pr)) { cancelled = 1; since = osGetTime(); httpcCancelConnection(&b->c); }
+        if (cancelled && osGetTime() - since > HF_GIVEUP_MS) { *abandoned = 1; return HF_ABORT; }   /* b stays */
     }
-    threadJoin(t, U64_MAX); threadFree(t);
+    Result r = b->r;
+    free(b);
     if (cancelled) return HF_ABORT;
-    return R_FAILED(b.r) ? HF_USE_CURL : 0;
+    return R_FAILED(r) ? HF_USE_CURL : 0;
 }
 static int httpc_fetch(const char *url, DlFile *df, Prog *pr) {
     char cur[1024]; url_enc(url, cur, sizeof cur);
@@ -301,7 +314,8 @@ static int httpc_fetch(const char *url, DlFile *df, Prog *pr) {
         /* Any pre-body failure hands the attempt to curl -- the exact behavior of the proven
          * builds. (Tradeoff, accepted: on a truly dead network curl's DNS wait can run long,
          * but the UI is protected by the bounded 15s stop-wait, and every screen stays free.) */
-        { int br = hf_begin(&c, pr); if (br) { httpcCloseContext(&c); return br; } }
+        {   int gone = 0, br = hf_begin(&c, pr, &gone);
+            if (br) { if (!gone) httpcCloseContext(&c); return br; } }
         u32 status = 0;
         {   Result sr; s64 waited = 0;
             for (;;) {
