@@ -397,12 +397,17 @@ static int httpc_fetch(const char *url, DlFile *df, Prog *pr) {
     return HF_FAIL;   /* redirect loop */
 }
 
+/* attempts per download_to_file (each resumes the last); a caller with another source to try (the
+ * self-updater) asks for fewer, so a bad connection moves on in seconds, not minutes */
+static int g_max_tries = 5;
+void download_set_tries(int n) { g_max_tries = n > 0 ? n : 5; }
+
 bool download_to_file(const char *url, const char *dest, dl_progress_cb cb, void *user) {
     if (!downloader_init()) return false;
     g_write_fail = 0; g_last_http = 0;
     char part[512]; part_path_for_url(url, part, sizeof part);
 
-    const int MAX_TRIES = 5;
+    const int MAX_TRIES = g_max_tries;
     for (int attempt = 0; attempt < MAX_TRIES; attempt++) {
         struct stat st;
         curl_off_t off = (stat(part, &st) == 0) ? (curl_off_t)st.st_size : 0;
