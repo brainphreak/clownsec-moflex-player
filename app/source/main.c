@@ -5346,6 +5346,8 @@ static int extplay_launch(const char *path) {
 }
 
 static int g_play_to_browser = 0;   /* set by a browser (Big Top, Plex) that redraws its own top screen */
+/* a server video opening: what it's doing, under the video's name (moflex_set_status_hook) */
+static void open_status_draw(const char *msg) { msg_screen_nowait(g_now_playing[0] ? g_now_playing : "BIG TOP", msg); }
 static MoflexResult play_movie(const char *path) {
     /* a Big Top video streams from the server: none of the card checks below apply to it */
     int remote = !strncmp(path, "bigtop:", 7);
@@ -5440,6 +5442,9 @@ static MoflexResult play_movie(const char *path) {
           int rc = resume_prompt(g_now_playing, rp);
           if (rc < 0) { cia_clear_selection(); branding_show(); return MOFLEX_QUIT_BACK; }   /* B -> back */
           if (rc == 0) moflex_resume_clear(path);                                            /* start over */
+          /* the question would stay on screen through the open: say it's on its way */
+          if (remote) msg_screen_nowait(g_now_playing, rc == 0 ? "Starting from the beginning...\n\nB: cancel"
+                                                              : "Finding where you left off...\n\nB: cancel");
       } }
     /* stop the background SD walk from fighting the movie for the card (slow loads/resumes) */
     int was_scanning = !s_dt_done && !s_dt_consumed;
@@ -8062,6 +8067,7 @@ int main(void) {
     gfxInitDefault();
     romfsInit();                /* files shipped inside the app (the store's song) */
     moflex_set_open_hook(bt_open_media);   /* "bigtop:" videos stream from a Big Top server */
+    moflex_set_status_hook(open_status_draw);   /* ...and say what the open is waiting on */
     httpfile_set_wait_hook(moflex_seek_wait_hook);
     live_set_wait_hook(moflex_seek_wait_hook);   /* an Old 3DS's live stream: B while it waits too */
     bt_set_cancel(bt_b_pressed);                       /* B cancels a Big Top request the screen waits on */   /* ...and a seek over Wi-Fi can be changed mid-way */

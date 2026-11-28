@@ -53,6 +53,8 @@ int  moflex_conv3d_get(void);   /* a saved "2D -> 3D" counts only while this is 
 /* A Big Top stream's first reads: B gives up (the app turns it on around the open; the engine turns
  * it off once the film is playing). moflex_open_cancelled() = B ended the open. */
 void moflex_open_cancellable(int on);
+/* shown on the app's screen while a server video opens (step, and how long a read has waited) */
+void moflex_set_status_hook(void (*fn)(const char *msg));
 int  moflex_open_cancelled(void);
 
 /* ---- shared with the MP4 player: one resume/volume/subtitle system across both formats ---- */

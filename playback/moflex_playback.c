@@ -168,10 +168,37 @@ static touchPosition g_seek_cut_tp;      /* where the touch that dropped a seek 
 static volatile int g_open_busy = 0, g_open_cut = 0;
 void moflex_open_cancellable(int on) { g_open_busy = on; g_open_cut = 0; }
 int  moflex_open_cancelled(void) { return g_open_cut; }
+/* What the open is doing, on the app's screen, so a slow server doesn't look like a frozen
+ * player: the step, and once a read has waited a while, for how long. Only until the engine takes
+ * the screens over (g_status_ok goes to 0 before any gfx change). */
+static void (*g_status_hook)(const char *msg) = NULL;
+void moflex_set_status_hook(void (*fn)(const char *msg)) { g_status_hook = fn; }
+static int g_status_ok = 0;
+static const char *g_status_step = "Opening the video...";
+static void open_status(const char *step) {
+    g_status_step = step;
+    if (g_status_ok && g_status_hook) {
+        char b[160]; snprintf(b, sizeof b, "%s\n\nB: cancel", step); g_status_hook(b);
+    }
+}
+static void status_off(void) { g_status_ok = 0; }
+static void open_wait_tick(void) {     /* a read is waiting (called every ~60 ms while it does) */
+    static u64 w0, wlast, drawn;
+    u64 now = osGetTime();
+    if (now - wlast > 400) { w0 = now; drawn = 0; }   /* a new wait */
+    wlast = now;
+    if (!g_status_ok || !g_status_hook || now - w0 < 2000 || now - drawn < 1000) return;
+    drawn = now;
+    char b[200];
+    snprintf(b, sizeof b, "%s\n\nWaiting for Big Top... %llu s\n(B: cancel)", g_status_step,
+             (unsigned long long)((now - w0) / 1000));
+    g_status_hook(b);
+}
 int moflex_seek_wait_hook(int poll) {
     if (g_open_busy) {
         if (g_open_cut) return 1;
         if (!poll) return 0;
+        open_wait_tick();
         hidScanInput();
         if (hidKeysDown() & KEY_B) { g_open_cut = 1; return 1; }
         return 0;
@@ -5413,7 +5440,7 @@ static MoflexResult moflex_play_ring(const char *path) {
     subs_autoload(path);
     if (g_trsub_sel < 0 || g_trsub_sel >= g_tra.sub_n) g_trsub_sel = 0;
     if (g_nsubs == 0) {                                  /* sidecars win over embedded */
-        if (g_tra.sub_n > 0) { if (trsub_stash_f(f, path, g_trsub_sel)) subs_load(EMB_SRT); }
+        if (g_tra.sub_n > 0) { open_status("Reading the subtitles..."); if (trsub_stash_f(f, path, g_trsub_sel)) subs_load(EMB_SRT); }
         else if (g_emb_sub_found) subs_load(EMB_SRT);
     }
 
@@ -5422,6 +5449,7 @@ static MoflexResult moflex_play_ring(const char *path) {
      * format); citro2d rendering into that garbled state is what produced the comb/doubled screens.
      * Tear it all down and gfxInitDefault() fresh so citro2d owns a known-good state (the app re-inits
      * its own console after moflex_play() returns, so this is safe). Restored the same way on exit. */
+    status_off();
     gfxExit();
     gfxInitDefault();
     /* Freshly allocated framebuffers hold GARBAGE, and the GPU setup below takes long enough for it
@@ -6828,6 +6856,7 @@ static MoflexResult moflex_play_classic(const char *path) {
     AVFrame *setR[2] = { av_frame_alloc(), av_frame_alloc() };
     int cur_set = 0, pair_in_flight = 0;
 
+    status_off();
     gfxSetScreenFormat(GFX_TOP, GSP_BGR8_OES);   /* 24-bit video (RGB565 banded the gradients) */
     gfxSetDoubleBuffering(GFX_TOP, true);   /* MUST be on: both eyes go to the back
         buffer and appear together only on gfxSwapBuffers. Single-buffered here would
@@ -7499,7 +7528,15 @@ static MoflexResult moflex_play_soft(const char *path) {
  * avoid the software-UI gfx conflict. USE_RING_3D=0 falls back to the software banking engine (which
  * is decode+transpose-bound on Old 3DS). Either way, if the engine can't allocate -> classic. */
 #define USE_RING_3D 1
+static MoflexResult moflex_play_(const char *path);
 MoflexResult moflex_play(const char *path) {
+    g_status_ok = !strncmp(path, "bigtop:", 7);    /* a server video: say what the open waits on */
+    open_status("Opening the video...");
+    MoflexResult r = moflex_play_(path);
+    status_off();
+    return r;
+}
+static MoflexResult moflex_play_(const char *path) {
     int is3d = 0;
     FILE *f = media_fopen(path);
     if (f) {
