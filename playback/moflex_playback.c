@@ -1324,9 +1324,13 @@ static void trailer_probe(FILE *f) {
 /* Copy embedded subtitle track k to the scratch file (fresh handle: the demuxer owns f). */
 static int g_trsub_sel = 0;
 #define EMB_SRT "sdmc:/moflex_player/.embedded.srt"
-static int trsub_stash(const char *path, int k) {
+/* `open`: the video's own FILE when nothing else is reading it (at the start): a Big Top video
+ * then reads the track over the connection it already has. A second connection opened and
+ * closed while the video started could stall the start for minutes on a 3DS. */
+static int trsub_stash_f(FILE *open, const char *path, int k) {
     if (k < 0 || k >= g_tra.sub_n) return 0;
-    FILE *sf = media_fopen(path);
+    off_t back = open ? ftello(open) : 0;
+    FILE *sf = open ? open : media_fopen(path);
     if (!sf) return 0;
     /* in chunks: a raw fansub track can run to megabytes, and the heap is needed for video */
     static char buf[32 * 1024];
@@ -1346,9 +1350,11 @@ static int trsub_stash(const char *path, int k) {
             if (!ok) remove(EMB_SRT);                   /* never leave half a track to load */
         }
     }
-    fclose(sf);
+    if (open) fseeko(open, back, SEEK_SET);
+    else fclose(sf);
     return ok;
 }
+static int trsub_stash(const char *path, int k) { return trsub_stash_f(NULL, path, k); }
 
 
 /* ---- dual-audio track selection (e.g. English first for the official player, original
@@ -5407,7 +5413,7 @@ static MoflexResult moflex_play_ring(const char *path) {
     subs_autoload(path);
     if (g_trsub_sel < 0 || g_trsub_sel >= g_tra.sub_n) g_trsub_sel = 0;
     if (g_nsubs == 0) {                                  /* sidecars win over embedded */
-        if (g_tra.sub_n > 0) { if (trsub_stash(path, g_trsub_sel)) subs_load(EMB_SRT); }
+        if (g_tra.sub_n > 0) { if (trsub_stash_f(f, path, g_trsub_sel)) subs_load(EMB_SRT); }
         else if (g_emb_sub_found) subs_load(EMB_SRT);
     }
 
@@ -6848,7 +6854,7 @@ static MoflexResult moflex_play_classic(const char *path) {
     subs_autoload(path);   /* load a matching .srt (sidecar or moviedata/) if one exists */
     if (g_nsubs == 0 && g_tra.present && g_tra.sub_n > 0) {   /* trailer subtitles (SUPER MOFLEX) */
         if (g_trsub_sel < 0 || g_trsub_sel >= g_tra.sub_n) g_trsub_sel = 0;
-        if (trsub_stash(path, g_trsub_sel)) subs_load(EMB_SRT);
+        if (trsub_stash_f(f, path, g_trsub_sel)) subs_load(EMB_SRT);
     }
     def_apply_subs(g_tra.lang_main);   /* single-audio path: the file's main language */
 

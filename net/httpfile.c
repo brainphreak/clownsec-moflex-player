@@ -61,6 +61,8 @@ typedef struct {
     LightLock lk;
     Thread th;
     volatile int stop;
+    volatile int closing;           /* closing: no new requests, but the one in flight may finish */
+    volatile int busy;              /* the worker is inside a request */
     long long want;                 /* the block a read is waiting for (-1: none) */
     long long cur;                  /* where reading is: the prefetch window starts here */
     long long last; int seq;        /* sequential-read detection */
@@ -127,6 +129,11 @@ static unsigned long hf_heap_free_kb(void) {
     return lo;
 }
 static HFile *g_hf_cur;   /* the most recently opened file still open (playback's, after the probe) */
+/* every file open now: when a second one (a subtitle or audio track from the trailer) closes,
+ * the one still open becomes current again -- it used to be left at none, which turned off the
+ * playback start's read-ahead for the rest of that video */
+#define HF_OPEN_MAX 4
+static HFile *g_hf_list[HF_OPEN_MAX];
 static int slot_of(HFile *h, long long blk) {
     for (int i = 0; i < h->nslots; i++)
         if (h->slots[i].state != SL_EMPTY && h->slots[i].blk == blk) return i;
@@ -139,6 +146,7 @@ static int claim(HFile *h, long long target);
 static int next_jobs(HFile *h) {
     long long nblk = (h->size + HB_SIZE - 1) / HB_SIZE;
     h->nfill = 0; h->fill_i = 0;
+    if (h->closing) return 0;
     if (h->want >= 0 && slot_of(h, h->want) < 0) {
         int i = claim(h, h->want);
         if (i >= 0) h->fills[h->nfill++] = &h->slots[i];
@@ -200,8 +208,9 @@ static void worker(void *arg) {
     while (!h->stop && h->e) {
         LightLock_Lock(&h->lk);
         int n = next_jobs(h);
+        if (n) h->busy = 1;
         LightLock_Unlock(&h->lk);
-        if (!n) { svcSleepThread(3 * 1000 * 1000LL); continue; }   /* idle: no socket wait */
+        if (!n) { h->busy = 0; svcSleepThread(3 * 1000 * 1000LL); continue; }   /* idle: no socket wait */
         long long a = h->fills[0]->blk * HB_SIZE, b = (h->fills[n - 1]->blk + 1) * HB_SIZE - 1;
         if (b >= h->size) b = h->size - 1;
         char range[48]; snprintf(range, sizeof range, "%lld-%lld", a, b);
@@ -220,6 +229,7 @@ static void worker(void *arg) {
             h->failed++;
         }
         LightLock_Unlock(&h->lk);
+        h->busy = 0;
         if (!ok && !h->stop) svcSleepThread(200 * 1000 * 1000LL);   /* don't hammer a failing server */
     }
     if (h->e) curl_easy_cleanup(h->e);
@@ -289,8 +299,18 @@ static int hf_seek(void *c, off_t *off, int whence) {
 
 static int hf_close(void *c) {
     HFile *h = (HFile *)c;
-    if (g_hf_cur == h) g_hf_cur = NULL;
+    /* Let a request already on its way finish (at most 3 s) instead of cutting the connection in
+     * the middle of it: a 3DS socket closed mid-transfer could hold up the console's whole network
+     * service, and the file still open (playback) waited behind it -- minutes before a super
+     * moflex with subtitles started. The blocks it brings are kept with the rest. */
+    h->closing = 1;
+    for (u64 t = osGetTime(); h->busy && osGetTime() - t < 3000; ) svcSleepThread(5 * 1000 * 1000LL);
     h->stop = 1;
+    for (int i = 0; i < HF_OPEN_MAX; i++) if (g_hf_list[i] == h) g_hf_list[i] = NULL;
+    if (g_hf_cur == h) {
+        g_hf_cur = NULL;
+        for (int i = 0; i < HF_OPEN_MAX; i++) if (g_hf_list[i]) g_hf_cur = g_hf_list[i];
+    }
     if (h->th) { threadJoin(h->th, U64_MAX); threadFree(h->th); }
     if (g_hf_open > 0) g_hf_open--;
     /* one line per opened file: was playback waiting on the network, or not? */
@@ -312,6 +332,9 @@ static int hf_close(void *c) {
             fclose(lf);
         }
     }
+    /* a second file (a trailer track) closing while playback's is open: nothing to keep -- parking
+     * it held its 2 MB through the whole film, heap curl needs on an Old 3DS */
+    if (g_hf_open > 0) { free(h->mem); free(h->slots); free(h->url); free(h); return 0; }
     /* keep the blocks a moment for the playback that usually reopens this file right away */
     httpfile_drop_cache();
     for (int i = 0; i < h->nslots; i++) if (h->slots[i].state != SL_READY) h->slots[i].state = SL_EMPTY;
@@ -355,6 +378,7 @@ FILE *httpfile_open(const char *url, long long size, size_t ring_bytes) {
     if (!h->th) { free(h->mem); free(h->slots); free(h->url); free(h); return NULL; }
     cookie_io_functions_t io = { hf_read, NULL, hf_seek, hf_close };
     g_hf_open++;
+    for (int i = 0; i < HF_OPEN_MAX; i++) if (!g_hf_list[i]) { g_hf_list[i] = h; break; }
     FILE *f = fopencookie(h, "rb", io);
     if (!f) { hf_close(h); return NULL; }
     setvbuf(f, NULL, _IOFBF, 32 * 1024);
